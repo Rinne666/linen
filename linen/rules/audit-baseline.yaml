@@ -1,0 +1,175 @@
+# Small integration baseline, not a comprehensive security ruleset.
+rules:
+  - id: python-dynamic-eval-candidate
+    languages: [python]
+    severity: WARNING
+    message: Dynamic eval requires verification of input control and reachability.
+    metadata:
+      cwe: ["CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"]
+    pattern: eval($EXPRESSION)
+  - id: python-shell-candidate
+    languages: [python]
+    severity: WARNING
+    message: Shell invocation requires input and authorization tracing.
+    metadata:
+      cwe: ["CWE-78: OS Command Injection"]
+    pattern: os.system($COMMAND)
+  - id: java-url-open-stream-candidate
+    languages: [java]
+    severity: WARNING
+    message: URL stream creation needs user-input, SSRF, and network-boundary verification.
+    metadata:
+      cwe: ["CWE-918: Server-Side Request Forgery (SSRF)"]
+    pattern-either:
+      - pattern: new URL($URL).openStream()
+      - pattern: new URL($URL).openConnection()
+      - pattern: new URL($URL).openConnection($PROXY)
+      - pattern: $URI.toURL().openConnection()
+  - id: java-runtime-exec-candidate
+    languages: [java]
+    severity: WARNING
+    message: Process execution needs command provenance and authorization verification.
+    metadata:
+      cwe: ["CWE-78: OS Command Injection"]
+    pattern-either:
+      - pattern: Runtime.getRuntime().exec($COMMAND)
+      - pattern: new ProcessBuilder(...)
+  - id: java-yaml-load-candidate
+    languages: [java]
+    severity: WARNING
+    message: YAML loading needs safe-constructor and untrusted-input verification.
+    metadata:
+      cwe: ["CWE-502: Deserialization of Untrusted Data"]
+    pattern-either:
+      - pattern: $YAML.load($INPUT)
+      - pattern: $YAML.loadAs($INPUT, ...)
+  - id: java-object-deserialization-candidate
+    languages: [java]
+    severity: WARNING
+    message: Native object deserialization requires provenance, filtering, and gadget verification.
+    metadata:
+      cwe: ["CWE-502: Deserialization of Untrusted Data"]
+    pattern: $STREAM.readObject()
+  - id: java-script-evaluation-candidate
+    languages: [java]
+    severity: WARNING
+    message: Script or expression evaluation requires input-control and sandbox verification.
+    metadata:
+      cwe: ["CWE-94: Improper Control of Generation of Code"]
+    pattern-either:
+      - pattern: $ENGINE.eval($CODE)
+      - pattern: $ENGINE.eval($CODE, ...)
+      - pattern: $SHELL.evaluate($CODE)
+      - pattern: $PARSER.parseExpression($CODE)
+  - id: java-http-client-url-candidate
+    languages: [java]
+    severity: WARNING
+    message: Outbound HTTP target requires SSRF, scheme, redirect, and network-boundary verification.
+    metadata:
+      cwe: ["CWE-918: Server-Side Request Forgery (SSRF)"]
+    pattern-either:
+      - pattern: $REST.getForObject($URL, ...)
+      - pattern: $REST.getForEntity($URL, ...)
+      - pattern: $REST.exchange($URL, ...)
+      - pattern: WebClient.create($URL)
+      - pattern: WebClient.builder().baseUrl($URL)
+      - pattern: HttpRequest.newBuilder($URI)
+  - id: java-file-path-candidate
+    languages: [java]
+    severity: WARNING
+    message: File-system path construction or write requires traversal, root, and authorization verification.
+    metadata:
+      cwe: ["CWE-22: Improper Limitation of a Pathname to a Restricted Directory"]
+    pattern-either:
+      - pattern: new File($PATH)
+      - pattern: new File($PARENT, $CHILD)
+      - pattern: Paths.get($PATH, ...)
+      - pattern: Files.write($PATH, ...)
+      - pattern: new FileOutputStream($PATH, ...)
+  - id: java-dynamic-class-loading-candidate
+    languages: [java]
+    severity: WARNING
+    message: Dynamic class loading requires provenance and allowlist verification.
+    metadata:
+      cwe: ["CWE-470: Use of Externally-Controlled Input to Select Classes or Code"]
+    pattern-either:
+      - pattern: Class.forName($NAME)
+      - pattern: $LOADER.loadClass($NAME)
+  - id: java-weak-crypto-selection-candidate
+    languages: [java]
+    severity: WARNING
+    message: Cryptographic algorithm selection requires constant, mode, padding, and key-management verification.
+    metadata:
+      cwe: ["CWE-327: Use of a Broken or Risky Cryptographic Algorithm"]
+    pattern-either:
+      - pattern: Cipher.getInstance($TRANSFORMATION)
+      - pattern: MessageDigest.getInstance($ALGORITHM)
+      - pattern: Mac.getInstance($ALGORITHM)
+  - id: java-permissive-graal-context-candidate
+    languages: [java]
+    severity: WARNING
+    message: Graal host or all-access enablement requires tenant-boundary and untrusted-code verification.
+    metadata:
+      cwe: ["CWE-250: Execution with Unnecessary Privileges"]
+    pattern-either:
+      - pattern: $BUILDER.allowAllAccess(true)
+      - pattern: $BUILDER.allowHostAccess(HostAccess.ALL)
+      - pattern: $BUILDER.allowIO(true)
+  - id: javascript-child-process-candidate
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Child-process execution needs command provenance and authorization verification.
+    metadata:
+      cwe: ["CWE-78: OS Command Injection"]
+    pattern-either:
+      - pattern: child_process.exec($COMMAND, ...)
+      - pattern: child_process.execSync($COMMAND, ...)
+  - id: javascript-dynamic-code-candidate
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Dynamic JavaScript compilation requires untrusted-input and reachability verification.
+    metadata:
+      cwe: ["CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"]
+    pattern-either:
+      - pattern: eval($CODE)
+      - pattern: new Function(...)
+  - id: javascript-outbound-url-candidate
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Outbound request target requires SSRF and redirect verification.
+    metadata:
+      cwe: ["CWE-918: Server-Side Request Forgery (SSRF)"]
+    pattern-either:
+      - pattern: fetch($URL, ...)
+      - pattern: axios.get($URL, ...)
+      - pattern: axios.post($URL, ...)
+  - id: python-subprocess-shell-candidate
+    languages: [python]
+    severity: WARNING
+    message: Subprocess execution requires argument provenance and shell-expansion verification.
+    metadata:
+      cwe: ["CWE-78: OS Command Injection"]
+    pattern-either:
+      - pattern: subprocess.run(..., shell=True, ...)
+      - pattern: subprocess.Popen(..., shell=True, ...)
+      - pattern: subprocess.call(..., shell=True, ...)
+  - id: python-deserialization-candidate
+    languages: [python]
+    severity: WARNING
+    message: Deserialization requires trusted-input and safe-loader verification.
+    metadata:
+      cwe: ["CWE-502: Deserialization of Untrusted Data"]
+    pattern-either:
+      - pattern: pickle.loads($INPUT)
+      - pattern: pickle.load($INPUT)
+      - pattern: yaml.load($INPUT, ...)
+  - id: python-outbound-url-candidate
+    languages: [python]
+    severity: WARNING
+    message: Outbound request target requires SSRF, redirect, and scheme verification.
+    metadata:
+      cwe: ["CWE-918: Server-Side Request Forgery (SSRF)"]
+    pattern-either:
+      - pattern: requests.get($URL, ...)
+      - pattern: requests.post($URL, ...)
+      - pattern: urllib.request.urlopen($URL, ...)

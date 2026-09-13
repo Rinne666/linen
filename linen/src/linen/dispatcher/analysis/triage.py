@@ -1,0 +1,386 @@
+"""Graph-derived scanner triage and per-candidate verification contracts."""
+from __future__ import annotations
+
+import json
+import uuid
+from pathlib import Path
+
+from linen.dispatcher.analysis.artifacts import load_artifact
+from linen.dispatcher.analysis.semgrep import digest, write_json
+from linen.dispatcher.config import CandidateTriageConfig
+from linen.server.models import Fact, Intent, ProjectDetail
+
+
+TRIAGE_PREFIX = "@candidate-triage:"
+VERIFY_PREFIX = "@candidate-verify:"
+SCAN_SUMMARY_PREFIX = "@analysis:candidate-summary:"
+CANDIDATE_FACT_TYPES = {"scan_batch", "route_scan"}
+TRIAGE_OUTCOMES = {"keep", "drop", "duplicate"}
+VERIFY_OUTCOMES = {"confirmed", "refuted", "blocked"}
+
+
+def _artifact_file(path: Path, manifest: dict, name: str) -> bytes:
+    expected = manifest.get("artifact_hashes", {}).get(name)
+    target = path.parent / name
+    if not expected or not target.is_file():
+        raise ValueError(f"Scanner artifact is missing {name}")
+    data = target.read_bytes()
+    if digest(data) != expected:
+        raise ValueError(f"Scanner artifact changed: {name}")
+    return data
+
+
+def scanner_candidates(fact: Fact, workdir: Path) -> tuple[Path, dict, list[dict]]:
+    if fact.type not in CANDIDATE_FACT_TYPES:
+        raise ValueError("Candidate source must be a scan_batch or route_scan fact")
+    path, manifest = load_artifact(fact, workdir)
+    if manifest.get("status") != "completed":
+        raise ValueError(f"Scanner {fact.id} is not complete: {manifest.get('status')}")
+    candidates = json.loads(_artifact_file(path, manifest, "candidates.json"))
+    if not isinstance(candidates, list):
+        raise ValueError("candidates.json must contain an array")
+    fingerprints = [candidate.get("fingerprint") for candidate in candidates]
+    if any(not isinstance(value, str) or not value for value in fingerprints):
+        raise ValueError("Every candidate requires a fingerprint")
+    if len(set(fingerprints)) != len(fingerprints):
+        raise ValueError("Candidate fingerprints must be unique within a scanner batch")
+    return path, manifest, sorted(candidates, key=lambda item: item["fingerprint"])
+
+
+def batch_description(fact_id: str, start: int, stop: int) -> str:
+    return f"{TRIAGE_PREFIX}{fact_id}:{start}-{stop}"
+
+
+def batches(fact: Fact, workdir: Path, config: CandidateTriageConfig) -> list[dict]:
+    _, _, candidates = scanner_candidates(fact, workdir)
+    result = []
+    for start in range(0, len(candidates), config.candidates_per_batch):
+        stop = min(start + config.candidates_per_batch, len(candidates))
+        result.append({
+            "description": batch_description(fact.id, start, stop),
+            "source_fact_id": fact.id,
+            "start": start,
+            "stop": stop,
+            "candidates": candidates[start:stop],
+        })
+    if len(result) > config.max_batches:
+        raise ValueError(
+            f"Candidate triage needs {len(result)} batches (limit {config.max_batches}); nothing was truncated"
+        )
+    return result
+
+
+def _batch_for_intent(
+    project: ProjectDetail,
+    intent: Intent,
+    workdir: Path,
+    config: CandidateTriageConfig,
+) -> tuple[Fact, dict]:
+    for fact in project.facts:
+        if fact.id in intent.from_ and fact.type in CANDIDATE_FACT_TYPES:
+            match = next(
+                (batch for batch in batches(fact, workdir, config)
+                 if batch["description"] == intent.description.strip()),
+                None,
+            )
+            if match is not None and (intent.type or "").startswith("triage"):
+                return fact, match
+    raise ValueError("Triage intent must reference its scanner fact and an exact candidate batch")
+
+
+def triage_context_prompt(
+    project: ProjectDetail,
+    intent: Intent,
+    workdir: Path,
+    config: CandidateTriageConfig,
+) -> str:
+    source, batch = _batch_for_intent(project, intent, workdir, config)
+    path, manifest = load_artifact(source, workdir)
+    return "\nManaged candidate triage (the graph remains the task ledger):\n" + json.dumps({
+        "source_fact_id": source.id,
+        "scanner": manifest.get("scanner"),
+        "snapshot": manifest.get("snapshot", {}).get("id"),
+        "source_root": str(path.parent / "source"),
+        "candidates": batch["candidates"],
+    }, ensure_ascii=False) + """
+Read the cited source for every candidate. Return accepted:true with data.description,
+data.type="candidate_triage", data.evidence, and data.triage containing exactly one
+object per fingerprint: {fingerprint, outcome, category, rationale, duplicate_of?}.
+outcome is keep, drop, or duplicate. keep means a plausible trust-boundary crossing
+that needs a dedicated verification branch. drop requires a concrete source-grounded
+reason such as test-only, unreachable, safe API, or scanner mismatch. duplicate requires
+duplicate_of naming another fingerprint in this batch or a clearly cited earlier graph
+candidate. This task classifies candidates; it does not claim a vulnerability.
+"""
+
+
+def triage_outcome_fact(
+    payload: dict,
+    project: ProjectDetail,
+    intent: Intent,
+    workdir: Path,
+    config: CandidateTriageConfig,
+) -> dict[str, str]:
+    source, batch = _batch_for_intent(project, intent, workdir, config)
+    data = payload.get("data", payload)
+    rows = data.get("triage") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("Managed triage requires data.triage")
+    expected = {candidate["fingerprint"] for candidate in batch["candidates"]}
+    actual = [row.get("fingerprint") for row in rows if isinstance(row, dict)]
+    if len(actual) != len(rows) or set(actual) != expected or len(actual) != len(set(actual)):
+        raise ValueError("Triage output must cover every assigned fingerprint exactly once")
+    normalized = []
+    for row in rows:
+        outcome = row.get("outcome")
+        rationale = row.get("rationale")
+        category = row.get("category")
+        if outcome not in TRIAGE_OUTCOMES:
+            raise ValueError(f"Unknown triage outcome: {outcome}")
+        if not isinstance(rationale, str) or not rationale.strip():
+            raise ValueError("Every triage decision requires a rationale")
+        if not isinstance(category, str) or not category.strip():
+            raise ValueError("Every triage decision requires a category")
+        duplicate_of = row.get("duplicate_of")
+        if outcome == "duplicate" and (not isinstance(duplicate_of, str) or not duplicate_of):
+            raise ValueError("duplicate triage decisions require duplicate_of")
+        normalized.append({
+            "fingerprint": row["fingerprint"],
+            "outcome": outcome,
+            "category": category.strip(),
+            "rationale": rationale.strip(),
+            **({"duplicate_of": duplicate_of} if duplicate_of else {}),
+        })
+    record = {
+        "schema_version": 1,
+        "source_fact_id": source.id,
+        "batch": {"start": batch["start"], "stop": batch["stop"]},
+        "decisions": sorted(normalized, key=lambda row: row["fingerprint"]),
+    }
+    directory = workdir / ".linen-analysis" / ("triage-" + uuid.uuid4().hex)
+    directory.mkdir(parents=True)
+    path = directory / "result.json"
+    write_json(path, record)
+    counts = {outcome: sum(row["outcome"] == outcome for row in normalized) for outcome in sorted(TRIAGE_OUTCOMES)}
+    return {
+        "type": "candidate_triage",
+        "description": f"Candidate triage for {source.id} [{batch['start']}:{batch['stop']}]: {counts}.",
+        "evidence": (
+            f"artifact: {path}\nmanifest_sha256: {digest(path.read_bytes())}\n"
+            f"source_fact_id: {source.id}\nstatus: completed"
+        ),
+    }
+
+
+def triage_record(fact: Fact, workdir: Path) -> dict:
+    if fact.type != "candidate_triage":
+        raise ValueError("Expected candidate_triage fact")
+    _, record = load_artifact(fact, workdir)
+    if not isinstance(record.get("decisions"), list) or not record.get("source_fact_id"):
+        raise ValueError("Invalid candidate triage artifact")
+    return record
+
+
+def verify_description(source_fact_id: str, fingerprint: str, attempt: int) -> str:
+    return f"{VERIFY_PREFIX}{source_fact_id}:{fingerprint}:{attempt}"
+
+
+def _verification_target(
+    project: ProjectDetail,
+    intent: Intent,
+    workdir: Path,
+) -> tuple[Fact, dict, dict]:
+    triage_fact = next(
+        (fact for fact in project.facts if fact.id in intent.from_ and fact.type == "candidate_triage"),
+        None,
+    )
+    if triage_fact is None or not intent.description.startswith(VERIFY_PREFIX):
+        raise ValueError("Candidate verification must reference a candidate_triage fact")
+    record = triage_record(triage_fact, workdir)
+    parts = intent.description.split(":")
+    if len(parts) < 4:
+        raise ValueError("Invalid candidate verification description")
+    fingerprint = parts[-2]
+    decision = next(
+        (row for row in record["decisions"] if row["fingerprint"] == fingerprint and row["outcome"] == "keep"),
+        None,
+    )
+    if decision is None:
+        raise ValueError("Candidate verification must target a kept candidate")
+    scanner_fact = next((fact for fact in project.facts if fact.id == record["source_fact_id"]), None)
+    if scanner_fact is None:
+        raise ValueError("Candidate scanner fact is missing")
+    _, _, candidates = scanner_candidates(scanner_fact, workdir)
+    candidate = next((item for item in candidates if item["fingerprint"] == fingerprint), None)
+    if candidate is None:
+        raise ValueError("Candidate fingerprint is missing from scanner evidence")
+    return triage_fact, decision, candidate
+
+
+def verification_context_prompt(project: ProjectDetail, intent: Intent, workdir: Path) -> str:
+    _, decision, candidate = _verification_target(project, intent, workdir)
+    return "\nManaged candidate verification:\n" + json.dumps({
+        "candidate": candidate,
+        "triage": decision,
+    }, ensure_ascii=False) + """
+Independently verify this one candidate end to end. Return accepted:true with the normal
+data.description/type/evidence fields plus data.candidate_disposition containing:
+{fingerprint, outcome, rationale}. outcome must be confirmed, refuted, or blocked.
+confirmed requires type=vulnerability and a closed source/reachability/guard/sink chain.
+refuted requires type=candidate_disposition and decisive counter-evidence. blocked is
+reserved for missing build/runtime/dependency evidence and also uses candidate_disposition.
+Do not silently switch to another candidate.
+"""
+
+
+def verification_outcome_fact(
+    payload: dict,
+    project: ProjectDetail,
+    intent: Intent,
+    workdir: Path,
+) -> dict[str, str]:
+    _, _, candidate = _verification_target(project, intent, workdir)
+    data = payload.get("data", payload)
+    disposition = data.get("candidate_disposition") if isinstance(data, dict) else None
+    if not isinstance(disposition, dict):
+        raise ValueError("Candidate verification requires data.candidate_disposition")
+    if disposition.get("fingerprint") != candidate["fingerprint"]:
+        raise ValueError("Candidate disposition fingerprint does not match the assigned candidate")
+    outcome = disposition.get("outcome")
+    rationale = disposition.get("rationale")
+    if outcome not in VERIFY_OUTCOMES or not isinstance(rationale, str) or not rationale.strip():
+        raise ValueError("Candidate disposition requires a valid outcome and rationale")
+    fact_type = data.get("type")
+    if outcome == "confirmed" and fact_type != "vulnerability":
+        raise ValueError("A confirmed candidate must produce type=vulnerability")
+    if outcome != "confirmed" and fact_type != "candidate_disposition":
+        raise ValueError("A non-confirmed candidate must produce type=candidate_disposition")
+    evidence = data.get("evidence")
+    if not isinstance(evidence, str) or not evidence.strip():
+        raise ValueError("Candidate verification requires evidence")
+    envelope = {
+        "schema_version": 1,
+        "fingerprint": candidate["fingerprint"],
+        "outcome": outcome,
+        "rationale": rationale.strip(),
+        "worker_evidence": evidence.strip(),
+    }
+    return {
+        "type": fact_type,
+        "description": data["description"].strip(),
+        "evidence": json.dumps(envelope, ensure_ascii=False),
+    }
+
+
+def scanner_summary_description(source_fact_id: str) -> str:
+    return f"{SCAN_SUMMARY_PREFIX}{source_fact_id}"
+
+
+def verification_attempts(project: ProjectDetail, source_fact_id: str, fingerprint: str) -> list[Intent]:
+    prefix = f"{VERIFY_PREFIX}{source_fact_id}:{fingerprint}:"
+    return sorted(
+        [intent for intent in project.intents if intent.description.startswith(prefix)],
+        key=lambda intent: (intent.created_at, intent.id),
+    )
+
+
+def terminal_verification(
+    project: ProjectDetail,
+    source_fact_id: str,
+    fingerprint: str,
+) -> Fact | None:
+    facts = {fact.id: fact for fact in project.facts}
+    for intent in reversed(verification_attempts(project, source_fact_id, fingerprint)):
+        fact = facts.get(intent.to or "")
+        if fact is None:
+            continue
+        if fact.type == "vulnerability":
+            return fact
+        if fact.type == "candidate_disposition":
+            try:
+                if json.loads(fact.evidence or "").get("outcome") == "refuted":
+                    return fact
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+def scanner_summary_inputs(
+    project: ProjectDetail,
+    source: Fact,
+    workdir: Path,
+    config: CandidateTriageConfig,
+) -> dict | None:
+    from linen.dispatcher.analysis.coverage import reviewed
+
+    expected_batches = batches(source, workdir, config)
+    triage_facts: list[Fact] = []
+    facts = {fact.id: fact for fact in project.facts}
+    for batch in expected_batches:
+        matching = [intent for intent in project.intents if intent.description == batch["description"]]
+        if len(matching) != 1:
+            return None
+        fact = facts.get(matching[0].to or "")
+        if fact is None or fact.type != "candidate_triage" or not reviewed(project, fact.id):
+            return None
+        triage_facts.append(fact)
+    decisions = []
+    terminal_facts: list[Fact] = []
+    for fact in triage_facts:
+        decisions.extend(triage_record(fact, workdir)["decisions"])
+    for decision in decisions:
+        if decision["outcome"] != "keep":
+            continue
+        terminal = terminal_verification(project, source.id, decision["fingerprint"])
+        if terminal is None or not reviewed(project, terminal.id):
+            return None
+        terminal_facts.append(terminal)
+    return {
+        "source": source,
+        "triage_facts": triage_facts,
+        "terminal_facts": terminal_facts,
+        "decisions": decisions,
+        "description": scanner_summary_description(source.id),
+    }
+
+
+def scanner_summary_fact(
+    project: ProjectDetail,
+    intent: Intent,
+    workdir: Path,
+    config: CandidateTriageConfig,
+) -> dict[str, str]:
+    source_id = intent.description.removeprefix(SCAN_SUMMARY_PREFIX)
+    source = next((fact for fact in project.facts if fact.id == source_id and fact.type in CANDIDATE_FACT_TYPES), None)
+    if source is None or intent.description != scanner_summary_description(source_id):
+        raise ValueError("Invalid scanner summary intent")
+    inputs = scanner_summary_inputs(project, source, workdir, config)
+    if inputs is None or (intent.type or "") != "synthesize":
+        raise ValueError("Scanner summary requires complete reviewed triage and verification")
+    expected = {source.id, *(fact.id for fact in inputs["triage_facts"]),
+                *(fact.id for fact in inputs["terminal_facts"])}
+    if set(intent.from_) != expected:
+        raise ValueError("Scanner summary must fan in every triage and terminal verification fact")
+    counts = {outcome: sum(row["outcome"] == outcome for row in inputs["decisions"])
+              for outcome in sorted(TRIAGE_OUTCOMES)}
+    record = {
+        "schema_version": 1,
+        "kind": "candidate_scanner_summary",
+        "source_fact_id": source.id,
+        "counts": counts,
+        "triage_fact_ids": [fact.id for fact in inputs["triage_facts"]],
+        "terminal_fact_ids": [fact.id for fact in inputs["terminal_facts"]],
+        "fingerprints": sorted(row["fingerprint"] for row in inputs["decisions"]),
+    }
+    directory = workdir / ".linen-analysis" / ("summary-" + uuid.uuid4().hex)
+    directory.mkdir(parents=True)
+    path = directory / "candidate-summary.json"
+    write_json(path, record)
+    return {
+        "type": "module_summary",
+        "description": f"Scanner candidate set {source.id} fully dispositioned: {counts}.",
+        "evidence": (
+            f"artifact: {path}\nmanifest_sha256: {digest(path.read_bytes())}\n"
+            f"source_fact_id: {source.id}\nstatus: completed"
+        ),
+    }

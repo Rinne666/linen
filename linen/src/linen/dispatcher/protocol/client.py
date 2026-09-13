@@ -1,0 +1,470 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+import logging
+import threading
+
+from pydantic import TypeAdapter
+import requests
+from requests.adapters import HTTPAdapter
+
+from linen.server.models import (
+    AuditStage,
+    CompletionGate,
+    Intent,
+    ProjectDetail,
+    ProjectSummary,
+    Settings,
+    SkillRun,
+)
+
+LOG = logging.getLogger(__name__)
+
+
+class ProtocolError(RuntimeError):
+    def __init__(self, message: str, status_code: int, response_text: str = ""):
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_text = response_text
+
+
+@dataclass(slots=True)
+class ApiResult:
+    status_code: int
+    data: Any | None = None
+    text: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return 200 <= self.status_code < 300
+
+
+class LinenClient:
+    def __init__(self, base_url: str, timeout: float = 10.0):
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+        self._summary_adapter = TypeAdapter(list[ProjectSummary])
+        self._local = threading.local()
+        self._sessions: dict[int, requests.Session] = {}
+        self._sessions_lock = threading.Lock()
+
+    def close(self) -> None:
+        with self._sessions_lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
+            session.close()
+
+    def list_projects(self) -> list[ProjectSummary]:
+        response = self._session().get(self._url("/projects"), timeout=self._timeout)
+        response.raise_for_status()
+        return self._summary_adapter.validate_python(response.json())
+
+    def get_project(self, project_id: str) -> ProjectDetail:
+        response = self._session().get(self._url(f"/projects/{project_id}"), timeout=self._timeout)
+        response.raise_for_status()
+        return ProjectDetail.model_validate(response.json())
+
+    def get_settings(self) -> Settings:
+        response = self._session().get(self._url("/settings"), timeout=self._timeout)
+        response.raise_for_status()
+        return Settings.model_validate(response.json())
+
+    def get_completion_gate(
+        self, project_id: str, from_ids: list[str] | None = None,
+    ) -> CompletionGate:
+        response = self._session().get(
+            self._url(f"/projects/{project_id}/completion-gate"),
+            params=[("from_id", fact_id) for fact_id in (from_ids or [])],
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        return CompletionGate.model_validate(response.json())
+
+    def upsert_audit_stage(
+        self,
+        project_id: str,
+        stage_id: str,
+        *,
+        label: str,
+        phase_order: int,
+        status: str,
+        required: bool = True,
+        capability: str | None = None,
+        skill_id: str | None = None,
+        run_id: str | None = None,
+        detail: str | None = None,
+        source_generation: int | None = None,
+        plan_revision: int | None = None,
+        actor: str = "dispatcher",
+    ) -> ApiResult:
+        body: dict[str, Any] = {
+            "label": label,
+            "phase_order": phase_order,
+            "required": required,
+            "status": status,
+            "actor": actor,
+        }
+        for key, value in {
+            "capability": capability,
+            "skill_id": skill_id,
+            "run_id": run_id,
+            "detail": detail,
+            "source_generation": source_generation,
+            "plan_revision": plan_revision,
+        }.items():
+            if value is not None:
+                body[key] = value
+        return self._request_json(
+            "PUT",
+            f"/projects/{project_id}/stages/{stage_id}",
+            json=body,
+        )
+
+    def list_audit_stages(self, project_id: str) -> list[AuditStage]:
+        """Read the server-owned stage projection for reconciliation."""
+        response = self._session().get(
+            self._url(f"/projects/{project_id}/stages"), timeout=self._timeout,
+        )
+        response.raise_for_status()
+        return TypeAdapter(list[AuditStage]).validate_python(response.json())
+
+    def create_skill_run(
+        self,
+        project_id: str,
+        *,
+        stage_id: str,
+        skill_id: str,
+        skill_version: str,
+        capability: str,
+        status: str,
+        intent_id: str | None = None,
+        command: str | None = None,
+        artifact_ref: str | None = None,
+        artifact_sha256: str | None = None,
+        detail: str | None = None,
+        source_generation: int | None = None,
+        plan_revision: int | None = None,
+        actor: str = "dispatcher",
+    ) -> ApiResult:
+        body = {
+            "stage_id": stage_id,
+            "skill_id": skill_id,
+            "skill_version": skill_version,
+            "capability": capability,
+            "status": status,
+            "actor": actor,
+        }
+        for key, value in {
+            "intent_id": intent_id,
+            "command": command,
+            "artifact_ref": artifact_ref,
+            "artifact_sha256": artifact_sha256,
+            "detail": detail,
+            "source_generation": source_generation,
+            "plan_revision": plan_revision,
+        }.items():
+            if value is not None:
+                body[key] = value
+        return self._request_json(
+            "POST", f"/projects/{project_id}/skill-runs", json=body,
+        )
+
+    def update_skill_run(
+        self,
+        project_id: str,
+        run_id: str,
+        *,
+        stage_id: str,
+        skill_id: str,
+        skill_version: str,
+        capability: str,
+        status: str,
+        intent_id: str | None = None,
+        command: str | None = None,
+        artifact_ref: str | None = None,
+        artifact_sha256: str | None = None,
+        detail: str | None = None,
+        source_generation: int | None = None,
+        plan_revision: int | None = None,
+        actor: str = "dispatcher",
+    ) -> ApiResult:
+        """Finalize or amend a dispatcher-issued skill execution receipt."""
+        body: dict[str, Any] = {
+            "stage_id": stage_id,
+            "skill_id": skill_id,
+            "skill_version": skill_version,
+            "capability": capability,
+            "status": status,
+            "actor": actor,
+        }
+        for key, value in {
+            "intent_id": intent_id,
+            "command": command,
+            "artifact_ref": artifact_ref,
+            "artifact_sha256": artifact_sha256,
+            "detail": detail,
+            "source_generation": source_generation,
+            "plan_revision": plan_revision,
+        }.items():
+            if value is not None:
+                body[key] = value
+        return self._request_json(
+            "PUT", f"/projects/{project_id}/skill-runs/{run_id}", json=body,
+        )
+
+    def list_skill_runs(self, project_id: str) -> list[SkillRun]:
+        response = self._session().get(
+            self._url(f"/projects/{project_id}/skill-runs"), timeout=self._timeout,
+        )
+        response.raise_for_status()
+        return TypeAdapter(list[SkillRun]).validate_python(response.json())
+
+    def export_project(self, project_id: str) -> str:
+        response = self._session().get(
+            self._url(f"/projects/{project_id}/export"),
+            params={"format": "yaml"},
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        return response.text
+
+    def heartbeat(self, project_id: str, intent_id: str, worker: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/intents/{intent_id}/heartbeat",
+            json={"worker": worker},
+        )
+
+    def claim_reason(self, project_id: str, worker: str, lease_id: str, trigger: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/reason/claim",
+            json={"worker": worker, "lease_id": lease_id, "trigger": trigger},
+        )
+
+    def reason_heartbeat(self, project_id: str, worker: str, lease_id: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/reason/heartbeat",
+            json={"worker": worker, "lease_id": lease_id},
+        )
+
+    def release_reason(self, project_id: str, worker: str, lease_id: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/reason/release",
+            json={"worker": worker, "lease_id": lease_id},
+        )
+
+    def release(self, project_id: str, intent_id: str, worker: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/intents/{intent_id}/release",
+            json={"worker": worker},
+        )
+
+    def report_intent_error(
+        self,
+        project_id: str,
+        intent_id: str,
+        worker: str,
+        *,
+        task_type: str,
+        code: str,
+        classification: str,
+        message: str,
+        remediation: str | None = None,
+        base_retry_seconds: int = 15,
+        max_retry_seconds: int = 900,
+        max_attempts: int = 5,
+    ) -> ApiResult:
+        body: dict[str, Any] = {
+            "worker": worker,
+            "task_type": task_type,
+            "code": code,
+            "classification": classification,
+            "message": message,
+            "base_retry_seconds": base_retry_seconds,
+            "max_retry_seconds": max_retry_seconds,
+            "max_attempts": max_attempts,
+        }
+        if remediation is not None:
+            body["remediation"] = remediation
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/intents/{intent_id}/fail",
+            json=body,
+        )
+
+    def retry_intent(
+        self, project_id: str, intent_id: str, actor: str,
+    ) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/intents/{intent_id}/retry",
+            json={"actor": actor},
+        )
+
+    def compact_coverage_intents(
+        self,
+        project_id: str,
+        *,
+        keep: int = 4,
+        dry_run: bool = True,
+    ) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/intents/compact-coverage",
+            json={"keep": keep, "dry_run": dry_run},
+        )
+
+    def conclude(
+        self,
+        project_id: str,
+        intent_id: str,
+        worker: str,
+        description: str,
+        *,
+        fact_type: str | None = None,
+        evidence: str | None = None,
+        status: str = "draft",
+        display_title: str | None = None,
+        semantic_type: str | None = None,
+    ) -> ApiResult:
+        body: dict[str, Any] = {
+            "worker": worker,
+            "description": description,
+            "status": status,
+        }
+        if fact_type is not None:
+            body["type"] = fact_type
+        if evidence is not None:
+            body["evidence"] = evidence
+        if display_title is not None:
+            body["display_title"] = display_title
+        if semantic_type is not None:
+            body["semantic_type"] = semantic_type
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/intents/{intent_id}/conclude",
+            json=body,
+        )
+
+    def complete(self, project_id: str, from_ids: list[str], description: str, worker: str) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/complete",
+            json={"from": from_ids, "description": description, "worker": worker},
+        )
+
+    def create_review(
+        self,
+        project_id: str,
+        fact_id: str,
+        verdict: str,
+        summary: str,
+        *,
+        confidence: str | None = None,
+        reasoning: str | None = None,
+        intent_id: str | None = None,
+        created_by: str | None = None,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> ApiResult:
+        """Submit an adversarial Review for a fact. Returns ApiResult with
+        the server-aggregated fact status in the response body."""
+        body: dict[str, Any] = {
+            "verdict": verdict,
+            "summary": summary,
+        }
+        if confidence is not None:
+            body["confidence"] = confidence
+        if reasoning is not None:
+            body["reasoning"] = reasoning
+        if intent_id is not None:
+            body["intent_id"] = intent_id
+        if created_by is not None:
+            body["created_by"] = created_by
+        if diagnostics:
+            from linen.server.models import ReviewDiagnostics
+            body.update(ReviewDiagnostics.model_validate(diagnostics).model_dump(exclude_none=True))
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/facts/{fact_id}/reviews",
+            json=body,
+        )
+
+    def create_hint(self, project_id: str, content: str, creator: str) -> ApiResult:
+        return self._request_json(
+            "POST", f"/projects/{project_id}/hints",
+            json={"content": content, "creator": creator},
+        )
+
+    def create_intent(
+        self,
+        project_id: str,
+        from_ids: list[str],
+        description: str,
+        creator: str,
+        *,
+        intent_type: str | None = None,
+        display_title: str | None = None,
+        semantic_type: str | None = None,
+        relation_type: str | None = None,
+        phase: str | None = None,
+    ) -> ApiResult:
+        body: dict[str, Any] = {
+            "from": from_ids,
+            "description": description,
+            "creator": creator,
+            "worker": None,
+        }
+        if intent_type is not None:
+            body["type"] = intent_type
+        if display_title is not None:
+            body["display_title"] = display_title
+        if semantic_type is not None:
+            body["semantic_type"] = semantic_type
+        if relation_type is not None:
+            body["relation_type"] = relation_type
+        if phase is not None:
+            body["phase"] = phase
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/intents",
+            json=body,
+        )
+
+    def _request_json(self, method: str, path: str, json: dict[str, Any]) -> ApiResult:
+        try:
+            response = self._session().request(
+                method,
+                self._url(path),
+                json=json,
+                timeout=self._timeout,
+            )
+        except requests.RequestException as exc:
+            LOG.warning("request failed method=%s path=%s error=%s", method, path, exc)
+            return ApiResult(status_code=0, text=str(exc))
+        data: Any | None = None
+        if response.headers.get("content-type", "").startswith("application/json"):
+            data = response.json()
+        return ApiResult(status_code=response.status_code, data=data, text=response.text)
+
+    def _url(self, path: str) -> str:
+        return f"{self._base_url}{path}"
+
+    def _session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is not None:
+            return session
+
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64, pool_block=False)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        self._local.session = session
+        with self._sessions_lock:
+            self._sessions[threading.get_ident()] = session
+        return session

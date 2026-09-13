@@ -1,0 +1,198 @@
+# Source-code vulnerability audit configuration.
+#
+# This is a thin variation of dispatch.local.example.yaml. The architectural
+# contract (server, dispatcher, tasks, prompts) is unchanged from the generic
+# problem-solving engine. The only things that differ from a generic deployment:
+#
+#   1. prompt_group: "vuln_audit"  — switches the task prompts to a vuln-mining
+#      prompt set (linen/src/linen/dispatcher/prompts/vuln_audit/)
+#   2. local.agents_md: path to a worker brief — in this case the bundled
+#      vuln-audit AGENTS.md that tells the worker the repo is at ./repo/
+#   3. local.repo_root: the source tree being audited. Each project workdir
+#      gets a `repo/` symlink to this path.
+#   4. workers with NO "bootstrap" task_type — source-code audits are iterative
+#      and should not go through the one-shot bootstrap phase. The project
+#      goes straight to reason after creation.
+#
+# Usage:
+#   cp dispatch.vuln.example.yaml dispatch.yaml
+#   uv run --project linen linen serve                           # one terminal
+#   uv run --project linen linen dispatch --config dispatch.yaml # another
+#
+# Then create a project with bootstrap_enabled=false and a scope-audit target:
+#   curl -X POST http://127.0.0.1:9000/projects -H "Content-Type: application/json" \
+#     -d '{
+#       "title": "audit-todoapp",
+#       "origin": "/Users/you/code/todoapp",
+#       "goal": "SQL injection in any user-input -> DB query path; also XSS in any HTML render",
+#       "bootstrap_enabled": false,
+#       "audit_mode": "scope"
+#     }'
+
+server: "http://127.0.0.1:9000"
+
+# Coverage-driven audit: the plan covers every included file × topic on a
+# frozen snapshot. A finding alone cannot complete the project.
+audit:
+  enabled: true
+  mode: scope
+  # Mandatory pre-coverage gate. The dispatcher freezes local policy files and
+  # optional maintainer/advisory material; an Explore worker then produces a
+  # quoted trust-boundary and pre-exclusion decision for independent review.
+  scope_adjudication:
+    enabled: true
+    local_paths:
+      - SECURITY.md
+      - .github/SECURITY.md
+      - README.md
+      - CONTRIBUTING.md
+      - "docs/**/security*.md"
+      - "docs/**/threat*.md"
+      - "docs/**/architecture*.md"
+      - "docs/**/deployment*.md"
+    policy_urls: []  # Add official HTTPS VRP or trust-anchor pages here.
+    github_advisories: true
+    fetch_timeout: 15
+    max_documents: 64
+    max_document_bytes: 1000000
+  # Uses the existing Reason worker and lock, but starts an independent
+  # conversation for each changed graph revision. The model can only propose
+  # semantic verification intents; dispatcher validation owns all writes.
+  graph_reason:
+    enabled: true
+    timeout: 120
+    max_intents: 3
+    max_attempts_per_revision: 2
+  # Existing Explore workers run these as isolated conversations. The
+  # dispatcher selects one recipe per graph-derived Intent and validates its
+  # cited result before it may become a Fact.
+  semantic:
+    enabled: true
+    architecture: true
+    authorization: true
+    state_concurrency: true
+    cross_service: true
+    contract: true
+    hypothesis_profiles: [backward, contradiction, attack-composition]
+    variant_search: true
+    max_verify_attempts: 2
+  coverage:
+    topics: [input-validation, authorization, dangerous-operations]
+    files_per_cell: 20
+    max_cells: 1000
+    max_attempts_per_cell: 3
+  review_sandbox:
+    enabled: false
+    # Prepare a trusted local image containing the configured reviewer CLI.
+    image: "linen-worker-review:latest"
+    network: none  # bridge permits model API access, but is not an egress allowlist
+    env_allowlist: []  # Explicitly name only the API credentials the image needs.
+  poc_sandbox:
+    enabled: false
+    # Required before a `poc:isolated` graph branch may execute. The image
+    # must already exist locally; Linen never pulls it and never falls back
+    # to host execution.
+    image: "linen-worker-poc:latest"
+    network: none
+    env_allowlist: []
+  spring:
+    enabled: true
+  triage:
+    enabled: true
+    candidates_per_batch: 20
+    max_batches: 500
+    max_verify_attempts: 3
+  semgrep:
+    enabled: true
+    rules: "linen/rules/audit-baseline.yaml"
+    timeout: 300
+    max_target_bytes: 2000000  # align with coverage.max_target_bytes
+    cache: true
+  # Java bytecode pass. Build the target in an isolated/trusted build lane
+  # first; Linen never executes repository Maven/Gradle scripts implicitly.
+  spotbugs:
+    enabled: false
+    executable: "spotbugs"
+    plugin: "/absolute/path/to/findsecbugs-plugin.jar"
+    targets: ["**/target/classes", "**/build/classes/java/main"]
+    timeout: 600
+  # Dependency advisory baseline. OSV-Scanner v2 emits SARIF directly.
+  osv:
+    enabled: false
+    executable: "osv-scanner"
+    recursive: true
+    timeout: 300
+  # Frozen working-tree secret scan. Historical-commit scanning is deliberately
+  # separate because scope mode must remain tied to its canonical snapshot.
+  gitleaks:
+    enabled: false
+    executable: "gitleaks"
+    redact_percent: 100
+    timeout: 300
+  # Filesystem dependency, secret and deployment/IaC configuration scan.
+  trivy:
+    enabled: false
+    executable: "trivy"
+    scanners: [vuln, misconfig, secret]
+    timeout: 600
+
+runtime:
+  worker_healthcheck: disabled
+  max_workers: 3
+  max_running_projects: 2
+  max_project_workers: 2
+  interval: 3
+  healthcheck_timeout: 15
+  prompt_group: "vuln_audit"
+
+tasks:
+  # Reason timeouts are typically shorter than explore (reason just reads the
+  # graph and proposes intents). Explore can be long — workers may read many
+  # files before forming a finding.
+  bootstrap:
+    timeout: 300
+    conclude_timeout: 60
+  reason:
+    timeout: 120
+    max_intents: 3
+  explore:
+    timeout: 900        # 15 min — long enough to read a meaningful code slice
+    conclude_timeout: 90
+
+local:
+  workspace_root: "/Users/you/.local/share/linen/workspaces"
+  completed_action: keep
+
+  # The source tree being audited. Each new project workdir will get a
+  # `repo/` symlink pointing here, so the worker can `cd repo` to read code.
+  repo_root: "/Users/you/code/audit-targets/todoapp"
+
+  # Worker brief — copy the bundled vuln_audit/AGENTS.md into each new
+  # project workdir (and as CLAUDE.md for Claude Code). The path below is
+  # relative to the dispatcher's CWD; use an absolute path if you launch
+  # the dispatcher from a different directory.
+  agents_md: "linen/src/linen/dispatcher/prompts/vuln_audit/AGENTS.md"
+
+# No "bootstrap" task type on any worker — source-code audits are iterative
+# and the project should go directly to reason after creation.
+workers:
+  - name: "audit-claude"
+    type: "claudecode"
+    task_types: [reason, explore, review]
+    max_running: 1
+    priority: 0
+
+  - name: "audit-codex"
+    type: "codex"
+    task_types: [explore, review]
+    max_running: 1
+    priority: 1
+
+  # Pi is good for focused reasoning AND for code reading (it has read, grep,
+  # find, bash tools). Use it for both phases if you want a second opinion
+  # alongside Claude/Codex.
+  - name: "audit-pi"
+    type: "pi"
+    task_types: [reason, explore, review]
+    max_running: 1
+    priority: 2

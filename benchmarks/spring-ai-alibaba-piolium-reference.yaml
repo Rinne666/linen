@@ -1,0 +1,44 @@
+# Comparative reference extracted from the local Piolium audit artifacts at
+# commit f82da0b50f35744c13968191be2b1cd2452ef550. These are benchmark labels,
+# not claims that Linen or Piolium proves the repository safe. Before using
+# this as release ground truth, manually adjudicate each static-only item.
+repository: alibaba/spring-ai-alibaba
+commit: f82da0b50f35744c13968191be2b1cd2452ef550
+source: external/piolium/findings-draft/poc-verification-report.md
+expected:
+  - id: q1-001
+    name: embedded-private-key-material
+    validation: static-only
+  - id: q2-001
+    name: studio-run-sse-unauthenticated
+    validation: live
+  - id: q2-002
+    name: graph-studio-api-unauthenticated
+    validation: live
+  - id: q2-003
+    name: sandbox-manager-arbitrary-code-execution
+    validation: live
+  - id: q2-004
+    name: prompt-run-route-unauthenticated
+    validation: live
+  - id: q2-005
+    name: filesystem-boundary-weakness
+    validation: static-only
+  - id: q2-007
+    name: rsa-private-key-resource-risk
+    validation: static-only
+  - id: q2-008
+    name: studio-enumeration-unauthenticated
+    validation: live
+  - id: q2-009
+    name: studio-resume-hitl-unauthenticated
+    validation: live
+  - id: q2-010
+    name: sandbox-tool-execution
+    validation: static-only
+  - id: q2-011
+    name: jwt-signature-not-enforced
+    validation: static-and-chain
+excluded:
+  - id: q2-006
+    reason: Piolium live validation downgraded the production impact to informational.
