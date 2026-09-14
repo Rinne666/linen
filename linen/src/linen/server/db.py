@@ -247,18 +247,107 @@ CREATE INDEX IF NOT EXISTS human_decisions_target_idx
 -- remains in relational tables; this ledger powers Activities and forensics.
 CREATE TABLE IF NOT EXISTS audit_events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    run_id TEXT,
+    idempotency_key TEXT,
+    schema_version INTEGER NOT NULL DEFAULT 1,
     event_type TEXT NOT NULL,
     actor TEXT NOT NULL,
     entity_kind TEXT,
     entity_id TEXT,
     source_generation INTEGER NOT NULL,
     plan_revision INTEGER NOT NULL,
+    graph_revision INTEGER NOT NULL DEFAULT 0,
     payload TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS audit_events_project_idx
     ON audit_events (project_id, sequence);
+-- Versioned dispatcher/runtime projections.  These tables are deliberately
+-- additive: the legacy execution and skill ledgers remain authoritative for
+-- their existing APIs while vNext clients use these structured contracts.
+CREATE TABLE IF NOT EXISTS artifacts (
+    artifact_id TEXT NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    kind TEXT NOT NULL,
+    workspace_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    byte_size INTEGER,
+    producer_run_id TEXT,
+    related_node_ids TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT,
+    PRIMARY KEY (artifact_id, project_id)
+);
+CREATE INDEX IF NOT EXISTS artifacts_project_idx ON artifacts(project_id, created_at, artifact_id);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    intent_id TEXT,
+    task_type TEXT NOT NULL,
+    stage TEXT,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    idempotency_key TEXT NOT NULL,
+    graph_revision INTEGER NOT NULL DEFAULT 0,
+    source_generation INTEGER NOT NULL DEFAULT 1,
+    plan_revision INTEGER NOT NULL DEFAULT 1,
+    context_projection_id TEXT,
+    worker_manifest_digest TEXT,
+    timeout_seconds INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    worker_name TEXT,
+    worker_type TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    artifact_ids TEXT NOT NULL DEFAULT '[]',
+    error_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, project_id),
+    UNIQUE (project_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS runs_project_idx ON runs(project_id, created_at, run_id);
+
+CREATE TABLE IF NOT EXISTS context_projections (
+    projection_id TEXT NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    snapshot_id TEXT NOT NULL,
+    graph_revision INTEGER NOT NULL DEFAULT 0,
+    source_generation INTEGER NOT NULL DEFAULT 1,
+    plan_revision INTEGER NOT NULL DEFAULT 1,
+    intent_id TEXT,
+    stage TEXT,
+    node_ids TEXT NOT NULL DEFAULT '[]',
+    edge_ids TEXT NOT NULL DEFAULT '[]',
+    artifact_ids TEXT NOT NULL DEFAULT '[]',
+    context TEXT NOT NULL DEFAULT '{}',
+    selection_policy TEXT NOT NULL,
+    request TEXT,
+    created_at TEXT NOT NULL,
+    projection_digest TEXT,
+    PRIMARY KEY (projection_id, project_id)
+);
+CREATE INDEX IF NOT EXISTS context_projections_project_idx
+    ON context_projections(project_id, created_at, projection_id);
+
+CREATE TABLE IF NOT EXISTS snapshots (
+    snapshot_id TEXT NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    graph_revision INTEGER NOT NULL,
+    source_generation INTEGER NOT NULL,
+    plan_revision INTEGER NOT NULL,
+    nodes TEXT NOT NULL DEFAULT '[]',
+    edges TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, project_id)
+);
+CREATE INDEX IF NOT EXISTS snapshots_project_idx ON snapshots(project_id, created_at, snapshot_id);
 
 CREATE TABLE IF NOT EXISTS report_snapshots (
     id TEXT NOT NULL,
@@ -301,10 +390,17 @@ def configure(path: Path) -> None:
         _ensure_fact_columns(conn)
         _ensure_intent_columns(conn)
         _ensure_review_columns(conn)
+        _ensure_vnext_columns(conn)
 
 
 def _ensure_project_columns(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)")}
+    # A few early databases did not carry the reason lease bookkeeping at all.
+    # Add those nullable control-plane columns before the lease invalidation
+    # below so migration remains safe for the smallest legacy schema.
+    for name in ("reason_worker", "reason_trigger", "reason_started_at", "reason_last_heartbeat_at"):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE projects ADD COLUMN {name} TEXT")
     if "bootstrap_enabled" not in columns:
         conn.execute("ALTER TABLE projects ADD COLUMN bootstrap_enabled INTEGER NOT NULL DEFAULT 1")
     if "repo_root" not in columns:
@@ -429,6 +525,78 @@ def _ensure_review_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE reviews ADD COLUMN diagnostics TEXT NOT NULL DEFAULT '{}'")
     if "source_generation" not in columns:
         conn.execute("ALTER TABLE reviews ADD COLUMN source_generation INTEGER NOT NULL DEFAULT 1")
+
+
+def _ensure_vnext_columns(conn: sqlite3.Connection) -> None:
+    """Migrate installations created before the structured server contracts.
+
+    Every change is additive and all backfills are deterministic.  In
+    particular, old audit rows receive an identity derived from their stable
+    autoincrement sequence; no historical payload is rewritten.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(audit_events)")}
+    additions = (
+        ("event_id", "TEXT"),
+        ("run_id", "TEXT"),
+        ("idempotency_key", "TEXT"),
+        ("schema_version", "INTEGER NOT NULL DEFAULT 1"),
+        ("graph_revision", "INTEGER NOT NULL DEFAULT 0"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            conn.execute(f"ALTER TABLE audit_events ADD COLUMN {name} {definition}")
+    conn.execute(
+        "UPDATE audit_events SET event_id = 'evt-' || sequence WHERE event_id IS NULL OR trim(event_id) = ''"
+    )
+    conn.execute("UPDATE audit_events SET schema_version = 1 WHERE schema_version IS NULL")
+    conn.execute("UPDATE audit_events SET graph_revision = 0 WHERE graph_revision IS NULL")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS audit_events_idempotency_idx "
+        "ON audit_events (project_id, idempotency_key) WHERE idempotency_key IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS audit_events_event_id_idx "
+        "ON audit_events (project_id, event_id)"
+    )
+    # CREATE TABLE IF NOT EXISTS is safe for both fresh and legacy databases;
+    # keep the definitions in one place by executing only the vNext tail.
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS artifacts (
+        artifact_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        schema_version INTEGER NOT NULL DEFAULT 1, kind TEXT NOT NULL, workspace_path TEXT NOT NULL,
+        sha256 TEXT NOT NULL, media_type TEXT NOT NULL, byte_size INTEGER, producer_run_id TEXT,
+        related_node_ids TEXT NOT NULL DEFAULT '[]', created_at TEXT,
+        PRIMARY KEY (artifact_id, project_id)
+    );
+    CREATE INDEX IF NOT EXISTS artifacts_project_idx ON artifacts(project_id, created_at, artifact_id);
+    CREATE TABLE IF NOT EXISTS runs (
+        run_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        schema_version INTEGER NOT NULL DEFAULT 1, intent_id TEXT, task_type TEXT NOT NULL, stage TEXT,
+        attempt INTEGER NOT NULL DEFAULT 1, idempotency_key TEXT NOT NULL, graph_revision INTEGER NOT NULL DEFAULT 0,
+        source_generation INTEGER NOT NULL DEFAULT 1, plan_revision INTEGER NOT NULL DEFAULT 1,
+        context_projection_id TEXT, worker_manifest_digest TEXT, timeout_seconds INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued', worker_name TEXT, worker_type TEXT, started_at TEXT,
+        finished_at TEXT, artifact_ids TEXT NOT NULL DEFAULT '[]', error_id TEXT, created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL, PRIMARY KEY (run_id, project_id), UNIQUE (project_id, idempotency_key)
+    );
+    CREATE INDEX IF NOT EXISTS runs_project_idx ON runs(project_id, created_at, run_id);
+    CREATE TABLE IF NOT EXISTS context_projections (
+        projection_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        schema_version INTEGER NOT NULL DEFAULT 1, snapshot_id TEXT NOT NULL, graph_revision INTEGER NOT NULL DEFAULT 0,
+        source_generation INTEGER NOT NULL DEFAULT 1, plan_revision INTEGER NOT NULL DEFAULT 1, intent_id TEXT, stage TEXT,
+        node_ids TEXT NOT NULL DEFAULT '[]', edge_ids TEXT NOT NULL DEFAULT '[]', artifact_ids TEXT NOT NULL DEFAULT '[]',
+        context TEXT NOT NULL DEFAULT '{}', selection_policy TEXT NOT NULL, request TEXT, created_at TEXT NOT NULL,
+        projection_digest TEXT, PRIMARY KEY (projection_id, project_id)
+    );
+    CREATE INDEX IF NOT EXISTS context_projections_project_idx ON context_projections(project_id, created_at, projection_id);
+    CREATE TABLE IF NOT EXISTS snapshots (
+        snapshot_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        schema_version INTEGER NOT NULL DEFAULT 1, graph_revision INTEGER NOT NULL, source_generation INTEGER NOT NULL,
+        plan_revision INTEGER NOT NULL, nodes TEXT NOT NULL DEFAULT '[]', edges TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+        PRIMARY KEY (snapshot_id, project_id)
+    );
+    CREATE INDEX IF NOT EXISTS snapshots_project_idx ON snapshots(project_id, created_at, snapshot_id);
+    """)
 
 
 def _ensure_intent_columns(conn: sqlite3.Connection) -> None:

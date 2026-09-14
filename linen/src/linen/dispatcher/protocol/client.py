@@ -18,6 +18,13 @@ from linen.server.models import (
     Settings,
     SkillRun,
 )
+from linen.contracts import (
+    ArtifactMetadata,
+    AuditEventEnvelope,
+    BlackboardSnapshot,
+    ContextProjection,
+    RunEnvelope,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -70,6 +77,101 @@ class LinenClient:
         response = self._session().get(self._url("/settings"), timeout=self._timeout)
         response.raise_for_status()
         return Settings.model_validate(response.json())
+
+    def get_snapshot(self, project_id: str) -> BlackboardSnapshot:
+        """Fetch and validate the canonical Blackboard snapshot."""
+        return self._contract_request(
+            "GET", f"/projects/{project_id}/snapshot", model=BlackboardSnapshot,
+        )
+
+    # Noun-first alias used by dispatcher adapters.
+    snapshot = get_snapshot
+
+    def register_artifact(self, artifact: ArtifactMetadata) -> ArtifactMetadata | ApiResult:
+        """Register immutable Artifact metadata; return ApiResult on HTTP failure."""
+        return self._contract_request(
+            "POST", f"/projects/{artifact.project_id}/artifacts",
+            model=ArtifactMetadata, json=artifact.model_dump(mode="json"), strict=False,
+        )
+
+    create_artifact = register_artifact
+
+    def get_artifact(self, project_id: str, artifact_id: str) -> ArtifactMetadata:
+        return self._contract_request(
+            "GET", f"/projects/{project_id}/artifacts/{artifact_id}", model=ArtifactMetadata,
+        )
+
+    def list_artifacts(self, project_id: str) -> list[ArtifactMetadata]:
+        return self._contract_request(
+            "GET", f"/projects/{project_id}/artifacts",
+            model=TypeAdapter(list[ArtifactMetadata]),
+        )
+
+    def register_run(self, run: RunEnvelope) -> RunEnvelope | ApiResult:
+        """Register one dispatcher attempt, including its running status."""
+        return self._contract_request(
+            "POST", f"/projects/{run.project_id}/runs", model=RunEnvelope,
+            json=run.model_dump(mode="json"), strict=False,
+        )
+
+    create_run = register_run
+
+    def get_run(self, project_id: str, run_id: str) -> RunEnvelope:
+        return self._contract_request(
+            "GET", f"/projects/{project_id}/runs/{run_id}", model=RunEnvelope,
+        )
+
+    def list_runs(self, project_id: str) -> list[RunEnvelope]:
+        return self._contract_request(
+            "GET", f"/projects/{project_id}/runs", model=TypeAdapter(list[RunEnvelope]),
+        )
+
+    def recover_runs(self, project_id: str) -> list[RunEnvelope]:
+        """Mark orphaned running attempts interrupted during dispatcher recovery."""
+        return self._contract_request(
+            "POST", f"/projects/{project_id}/runs/recover",
+            model=TypeAdapter(list[RunEnvelope]),
+        )
+
+    def transition_run(self, run: RunEnvelope) -> RunEnvelope | ApiResult:
+        """Transition a run; server remains authoritative for the state machine."""
+        return self._contract_request(
+            "PUT", f"/projects/{run.project_id}/runs/{run.run_id}", model=RunEnvelope,
+            json=run.model_dump(mode="json"), strict=False,
+        )
+
+    def register_context_projection(
+        self, projection: ContextProjection,
+    ) -> ContextProjection | ApiResult:
+        return self._contract_request(
+            "POST", f"/projects/{projection.project_id}/context-projections",
+            model=ContextProjection, json=projection.model_dump(mode="json"), strict=False,
+        )
+
+    register_context = register_context_projection
+    create_context_projection = register_context_projection
+
+    def get_context_projection(self, project_id: str, projection_id: str) -> ContextProjection:
+        return self._contract_request(
+            "GET", f"/projects/{project_id}/context-projections/{projection_id}",
+            model=ContextProjection,
+        )
+
+    def list_context_projections(self, project_id: str) -> list[ContextProjection]:
+        return self._contract_request(
+            "GET", f"/projects/{project_id}/context-projections",
+            model=TypeAdapter(list[ContextProjection]),
+        )
+
+    list_contexts = list_context_projections
+
+    def append_event(self, event: AuditEventEnvelope) -> AuditEventEnvelope | ApiResult:
+        return self._contract_request(
+            "POST", f"/projects/{event.project_id}/events", model=AuditEventEnvelope,
+            json=event.model_dump(mode="json"), strict=False,
+        )
+
+    append_audit_event = append_event
 
     def get_completion_gate(
         self, project_id: str, from_ids: list[str] | None = None,
@@ -451,6 +553,35 @@ class LinenClient:
         if response.headers.get("content-type", "").startswith("application/json"):
             data = response.json()
         return ApiResult(status_code=response.status_code, data=data, text=response.text)
+
+    def _contract_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        model: Any,
+        json: dict[str, Any] | None = None,
+        strict: bool = True,
+    ) -> Any:
+        """Decode successful vNext responses through their contract model.
+
+        Read methods retain the existing client's raising behavior.  Write
+        methods return ApiResult on HTTP failure so callers can log the
+        protocol problem without changing the underlying Worker result.
+        """
+        result = self._request_json(method, path, json=json or {})
+        if not result.ok:
+            if strict:
+                raise ProtocolError(
+                    f"vNext request failed: {method} {path}", result.status_code, result.text,
+                )
+            return result
+        try:
+            return model.validate_python(result.data) if isinstance(model, TypeAdapter) else model.model_validate(result.data)
+        except Exception as exc:
+            raise ProtocolError(
+                f"invalid vNext response: {method} {path}", result.status_code, result.text,
+            ) from exc
 
     def _url(self, path: str) -> str:
         return f"{self._base_url}{path}"

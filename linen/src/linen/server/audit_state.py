@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import uuid
 from typing import Any
 
 from linen.server.models import (
@@ -172,23 +173,41 @@ def append_event(
     entity_id: str | None = None,
     payload: dict[str, Any] | None = None,
     created_at: str | None = None,
-) -> None:
+    event_id: str | None = None,
+    run_id: str | None = None,
+    idempotency_key: str | None = None,
+    graph_revision: int | None = None,
+) -> int:
     project = get_project_or_404(conn, project_id)
+    if idempotency_key:
+        existing = conn.execute(
+            "SELECT sequence FROM audit_events WHERE project_id = ? AND idempotency_key = ?",
+            (project_id, idempotency_key),
+        ).fetchone()
+        if existing is not None:
+            return int(existing["sequence"])
+    event_id = event_id or f"evt-{uuid.uuid4().hex}"
     conn.execute(
-        "INSERT INTO audit_events (project_id, event_type, actor, entity_kind, entity_id, "
-        "source_generation, plan_revision, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audit_events (event_id, project_id, run_id, idempotency_key, schema_version, "
+        "event_type, actor, entity_kind, entity_id, source_generation, plan_revision, graph_revision, payload, created_at) "
+        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
+            event_id,
             project_id,
+            run_id,
+            idempotency_key,
             event_type,
             actor,
             entity_kind,
             entity_id,
             project["source_generation"] if "source_generation" in project.keys() else 1,
             project["plan_revision"] if "plan_revision" in project.keys() else 1,
+            graph_revision if graph_revision is not None else project["graph_revision"] if "graph_revision" in project.keys() else 0,
             json.dumps(payload or {}, ensure_ascii=False, sort_keys=True),
             created_at or utcnow(),
         ),
     )
+    return int(conn.execute("SELECT last_insert_rowid() AS sequence").fetchone()["sequence"])
 
 
 def create_graph_edge(

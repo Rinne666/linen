@@ -17,7 +17,12 @@ from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT, run_spring
 from linen.dispatcher.skills import build_receipt, skill_for_scanner, validate_receipt
 
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
-from linen.dispatcher.contracts import parse_json_output, validate_explore_payload
+from linen.contracts.common import canonical_digest
+from linen.dispatcher.contracts import (
+    extract_context_request,
+    parse_json_output,
+    validate_explore_payload,
+)
 from linen.dispatcher.prompting import load_prompt, render_prompt
 from linen.dispatcher.protocol.client import LinenClient
 from linen.dispatcher.runtime.cancellation import TaskCancellation
@@ -26,15 +31,19 @@ from linen.dispatcher.runtime.heartbeat import HeartbeatLease
 from linen.dispatcher.runtime.review_sandbox import ReviewSandboxBackend
 from linen.dispatcher.tasks.common import (
     best_effort_release,
+    append_context_projection_reference,
     cancel_reason,
     classify_provider_failure,
     did_timeout,
+    build_context_execution_contracts,
+    expand_context_projection,
     project_allows_conclude_fallback,
+    prepare_intent_projection,
     preview,
     run_worker_process,
     task_healthcheck_enabled,
     write_conclude_result,
-    write_graph_snapshot_reference,
+    write_context_projection_reference,
 )
 from linen.dispatcher.workers.registry import get_driver
 from linen.server.models import Intent, ProjectDetail
@@ -154,6 +163,8 @@ def run_explore_task(
     intent: Intent,
     worker: WorkerConfig,
     cancellation: TaskCancellation,
+    attempt: int = 1,
+    trigger: str | None = None,
 ) -> str:
     driver = get_driver(worker.type)
     task_started = time.perf_counter()
@@ -429,6 +440,28 @@ def run_explore_task(
                 best_effort_release(client, project.project.id, intent.id, worker.name)
                 return "unhealthy"
 
+        projection = prepare_intent_projection(
+            client,
+            project,
+            intent_id=intent.id,
+            phase="explore_execute",
+            current_graph_revision=project.project.graph_revision,
+        )
+        if projection is None:
+            best_effort_release(client, project.project.id, intent.id, worker.name)
+            return "failed"
+        try:
+            context_reference = write_context_projection_reference(
+                backend, container_name, projection, phase="explore_execute",
+            )
+        except Exception:
+            LOG.exception(
+                "explore context projection reference write failed project=%s intent=%s",
+                project.project.id, intent.id,
+            )
+            best_effort_release(client, project.project.id, intent.id, worker.name)
+            return "failed"
+
         poc_isolated = (intent.type or "").startswith("poc:isolated")
         execution_backend = backend
         sandbox_snapshot = None
@@ -457,6 +490,12 @@ def run_explore_task(
             audit_recipes.parse_recipe_intent(intent, config.runtime.prompt_group)
             if scope_audit and config.audit.semantic.enabled else None
         )
+        continuation_allowed = not (
+            coverage_task
+            or scope_adjudication_task
+            or semantic_recipe is not None
+            or poc_isolated
+        )
         recipe_id = None
         recipe_label = None
         recipe_version = None
@@ -484,9 +523,7 @@ def run_explore_task(
             prompt = render_prompt(
                 load_prompt(config.runtime.prompt_group, "explore.md"),
                 {
-                    "graph_yaml": graph_context or write_graph_snapshot_reference(
-                        backend, container_name, export_yaml.strip(), phase="explore_execute",
-                    ),
+                    "graph_yaml": graph_context or context_reference,
                     "intent_id": intent.id,
                     "intent_type": intent.type or "verify",
                     "intent_description": intent.description,
@@ -507,6 +544,28 @@ def run_explore_task(
                 "Do not attempt persistence, external callbacks, or host access. Return a bounded, "
                 "reproducible validation result as the one Fact for this Intent.\n"
             )
+        if not poc_isolated:
+            prompt = append_context_projection_reference(prompt, context_reference)
+        recipe_id = recipe_id or "explore"
+        worker_manifest, run_envelope = build_context_execution_contracts(
+            project,
+            worker,
+            projection,
+            phase="scope_adjudication" if scope_adjudication_task else (
+                "semantic_recipe" if semantic_recipe is not None else "explore_execute"
+            ),
+            timeout_seconds=config.tasks.explore.timeout,
+            prompt=prompt,
+            logical_scope=(
+                f"explore:{intent.id}:graph-{projection.graph_revision}:"
+                f"trigger-{(trigger or 'scheduler').strip() or 'scheduler'}"
+            ),
+            attempt=attempt,
+            intent_id=intent.id,
+            recipe_id=recipe_id,
+            recipe_label=recipe_label,
+            recipe_version=recipe_version,
+        )
         session = driver.prepare_session()
         execute = driver.build_execute(worker, prompt, session)
         if poc_isolated and execute.argv[:2] == ["codex", "exec"]:
@@ -532,6 +591,11 @@ def run_explore_task(
             recipe_id=recipe_id,
             recipe_label=recipe_label,
             recipe_version=recipe_version,
+            client=client,
+            run_envelope=run_envelope,
+            worker_manifest=worker_manifest,
+            context_projection_id=run_envelope.context_projection_id,
+            recipe_content_digest=worker_manifest.recipe.digest,
         )
         execute_ms = int((time.perf_counter() - execute_started) * 1000)
         session = driver.extract_session(session, first.stdout, first.stderr)
@@ -567,9 +631,33 @@ def run_explore_task(
             best_effort_release(client, project.project.id, intent.id, worker.name)
             return provider_failure
         if not did_timeout(first) and first.returncode == 0:
+            payload: object = None
             try:
                 model_output = driver.extract_response_text(first.stdout, first.stderr)
                 payload = parse_json_output(model_output)
+                if _is_context_required_payload(payload):
+                    context_request = extract_context_request(payload)
+                    if not continuation_allowed or context_request is None:
+                        raise ValueError(
+                            "context_required is unavailable for this managed or isolated explore path"
+                        )
+                    return _run_context_continuation(
+                        config,
+                        client,
+                        backend,
+                        container_name,
+                        worker,
+                        driver,
+                        project,
+                        intent,
+                        projection,
+                        run_envelope,
+                        context_request,
+                        lease,
+                        cancellation,
+                        attempt=attempt,
+                        trigger=trigger,
+                    )
                 if coverage_task:
                     payload = coverage.normalize_payload(payload)
                 kind, fact = validate_explore_payload(payload)
@@ -587,6 +675,12 @@ def run_explore_task(
                     preview(first.stdout),
                     preview(first.stderr),
                 )
+                # A context-required envelope is a closed protocol branch:
+                # malformed/managed/recursive requests fail directly and must
+                # never be reinterpreted as permission for conclude fallback.
+                if _is_context_required_payload(payload):
+                    best_effort_release(client, project.project.id, intent.id, worker.name)
+                    return "failed"
                 if poc_isolated:
                     best_effort_release(client, project.project.id, intent.id, worker.name)
                     return "failed"
@@ -604,6 +698,8 @@ def run_explore_task(
                     lease,
                     cancellation,
                     failure_detail=str(exc),
+                    attempt=attempt,
+                    trigger=trigger,
                 )
             if kind == "rejected":
                 LOG.warning(
@@ -657,6 +753,8 @@ def run_explore_task(
                 lease,
                 cancellation,
                 failure_detail="Initial coverage/explore execution timed out before producing a valid result",
+                attempt=attempt,
+                trigger=trigger,
             )
         LOG.warning(
             "explore command failed project=%s intent=%s worker=%s code=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -679,6 +777,141 @@ def run_explore_task(
         lease.stop()
 
 
+def _is_context_required_payload(payload: object) -> bool:
+    return (
+        isinstance(payload, dict)
+        and payload.get("accepted") is True
+        and isinstance(payload.get("data"), dict)
+        and payload["data"].get("status") == "context_required"
+    )
+
+
+def _run_context_continuation(
+    config: DispatchConfig,
+    client: LinenClient,
+    backend: ExecutionBackend,
+    container_name: str,
+    worker: WorkerConfig,
+    driver,
+    project: ProjectDetail,
+    intent: Intent,
+    projection,
+    initial_run,
+    request,
+    lease: HeartbeatLease,
+    cancellation: TaskCancellation,
+    *,
+    attempt: int,
+    trigger: str | None,
+) -> str:
+    """Run exactly one fresh-session context continuation for generic explore."""
+    phase = "explore_context_continuation"
+    continuation_started = time.perf_counter()
+    try:
+        expanded = expand_context_projection(client, projection, request)
+        if expanded is None:
+            raise RuntimeError("context projection expansion failed")
+        context_reference = write_context_projection_reference(
+            backend, container_name, expanded, phase=phase,
+        )
+        prompt = render_prompt(
+            load_prompt(config.runtime.prompt_group, "explore.md"),
+            {
+                "graph_yaml": context_reference,
+                "intent_id": intent.id,
+                "intent_type": intent.type or "verify",
+                "intent_description": intent.description,
+            },
+        )
+        prompt += (
+            "\n\nThis is the one permitted context continuation for this explore attempt. "
+            "Use only the expanded ContextProjection reference above. Do not request more "
+            "context. Return the final explore schema now as one raw JSON object."
+        )
+        if context_reference not in prompt:
+            prompt = append_context_projection_reference(prompt, context_reference)
+
+        # A continuation is a new execution boundary, not a resume of the
+        # initial CLI session. Its identity is stable for the initial run and
+        # request but intentionally does not include a lease identifier.
+        request_digest = f"sha256:{canonical_digest(request)}"
+        logical_scope = f"{phase}:{initial_run.run_id}:{request_digest}"
+        worker_manifest, continuation_run = build_context_execution_contracts(
+            project,
+            worker,
+            projection=expanded,
+            phase=phase,
+            timeout_seconds=config.tasks.explore.timeout,
+            prompt=prompt,
+            logical_scope=logical_scope,
+            attempt=attempt,
+            intent_id=intent.id,
+            recipe_id=phase,
+        )
+        continuation_session = driver.prepare_session()
+        execute = driver.build_execute(worker, prompt, continuation_session)
+        result = _run_process(
+            backend,
+            container_name,
+            worker,
+            execute.argv,
+            phase=phase,
+            timeout=config.tasks.explore.timeout,
+            lease=lease,
+            cancellation=cancellation,
+            recipe_id=phase,
+            client=client,
+            run_envelope=continuation_run,
+            worker_manifest=worker_manifest,
+            context_projection_id=continuation_run.context_projection_id,
+            recipe_content_digest=worker_manifest.recipe.digest,
+        )
+        cancelled = cancel_reason(result, cancellation)
+        if cancelled is not None:
+            best_effort_release(client, project.project.id, intent.id, worker.name)
+            return "cancelled"
+        if lease.failure is not None:
+            best_effort_release(client, project.project.id, intent.id, worker.name)
+            return "failed"
+        provider_failure = classify_provider_failure(result)
+        if provider_failure in {"rate_limited", "quota_exhausted"}:
+            best_effort_release(client, project.project.id, intent.id, worker.name)
+            return provider_failure
+        if provider_failure is not None or did_timeout(result) or result.returncode != 0:
+            best_effort_release(client, project.project.id, intent.id, worker.name)
+            return "failed"
+
+        payload = parse_json_output(driver.extract_response_text(result.stdout, result.stderr))
+        if _is_context_required_payload(payload):
+            raise ValueError("context continuation may not request context a second time")
+        kind, fact = validate_explore_payload(payload)
+        if kind != "fact" or fact is None:
+            best_effort_release(client, project.project.id, intent.id, worker.name)
+            return "failed"
+        fact = _managed_result(config, project, intent, container_name, payload, fact)
+        return write_conclude_result(
+            client,
+            project.project.id,
+            intent.id,
+            worker.name,
+            fact["description"],
+            source=phase,
+            phase_ms=int((time.perf_counter() - continuation_started) * 1000),
+            total_ms=int((time.perf_counter() - continuation_started) * 1000),
+            fact_type=fact["type"],
+            evidence=fact["evidence"],
+        )
+    except Exception as exc:
+        LOG.warning(
+            "explore context continuation failed project=%s intent=%s error=%s",
+            project.project.id,
+            intent.id,
+            exc,
+        )
+        best_effort_release(client, project.project.id, intent.id, worker.name)
+        return "failed"
+
+
 def _try_conclude_fallback(
     config: DispatchConfig,
     client: LinenClient,
@@ -693,6 +926,9 @@ def _try_conclude_fallback(
     lease: HeartbeatLease,
     cancellation: TaskCancellation,
     failure_detail: str | None = None,
+    *,
+    attempt: int = 1,
+    trigger: str | None = None,
 ) -> str:
     if not driver.supports_conclude() or not session:
         LOG.info(
@@ -732,6 +968,27 @@ def _try_conclude_fallback(
     container_name = backend.ensure_running(project_id)
     fresh_project = client.get_project(project_id)
     scope_audit = config.audit.enabled and fresh_project.project.audit_mode == "scope"
+    projection = prepare_intent_projection(
+        client,
+        fresh_project,
+        intent_id=intent.id,
+        phase="explore_conclude",
+        current_graph_revision=fresh_project.project.graph_revision,
+    )
+    if projection is None:
+        best_effort_release(client, project_id, intent.id, worker.name)
+        return "failed"
+    try:
+        context_reference = write_context_projection_reference(
+            backend, container_name, projection, phase="explore_conclude",
+        )
+    except Exception:
+        LOG.exception(
+            "explore conclude context reference write failed project=%s intent=%s",
+            project_id, intent.id,
+        )
+        best_effort_release(client, project_id, intent.id, worker.name)
+        return "failed"
 
     coverage_task = scope_audit and intent.description.startswith(coverage.CELL_PREFIX)
     scope_adjudication_task = (
@@ -774,12 +1031,7 @@ def _try_conclude_fallback(
         prompt = render_prompt(
             load_prompt(config.runtime.prompt_group, "explore_conclude.md"),
             {
-                "graph_yaml": write_graph_snapshot_reference(
-                    backend,
-                    container_name,
-                    export_yaml.strip(),
-                    phase="explore_conclude",
-                ),
+                "graph_yaml": context_reference,
                 "intent_id": intent.id,
                 "intent_type": intent.type or "verify",
                 "intent_description": intent.description,
@@ -795,9 +1047,7 @@ def _try_conclude_fallback(
         )
     if config.audit.enabled and fresh_project.project.audit_mode != "none":
         prompt += "\n" + SOURCE_DATA_BOUNDARY
-    conclude_argv = driver.build_conclude(worker, prompt, session)
-    LOG.info("starting conclude fallback project=%s intent=%s worker=%s", project_id, intent.id, worker.name)
-    conclude_started = time.perf_counter()
+    prompt = append_context_projection_reference(prompt, context_reference)
     conclude_phase = (
         "scope_adjudication_conclude"
         if scope_adjudication_task
@@ -805,6 +1055,27 @@ def _try_conclude_fallback(
         if semantic_recipe is not None
         else "explore_conclude"
     )
+    recipe_id = recipe_id or "explore_conclude"
+    worker_manifest, run_envelope = build_context_execution_contracts(
+        fresh_project,
+        worker,
+        projection,
+        phase=conclude_phase,
+        timeout_seconds=config.tasks.explore.conclude_timeout,
+        prompt=prompt,
+        logical_scope=(
+            f"explore-conclude:{intent.id}:graph-{projection.graph_revision}:"
+            f"trigger-{(trigger or 'scheduler').strip() or 'scheduler'}"
+        ),
+        attempt=attempt,
+        intent_id=intent.id,
+        recipe_id=recipe_id,
+        recipe_label=recipe_label,
+        recipe_version=recipe_version,
+    )
+    conclude_argv = driver.build_conclude(worker, prompt, session)
+    LOG.info("starting conclude fallback project=%s intent=%s worker=%s", project_id, intent.id, worker.name)
+    conclude_started = time.perf_counter()
     result = _run_process(
         backend,
         container_name,
@@ -817,6 +1088,11 @@ def _try_conclude_fallback(
         recipe_id=recipe_id,
         recipe_label=recipe_label,
         recipe_version=recipe_version,
+        client=client,
+        run_envelope=run_envelope,
+        worker_manifest=worker_manifest,
+        context_projection_id=run_envelope.context_projection_id,
+        recipe_content_digest=worker_manifest.recipe.digest,
     )
     conclude_ms = int((time.perf_counter() - conclude_started) * 1000)
     cancelled = cancel_reason(result, cancellation)
@@ -973,6 +1249,11 @@ def _run_process(
     recipe_id: str | None = None,
     recipe_label: str | None = None,
     recipe_version: int | None = None,
+    client: LinenClient | None = None,
+    run_envelope=None,
+    worker_manifest=None,
+    context_projection_id: str | None = None,
+    recipe_content_digest: str | None = None,
 ):
     return run_worker_process(
         backend,
@@ -986,4 +1267,9 @@ def _run_process(
         recipe_id=recipe_id,
         recipe_label=recipe_label,
         recipe_version=recipe_version,
+        client=client,
+        run_envelope=run_envelope,
+        worker_manifest=worker_manifest,
+        context_projection_id=context_projection_id,
+        recipe_content_digest=recipe_content_digest,
     )

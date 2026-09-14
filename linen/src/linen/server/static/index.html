@@ -987,7 +987,7 @@
       </div>
       <div class="flex items-center justify-between gap-3 border-b border-slate-100 bg-slate-50/80 px-3 py-2 shrink-0 select-none">
         <span class="min-w-0 truncate text-[10px] text-slate-400"
-          x-text="sideTab === 'pi' ? 'Prompts and worker responses load on demand' : sideTab === 'gate' ? 'Completion is evidence-gated, not inferred from an idle queue' : sideTab === 'log' ? 'Audit events in execution order' : sideTab === 'hints' ? 'Operator guidance and context' : 'Node and edge evidence is selectable'"></span>
+          x-text="sideTab === 'pi' ? 'Worker archives and contract run metadata load on demand' : sideTab === 'gate' ? 'Completion is evidence-gated, not inferred from an idle queue' : sideTab === 'log' ? 'Audit events in execution order' : sideTab === 'hints' ? 'Operator guidance and context' : 'Node and edge evidence is selectable'"></span>
         <button type="button" @click="copySidePanelText()"
           class="inline-flex h-7 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-[11px] font-medium text-slate-600 hover:border-brand-200 hover:bg-brand-50 hover:text-brand-700 transition"
           title="Copies highlighted text, or all text in the current sidebar tab">
@@ -1476,6 +1476,8 @@
                     </div>
                     <div class="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-slate-400">
                       <span class="rounded bg-indigo-50 px-1.5 py-0.5 font-medium text-indigo-700" x-text="formatExecutionPhase(run.phase)"></span>
+                      <span x-show="run.run_id" class="max-w-full truncate rounded bg-sky-50 px-1.5 py-0.5 font-mono font-medium text-sky-700" x-text="`Run · ${run.run_id}`"></span>
+                      <span x-show="runMetadataForExecution(run).status" class="rounded bg-slate-100 px-1.5 py-0.5 font-medium text-slate-600" x-text="runMetadataForExecution(run).status"></span>
                       <span x-show="run.recipe_id" class="max-w-full truncate rounded bg-fuchsia-50 px-1.5 py-0.5 font-medium text-fuchsia-700"
                         :title="`${run.recipe_label || run.recipe_id} · ${run.recipe_id}${run.recipe_version ? ` v${run.recipe_version}` : ''}`"
                         x-text="`Recipe · ${run.recipe_label || run.recipe_id}${run.recipe_version ? ` v${run.recipe_version}` : ''}`"></span>
@@ -1493,27 +1495,83 @@
                 <div x-show="piExecutionDetailErrors[run.id]" class="px-3 py-3 text-xs text-rose-300" x-text="piExecutionDetailErrors[run.id]"></div>
                 <template x-if="piExecutionDetails[run.id]">
                   <div class="divide-y divide-slate-800">
-                    <section x-show="piExecutionDetails[run.id].recipe_id" class="px-3 py-3">
+                    <section x-show="run.run_id || run.run_only" class="px-3 py-3">
+                      <div class="mb-2 flex items-center justify-between gap-3">
+                        <span class="text-[10px] font-bold uppercase tracking-[0.12em] text-sky-300">Contract run</span>
+                        <span x-show="run.run_only" class="rounded bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-400">No archive record</span>
+                      </div>
+                      <div class="grid grid-cols-2 gap-x-3 gap-y-1.5 text-[10px]">
+                        <span class="text-slate-500">run_id <b class="ml-1 break-all font-mono font-normal text-slate-200" x-text="runMetadataForExecution(run).run_id || '—'"></b></span>
+                        <span class="text-slate-500">attempt <b class="ml-1 font-mono font-normal text-slate-200" x-text="runMetadataForExecution(run).attempt ?? '—'"></b></span>
+                        <span class="text-slate-500">status <b class="ml-1 font-normal text-slate-200" x-text="runMetadataForExecution(run).status || 'unmatched'"></b></span>
+                        <span class="text-slate-500">stage <b class="ml-1 break-all font-normal text-slate-200" x-text="runMetadataForExecution(run).stage || run.phase || '—'"></b></span>
+                        <span class="col-span-2 text-slate-500">context <b class="ml-1 break-all font-mono font-normal text-slate-200" x-text="runMetadataForExecution(run).context_projection_id || '—'"></b></span>
+                        <span class="col-span-2 text-slate-500">manifest <b class="ml-1 break-all font-mono font-normal text-slate-300" x-text="runMetadataForExecution(run).worker_manifest_digest || run.manifest_digest || '—'"></b></span>
+                        <span class="text-slate-500">started <b class="ml-1 font-normal text-slate-300" x-text="runMetadataForExecution(run).started_at || run.started_at || '—'"></b></span>
+                        <span class="text-slate-500">finished <b class="ml-1 font-normal text-slate-300" x-text="runMetadataForExecution(run).finished_at || '—'"></b></span>
+                        <span x-show="runMetadataForExecution(run).error_id" class="col-span-2 text-rose-300">error <b class="ml-1 break-all font-mono font-normal" x-text="runMetadataForExecution(run).error_id"></b></span>
+                      </div>
+                      <div x-show="(runMetadataForExecution(run).artifact_ids || []).length" class="mt-3 space-y-1.5">
+                        <p class="text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Artifacts</p>
+                        <template x-for="artifactId in (runMetadataForExecution(run).artifact_ids || [])" :key="`${run.id}-${artifactId}`">
+                          <div class="rounded-md border border-slate-800 bg-slate-900/70 px-2 py-1.5">
+                            <button type="button" @click.stop="toggleArtifactMetadata(artifactId)" class="flex w-full items-center justify-between gap-2 text-left text-[10px] font-mono text-sky-300 hover:text-sky-200">
+                              <span class="break-all" x-text="artifactId"></span><span x-text="piArtifactOpenIds[artifactId] ? 'Hide' : 'Metadata'"></span>
+                            </button>
+                            <div x-show="piArtifactLoadingIds[artifactId]" class="mt-1 text-[10px] text-slate-500">Loading metadata…</div>
+                            <div x-show="piArtifactErrors[artifactId]" class="mt-1 break-words text-[10px] text-rose-300" x-text="piArtifactErrors[artifactId]"></div>
+                            <template x-if="piArtifactMetadata[artifactId] && piArtifactOpenIds[artifactId]">
+                              <div class="mt-2 space-y-1 text-[10px] text-slate-400">
+                                <p><span class="text-slate-600">kind</span> <span class="ml-1 text-slate-200" x-text="piArtifactMetadata[artifactId].kind"></span> · <span class="text-slate-600">size</span> <span x-text="piArtifactMetadata[artifactId].byte_size ?? '—'"></span></p>
+                                <p class="break-all"><span class="text-slate-600">path</span> <span class="ml-1 font-mono text-slate-300" x-text="piArtifactMetadata[artifactId].workspace_path"></span></p>
+                                <p class="break-all font-mono"><span class="text-slate-600">sha256</span> <span class="ml-1 text-slate-300" x-text="piArtifactMetadata[artifactId].sha256"></span></p>
+                                <div x-show="isTextArtifact(piArtifactMetadata[artifactId])" class="pt-1">
+                                  <button type="button" @click.stop="toggleArtifactContent(artifactId)" class="mr-2 rounded border border-slate-700 px-2 py-1 text-[10px] text-slate-300 hover:border-sky-500 hover:text-white" x-text="piArtifactContentOpenIds[artifactId] ? 'Hide content' : 'View text content'"></button>
+                                  <button x-show="piArtifactContent[artifactId]" type="button" @click.stop="copyText(piArtifactContent[artifactId])" class="rounded border border-slate-700 px-2 py-1 text-[10px] text-slate-300 hover:border-sky-500 hover:text-white">Copy</button>
+                                  <span x-show="piArtifactContentLoadingIds[artifactId]" class="ml-2 text-slate-500">Loading…</span>
+                                  <pre x-show="piArtifactContentOpenIds[artifactId] && piArtifactContent[artifactId]" class="execution-code mt-2 max-h-48 overflow-auto rounded bg-slate-950 p-2 font-mono text-[10px] leading-relaxed text-slate-300" x-text="piArtifactContent[artifactId]"></pre>
+                                </div>
+                              </div>
+                            </template>
+                          </div>
+                        </template>
+                      </div>
+                      <div x-show="runMetadataForExecution(run).context_projection_id" class="mt-3 rounded-md border border-slate-800 bg-slate-900/70 px-2 py-1.5">
+                        <button type="button" @click.stop="toggleContextProjection(runMetadataForExecution(run).context_projection_id)" class="flex w-full items-center justify-between gap-2 text-left text-[10px] text-violet-300 hover:text-violet-200">
+                          <span class="break-all font-mono" x-text="`Context · ${runMetadataForExecution(run).context_projection_id}`"></span><span x-text="piContextOpenIds[runMetadataForExecution(run).context_projection_id] ? 'Hide' : 'Inspect'"></span>
+                        </button>
+                        <div x-show="piContextLoadingIds[runMetadataForExecution(run).context_projection_id]" class="mt-1 text-[10px] text-slate-500">Loading projection…</div>
+                        <div x-show="piContextErrors[runMetadataForExecution(run).context_projection_id]" class="mt-1 break-words text-[10px] text-rose-300" x-text="piContextErrors[runMetadataForExecution(run).context_projection_id]"></div>
+                        <template x-if="piContextProjections[runMetadataForExecution(run).context_projection_id] && piContextOpenIds[runMetadataForExecution(run).context_projection_id]">
+                          <div class="mt-2 text-[10px] text-slate-400">
+                            <p><span class="text-slate-600">nodes</span> <span class="text-slate-200" x-text="piContextProjections[runMetadataForExecution(run).context_projection_id].node_ids.length"></span> · <span class="text-slate-600">edges</span> <span class="text-slate-200" x-text="piContextProjections[runMetadataForExecution(run).context_projection_id].edge_ids.length"></span></p>
+                            <pre class="execution-code mt-2 max-h-48 overflow-auto rounded bg-slate-950 p-2 font-mono text-[10px] leading-relaxed text-slate-300" x-text="formatJson(piContextProjections[runMetadataForExecution(run).context_projection_id])"></pre>
+                          </div>
+                        </template>
+                      </div>
+                    </section>
+                    <section x-show="run.run_only" class="px-3 py-5 text-center text-xs text-slate-500">This RunEnvelope has no matching Pi execution archive.</section>
+                    <section x-show="!run.run_only && piExecutionDetails[run.id].recipe_id" class="px-3 py-3">
                       <p class="text-[10px] font-bold uppercase tracking-[0.12em] text-fuchsia-300">Audit recipe</p>
                       <p class="mt-1.5 text-sm font-semibold text-white" x-text="piExecutionDetails[run.id].recipe_label || piExecutionDetails[run.id].recipe_id"></p>
                       <p class="mt-1 break-all font-mono text-[10px] text-slate-400"
                         x-text="`${piExecutionDetails[run.id].recipe_id}${piExecutionDetails[run.id].recipe_version ? ` · v${piExecutionDetails[run.id].recipe_version}` : ''}`"></p>
                     </section>
-                    <section class="px-3 py-3">
+                    <section x-show="!run.run_only" class="px-3 py-3">
                       <div class="mb-2 flex items-center justify-between gap-3">
                         <span class="text-[10px] font-bold uppercase tracking-[0.12em] text-cyan-300">Prompt · -p</span>
                         <button type="button" @click="copyText(piExecutionDetails[run.id].prompt || '')" class="text-[10px] font-medium text-slate-400 hover:text-white">Copy</button>
                       </div>
                       <pre class="execution-code max-h-64 overflow-auto font-mono text-[11px] leading-relaxed text-slate-300" x-text="piExecutionDetails[run.id].prompt || 'Prompt was not captured for this legacy execution.'"></pre>
                     </section>
-                    <section class="px-3 py-3">
+                    <section x-show="!run.run_only" class="px-3 py-3">
                       <div class="mb-2 flex items-center justify-between gap-3">
                         <span class="text-[10px] font-bold uppercase tracking-[0.12em] text-emerald-300">Worker response</span>
                         <button type="button" @click="copyText(piExecutionDetails[run.id].response || '')" class="text-[10px] font-medium text-slate-400 hover:text-white">Copy</button>
                       </div>
                       <pre class="execution-code max-h-80 overflow-auto font-mono text-[11px] leading-relaxed text-slate-200" x-text="piExecutionDetails[run.id].response || 'No final assistant text. Load the raw stream for details.'"></pre>
                     </section>
-                    <section class="px-3 py-2.5">
+                    <section x-show="!run.run_only" class="px-3 py-2.5">
                       <button type="button" @click="togglePiRawStream(run.id)" class="flex w-full items-center justify-between gap-3 text-left text-[11px] font-medium text-slate-300 hover:text-white">
                         <span x-text="piRawStreamOpenIds[run.id] ? 'Hide raw stdout stream' : `Load raw stdout · ${formatBytes(run.stdout_bytes)}`"></span>
                         <svg class="h-3.5 w-3.5 shrink-0 transition-transform" :class="{ 'rotate-180': piRawStreamOpenIds[run.id] }" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
@@ -1529,9 +1587,9 @@
             </article>
           </template>
 
-          <button x-show="piExecutions.length < piExecutionTotal" type="button" @click="loadPiExecutions(false)" :disabled="piExecutionsLoading"
+          <button x-show="piExecutionArchiveCount < piExecutionArchiveTotal" type="button" @click="loadPiExecutions(false)" :disabled="piExecutionsLoading"
             class="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-600 hover:border-brand-200 hover:text-brand-700 disabled:cursor-wait disabled:opacity-40">
-            <span x-text="piExecutionsLoading ? 'Loading…' : `Load older runs · ${piExecutions.length} / ${piExecutionTotal}`"></span>
+            <span x-text="piExecutionsLoading ? 'Loading…' : `Load older runs · ${piExecutionArchiveCount} / ${piExecutionArchiveTotal}`"></span>
           </button>
         </div>
       </div>
@@ -2002,6 +2060,10 @@ function linenApp() {
     decisionSubmitting: false,
     piExecutions: [],
     piExecutionTotal: 0,
+    piExecutionArchiveCount: 0,
+    piExecutionArchiveTotal: 0,
+    contractRuns: [],
+    contractRunsLoading: false,
     piExecutionPhase: '',
     piExecutionsLoading: false,
     piExecutionsError: '',
@@ -2012,6 +2074,17 @@ function linenApp() {
     piRawStreamOpenIds: {},
     piRawStreamLoadingId: null,
     piRawStreams: {},
+    piArtifactMetadata: {},
+    piArtifactLoadingIds: {},
+    piArtifactContent: {},
+    piArtifactContentLoadingIds: {},
+    piArtifactOpenIds: {},
+    piArtifactContentOpenIds: {},
+    piArtifactErrors: {},
+    piContextProjections: {},
+    piContextLoadingIds: {},
+    piContextOpenIds: {},
+    piContextErrors: {},
     yamlPreviewTitle: '',
     yamlPreviewText: '',
     yamlPreviewHtml: '',
@@ -3134,6 +3207,10 @@ function linenApp() {
     resetPiExecutionState() {
       this.piExecutions = [];
       this.piExecutionTotal = 0;
+      this.piExecutionArchiveCount = 0;
+      this.piExecutionArchiveTotal = 0;
+      this.contractRuns = [];
+      this.contractRunsLoading = false;
       this.piExecutionsLoading = false;
       this.piExecutionsError = '';
       this.expandedPiExecutionId = null;
@@ -3143,6 +3220,17 @@ function linenApp() {
       this.piRawStreamOpenIds = {};
       this.piRawStreamLoadingId = null;
       this.piRawStreams = {};
+      this.piArtifactMetadata = {};
+      this.piArtifactLoadingIds = {};
+      this.piArtifactContent = {};
+      this.piArtifactContentLoadingIds = {};
+      this.piArtifactOpenIds = {};
+      this.piArtifactContentOpenIds = {};
+      this.piArtifactErrors = {};
+      this.piContextProjections = {};
+      this.piContextLoadingIds = {};
+      this.piContextOpenIds = {};
+      this.piContextErrors = {};
     },
 
     openPiExecutionsTab() {
@@ -3155,7 +3243,7 @@ function linenApp() {
     async loadPiExecutions(reset = true) {
       if (!this.selectedProjectId || this.piExecutionsLoading) return;
       const projectId = this.selectedProjectId;
-      const offset = reset ? 0 : this.piExecutions.length;
+      const offset = reset ? 0 : this.piExecutionArchiveCount;
       const query = new URLSearchParams({ offset: String(offset), limit: '40' });
       if (this.piExecutionPhase) query.set('phase', this.piExecutionPhase);
       this.piExecutionsLoading = true;
@@ -3165,15 +3253,40 @@ function linenApp() {
         this.piRawStreamOpenIds = {};
       }
       try {
-        const page = await this.api('GET', `/projects/${encodeURIComponent(projectId)}/executions?${query}`);
+        const [pageResult, runsResult] = await Promise.allSettled([
+          this.api('GET', `/projects/${encodeURIComponent(projectId)}/executions?${query}`),
+          this.api('GET', `/projects/${encodeURIComponent(projectId)}/runs`),
+        ]);
+        if (pageResult.status === 'rejected') throw pageResult.reason;
+        const page = pageResult.value;
+        const runs = runsResult.status === 'fulfilled' && Array.isArray(runsResult.value)
+          ? runsResult.value : [];
         if (this.selectedProjectId !== projectId) return;
+        this.contractRuns = runs;
+        const incoming = page.items || [];
+        this.piExecutionArchiveTotal = page.total || 0;
         if (reset) {
-          this.piExecutions = page.items || [];
+          this.piExecutions = incoming;
         } else {
           const known = new Set(this.piExecutions.map(item => item.id));
-          this.piExecutions = [...this.piExecutions, ...(page.items || []).filter(item => !known.has(item.id))];
+          this.piExecutions = [...this.piExecutions, ...incoming.filter(item => !known.has(item.id))];
         }
-        this.piExecutionTotal = page.total || 0;
+        // Contract runs without an execution archive entry still belong in
+        // Runs, but are clearly marked as metadata-only rows.  If an older
+        // archive page later reveals the matching execution, remove the
+        // temporary metadata-only row to avoid duplicates.
+        const actualRunIds = new Set(this.piExecutions.filter(item => !item.run_only && item.run_id).map(item => item.run_id));
+        const runOnlyIds = new Set(this.piExecutions.filter(item => item.run_only).map(item => item.run_id));
+        const runOnly = runs
+          .filter(run => (!this.piExecutionPhase || run.stage === this.piExecutionPhase || run.task_type === this.piExecutionPhase))
+          .filter(run => run.run_id && !actualRunIds.has(run.run_id) && !runOnlyIds.has(run.run_id))
+          .map(run => this.contractRunAsExecution(run));
+        this.piExecutions = [
+          ...this.piExecutions.filter(item => !item.run_only || !actualRunIds.has(item.run_id)),
+          ...runOnly,
+        ];
+        this.piExecutionTotal = Math.max(page.total || 0, this.piExecutions.length);
+        this.piExecutionArchiveCount = this.piExecutions.filter(item => !item.run_only).length;
       } catch (error) {
         if (this.selectedProjectId === projectId) {
           this.piExecutionsError = error.message || String(error);
@@ -3191,6 +3304,14 @@ function linenApp() {
       this.expandedPiExecutionId = executionId;
       if (this.piExecutionDetails[executionId] || this.piExecutionDetailLoadingId === executionId) return;
       const projectId = this.selectedProjectId;
+      const row = this.piExecutions.find(item => item.id === executionId);
+      if (row?.run_only) {
+        this.piExecutionDetails = {
+          ...this.piExecutionDetails,
+          [executionId]: { ...row, prompt: '', response: '', stderr: '' },
+        };
+        return;
+      }
       this.piExecutionDetailLoadingId = executionId;
       this.piExecutionDetailErrors = { ...this.piExecutionDetailErrors, [executionId]: '' };
       try {
@@ -3213,6 +3334,8 @@ function linenApp() {
     },
 
     async togglePiRawStream(executionId) {
+      const row = this.piExecutions.find(item => item.id === executionId);
+      if (row?.run_only) return;
       const isOpen = !!this.piRawStreamOpenIds[executionId];
       this.piRawStreamOpenIds = { ...this.piRawStreamOpenIds, [executionId]: !isOpen };
       if (isOpen || this.piRawStreams[executionId] || this.piRawStreamLoadingId === executionId) return;
@@ -3230,6 +3353,92 @@ function linenApp() {
       } finally {
         if (this.piRawStreamLoadingId === executionId) this.piRawStreamLoadingId = null;
       }
+    },
+
+    contractRunForExecution(execution) {
+      if (!execution?.run_id) return null;
+      return this.contractRuns.find(run => run.run_id === execution.run_id) || null;
+    },
+
+    contractRunAsExecution(run) {
+      return {
+        id: `run:${run.run_id}`,
+        run_only: true,
+        command: `${run.task_type || 'worker'} run`,
+        phase: run.stage || run.task_type || 'run',
+        worker: run.worker_name || 'dispatcher',
+        started_at: run.started_at || '',
+        duration_ms: 0,
+        timeout_seconds: run.timeout_seconds || 0,
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        run_id: run.run_id,
+      };
+    },
+
+    runMetadataForExecution(execution) {
+      return this.contractRunForExecution(execution) || execution || {};
+    },
+
+    isTextArtifact(artifact) {
+      const mediaType = String(artifact?.media_type || '').toLowerCase();
+      return mediaType.startsWith('text/') || /json|javascript|xml|yaml|markdown|sarif/.test(mediaType);
+    },
+
+    async toggleArtifactMetadata(artifactId) {
+      const open = !!this.piArtifactOpenIds[artifactId];
+      this.piArtifactOpenIds = { ...this.piArtifactOpenIds, [artifactId]: !open };
+      if (open || this.piArtifactMetadata[artifactId] || this.piArtifactLoadingIds[artifactId]) return;
+      const projectId = this.selectedProjectId;
+      this.piArtifactLoadingIds = { ...this.piArtifactLoadingIds, [artifactId]: true };
+      try {
+        const metadata = await this.api('GET', `/projects/${encodeURIComponent(projectId)}/artifacts/${encodeURIComponent(artifactId)}`);
+        if (this.selectedProjectId !== projectId) return;
+        this.piArtifactMetadata = { ...this.piArtifactMetadata, [artifactId]: metadata };
+      } catch (error) {
+        this.piArtifactErrors = { ...this.piArtifactErrors, [artifactId]: error.message || String(error) };
+      } finally {
+        this.piArtifactLoadingIds = { ...this.piArtifactLoadingIds, [artifactId]: false };
+      }
+    },
+
+    async toggleArtifactContent(artifactId) {
+      const open = !!this.piArtifactContentOpenIds[artifactId];
+      this.piArtifactContentOpenIds = { ...this.piArtifactContentOpenIds, [artifactId]: !open };
+      if (open || this.piArtifactContent[artifactId] || this.piArtifactContentLoadingIds[artifactId]) return;
+      const projectId = this.selectedProjectId;
+      this.piArtifactContentLoadingIds = { ...this.piArtifactContentLoadingIds, [artifactId]: true };
+      try {
+        const content = await this.fetchText(`/projects/${encodeURIComponent(projectId)}/artifacts/${encodeURIComponent(artifactId)}/content`);
+        if (this.selectedProjectId !== projectId) return;
+        this.piArtifactContent = { ...this.piArtifactContent, [artifactId]: content || '(empty artifact)' };
+      } catch (error) {
+        this.piArtifactErrors = { ...this.piArtifactErrors, [artifactId]: error.message || String(error) };
+        this.piArtifactContentOpenIds = { ...this.piArtifactContentOpenIds, [artifactId]: false };
+      } finally {
+        this.piArtifactContentLoadingIds = { ...this.piArtifactContentLoadingIds, [artifactId]: false };
+      }
+    },
+
+    async toggleContextProjection(projectionId) {
+      const open = !!this.piContextOpenIds[projectionId];
+      this.piContextOpenIds = { ...this.piContextOpenIds, [projectionId]: !open };
+      if (open || this.piContextProjections[projectionId] || this.piContextLoadingIds[projectionId]) return;
+      const projectId = this.selectedProjectId;
+      this.piContextLoadingIds = { ...this.piContextLoadingIds, [projectionId]: true };
+      try {
+        const projection = await this.api('GET', `/projects/${encodeURIComponent(projectId)}/context-projections/${encodeURIComponent(projectionId)}`);
+        if (this.selectedProjectId !== projectId) return;
+        this.piContextProjections = { ...this.piContextProjections, [projectionId]: projection };
+      } catch (error) {
+        this.piContextErrors = { ...this.piContextErrors, [projectionId]: error.message || String(error) };
+      } finally {
+        this.piContextLoadingIds = { ...this.piContextLoadingIds, [projectionId]: false };
+      }
+    },
+
+    formatJson(value) {
+      try { return JSON.stringify(value, null, 2); } catch (_) { return String(value || ''); }
     },
 
     formatExecutionPhase(phase) {
@@ -3257,6 +3466,10 @@ function linenApp() {
     },
 
     piExecutionStatusDotClass(run) {
+      const status = this.runMetadataForExecution(run).status;
+      if (['failed', 'blocked', 'cancelled', 'interrupted', 'timed_out'].includes(status)) return 'bg-rose-500';
+      if (status === 'running') return 'bg-amber-400';
+      if (status === 'queued') return 'bg-sky-400';
       if (run.cancelled || run.timed_out || (run.returncode !== null && run.returncode !== 0)) return 'bg-rose-500';
       return 'bg-emerald-500';
     },

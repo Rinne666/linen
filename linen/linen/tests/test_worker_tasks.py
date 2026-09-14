@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import json
 
 from linen.dispatcher.protocol.client import ApiResult
 from linen.dispatcher.runtime.cancellation import TaskCancellation
@@ -62,8 +63,10 @@ def test_reason_writes_graph_snapshot_and_creates_intent(monkeypatch) -> None:
     container_name, path, content = containers.writes[0]
     assert container_name == "container-proj_001"
     assert path.startswith("/tmp/linen-prompts/reason_execute-")
-    assert path.endswith("/graph.yaml")
-    assert content == graph_yaml
+    assert path.endswith("/context.json")
+    projection_payload = json.loads(content)
+    assert projection_payload["context"]["degraded"] is True
+    assert graph_yaml not in content
     assert graph_yaml not in driver.execute_prompts[0]
     assert path in driver.execute_prompts[0]
 

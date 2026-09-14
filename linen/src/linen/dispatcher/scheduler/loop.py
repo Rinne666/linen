@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+import inspect
 import json
 import logging
+import re
 import shutil
 import subprocess
 import time
@@ -72,6 +75,8 @@ class DispatcherLoop:
         self.project_cursor = 0
         self._settings_checked = False
         self._startup_healthchecks_checked = False
+        self._orphan_recovery_done: set[str] = set()
+        self._orphan_recovery_reported: set[str] = set()
 
     def close(self) -> None:
         if self.futures:
@@ -96,6 +101,7 @@ class DispatcherLoop:
                     self._reap_futures()
                     self._reap_cleanup_futures()
                     summaries = self.client.list_projects()
+                    self._recover_orphan_runs(summaries)
                     self._initialize_reason_checkpoints(summaries)
                     self._refresh_runtime_projects(summaries)
                     self._cancel_inactive_tasks(summaries)
@@ -215,6 +221,143 @@ class DispatcherLoop:
         except (OSError, subprocess.SubprocessError):
             return path, False
         return path, result.returncode == 0
+
+    def _recover_orphan_runs(self, summaries: list[ProjectSummary]) -> None:
+        """Recover expired server runs once per active project lifetime.
+
+        The server decides which running rows are expired and returns only
+        those rows as ``interrupted``. Recovery restores scheduler retry and
+        checkpoint state only; it never mutates facts, intents, or edges.
+        """
+        done = getattr(self, "_orphan_recovery_done", None)
+        if done is None:
+            done = set()
+            self._orphan_recovery_done = done
+        reported = getattr(self, "_orphan_recovery_reported", None)
+        if reported is None:
+            reported = set()
+            self._orphan_recovery_reported = reported
+        recover = getattr(getattr(self, "client", None), "recover_runs", None)
+        for summary in summaries:
+            if summary.status != "active" or summary.id in done:
+                continue
+            if recover is None:
+                # Legacy clients cannot perform recovery; avoid retrying the
+                # unsupported operation on every scheduler tick.
+                done.add(summary.id)
+                continue
+            try:
+                recovered = recover(summary.id)
+            except Exception:
+                LOG.exception("orphan run recovery failed project=%s", summary.id)
+                continue
+            # A failed request remains eligible for the next scheduler tick;
+            # only a successful response (including []) consumes the one-shot
+            # lifecycle recovery slot.
+            done.add(summary.id)
+            if getattr(recovered, "data", None) is not None:
+                recovered = recovered.data
+            if not isinstance(recovered, (list, tuple)) or not recovered:
+                continue
+            for run in recovered:
+                value = lambda key, default=None: (
+                    run.get(key, default) if isinstance(run, Mapping)
+                    else getattr(run, key, default)
+                )
+                run_id = str(value("run_id", "")).strip()
+                if not run_id or run_id in reported:
+                    continue
+                status = value("status")
+                if status not in {None, "interrupted"}:
+                    continue
+                reported.add(run_id)
+                project_id = str(value("project_id") or summary.id)
+                intent_id = value("intent_id")
+                task_type = str(value("task_type", ""))
+                attempt = int(value("attempt") or 1)
+                graph_revision = int(value("graph_revision") or 0)
+                worker = str(value("worker_name") or "dispatcher.recovery")
+                if intent_id:
+                    self._report_orphan_intent_error(
+                        project_id, str(intent_id), worker or "dispatcher.recovery", task_type,
+                    )
+                elif task_type in {"audit_graph_reason", "audit_graph"}:
+                    checkpoints = getattr(self, "audit_graph_checkpoints", None)
+                    if checkpoints is None:
+                        checkpoints = {}
+                        self.audit_graph_checkpoints = checkpoints
+                    prior = checkpoints.get(project_id)
+                    prior_attempts = (
+                        prior.attempts
+                        if prior is not None and prior.graph_revision == graph_revision
+                        else 0
+                    )
+                    checkpoints[project_id] = AuditGraphCheckpoint(
+                        graph_revision=graph_revision,
+                        attempts=max(prior_attempts, attempt),
+                    )
+                elif task_type in {"reason", "reason_execute"}:
+                    checkpoints = getattr(self, "reason_checkpoints", None)
+                    if checkpoints is None:
+                        checkpoints = {}
+                        self.reason_checkpoints = checkpoints
+                    prior = checkpoints.get(project_id)
+                    if prior is None or prior.graph_revision != graph_revision:
+                        checkpoints[project_id] = ReasonCheckpoint(
+                            fact_count=summary.fact_count,
+                            hint_count=summary.hint_count,
+                            open_intent_count=(
+                                summary.working_intent_count
+                                + summary.unclaimed_intent_count
+                            ),
+                            graph_revision=graph_revision,
+                            attempts=attempt,
+                            last_attempt_failed=True,
+                            review_count=summary.review_count,
+                        )
+                    else:
+                        prior.attempts = max(prior.attempts, attempt)
+                        prior.last_attempt_failed = True
+
+    def _report_orphan_intent_error(
+        self,
+        project_id: str,
+        intent_id: str,
+        worker: str,
+        task_type: str,
+    ) -> None:
+        reporter = getattr(getattr(self, "client", None), "report_intent_error", None)
+        if reporter is None:
+            return
+        normalized_type = {
+            "bootstrap": "bootstrap",
+            "explore": "explore",
+            "explore_execute": "explore",
+            "review": "review",
+            "review_execute": "review",
+        }.get(task_type, task_type or "explore")
+        try:
+            response = reporter(
+                project_id, intent_id, worker,
+                task_type=normalized_type,
+                code="orphan_run_interrupted",
+                classification="transient",
+                message="The dispatcher recovered an expired running attempt; retry it.",
+                remediation="Inspect the prior run output if the retry fails again.",
+                base_retry_seconds=15,
+                max_retry_seconds=300,
+                max_attempts=2,
+            )
+            if not response.ok:
+                LOG.warning(
+                    "orphan intent error write failed project=%s intent=%s status=%s body=%s",
+                    project_id, intent_id, response.status_code, response.text,
+                )
+        except Exception:
+            LOG.exception(
+                "orphan intent error persistence crashed project=%s intent=%s",
+                project_id, intent_id,
+            )
 
     def _dispatch_available(self, summaries: list[ProjectSummary]) -> None:
         if len(self.futures) >= self.config.runtime.max_workers:
@@ -679,6 +822,83 @@ class DispatcherLoop:
             return False
         return self._dispatch_bootstrap(project, intent)
 
+    @staticmethod
+    def _intent_attempt(
+        project: ProjectDetail,
+        intent: Intent,
+        *,
+        task_type: str,
+    ) -> int:
+        """Derive an intent attempt from the append-only error history.
+
+        A lease is an authorization token and is intentionally not part of
+        execution identity.  Only the current unresolved error for this
+        intent/task contributes; resolved history belongs to an older logical
+        plan and must not advance a fresh attempt after restart.
+        """
+        current = [
+            error
+            for error in project.errors
+            if (
+                error.intent_id == intent.id
+                and error.task_type == task_type
+                and error.resolved_at is None
+            )
+        ]
+        if not current:
+            return 1
+        return max(int(error.attempt_count) for error in current) + 1
+
+    def _reason_attempt(
+        self,
+        project: ProjectDetail,
+        trigger: str,
+        *,
+        profile: str,
+    ) -> int:
+        """Return the attempt encoded by a deterministic reason trigger."""
+        match = re.search(r"(?:^|:)attempt:(\d+)(?:$|,)", trigger)
+        if match is not None:
+            return max(1, int(match.group(1)))
+        checkpoint = self.reason_checkpoints.get(project.project.id)
+        if (
+            profile == "default"
+            and checkpoint is not None
+            and checkpoint.last_attempt_failed
+            and checkpoint.graph_revision == project.project.graph_revision
+        ):
+            return max(1, checkpoint.attempts + 1)
+        return 1
+
+    def _submit_task_runner(self, runner, *args, **kwargs):
+        """Submit vNext kwargs without breaking legacy fake runners.
+
+        Older embedders commonly replace task runners with positional-only
+        fakes.  Filter only the additive contract keywords when the callable
+        does not declare them; runners with ``**kwargs`` receive the full
+        contract payload.
+        """
+        try:
+            parameters = inspect.signature(runner).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if not accepts_kwargs:
+            names = {
+                parameter.name
+                for parameter in parameters
+                if parameter.kind
+                in {
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                }
+            }
+            kwargs = {name: value for name, value in kwargs.items() if name in names}
+        return self.executor.submit(runner, *args, **kwargs)
+
     def _dispatch_reason(
         self,
         project: ProjectDetail,
@@ -710,6 +930,7 @@ class DispatcherLoop:
             return False
         self._clear_log_state(f"project:{project.project.id}:worker:reason")
         lease_id = uuid.uuid4().hex
+        attempt = self._reason_attempt(project, trigger, profile=profile)
         claim = self.client.claim_reason(project.project.id, worker.name, lease_id, trigger)
         if claim.status_code in (403, 409):
             level = logging.INFO if claim.status_code == 403 else logging.WARNING
@@ -735,7 +956,7 @@ class DispatcherLoop:
                 if profile == "audit_graph"
                 else run_reason_task
             )
-            future = self.executor.submit(
+            future = self._submit_task_runner(
                 task_runner,
                 self.config,
                 self.client,
@@ -745,6 +966,8 @@ class DispatcherLoop:
                 worker,
                 cancellation := TaskCancellation(),
                 lease_id=lease_id,
+                trigger=trigger,
+                attempt=attempt,
             )
         except Exception:
             LOG.exception("failed to submit reason task project=%s worker=%s", project.project.id, worker.name)
@@ -762,6 +985,8 @@ class DispatcherLoop:
             intent_count=len(project.intents),
             reason_profile=profile,
             graph_revision=project.project.graph_revision,
+            attempt=attempt,
+            trigger=trigger,
         )
         self.runtime_project_ids.add(project.project.id)
         self._clear_project_log_state(project.project.id)
@@ -787,6 +1012,8 @@ class DispatcherLoop:
             )
             return False
         self._clear_log_state(f"project:{project.project.id}:worker:bootstrap")
+        trigger = f"bootstrap:intent:{intent.id}"
+        attempt = self._intent_attempt(project, intent, task_type="bootstrap")
         claim = self.client.heartbeat(project.project.id, intent.id, worker.name)
         if claim.status_code in (403, 409):
             level = logging.INFO if claim.status_code == 403 else logging.WARNING
@@ -809,7 +1036,7 @@ class DispatcherLoop:
             )
             return False
         try:
-            future = self.executor.submit(
+            future = self._submit_task_runner(
                 run_bootstrap_task,
                 self.config,
                 self.client,
@@ -818,12 +1045,22 @@ class DispatcherLoop:
                 intent,
                 worker,
                 cancellation := TaskCancellation(),
+                trigger=trigger,
+                attempt=attempt,
             )
         except Exception:
             LOG.exception("failed to submit bootstrap task project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
             self._best_effort_release(project.project.id, intent.id, worker.name)
             return False
-        self.futures[future] = RunningTask(project.project.id, "bootstrap", worker.name, cancellation, intent_id=intent.id)
+        self.futures[future] = RunningTask(
+            project.project.id,
+            "bootstrap",
+            worker.name,
+            cancellation,
+            intent_id=intent.id,
+            attempt=attempt,
+            trigger=trigger,
+        )
         self.runtime_project_ids.add(project.project.id)
         self._clear_project_log_state(project.project.id)
         LOG.info("dispatched bootstrap project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
@@ -850,6 +1087,8 @@ class DispatcherLoop:
             )
             return False
         self._clear_log_state(f"project:{project.project.id}:worker:explore")
+        trigger = f"explore:intent:{intent.id}"
+        attempt = self._intent_attempt(project, intent, task_type="explore")
         claim = self.client.heartbeat(project.project.id, intent.id, worker.name)
         if claim.status_code in (403, 409):
             level = logging.INFO if claim.status_code == 403 else logging.WARNING
@@ -872,7 +1111,7 @@ class DispatcherLoop:
             )
             return False
         try:
-            future = self.executor.submit(
+            future = self._submit_task_runner(
                 run_explore_task,
                 self.config,
                 self.client,
@@ -882,6 +1121,8 @@ class DispatcherLoop:
                 intent,
                 worker,
                 cancellation := TaskCancellation(),
+                trigger=trigger,
+                attempt=attempt,
             )
         except Exception:
             LOG.exception("failed to submit explore task project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
@@ -894,6 +1135,8 @@ class DispatcherLoop:
             cancellation,
             intent_id=intent.id,
             provider_required=provider_required,
+            attempt=attempt,
+            trigger=trigger,
         )
         self.runtime_project_ids.add(project.project.id)
         self._clear_project_log_state(project.project.id)
@@ -923,6 +1166,8 @@ class DispatcherLoop:
             )
             return False
         self._clear_log_state(f"project:{project.project.id}:worker:review")
+        trigger = f"review:intent:{intent.id}"
+        attempt = self._intent_attempt(project, intent, task_type="review")
         claim = self.client.heartbeat(project.project.id, intent.id, worker.name)
         if claim.status_code in (403, 409):
             level = logging.INFO if claim.status_code == 403 else logging.WARNING
@@ -939,7 +1184,7 @@ class DispatcherLoop:
             )
             return False
         try:
-            future = self.executor.submit(
+            future = self._submit_task_runner(
                 run_review_task,
                 self.config,
                 self.client,
@@ -949,12 +1194,22 @@ class DispatcherLoop:
                 intent,
                 worker,
                 cancellation := TaskCancellation(),
+                trigger=trigger,
+                attempt=attempt,
             )
         except Exception:
             LOG.exception("failed to submit review task project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
             self._best_effort_release(project.project.id, intent.id, worker.name)
             return False
-        self.futures[future] = RunningTask(project.project.id, "review", worker.name, cancellation, intent_id=intent.id)
+        self.futures[future] = RunningTask(
+            project.project.id,
+            "review",
+            worker.name,
+            cancellation,
+            intent_id=intent.id,
+            attempt=attempt,
+            trigger=trigger,
+        )
         self.runtime_project_ids.add(project.project.id)
         self._clear_project_log_state(project.project.id)
         LOG.info("dispatched review project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
@@ -1311,6 +1566,18 @@ class DispatcherLoop:
         if len(project.reviews) > checkpoint.review_count:
             changes.append(f"reviews:{checkpoint.review_count}->{len(project.reviews)}")
         if not changes:
+            # A failed ordinary Reason execution is retried once after the
+            # persisted retry window.  The second failure is promoted to a
+            # blocked intent by the server's error ledger.
+            if (
+                checkpoint.last_attempt_failed
+                and checkpoint.graph_revision == project.project.graph_revision
+                and checkpoint.attempts < 2
+            ):
+                return (
+                    f"reason:revision:{project.project.graph_revision}:"
+                    f"attempt:{checkpoint.attempts + 1}"
+                )
             return None
         return ",".join(changes)
 
@@ -1457,7 +1724,11 @@ class DispatcherLoop:
                             self.config.audit.graph_reason.max_attempts_per_revision,
                             outcome,
                         )
-                elif outcome == "success" and task.task_type == "reason":
+                elif (
+                    task.task_type == "reason"
+                    and task.reason_profile != "audit_graph"
+                    and outcome != "cancelled"
+                ):
                     fresh = self.client.get_project(task.project_id)
                     checkpoint = ReasonCheckpoint(
                         fact_count=len(fresh.facts),
@@ -1465,6 +1736,11 @@ class DispatcherLoop:
                         open_intent_count=self._project_open_intent_count(fresh),
                         graph_revision=fresh.project.graph_revision,
                         review_count=len(fresh.reviews),
+                        # Keep successful checkpoints compatible with the
+                        # legacy value (zero); retry state is only meaningful
+                        # after a failed execution.
+                        attempts=(task.attempt or 1) if outcome != "success" else 0,
+                        last_attempt_failed=outcome not in {"success", "blocked"},
                     )
                     self.reason_checkpoints[task.project_id] = checkpoint
                     LOG.debug(
@@ -1510,21 +1786,21 @@ class DispatcherLoop:
                 "The task failed before it could produce a valid blackboard result.",
                 15,
                 300,
-                5,
+                2,
             ),
             "task_crashed": (
                 "task_crashed",
                 "The task runner raised an unexpected exception.",
                 15,
                 300,
-                5,
+                2,
             ),
             "unhealthy": (
                 "worker_unhealthy",
                 "The selected worker failed its health check.",
                 5,
                 60,
-                5,
+                2,
             ),
             "rate_limited": (
                 "provider_rate_limited",
@@ -1545,7 +1821,7 @@ class DispatcherLoop:
                 "The worker rejected the task under its current policy.",
                 5,
                 60,
-                5,
+                2,
             ),
         }
         code, message, base_retry, max_retry, max_attempts = profiles.get(
@@ -1555,7 +1831,7 @@ class DispatcherLoop:
                 f"The task ended with outcome {outcome}.",
                 15,
                 300,
-                5,
+                2,
             ),
         )
         if detail:

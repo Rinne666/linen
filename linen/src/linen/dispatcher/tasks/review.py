@@ -51,7 +51,11 @@ from linen.dispatcher.analysis.policy import SOURCE_DATA_BOUNDARY
 from linen.dispatcher.runtime.review_sandbox import ReviewSandboxBackend
 
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
-from linen.dispatcher.contracts import parse_json_output, validate_review_payload
+from linen.dispatcher.contracts import (
+    extract_context_request,
+    parse_json_output,
+    validate_review_payload,
+)
 from linen.dispatcher.prompting import load_prompt, render_prompt
 from linen.dispatcher.protocol.client import LinenClient
 from linen.dispatcher.runtime.cancellation import TaskCancellation
@@ -59,13 +63,16 @@ from linen.dispatcher.runtime.backend import ExecutionBackend
 from linen.dispatcher.runtime.heartbeat import HeartbeatLease
 from linen.dispatcher.tasks.common import (
     best_effort_release,
+    append_context_projection_reference,
     cancel_reason,
     classify_provider_failure,
     did_timeout,
+    build_context_execution_contracts,
     preview,
+    prepare_intent_projection,
     run_worker_process,
     task_healthcheck_enabled,
-    write_graph_snapshot_reference,
+    write_context_projection_reference,
 )
 from linen.dispatcher.workers.registry import get_driver
 from linen.server.models import (
@@ -157,6 +164,8 @@ def run_review_task(
     intent: Intent,
     worker: WorkerConfig,
     cancellation: TaskCancellation,
+    attempt: int = 1,
+    trigger: str | None = None,
 ) -> str:
     driver = get_driver(worker.type)
     task_started = time.perf_counter()
@@ -204,9 +213,30 @@ def run_review_task(
                 best_effort_release(client, project.project.id, intent.id, worker.name)
                 return "unhealthy"
 
-        # Inline the candidate fact so the worker doesn't have to grep the
-        # graph snapshot for it. The full graph is still available via the
-        # snapshot reference for chain context (sinks, sanitizers, etc.).
+        projection = prepare_intent_projection(
+            client,
+            project,
+            intent_id=intent.id,
+            phase="review_execute",
+            current_graph_revision=project.project.graph_revision,
+        )
+        if projection is None:
+            best_effort_release(client, project.project.id, intent.id, worker.name)
+            return "failed"
+        try:
+            context_reference = write_context_projection_reference(
+                backend, container_name, projection, phase="review_execute",
+            )
+        except Exception:
+            LOG.exception(
+                "review context projection reference write failed project=%s intent=%s",
+                project.project.id, intent.id,
+            )
+            best_effort_release(client, project.project.id, intent.id, worker.name)
+            return "failed"
+
+        # Inline the candidate fact so the worker doesn't have to search for it;
+        # broader graph access remains bounded by the registered projection.
         fact_block = (
             f"id: {fact.id}\n"
             f"description: {fact.description}\n"
@@ -245,12 +275,8 @@ def run_review_task(
             graph_context = "Withheld because coverage review uses its exact cell and frozen snapshot."
         elif profile == "vulnerability" and mode == "cold-verifier":
             fact_block = f"id: {fact.id}\ndescription: {fact.description}\ntype: {fact.type or '(none)'}\n"
-        elif config.audit.review_sandbox.enabled:
-            graph_context = export_yaml.strip()
-        else:
-            graph_context = write_graph_snapshot_reference(
-                backend, container_name, export_yaml.strip(), phase="review_execute",
-            )
+        elif not config.audit.review_sandbox.enabled:
+            graph_context = context_reference
         LOG.info(
             "review profile resolved project=%s intent=%s fact_id=%s profile=%s mode=%s prompt=%s",
             project.project.id, intent.id, fact_id, profile, mode, prompt_name,
@@ -301,6 +327,29 @@ def run_review_task(
                 "A coverage_plan/scan_batch is an execution or scope record, not a vulnerability claim. "
                 "No previous reviews are supplied in /input.\n"
             )
+        if not config.audit.review_sandbox.enabled:
+            prompt = append_context_projection_reference(prompt, context_reference)
+        worker_manifest, run_envelope = build_context_execution_contracts(
+            project,
+            worker,
+            projection,
+            phase="review_execute",
+            timeout_seconds=(
+                config.tasks.review.timeout
+                if config.tasks.review is not None
+                else config.tasks.explore.timeout
+            ),
+            prompt=prompt,
+            logical_scope=(
+                f"review:{intent.id}:graph-{projection.graph_revision}:"
+                f"trigger-{(trigger or 'scheduler').strip() or 'scheduler'}"
+            ),
+            attempt=attempt,
+            intent_id=intent.id,
+            recipe_id=f"review.{profile}.{mode}",
+            recipe_label=f"Review {profile} ({mode})",
+            recipe_version=1,
+        )
         session = driver.prepare_session()
         execute = driver.build_execute(worker, prompt, session)
         if config.audit.review_sandbox.enabled and execute.argv[:2] == ["codex", "exec"]:
@@ -324,6 +373,11 @@ def run_review_task(
             timeout_seconds=review_timeout,
             lease=lease,
             cancellation=cancellation,
+            client=client,
+            run_envelope=run_envelope,
+            worker_manifest=worker_manifest,
+            context_projection_id=run_envelope.context_projection_id,
+            recipe_content_digest=worker_manifest.recipe.digest,
         )
         execute_ms = int((time.perf_counter() - execute_started) * 1000)
         session = driver.extract_session(session, result.stdout, result.stderr)
@@ -363,6 +417,21 @@ def run_review_task(
         try:
             model_output = driver.extract_response_text(result.stdout, result.stderr)
             payload = parse_json_output(model_output)
+            context_request = extract_context_request(payload)
+            if context_request is not None:
+                LOG.error(
+                    "review requested unsupported context expansion project=%s intent=%s "
+                    "worker=%s node_ids=%s relation_types=%s artifact_ids=%s",
+                    project.project.id,
+                    intent.id,
+                    worker.name,
+                    context_request.node_ids,
+                    context_request.relation_types,
+                    context_request.artifact_ids,
+                )
+                _cleanup_review_sandbox(execution_backend)
+                best_effort_release(client, project.project.id, intent.id, worker.name)
+                return "failed"
             kind, review = validate_review_payload(
                 payload,
                 required_diagnostics=(
@@ -447,6 +516,18 @@ def _cleanup_cancelled(client, project_id, intent_id, worker_name, when: str) ->
     LOG.info("review cancelled project=%s intent=%s worker=%s when=%s", project_id, intent_id, worker_name, when)
     best_effort_release(client, project_id, intent_id, worker_name)
     return "cancelled"
+
+
+def _cleanup_review_sandbox(execution_backend: ExecutionBackend) -> None:
+    """Best-effort cleanup for an unsupported context request response."""
+    process = getattr(execution_backend, "last_process", None)
+    cleanup = getattr(process, "kill", None)
+    if not callable(cleanup):
+        return
+    try:
+        cleanup()
+    except Exception:
+        LOG.exception("review sandbox cleanup failed after context request")
 
 
 def _cleanup_lease_lost(client, project_id, intent_id, worker_name, lease, when: str) -> str:

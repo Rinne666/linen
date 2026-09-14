@@ -170,6 +170,7 @@ def _summary(record_path: Path, record: dict, session_id: str | None = None) -> 
     stderr_path = _text_path(record_path, "stderr")
     return PiExecutionSummary(
         id=record_path.stem,
+        schema_version=(record.get("schema_version") if isinstance(record.get("schema_version"), int) else 3),
         command="pi -p",
         phase=str(record.get("phase") or "unknown"),
         recipe_id=str(record["recipe_id"]) if record.get("recipe_id") else None,
@@ -191,6 +192,15 @@ def _summary(record_path: Path, record: dict, session_id: str | None = None) -> 
         response_available=_file_size(stdout_path) > 0,
         stdout_bytes=_file_size(stdout_path),
         stderr_bytes=_file_size(stderr_path),
+        run_id=str(record["run_id"]) if record.get("run_id") else None,
+        attempt=record["attempt"] if isinstance(record.get("attempt"), int) else None,
+        idempotency_key=str(record["idempotency_key"]) if record.get("idempotency_key") else None,
+        context_projection_id=(
+            str(record["context_projection_id"])
+            if record.get("context_projection_id") else None
+        ),
+        manifest_digest=str(record["manifest_digest"]) if record.get("manifest_digest") else None,
+        recipe_digest=str(record["recipe_digest"]) if record.get("recipe_digest") else None,
     )
 
 

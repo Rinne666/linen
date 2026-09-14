@@ -5,6 +5,7 @@ import time
 
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.contracts import (
+    extract_context_request,
     parse_json_output,
     validate_bootstrap_conclude_payload,
     validate_bootstrap_execute_payload,
@@ -17,15 +18,19 @@ from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.heartbeat import HeartbeatLease
 from linen.dispatcher.tasks.common import (
     best_effort_release,
+    append_context_projection_reference,
     cancel_reason,
     classify_provider_failure,
+    build_context_execution_contracts,
     did_timeout,
     project_allows_conclude_fallback,
     preview,
+    prepare_intent_projection,
     run_worker_process,
     task_healthcheck_enabled,
     write_conclude_result,
     write_conclude_result_with_fact_id,
+    write_context_projection_reference,
 )
 from linen.dispatcher.workers.registry import get_driver
 from linen.server.models import Intent, ProjectDetail
@@ -48,6 +53,8 @@ def run_bootstrap_task(
     intent: Intent,
     worker: WorkerConfig,
     cancellation: TaskCancellation,
+    attempt: int = 1,
+    trigger: str | None = None,
 ) -> str:
     audit_recon = _scope_audit_recon(config, project)
     if audit_recon and not config.audit.recon.enabled:
@@ -102,6 +109,28 @@ def run_bootstrap_task(
                 best_effort_release(client, project.project.id, intent.id, worker.name)
                 return "unhealthy"
 
+        projection = prepare_intent_projection(
+            client,
+            project,
+            intent_id=intent.id,
+            phase="bootstrap",
+            current_graph_revision=project.project.graph_revision,
+        )
+        if projection is None:
+            best_effort_release(client, project.project.id, intent.id, worker.name)
+            return "failed"
+        try:
+            context_reference = write_context_projection_reference(
+                backend, container_name, projection, phase="bootstrap",
+            )
+        except Exception:
+            LOG.exception(
+                "bootstrap context projection reference write failed project=%s intent=%s",
+                project.project.id, intent.id,
+            )
+            best_effort_release(client, project.project.id, intent.id, worker.name)
+            return "failed"
+
         prompt = render_prompt(
             load_prompt(config.runtime.prompt_group, "bootstrap.md"),
             _bootstrap_prompt_replacements(project),
@@ -114,6 +143,24 @@ def run_bootstrap_task(
                 "Map attack surface and prioritize later scope cells, but do not claim a "
                 "vulnerability is proven or that the audit is complete.\n"
             )
+        prompt = append_context_projection_reference(prompt, context_reference)
+        worker_manifest, run_envelope = build_context_execution_contracts(
+            project,
+            worker,
+            projection,
+            phase="bootstrap",
+            timeout_seconds=config.tasks.bootstrap.timeout,
+            prompt=prompt,
+            logical_scope=(
+                f"bootstrap:{intent.id}:graph-{projection.graph_revision}:"
+                f"trigger-{(trigger or 'scheduler').strip() or 'scheduler'}"
+            ),
+            attempt=attempt,
+            intent_id=intent.id,
+            recipe_id="bootstrap",
+            recipe_label="Bootstrap",
+            recipe_version=1,
+        )
 
         session = driver.prepare_session()
         execute = driver.build_execute(worker, prompt, session)
@@ -128,6 +175,11 @@ def run_bootstrap_task(
             timeout_seconds=config.tasks.bootstrap.timeout,
             lease=lease,
             cancellation=cancellation,
+            client=client,
+            run_envelope=run_envelope,
+            worker_manifest=worker_manifest,
+            context_projection_id=run_envelope.context_projection_id,
+            recipe_content_digest=worker_manifest.recipe.digest,
         )
         execute_ms = int((time.perf_counter() - execute_started) * 1000)
         session = driver.extract_session(session, first.stdout, first.stderr)
@@ -166,6 +218,20 @@ def run_bootstrap_task(
             try:
                 model_output = driver.extract_response_text(first.stdout, first.stderr)
                 payload = parse_json_output(model_output)
+                context_request = extract_context_request(payload)
+                if context_request is not None:
+                    LOG.error(
+                        "bootstrap requested unsupported context expansion project=%s "
+                        "intent=%s worker=%s node_ids=%s relation_types=%s artifact_ids=%s",
+                        project.project.id,
+                        intent.id,
+                        worker.name,
+                        context_request.node_ids,
+                        context_request.relation_types,
+                        context_request.artifact_ids,
+                    )
+                    best_effort_release(client, project.project.id, intent.id, worker.name)
+                    return "failed"
                 kind, data = validate_bootstrap_execute_payload(payload)
             except Exception as exc:
                 LOG.warning(
@@ -191,6 +257,8 @@ def run_bootstrap_task(
                     session,
                     lease,
                     cancellation,
+                    attempt=attempt,
+                    trigger=trigger,
                 )
             if kind == "rejected":
                 LOG.warning(
@@ -242,6 +310,8 @@ def run_bootstrap_task(
                 session,
                 lease,
                 cancellation,
+                attempt=attempt,
+                trigger=trigger,
             )
         LOG.warning(
             "bootstrap command failed project=%s intent=%s worker=%s code=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -276,6 +346,9 @@ def _try_conclude_fallback(
     session: str | None,
     lease: HeartbeatLease,
     cancellation: TaskCancellation,
+    *,
+    attempt: int = 1,
+    trigger: str | None = None,
 ) -> str:
     if not driver.supports_conclude() or not session:
         LOG.info(
@@ -319,12 +392,52 @@ def _try_conclude_fallback(
 
     container_name = backend.ensure_running(project.project.id)
 
+    projection = prepare_intent_projection(
+        client,
+        project,
+        intent_id=intent.id,
+        phase="bootstrap_conclude",
+        current_graph_revision=project.project.graph_revision,
+    )
+    if projection is None:
+        best_effort_release(client, project.project.id, intent.id, worker.name)
+        return "failed"
+    try:
+        context_reference = write_context_projection_reference(
+            backend, container_name, projection, phase="bootstrap_conclude",
+        )
+    except Exception:
+        LOG.exception(
+            "bootstrap conclude context reference write failed project=%s intent=%s",
+            project.project.id, intent.id,
+        )
+        best_effort_release(client, project.project.id, intent.id, worker.name)
+        return "failed"
+
     prompt = render_prompt(
         load_prompt(config.runtime.prompt_group, "bootstrap_conclude.md"),
         _bootstrap_prompt_replacements(project),
     )
     if config.runtime.prompt_group == "vuln_audit":
         prompt += "\n" + SOURCE_DATA_BOUNDARY
+    prompt = append_context_projection_reference(prompt, context_reference)
+    worker_manifest, run_envelope = build_context_execution_contracts(
+        project,
+        worker,
+        projection,
+        phase="bootstrap_conclude",
+        timeout_seconds=config.tasks.bootstrap.conclude_timeout,
+        prompt=prompt,
+        logical_scope=(
+            f"bootstrap-conclude:{intent.id}:graph-{projection.graph_revision}:"
+            f"trigger-{(trigger or 'scheduler').strip() or 'scheduler'}"
+        ),
+        attempt=attempt,
+        intent_id=intent.id,
+        recipe_id="bootstrap_conclude",
+        recipe_label="Bootstrap Conclude",
+        recipe_version=1,
+    )
     conclude_argv = driver.build_conclude(worker, prompt, session)
     LOG.info("starting bootstrap conclude fallback project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
     conclude_started = time.perf_counter()
@@ -337,6 +450,11 @@ def _try_conclude_fallback(
         timeout_seconds=config.tasks.bootstrap.conclude_timeout,
         lease=lease,
         cancellation=cancellation,
+        client=client,
+        run_envelope=run_envelope,
+        worker_manifest=worker_manifest,
+        context_projection_id=run_envelope.context_projection_id,
+        recipe_content_digest=worker_manifest.recipe.digest,
     )
     conclude_ms = int((time.perf_counter() - conclude_started) * 1000)
     cancelled = cancel_reason(result, cancellation)

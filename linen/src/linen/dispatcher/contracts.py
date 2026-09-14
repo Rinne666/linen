@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from linen.contracts import ContextRequest
 from linen.dispatcher.output_parser import extract_json_object
 from linen.server.models import REVIEW_DIAGNOSTIC_FIELDS
 
@@ -32,6 +33,34 @@ REVIEW_DIAGNOSTIC_REQUIRED_KEYS: dict[str, frozenset[str]] = {
 
 def parse_json_output(stdout: str) -> dict[str, Any]:
     return extract_json_object(stdout)
+
+
+def extract_context_request(payload: Any) -> ContextRequest | None:
+    """Extract one explicitly wrapped worker context request.
+
+    Context expansion is intentionally opt-in: ordinary task payloads (and
+    the legacy unwrapped forms) return ``None``.  Once a worker declares
+    ``status=context_required``, the envelope is closed and validated so a
+    worker cannot smuggle an unvalidated request or task result alongside it.
+    """
+    if not isinstance(payload, dict) or payload.get("accepted") is not True:
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict) or data.get("status") != "context_required":
+        return None
+    if set(payload) != {"accepted", "data"}:
+        raise ValueError("context_required response must contain exactly accepted and data")
+    if set(data) != {"status", "context_request"}:
+        raise ValueError(
+            "context_required data must contain exactly status and context_request"
+        )
+    raw_request = data.get("context_request")
+    if not isinstance(raw_request, dict):
+        raise ValueError("context_request must be an object")
+    try:
+        return ContextRequest.model_validate(raw_request)
+    except ValueError as exc:
+        raise ValueError(f"invalid context_request: {exc}") from exc
 
 
 def _unwrap_wrapped_payload(payload: dict[str, Any]) -> tuple[bool | None, dict[str, Any] | None]:

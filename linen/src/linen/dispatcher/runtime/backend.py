@@ -19,6 +19,7 @@ from typing import Literal, Protocol, runtime_checkable
 from linen.dispatcher.config import LocalConfig
 from linen.dispatcher.protocol.client import LinenClient
 from linen.dispatcher.runtime.process import ExecProcess, LocalProcess
+from linen.dispatcher.runtime.policy import BackendCapabilities
 
 LOG = logging.getLogger(__name__)
 
@@ -97,6 +98,36 @@ class LocalBackend:
 
     def close(self) -> None:
         return None
+
+    def capabilities(self) -> BackendCapabilities:
+        """Return the explicit enforcement declaration for local execution.
+
+        Local execution remains available for backwards compatibility, but a
+        worker is a host subprocess and inherits the host environment.  These
+        values are intentionally not advertised as sandbox guarantees; the
+        policy gate admits them only for the explicit legacy/local profile.
+        """
+
+        return BackendCapabilities(
+            backend_name="local",
+            host_process=True,
+            filesystem_isolation=False,
+            network_isolation=False,
+            control_tool_split=False,
+            credential_filtering=False,
+            resource_limits=False,
+            repo_access=["read-write"],
+            workspace_access=["read-write"],
+            control_channels=["configured_provider"],
+            tool_channels=["allow"],
+        )
+
+    # A named alias is useful to adapters that expose backend capabilities as
+    # a query rather than a method on the execution surface.  Keep both
+    # methods side-effect-free and leave ExecutionBackend unchanged for old
+    # fake backends and callers.
+    def get_capabilities(self) -> BackendCapabilities:
+        return self.capabilities()
 
     def _project_dir(self, project_id: str) -> Path:
         return self._root / project_id

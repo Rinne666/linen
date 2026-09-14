@@ -5,10 +5,12 @@ import json
 import pytest
 
 from linen.dispatcher.contracts import (
+    extract_context_request,
     parse_json_output,
     validate_explore_payload,
     validate_reason_payload,
 )
+from linen.contracts import ContextRequest
 from linen.dispatcher.runtime.process import LocalProcess
 from linen.dispatcher.workers.adapters.pi import PiDriver
 
@@ -18,6 +20,61 @@ def test_parse_json_output_extracts_object_from_markdown_noise() -> None:
         "accepted": True,
         "data": {},
     }
+
+
+def test_extract_context_request_accepts_only_closed_context_required_envelope() -> None:
+    payload = {
+        "accepted": True,
+        "data": {
+            "status": "context_required",
+            "context_request": {
+                "node_ids": ["f2"],
+                "relation_types": ["supports"],
+                "reason": "need source proof",
+            },
+        },
+    }
+    request = extract_context_request(payload)
+    assert isinstance(request, ContextRequest)
+    assert request.node_ids == ["f2"]
+
+    assert extract_context_request({"accepted": True, "data": {}}) is None
+    assert extract_context_request({"node_ids": ["f2"], "reason": "legacy"}) is None
+
+
+@pytest.mark.parametrize(
+    "payload, message",
+    [
+        (
+            {
+                "accepted": True,
+                "data": {
+                    "status": "context_required",
+                    "context_request": {"node_ids": [], "reason": "x"},
+                    "unexpected": True,
+                },
+            },
+            "exactly status and context_request",
+        ),
+        (
+            {
+                "accepted": True,
+                "data": {"status": "context_required", "context_request": {"node_ids": []}},
+            },
+            "invalid context_request",
+        ),
+        (
+            {
+                "accepted": True,
+                "data": {"status": "context_required", "context_request": "not-an-object"},
+            },
+            "context_request must be an object",
+        ),
+    ],
+)
+def test_extract_context_request_rejects_malformed_context_required(payload, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        extract_context_request(payload)
 
 
 def test_reason_payload_limits_number_of_intents() -> None:

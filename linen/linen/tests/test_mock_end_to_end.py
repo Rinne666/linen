@@ -406,7 +406,9 @@ def test_mock_scheduler_runs_reason_explore_reason_complete_chain(http_client: T
         ("i003", "goal"),
     ]
     assert any("/reason_execute-" in path and "f002" in content for _, path, content in containers.writes)
-    assert any("/explore_execute-" in path and "f001" in content for _, path, content in containers.writes)
+    # Explore workers receive only their bounded projection, not the complete
+    # graph export that used to contain unrelated f001 data.
+    assert any("/explore_execute-" in path and "i002" in content for _, path, content in containers.writes)
 
 
 def test_mock_scheduler_enabled_project_skips_bootstrap_when_worker_does_not_support_it(

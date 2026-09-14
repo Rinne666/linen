@@ -402,9 +402,12 @@ def test_explore_runs_real_local_cli_end_to_end(tmp_path: Path, monkeypatch) -> 
 
     assert outcome == "success"
     assert client.concluded == [("proj_001", "i001", "test-worker", "local fake fact")]
-    # graph snapshot was materialised on the host under the patched root
+    # Only the bounded context projection is materialised on the host; the
+    # legacy full graph export must not be written for an LLM worker.
     snapshot_root = tmp_path / "prompts"
-    assert any(p.name == "graph.yaml" for p in snapshot_root.rglob("*"))
+    context_files = list(snapshot_root.rglob("context.json"))
+    assert context_files
+    assert not list(snapshot_root.rglob("graph.yaml"))
 
 
 def test_explore_local_cli_rejection_releases_intent(tmp_path: Path, monkeypatch) -> None:

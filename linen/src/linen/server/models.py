@@ -548,6 +548,10 @@ class CompletionGate(BaseModel):
 
 class PiExecutionSummary(BaseModel):
     id: str
+    # Schema 3 records remain valid; schema 4 adds the optional contract
+    # identity below so the UI can join an execution archive entry with a
+    # persisted RunEnvelope without changing the legacy archive format.
+    schema_version: int = 3
     command: str = "pi -p"
     phase: str
     recipe_id: str | None = None
@@ -566,6 +570,12 @@ class PiExecutionSummary(BaseModel):
     response_available: bool = False
     stdout_bytes: int = 0
     stderr_bytes: int = 0
+    run_id: str | None = None
+    attempt: int | None = None
+    idempotency_key: str | None = None
+    context_projection_id: str | None = None
+    manifest_digest: str | None = None
+    recipe_digest: str | None = None
 
 
 class PiExecutionPage(BaseModel):
