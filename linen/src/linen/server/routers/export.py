@@ -26,6 +26,17 @@ from linen.server.services import (
 router = APIRouter(tags=["export"])
 
 
+def _export_proof(value: str | None) -> dict | None:
+    """Keep exports readable even if an old database contains bad JSON."""
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def format_export_timestamp(value: str | None) -> str | None:
     if not value:
         return value
@@ -42,7 +53,7 @@ def _load_project_data(conn, project_id: str):
     proj = get_project_or_404(conn, project_id)
 
     facts = conn.execute(
-        "SELECT id, description, display_title, type, semantic_type, evidence, status, "
+        "SELECT id, description, display_title, type, semantic_type, evidence, proof, status, "
         "source_generation, legacy FROM facts WHERE project_id = ?",
         (project_id,),
     ).fetchall()
@@ -113,6 +124,7 @@ def _export_yaml(conn, project_id: str) -> str:
             "legacy": bool(f["legacy"]),
             **({"type": f["type"]} if f["type"] else {}),
             **({"evidence": f["evidence"]} if f["evidence"] else {}),
+            **({"proof": proof} if (proof := _export_proof(f["proof"])) else {}),
         }
         for f in facts
     ]

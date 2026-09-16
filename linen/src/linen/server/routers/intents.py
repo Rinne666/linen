@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 
 from fastapi import APIRouter, HTTPException
 
@@ -41,6 +42,7 @@ from linen.server.services import (
     validate_intent_creator_worker,
     validate_goal_not_in_sources,
 )
+from linen.server.uvpg import validate_proof_payload
 
 router = APIRouter(tags=["intents"])
 
@@ -454,10 +456,13 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
         display_title = body.display_title or fact_display_title(
             fid, body.type, body.description, status=body.status,
         )
+        proof_errors = validate_proof_payload(conn, project_id, body.proof)
+        if proof_errors:
+            raise HTTPException(422, {"code": "INVALID_PROVENANCE", "details": proof_errors})
 
         conn.execute(
             "INSERT INTO facts (id, project_id, description, display_title, type, semantic_type, "
-            "evidence, source_generation, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "evidence, proof, source_generation, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 fid,
                 project_id,
@@ -466,6 +471,8 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
                 body.type,
                 semantic_type,
                 body.evidence,
+                json.dumps(body.proof.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+                if body.proof is not None else None,
                 project["source_generation"],
                 body.status,
             ),

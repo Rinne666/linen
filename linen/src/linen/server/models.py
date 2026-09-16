@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -50,6 +51,21 @@ FACT_TYPE_AUDIT_SUMMARY = "audit_summary"
 FACT_TYPE_POLICY_EVIDENCE = "policy_evidence"
 FACT_TYPE_SCOPE_ADJUDICATION = "scope_adjudication"
 FACT_TYPE_NEGATIVE_ASSURANCE = "negative_assurance"
+FACT_TYPE_PRINCIPAL = "principal"
+FACT_TYPE_ATTACKER_CONTROL = "attacker_control"
+FACT_TYPE_PRECONDITION = "precondition"
+FACT_TYPE_SECURITY_INVARIANT = "security_invariant"
+FACT_TYPE_SECURITY_BOUNDARY = "security_boundary"
+FACT_TYPE_SECURITY_CONTROL_ASSESSMENT = "security_control_assessment"
+FACT_TYPE_CAPABILITY_BEFORE = "capability_before"
+FACT_TYPE_CAPABILITY_AFTER = "capability_after"
+FACT_TYPE_CAPABILITY_DELTA = "capability_delta"
+FACT_TYPE_IMPACT_OBSERVATION = "impact_observation"
+FACT_TYPE_NEGATIVE_CONTROL = "negative_control"
+FACT_TYPE_CONFIG_SOURCE = "config_source"
+FACT_TYPE_CONFIG_RESOLUTION = "config_resolution"
+FACT_TYPE_EFFECTIVE_CONFIG = "effective_config"
+FACT_TYPE_REPRODUCTION = "reproduction"
 
 SEMANTIC_TYPE_AUDIT_TARGET = "audit_target"
 SEMANTIC_TYPE_AUDIT_OBJECTIVE = "audit_objective"
@@ -80,6 +96,10 @@ GRAPH_RELATION_TYPES: frozenset[str] = frozenset(
         "supersedes",
         "depends_on",
         "unclassified",
+        "controls", "enters_at", "flows_to", "guards", "authorizes", "denies",
+        "owns", "targets", "transitions_to", "precedes", "interleaves_with",
+        "resolves_to", "violates", "protects", "crosses", "grants", "observed_by",
+        "baseline_for",
     }
 )
 
@@ -104,6 +124,21 @@ AUDIT_ATTESTATION_FACT_TYPES: frozenset[str] = frozenset(
         FACT_TYPE_POLICY_EVIDENCE,
         FACT_TYPE_SCOPE_ADJUDICATION,
         FACT_TYPE_NEGATIVE_ASSURANCE,
+        FACT_TYPE_PRINCIPAL,
+        FACT_TYPE_ATTACKER_CONTROL,
+        FACT_TYPE_PRECONDITION,
+        FACT_TYPE_SECURITY_INVARIANT,
+        FACT_TYPE_SECURITY_BOUNDARY,
+        FACT_TYPE_SECURITY_CONTROL_ASSESSMENT,
+        FACT_TYPE_CAPABILITY_BEFORE,
+        FACT_TYPE_CAPABILITY_AFTER,
+        FACT_TYPE_CAPABILITY_DELTA,
+        FACT_TYPE_IMPACT_OBSERVATION,
+        FACT_TYPE_NEGATIVE_CONTROL,
+        FACT_TYPE_CONFIG_SOURCE,
+        FACT_TYPE_CONFIG_RESOLUTION,
+        FACT_TYPE_EFFECTIVE_CONFIG,
+        FACT_TYPE_REPRODUCTION,
     }
 )
 
@@ -194,6 +229,57 @@ ALL_FACT_STATUSES: frozenset[str] = frozenset(
 )
 
 
+class EvidenceRef(BaseModel):
+    snapshot_id: str | None = None
+    artifact_id: str | None = None
+    run_id: str | None = None
+    file: str | None = None
+    line_start: int | None = Field(default=None, ge=1)
+    line_end: int | None = Field(default=None, ge=1)
+    excerpt_sha256: str | None = None
+    tool: str | None = None
+    tool_version: str | None = None
+    rule_id: str | None = None
+
+    @field_validator(
+        "snapshot_id", "artifact_id", "run_id", "file", "excerpt_sha256",
+        "tool", "tool_version", "rule_id",
+    )
+    @classmethod
+    def _clean_optional(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class ProofPayload(BaseModel):
+    schema_version: int = Field(default=1, ge=1)
+    claim_kind: str = Field(min_length=1)
+    subject_ids: list[str] = Field(default_factory=list)
+    object_ids: list[str] = Field(default_factory=list)
+    applicability: dict[str, Any] = Field(default_factory=dict)
+    attributes: dict[str, Any] = Field(default_factory=dict)
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list)
+    artifact_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("claim_kind")
+    @classmethod
+    def _clean_claim_kind(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("claim_kind must not be empty")
+        return value
+
+    @field_validator("subject_ids", "object_ids", "artifact_ids")
+    @classmethod
+    def _clean_ids(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned):
+            raise ValueError("proof identifiers must not be empty")
+        return cleaned
+
+
 class Fact(BaseModel):
     id: str
     description: str
@@ -210,12 +296,25 @@ class Fact(BaseModel):
     # Free-text evidence: file:line, code excerpts, tool output, PoC trace.
     # Kept as a single string to avoid a separate table or sub-relations.
     evidence: str | None = None
+    proof: ProofPayload | None = None
     source_generation: int = 1
     legacy: bool = False
     # Lifecycle status. Default 'triaged' (fact was created by a worker, but
     # not yet adversarially reviewed). Reviews flip draft->triaged or
     # triaged->false_positive. See aggregate_fact_status_from_reviews().
     status: str = FACT_STATUS_TRIAGED
+
+    @field_validator("proof", mode="before")
+    @classmethod
+    def _decode_proof(cls, value: Any) -> Any:
+        if value in (None, ""):
+            return None
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError("proof must contain valid JSON") from exc
+        return value
 
 
 REVIEW_DIAGNOSTIC_FIELDS = (
@@ -828,6 +927,7 @@ class ConcludeRequest(BaseModel):
     description: str
     type: str | None = None
     evidence: str | None = None
+    proof: ProofPayload | None = None
     display_title: str | None = None
     semantic_type: str | None = None
     # Lifecycle status of the new fact. Defaults to 'draft' — the explore

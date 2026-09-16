@@ -1,0 +1,51 @@
+schema_version: 1
+invariants:
+  injection:
+    invariant_templates: ["attacker-controlled data cannot reach a dangerous sink without effective neutralization"]
+    typical_boundaries: [input, parser, query, command, template]
+    control_checks: [validation, encoding, parameterization, allowlist]
+    refutation_strategies: [effective_sanitizer, unreachable_sink, trusted_source]
+    proof_requirements: [attacker_control, reachability, security_boundary, impact_observation, negative_control]
+    cwe: [CWE-79, CWE-89, CWE-78]
+  authorization:
+    invariant_templates: ["a principal cannot access an object outside its authorization scope"]
+    typical_boundaries: [identity, policy, object_lookup, response]
+    control_checks: [ownership_check, scope_check, tenant_check]
+    refutation_strategies: [public_resource, equivalent_scope, enforced_policy]
+    proof_requirements: [principal, attacker_control, security_invariant, capability_delta, negative_control]
+    cwe: [CWE-639]
+  authentication_session:
+    invariant_templates: ["authentication and session state cannot be bypassed or confused"]
+    typical_boundaries: [login, session, token, middleware]
+    control_checks: [expiry, binding, rotation, signature]
+    refutation_strategies: [enforced_authentication, invalid_token, expired_session]
+    proof_requirements: [principal, security_boundary, capability_before, capability_after]
+    cwe: [CWE-287, CWE-384]
+  business_logic:
+    invariant_templates: ["state transitions preserve business authorization and conservation rules"]
+    typical_boundaries: [state, transition, invariant]
+    control_checks: [precondition, transition_guard, idempotency]
+    refutation_strategies: [unreachable_transition, enforced_precondition]
+    proof_requirements: [precondition, security_invariant, capability_delta, negative_control]
+    cwe: [CWE-840]
+  race_toc_tou:
+    invariant_templates: ["check and use observe one consistent state"]
+    typical_boundaries: [check, scheduling, use, lock]
+    control_checks: [transaction, lock, atomic_operation]
+    refutation_strategies: [atomicity, serialization, idempotent_use]
+    proof_requirements: [security_invariant, security_boundary, capability_delta, reproduction]
+    cwe: [CWE-367]
+  configuration:
+    invariant_templates: ["effective configuration matches the intended security policy"]
+    typical_boundaries: [config_source, config_resolution, effective_config]
+    control_checks: [precedence, default, environment, validation]
+    refutation_strategies: [safe_effective_config, unreachable_option]
+    proof_requirements: [config_source, config_resolution, effective_config, negative_control]
+    cwe: [CWE-16]
+  sandbox_isolation:
+    invariant_templates: ["untrusted execution cannot cross the declared isolation boundary"]
+    typical_boundaries: [worker, filesystem, network, control_channel]
+    control_checks: [filesystem_policy, network_policy, credential_policy]
+    refutation_strategies: [deny_default, inaccessible_target, isolated_backend]
+    proof_requirements: [attacker_control, security_boundary, capability_before, capability_after, reproduction]
+    cwe: [CWE-653]

@@ -123,6 +123,7 @@ from linen.server.models import (
     UpdateProjectTitleRequest,
     UpdateProjectStatusRequest,
 )
+from linen.server.uvpg import evaluate_shadow_gate
 from linen.server.services import (
     build_intents,
     list_intent_errors,
@@ -353,6 +354,14 @@ def get_project(project_id: str):
             stages=list_audit_stages(conn, project_id),
             decisions=list_human_decisions(conn, project_id),
         )
+
+
+@router.get("/projects/{project_id}/facts/{fact_id}/uvpg-shadow")
+def get_uvpg_shadow(project_id: str, fact_id: str):
+    """Evaluate the additive UVPG gate without changing project state."""
+    with get_conn() as conn:
+        get_project_or_404(conn, project_id)
+        return evaluate_shadow_gate(conn, project_id, fact_id).as_dict()
 
 
 @router.delete("/projects/{project_id}", status_code=204)

@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS facts (
     type TEXT,
     semantic_type TEXT NOT NULL DEFAULT 'observation',
     evidence TEXT,
+    proof TEXT,
     source_generation INTEGER NOT NULL DEFAULT 1,
     legacy INTEGER NOT NULL DEFAULT 0,
     -- Per-fact lifecycle, driven by Reviews + manual user action.
@@ -443,6 +444,8 @@ def _ensure_fact_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE facts ADD COLUMN type TEXT")
     if "evidence" not in columns:
         conn.execute("ALTER TABLE facts ADD COLUMN evidence TEXT")
+    if "proof" not in columns:
+        conn.execute("ALTER TABLE facts ADD COLUMN proof TEXT")
     if "display_title" not in columns:
         conn.execute("ALTER TABLE facts ADD COLUMN display_title TEXT")
     if "semantic_type" not in columns:
