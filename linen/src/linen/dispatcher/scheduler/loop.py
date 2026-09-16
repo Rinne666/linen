@@ -681,8 +681,9 @@ class DispatcherLoop:
                 fact.id for fact in current
                 if fact.status == "triaged"
                 and (
-                    fact.type == "negative_assurance"
-                    or fact.semantic_type in {"confirmed_finding", "negative_assurance"}
+                fact.type == "negative_assurance"
+                or fact.semantic_type in {"confirmed_finding", "negative_assurance"}
+                or (fact.type == "vulnerability" and fact.legacy)
                 )
             ]
         return []

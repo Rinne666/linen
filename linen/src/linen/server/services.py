@@ -379,7 +379,7 @@ def audit_completion_blockers_from_db(
     facts = {
         row["id"]: row
         for row in conn.execute(
-            "SELECT id, type, evidence, status FROM facts "
+            "SELECT id, type, semantic_type, legacy, evidence, proof, status FROM facts "
             "WHERE project_id = ? AND source_generation = ?",
             (project_id, generation),
         )
@@ -396,6 +396,16 @@ def audit_completion_blockers_from_db(
         (project_id, generation),
     ):
         parents.setdefault(row["to_fact_id"], []).append(row["fact_id"])
+    # A Technical Confirmation promotion is an evidence-chain edge, not an
+    # Intent conclusion. Include it so confirmed findings can be completed
+    # without making Completion perform confirmation itself.
+    for row in conn.execute(
+        "SELECT target_id, source_id FROM graph_edges WHERE project_id = ? "
+        "AND relation_type = 'promotes_to' AND source_kind = 'fact' AND target_kind = 'fact' "
+        "AND source_generation = ?",
+        (project_id, generation),
+    ):
+        parents.setdefault(row["target_id"], []).append(row["source_id"])
     review_rows = conn.execute(
         "SELECT fact_id, verdict, confidence FROM reviews WHERE project_id = ?", (project_id,)
     ).fetchall()
@@ -404,19 +414,21 @@ def audit_completion_blockers_from_db(
         reviews.setdefault(review["fact_id"], []).append(review)
 
     blockers: list[str] = []
-    required_types = {"audit_summary"} if audit_mode == "scope" else {
-        "vulnerability", "negative_assurance"
-    }
+    required_types = {"audit_summary"} if audit_mode == "scope" else {"negative_assurance"}
     required_ids = [
         fid for fid in from_ids
-        if facts.get(fid) and facts[fid]["type"] in required_types
+        if facts.get(fid) and (
+            facts[fid]["type"] in required_types
+            or facts[fid]["semantic_type"] == "confirmed_finding"
+            or (facts[fid]["type"] == "vulnerability" and bool(facts[fid]["legacy"]))
+        )
     ]
     if not required_ids:
         if audit_mode == "scope":
             blockers.append("Scope audit completion must reference an audit_summary fact.")
         else:
             blockers.append(
-                "Hypothesis audit completion must reference a vulnerability or negative_assurance fact."
+                "Hypothesis audit completion must reference a confirmed finding, legacy vulnerability, or negative_assurance fact."
             )
     if audit_mode == "scope" and (len(required_ids) != 1 or from_ids != required_ids):
         blockers.append("Scope audit completion must reference exactly one audit_summary fact.")
@@ -446,10 +458,16 @@ def audit_completion_blockers_from_db(
         if not fact["evidence"] or not fact["evidence"].strip():
             blockers.append(f"{fact_id} lacks evidence.")
         fact_reviews = reviews.get(fact_id, [])
-        if not fact_reviews or any(
+        technical_confirmation = False
+        if fact["semantic_type"] == "confirmed_finding":
+            try:
+                technical_confirmation = json.loads(fact["proof"] or "{}").get("attributes", {}).get("gate_version") == "uvpg-proof-v1"
+            except (TypeError, ValueError):
+                technical_confirmation = False
+        if not technical_confirmation and (not fact_reviews or any(
             review["verdict"] != "VALID" or review["confidence"] not in {"firm", "certain"}
             for review in fact_reviews
-        ):
+        )):
             blockers.append(f"{fact_id} needs VALID review(s) with firm/certain confidence.")
         if not parents.get(fact_id):
             blockers.append(f"{fact_id} has no incoming evidence chain.")

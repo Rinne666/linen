@@ -23,7 +23,8 @@ from linen.server.models import Fact, GraphEdge, ProofPayload
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LIBRARY = Path(__file__).resolve().parents[3] / "rules" / "invariant-library.yaml"
-GATE_VERSION = "uvpg-shadow-v2"
+PROOF_GATE_VERSION = "uvpg-proof-v1"
+GATE_VERSION = PROOF_GATE_VERSION  # compatibility alias for callers of Phase 1.5
 MAX_NODES = 128
 MAX_EDGES = 256
 
@@ -36,6 +37,7 @@ REASON_CODES = frozenset({
     "PROOF_CYCLE", "CROSS_CANDIDATE_EVIDENCE", "ROLE_TYPE_MISMATCH",
     "INVALID_EDGE_RELATION", "STALE_PROOF_GENERATION", "INVALID_SOURCE_EXCERPT",
     "ARTIFACT_HASH_MISMATCH", "PROOF_GRAPH_TOO_LARGE",
+    "PROOF_GRAPH_CHANGED",
 })
 REQUIRED_ROLES = {
     "attacker_control": "MISSING_ATTACKER_CONTROL", "reachability": "MISSING_REACHABILITY",
@@ -241,6 +243,39 @@ def _edge_valid(edge: GraphEdge, roles: dict[str, str], candidate_id: str) -> bo
     return (source, target, edge.relation_type) in EDGE_MATRIX
 
 
+def proof_graph_fingerprint(conn: sqlite3.Connection, project_id: str, candidate_fact_id: str) -> str:
+    """Hash the exact current proof inputs, excluding the promotion record."""
+    view = collect_candidate_proof_subgraph(conn, project_id, candidate_fact_id)
+    facts = []
+    for identifier in view.proof_fact_ids:
+        row = conn.execute(
+            "SELECT id, source_generation, type, semantic_type, status, proof FROM facts "
+            "WHERE project_id = ? AND id = ?", (project_id, identifier),
+        ).fetchone()
+        if row is not None and row["semantic_type"] != "confirmed_finding":
+            facts.append({key: row[key] for key in row.keys()})
+    edges = [
+        {key: row[key] for key in row.keys()}
+        for row in conn.execute(
+            "SELECT id, source_id, target_id, relation_type, source_generation, metadata "
+            "FROM graph_edges WHERE project_id = ? AND source_generation = ? "
+            "AND relation_type != 'promotes_to' ORDER BY id", (project_id, conn.execute("SELECT source_generation FROM projects WHERE id = ?", (project_id,)).fetchone()[0]),
+        )
+        if row["source_id"] in view.proof_fact_ids and row["target_id"] in view.proof_fact_ids
+    ]
+    generation = conn.execute("SELECT source_generation FROM projects WHERE id = ?", (project_id,)).fetchone()[0]
+    reviews = [
+        {key: row[key] for key in row.keys()}
+        for row in conn.execute(
+            "SELECT id, fact_id, verdict, confidence, source_generation FROM reviews "
+            "WHERE project_id = ? AND fact_id IN ({}) ORDER BY id".format(",".join("?" for _ in view.proof_fact_ids)),
+            (project_id, *view.proof_fact_ids),
+        )
+    ] if view.proof_fact_ids else []
+    payload = {"candidate_id": candidate_fact_id, "generation": generation, "gate_version": PROOF_GATE_VERSION, "facts": facts, "edges": edges, "reviews": reviews}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+
 @dataclass(frozen=True)
 class ShadowGateResult:
     status: str
@@ -249,7 +284,7 @@ class ShadowGateResult:
     proof_summary: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
-        return {"mode": "shadow", "gate_version": GATE_VERSION, "status": self.status, "reason_codes": list(self.reason_codes), "fact_id": self.fact_id, "proof_summary": self.proof_summary}
+        return {"mode": "shadow", "gate_version": PROOF_GATE_VERSION, "proof_gate_version": PROOF_GATE_VERSION, "status": self.status, "reason_codes": list(self.reason_codes), "fact_id": self.fact_id, "proof_summary": self.proof_summary}
 
 
 def evaluate_shadow_gate(conn: sqlite3.Connection, project_id: str, fact_id: str) -> ShadowGateResult:
@@ -299,6 +334,10 @@ def evaluate_shadow_gate(conn: sqlite3.Connection, project_id: str, fact_id: str
     summary["graph_closure_result"] = sorted(connected)
     unique = tuple(sorted(reasons))
     return ShadowGateResult("PASS" if not unique else "FAIL", unique, fact_id, summary)
+
+
+# Enforcement and shadow are intentionally aliases to one deterministic core.
+evaluate_proof_gate = evaluate_shadow_gate
 
 
 def load_invariant_library(path: Path | None = None) -> dict[str, Any]:

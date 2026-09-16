@@ -368,8 +368,10 @@ recipes:
         }
       }
 
-      confirmed requires type=vulnerability and a closed, externally reachable
-      chain with concrete impact. refuted and blocked require
+      confirmed means the worker believes a vulnerability candidate is ready for
+      the server-side Technical Confirmation Gate; it does not create a confirmed
+      finding. Use type=vulnerability for compatibility and provide a closed,
+      externally reachable chain with concrete impact. refuted and blocked require
       type=candidate_disposition. blocked is only for evidence that cannot be
       resolved through permitted read-only inspection. Include at least one
       exact frozen-source citation for every outcome.

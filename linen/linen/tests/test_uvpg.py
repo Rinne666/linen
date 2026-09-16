@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from linen.server import db
+from linen.server.routers.projects import confirm_technical_finding
 from linen.server.models import Fact, ProofPayload
 from linen.server.uvpg import evaluate_shadow_gate, load_invariant_library, validate_proof_payload
 
@@ -38,7 +39,7 @@ def test_proof_payload_validates_and_legacy_fact_still_parses(tmp_path, monkeypa
         assert result.status == "FAIL"
         assert "MISSING_PROOF_EDGE" not in result.reason_codes
         assert "MISSING_INVARIANT" in result.reason_codes
-        assert result.as_dict()["gate_version"] == "uvpg-shadow-v2"
+        assert result.as_dict()["gate_version"] == "uvpg-proof-v1"
 
 
 def test_shadow_gate_reports_missing_negative_control_without_blocking_completion(tmp_path, monkeypatch):
@@ -156,3 +157,27 @@ def test_proof_cycle_is_bounded_and_deterministic(tmp_path, monkeypatch):
         result = evaluate_shadow_gate(conn, "p", "candidate")
     assert result.status == "FAIL"
     assert "PROOF_CYCLE" in result.reason_codes
+
+
+def test_technical_confirmation_promotes_once_and_is_idempotent(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        conn.execute("UPDATE facts SET evidence = 'frozen evidence' WHERE id = 'candidate'")
+    first = confirm_technical_finding("p", "candidate")
+    second = confirm_technical_finding("p", "candidate")
+    assert first["status"] == "confirmed"
+    assert first["gate_version"] == "uvpg-proof-v1"
+    assert first["confirmed_fact_id"] == second["confirmed_fact_id"]
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM facts WHERE semantic_type = 'confirmed_finding'").fetchone()["n"] == 1
+        assert conn.execute("SELECT COUNT(*) AS n FROM graph_edges WHERE relation_type = 'promotes_to'").fetchone()["n"] == 1
+
+
+def test_failed_technical_confirmation_writes_nothing(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch, omit={"negative_control"})
+    response = confirm_technical_finding("p", "candidate")
+    assert response.status_code == 409
+    assert response.body
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM facts WHERE semantic_type = 'confirmed_finding'").fetchone()["n"] == 0
+        assert conn.execute("SELECT COUNT(*) AS n FROM graph_edges WHERE relation_type = 'promotes_to'").fetchone()["n"] == 0

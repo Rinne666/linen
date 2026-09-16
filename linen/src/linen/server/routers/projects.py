@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import json
+from dataclasses import replace
 import os
 import re
 import shutil
@@ -10,6 +12,7 @@ import threading
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 
 from linen.server.db import get_conn
 from linen.server.audit_state import (
@@ -123,7 +126,12 @@ from linen.server.models import (
     UpdateProjectTitleRequest,
     UpdateProjectStatusRequest,
 )
-from linen.server.uvpg import evaluate_shadow_gate
+from linen.server.uvpg import (
+    PROOF_GATE_VERSION,
+    evaluate_proof_gate,
+    evaluate_shadow_gate,
+    proof_graph_fingerprint,
+)
 from linen.server.services import (
     build_intents,
     list_intent_errors,
@@ -362,6 +370,97 @@ def get_uvpg_shadow(project_id: str, fact_id: str):
     with get_conn() as conn:
         get_project_or_404(conn, project_id)
         return evaluate_shadow_gate(conn, project_id, fact_id).as_dict()
+
+
+def _confirmation_result(result, *, status: str, candidate_id: str, confirmed_fact_id: str | None = None, fingerprint: str | None = None) -> dict:
+    payload = {
+        "mode": "enforcement",
+        "status": status,
+        "candidate_id": candidate_id,
+        "confirmed_fact_id": confirmed_fact_id,
+        "gate_version": PROOF_GATE_VERSION,
+        "proof_graph_sha256": fingerprint,
+        "reason_codes": list(result.reason_codes),
+        "proof_summary": result.proof_summary,
+    }
+    return payload
+
+
+@router.get("/projects/{project_id}/facts/{fact_id}/technical-confirmation")
+def get_technical_confirmation(project_id: str, fact_id: str):
+    """Dry-run the same proof core used by the enforcing promotion path."""
+    with get_conn() as conn:
+        get_project_or_404(conn, project_id)
+        result = evaluate_proof_gate(conn, project_id, fact_id)
+        fingerprint = proof_graph_fingerprint(conn, project_id, fact_id)
+        return _confirmation_result(
+            result,
+            status="eligible" if result.status == "PASS" else "not_confirmed",
+            candidate_id=fact_id,
+            fingerprint=fingerprint,
+        )
+
+
+@router.post("/projects/{project_id}/facts/{fact_id}/technical-confirmation")
+def confirm_technical_finding(project_id: str, fact_id: str):
+    """Atomically promote one candidate after deterministic proof validation."""
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        project = get_project_or_404(conn, project_id)
+        candidate = conn.execute(
+            "SELECT * FROM facts WHERE project_id = ? AND id = ?", (project_id, fact_id),
+        ).fetchone()
+        if candidate is None:
+            raise HTTPException(404, "Candidate fact not found")
+        if candidate["semantic_type"] != "candidate_finding":
+            raise HTTPException(409, "Technical confirmation requires a candidate_finding")
+        existing = conn.execute(
+            "SELECT f.id FROM facts f JOIN graph_edges e ON e.project_id = f.project_id "
+            "AND e.target_id = f.id WHERE f.project_id = ? AND e.source_id = ? "
+            "AND e.target_kind = 'fact' AND e.source_kind = 'fact' "
+            "AND e.relation_type = 'promotes_to' AND f.semantic_type = 'confirmed_finding' "
+            "ORDER BY f.id LIMIT 1", (project_id, fact_id),
+        ).fetchone()
+        if existing is not None:
+            fingerprint = proof_graph_fingerprint(conn, project_id, fact_id)
+            result = evaluate_proof_gate(conn, project_id, fact_id)
+            return _confirmation_result(result, status="confirmed", candidate_id=fact_id, confirmed_fact_id=existing["id"], fingerprint=fingerprint)
+
+        result = evaluate_proof_gate(conn, project_id, fact_id)
+        fingerprint = proof_graph_fingerprint(conn, project_id, fact_id)
+        if result.status != "PASS":
+            return JSONResponse(
+                status_code=409,
+                content=_confirmation_result(result, status="not_confirmed", candidate_id=fact_id, fingerprint=fingerprint),
+            )
+        if fingerprint != proof_graph_fingerprint(conn, project_id, fact_id):
+            result = replace(result, reason_codes=(*result.reason_codes, "PROOF_GRAPH_CHANGED"))
+            return JSONResponse(status_code=409, content=_confirmation_result(result, status="not_confirmed", candidate_id=fact_id, fingerprint=fingerprint))
+
+        now = utcnow()
+        confirmed_id = next_fact_id(conn, project_id)
+        proof = {
+            "schema_version": 1,
+            "claim_kind": "confirmed_finding",
+            "subject_ids": [fact_id],
+            "object_ids": result.proof_summary.get("fact_ids", []),
+            "attributes": {
+                "candidate_id": fact_id,
+                "gate_version": PROOF_GATE_VERSION,
+                "proof_graph_sha256": fingerprint,
+                "verification_level": "static_confirmed",
+                "confirmed_at": now,
+            },
+        }
+        conn.execute(
+            "INSERT INTO facts (id, project_id, description, display_title, type, semantic_type, evidence, proof, source_generation, status) "
+            "VALUES (?, ?, ?, ?, ?, 'confirmed_finding', ?, ?, ?, 'triaged')",
+            (confirmed_id, project_id, candidate["description"], f"Confirmed finding: {candidate['description'][:80]}", candidate["type"] or "vulnerability", candidate["evidence"], json.dumps(proof, sort_keys=True), project["source_generation"]),
+        )
+        create_graph_edge(conn, project_id, source_kind="fact", source_id=fact_id, target_kind="fact", target_id=confirmed_id, relation_type="promotes_to", created_by="technical_confirmation", metadata={"gate_version": PROOF_GATE_VERSION, "proof_graph_sha256": fingerprint}, created_at=now)
+        bump_graph_revision(conn, project_id)
+        append_event(conn, project_id, "technical_confirmation", "technical_confirmation", entity_kind="fact", entity_id=confirmed_id, payload={"candidate_id": fact_id, "confirmed_fact_id": confirmed_id, "gate_version": PROOF_GATE_VERSION, "proof_graph_sha256": fingerprint}, created_at=now)
+        return _confirmation_result(result, status="confirmed", candidate_id=fact_id, confirmed_fact_id=confirmed_id, fingerprint=fingerprint)
 
 
 @router.delete("/projects/{project_id}", status_code=204)

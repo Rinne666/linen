@@ -453,6 +453,11 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
         now = utcnow()
         fid = next_fact_id(conn, project_id)
         semantic_type = body.semantic_type or fact_semantic_type(fid, body.type, body.status)
+        if semantic_type == "confirmed_finding" or body.type == "confirmed_finding":
+            raise HTTPException(
+                422,
+                {"code": "CONFIRMED_FINDING_REQUIRES_TECHNICAL_GATE"},
+            )
         display_title = body.display_title or fact_display_title(
             fid, body.type, body.description, status=body.status,
         )

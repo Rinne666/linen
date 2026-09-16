@@ -376,6 +376,14 @@ def effective_human_decisions(
 
 
 def _strongly_reviewed(conn: sqlite3.Connection, project_id: str, fact_id: str) -> bool:
+    confirmed = conn.execute(
+        "SELECT semantic_type, proof FROM facts WHERE project_id = ? AND id = ?",
+        (project_id, fact_id),
+    ).fetchone()
+    if confirmed is not None and confirmed["semantic_type"] == "confirmed_finding":
+        proof = json.loads(confirmed["proof"] or "{}")
+        if proof.get("attributes", {}).get("gate_version") == "uvpg-proof-v1":
+            return True
     rows = conn.execute(
         "SELECT verdict, confidence FROM reviews WHERE project_id = ? AND fact_id = ?",
         (project_id, fact_id),
@@ -393,6 +401,14 @@ def _decisively_reviewed(conn: sqlite3.Connection, project_id: str, fact_id: str
     candidate would make correctly rejected findings permanently block an
     audit.  Confirmed evidence still uses ``_strongly_reviewed`` below.
     """
+    confirmed = conn.execute(
+        "SELECT semantic_type, proof FROM facts WHERE project_id = ? AND id = ?",
+        (project_id, fact_id),
+    ).fetchone()
+    if confirmed is not None and confirmed["semantic_type"] == "confirmed_finding":
+        proof = json.loads(confirmed["proof"] or "{}")
+        if proof.get("attributes", {}).get("gate_version") == "uvpg-proof-v1":
+            return True
     rows = conn.execute(
         "SELECT verdict, confidence FROM reviews WHERE project_id = ? AND fact_id = ?",
         (project_id, fact_id),
@@ -552,7 +568,7 @@ def completion_gate_from_db(
 
     audit_mode = project["audit_mode"] if "audit_mode" in project.keys() else "none"
     current_facts = conn.execute(
-        "SELECT id, type, semantic_type, status FROM facts WHERE project_id = ? "
+        "SELECT id, type, semantic_type, legacy, status FROM facts WHERE project_id = ? "
         "AND source_generation = ? AND id NOT IN ('origin', 'goal')",
         (project_id, generation),
     ).fetchall()
@@ -603,7 +619,8 @@ def completion_gate_from_db(
         selected_ids = [
             row["id"] for row in current_facts
             if (
-                row["type"] in {"vulnerability", "negative_assurance"}
+            row["type"] == "negative_assurance"
+            or (row["type"] == "vulnerability" and bool(row["legacy"]))
                 or row["semantic_type"] in {"confirmed_finding", "negative_assurance"}
             )
             and row["status"] == "triaged"

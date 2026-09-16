@@ -24,8 +24,29 @@ and negative-control Facts require the existing decisive review quality
 (`VALID` plus `firm`/`certain`); any invalid review is a contradiction. A
 candidate review does not attest its ancestors.
 
-TechnicalConfirmationGate remains shadow-only. It does not create confirmed
-findings and it does not affect Completion.
+Finding lifecycle is now explicitly split:
+
+`hypothesis / scanner / worker` may create a `candidate_finding`; the shared
+deterministic proof core evaluates its proof graph; the only confirmation
+authority is the server-side Technical Confirmation operation, which creates a
+new `confirmed_finding` Fact and a `candidate --promotes_to--> confirmed`
+GraphEdge. Ordinary `conclude` rejects an explicit `confirmed_finding` request
+with `CONFIRMED_FINDING_REQUIRES_TECHNICAL_GATE`. Existing `type=vulnerability`
+rows remain readable as candidates, and old rows marked `legacy` remain
+completion-compatible.
+
+`evaluate_proof_gate()` is the shared core used by both the read-only shadow
+endpoint and the enforcing confirmation endpoint. Its protocol version is
+`uvpg-proof-v1`; shadow/enforcement are modes, not separate rule sets. A
+confirmation stores the candidate id, gate version, proof graph SHA-256,
+verification level (`static_confirmed`), and timestamp in the confirmed Fact
+proof payload and audit event. Promotion is atomic and idempotent.
+
+Completion does not auto-confirm. New candidates do not satisfy hypothesis
+completion; a confirmed Fact does, through its promotion ancestry. Legacy
+vulnerability Facts remain accepted only for compatibility. Technical
+Confirmation does not inspect bounty scope, CVE eligibility, or reporting
+policy; those remain downstream concerns.
 
 Golden tests cover strict PASS, disconnected/missing invariant, cross-candidate
 contamination, invalid/missing review, and directed proof cycles. The next safe

@@ -226,7 +226,10 @@ def verification_context_prompt(project: ProjectDetail, intent: Intent, workdir:
 Independently verify this one candidate end to end. Return accepted:true with the normal
 data.description/type/evidence fields plus data.candidate_disposition containing:
 {fingerprint, outcome, rationale}. outcome must be confirmed, refuted, or blocked.
-confirmed requires type=vulnerability and a closed source/reachability/guard/sink chain.
+confirmed means the worker believes a vulnerability candidate is ready for the
+server-side Technical Confirmation Gate; it does not create a confirmed finding.
+Use type=vulnerability for compatibility and provide the closed source/reachability/
+guard/sink chain.
 refuted requires type=candidate_disposition and decisive counter-evidence. blocked is
 reserved for missing build/runtime/dependency evidence and also uses candidate_disposition.
 Do not silently switch to another candidate.
@@ -252,7 +255,7 @@ def verification_outcome_fact(
         raise ValueError("Candidate disposition requires a valid outcome and rationale")
     fact_type = data.get("type")
     if outcome == "confirmed" and fact_type != "vulnerability":
-        raise ValueError("A confirmed candidate must produce type=vulnerability")
+        raise ValueError("A confirmed candidate must produce a vulnerability candidate")
     if outcome != "confirmed" and fact_type != "candidate_disposition":
         raise ValueError("A non-confirmed candidate must produce type=candidate_disposition")
     evidence = data.get("evidence")

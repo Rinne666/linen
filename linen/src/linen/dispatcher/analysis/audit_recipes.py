@@ -707,7 +707,7 @@ def verification_outcome_fact(
     if outcome not in VERIFY_OUTCOMES or not isinstance(rationale, str) or not rationale.strip():
         raise ValueError("Semantic disposition requires a valid outcome and rationale")
     if outcome == "confirmed" and fact_type != "vulnerability":
-        raise ValueError("Confirmed semantic hypothesis must produce type=vulnerability")
+        raise ValueError("A confirmed hypothesis result must produce a vulnerability candidate")
     if outcome != "confirmed" and fact_type != "candidate_disposition":
         raise ValueError("Non-confirmed semantic hypothesis must produce candidate_disposition")
     if not isinstance(evidence, str) or not evidence.strip():
