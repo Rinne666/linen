@@ -219,9 +219,6 @@ def collect_candidate_proof_subgraph(conn: sqlite3.Connection, project_id: str, 
         view.provenance_errors.append("INVALID_PROVENANCE")
         return view
     edge_rows = conn.execute("SELECT * FROM graph_edges WHERE project_id = ? AND source_generation = ? ORDER BY id", (project_id, generation)).fetchall()
-    if len(edge_rows) > max_edges:
-        view.too_large = True
-        return view
     edges = []
     for row in edge_rows:
         data = dict(row)
@@ -229,7 +226,6 @@ def collect_candidate_proof_subgraph(conn: sqlite3.Connection, project_id: str, 
         edges.append(GraphEdge(**data))
     roles = _fact_roles(facts, candidate_fact_id)
     adjacency: dict[str, list[tuple[str, GraphEdge]]] = {}
-    invalid_edge_objects: list[GraphEdge] = []
     for edge in edges:
         if edge.source_kind != "fact" or edge.target_kind != "fact" or edge.source_id not in facts or edge.target_id not in facts:
             continue
@@ -237,18 +233,48 @@ def collect_candidate_proof_subgraph(conn: sqlite3.Connection, project_id: str, 
             continue
         edge_candidate = edge.metadata.get("candidate_id") if isinstance(edge.metadata, dict) else None
         if edge_candidate and edge_candidate != candidate_fact_id:
-            if candidate_fact_id in {edge.source_id, edge.target_id}:
-                view.foreign_fact_ids.extend(
-                    identifier for identifier in (edge.source_id, edge.target_id)
-                    if identifier != candidate_fact_id and identifier in facts
-                )
-                if _edge_is_uvpg_candidate_edge(edge, roles):
-                    view.invalid_edges.append(edge.id)
-                    invalid_edge_objects.append(edge)
             continue
         if is_proof_edge(edge, facts, candidate_fact_id):
             adjacency.setdefault(edge.source_id, []).append((edge.target_id, edge))
             adjacency.setdefault(edge.target_id, []).append((edge.source_id, edge))
+            continue
+    seen = {candidate_fact_id}; queue = [candidate_fact_id]; used: dict[str, GraphEdge] = {}
+    while queue:
+        current = queue.pop(0)
+        for other, edge in adjacency.get(current, []):
+            if edge.id not in used:
+                used[edge.id] = edge
+                if len(used) > max_edges:
+                    view.proof_fact_ids = sorted(seen)
+                    view.edges = [used[key] for key in sorted(used)]
+                    view.too_large = True
+                    return view
+            if other in seen:
+                continue
+            if len(seen) >= max_nodes:
+                view.proof_fact_ids = sorted(seen)
+                view.edges = [used[key] for key in sorted(used)]
+                view.too_large = True
+                return view
+            seen.add(other); queue.append(other)
+    view.proof_fact_ids = sorted(seen)
+    view.edges = [used[key] for key in sorted(used)]
+    reachable = set(view.proof_fact_ids)
+    local_invalid_edges: list[GraphEdge] = []
+    for edge in edges:
+        if edge.source_id not in reachable and edge.target_id not in reachable:
+            continue
+        if edge.relation_type in _IGNORED_BLACKBOARD_RELATIONS or edge.id in used:
+            continue
+        edge_candidate = edge.metadata.get("candidate_id") if isinstance(edge.metadata, dict) else None
+        if edge_candidate and edge_candidate != candidate_fact_id:
+            view.foreign_fact_ids.extend(
+                identifier for identifier in (edge.source_id, edge.target_id)
+                if identifier in facts and identifier != candidate_fact_id
+            )
+            if _edge_is_uvpg_candidate_edge(edge, roles):
+                view.invalid_edges.append(edge.id)
+                local_invalid_edges.append(edge)
             continue
         if roles.get(edge.source_id) == "foreign_candidate" or roles.get(edge.target_id) == "foreign_candidate":
             view.foreign_fact_ids.extend(
@@ -257,22 +283,9 @@ def collect_candidate_proof_subgraph(conn: sqlite3.Connection, project_id: str, 
             )
         if _edge_is_uvpg_candidate_edge(edge, roles):
             view.invalid_edges.append(edge.id)
-            invalid_edge_objects.append(edge)
-    seen = {candidate_fact_id}; queue = [candidate_fact_id]; used: dict[str, GraphEdge] = {}
-    while queue:
-        current = queue.pop(0)
-        for other, edge in adjacency.get(current, []):
-            used[edge.id] = edge
-            if other in seen:
-                continue
-            if len(seen) >= max_nodes:
-                view.too_large = True
-                return view
-            seen.add(other); queue.append(other)
-    view.proof_fact_ids = sorted(seen)
-    view.edges = [used[key] for key in sorted(used)]
+            local_invalid_edges.append(edge)
     directed: dict[str, list[str]] = {}
-    for edge in [*view.edges, *invalid_edge_objects]:
+    for edge in [*view.edges, *local_invalid_edges]:
         if edge.source_id in seen and edge.target_id in seen:
             directed.setdefault(edge.source_id, []).append(edge.target_id)
     visiting: set[str] = set()

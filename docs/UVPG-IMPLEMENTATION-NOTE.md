@@ -57,6 +57,8 @@ Fact-to-Fact edges only. Process, discovery, review, lifecycle, and promotion
 edges are ignored, while malformed edges between recognized UVPG roles are
 reported as integrity blockers. In particular, `promotes_to` and workflow
 `supports` edges cannot contaminate a candidate's proof closure.
+ProofGraphView limits and integrity errors are candidate-local: unreachable
+Blackboard edges cannot fail another candidate's proof.
 
 Reason currently sees the Blackboard projection and creates ordinary bounded
 Intents through AuditGraph; before this phase it did not consume Technical Gate

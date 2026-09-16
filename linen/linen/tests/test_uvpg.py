@@ -15,6 +15,8 @@ from linen.server.uvpg import (
     derive_proof_gaps,
     evaluate_shadow_gate,
     load_invariant_library,
+    MAX_EDGES,
+    proof_graph_fingerprint,
     validate_proof_payload,
 )
 from linen.server.routers.reviews import create_review
@@ -294,3 +296,74 @@ def test_unrelated_candidate_canonical_edges_do_not_contaminate_projection(tmp_p
         result = evaluate_shadow_gate(conn, "p", "candidate")
     assert result.status == "PASS"
     assert not set(view.proof_fact_ids) & {"candidate-b", "b-capability_before", "b-capability_after", "b-capability_delta", "b-negative_control"}
+
+
+def test_unrelated_blackboard_edges_do_not_consume_local_edge_budget(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        for index in range(MAX_EDGES + 20):
+            fact_id = f"noise-{index:03d}"
+            conn.execute("INSERT INTO facts (id, project_id, description, type) VALUES (?, 'p', ?, 'noise')", (fact_id, fact_id))
+            conn.execute("INSERT INTO graph_edges (id, project_id, source_kind, source_id, target_kind, target_id, relation_type, created_at, created_by) VALUES (?, 'p', 'fact', ?, 'fact', 'candidate', 'produces', 'now', 'test')", (f"noise-edge-{index:03d}", fact_id))
+        result = evaluate_shadow_gate(conn, "p", "candidate")
+    assert result.status == "PASS"
+    assert "PROOF_GRAPH_TOO_LARGE" not in result.reason_codes
+
+
+def test_reachable_local_proof_edges_consume_edge_budget(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        for index in range(MAX_EDGES + 1):
+            fact_id = f"extra-attacker-{index:03d}"
+            conn.execute("INSERT INTO facts (id, project_id, description, type) VALUES (?, 'p', ?, 'attacker_control')", (fact_id, fact_id))
+            conn.execute("INSERT INTO graph_edges (id, project_id, source_kind, source_id, target_kind, target_id, relation_type, created_at, created_by) VALUES (?, 'p', 'fact', 'candidate', 'fact', ?, 'depends_on', 'now', 'test')", (f"extra-edge-{index:03d}", fact_id))
+        result = evaluate_shadow_gate(conn, "p", "candidate")
+    assert result.status == "FAIL"
+    assert "PROOF_GRAPH_TOO_LARGE" in result.reason_codes
+
+
+def test_remote_legacy_candidate_and_malformed_edge_are_ignored(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        conn.execute("INSERT INTO facts (id, project_id, description, type, semantic_type) VALUES ('candidate-b', 'p', 'candidate b', 'vulnerability', 'candidate_finding')")
+        conn.execute("INSERT INTO facts (id, project_id, description, type) VALUES ('b-invariant', 'p', 'b invariant', 'security_invariant')")
+        conn.execute("INSERT INTO graph_edges (id, project_id, source_kind, source_id, target_kind, target_id, relation_type, created_at, created_by) VALUES ('b-malformed', 'p', 'fact', 'b-invariant', 'fact', 'candidate-b', 'baseline_for', 'now', 'test')")
+        result = evaluate_shadow_gate(conn, "p", "candidate")
+    assert result.status == "PASS"
+    assert "CROSS_CANDIDATE_EVIDENCE" not in result.reason_codes
+    assert "INVALID_EDGE_RELATION" not in result.reason_codes
+
+
+def test_legacy_cross_candidate_fact_is_rejected_when_reachable(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        conn.execute("INSERT INTO facts (id, project_id, description, type, semantic_type) VALUES ('candidate-b', 'p', 'candidate b', 'vulnerability', 'candidate_finding')")
+        conn.execute("INSERT INTO facts (id, project_id, description, type) VALUES ('b-before', 'p', 'b before', 'capability_before')")
+        conn.execute("INSERT INTO graph_edges (id, project_id, source_kind, source_id, target_kind, target_id, relation_type, created_at, created_by) VALUES ('a-to-b-proof', 'p', 'fact', 'candidate', 'fact', 'b-before', 'depends_on', 'now', 'test')")
+        conn.execute("INSERT INTO graph_edges (id, project_id, source_kind, source_id, target_kind, target_id, relation_type, created_at, created_by) VALUES ('b-anchor', 'p', 'fact', 'candidate-b', 'fact', 'b-before', 'depends_on', 'now', 'test')")
+        result = evaluate_shadow_gate(conn, "p", "candidate")
+    assert result.status == "FAIL"
+    assert "CROSS_CANDIDATE_EVIDENCE" in result.reason_codes
+
+
+def test_local_malformed_edge_is_not_silently_ignored(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        conn.execute("INSERT INTO graph_edges (id, project_id, source_kind, source_id, target_kind, target_id, relation_type, created_at, created_by) VALUES ('local-malformed', 'p', 'fact', 'candidate', 'fact', 'security_invariant', 'baseline_for', 'now', 'test')")
+        result = evaluate_shadow_gate(conn, "p", "candidate")
+    assert result.status == "FAIL"
+    assert "INVALID_EDGE_RELATION" in result.reason_codes
+
+
+def test_fingerprint_ignores_remote_mutation_but_tracks_local_review(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        first = proof_graph_fingerprint(conn, "p", "candidate")
+        conn.execute("INSERT INTO facts (id, project_id, description, type, semantic_type) VALUES ('candidate-b', 'p', 'candidate b', 'vulnerability', 'candidate_finding')")
+        conn.execute("INSERT INTO facts (id, project_id, description, type) VALUES ('b-before', 'p', 'b before', 'capability_before')")
+        conn.execute("INSERT INTO graph_edges (id, project_id, source_kind, source_id, target_kind, target_id, relation_type, created_at, created_by) VALUES ('remote-edge', 'p', 'fact', 'candidate-b', 'fact', 'b-before', 'depends_on', 'now', 'test')")
+        second = proof_graph_fingerprint(conn, "p", "candidate")
+        conn.execute("INSERT INTO reviews (id, project_id, fact_id, verdict, confidence, summary, created_at) VALUES ('local-review', 'p', 'attacker_control', 'VALID', 'firm', 'local', 'later')")
+        third = proof_graph_fingerprint(conn, "p", "candidate")
+    assert first == second
+    assert third != second
