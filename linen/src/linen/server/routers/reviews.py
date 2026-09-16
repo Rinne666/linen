@@ -82,19 +82,24 @@ def create_review(project_id: str, fact_id: str, body: CreateReviewRequest):
                 (new_status, fact_id, project_id),
             )
         if fact_row["type"] == "vulnerability":
-            if body.verdict == "INVALID":
-                semantic_type = "rejected_finding"
-            elif body.verdict == "VALID" and body.confidence in {"firm", "certain"}:
+            if fact_row["semantic_type"] == "confirmed_finding":
+                # A review cannot demote or re-promote an authoritative
+                # confirmation; later disposition remains an explicit
+                # lifecycle operation.
                 semantic_type = "confirmed_finding"
+            elif body.verdict == "INVALID":
+                semantic_type = "rejected_finding"
             else:
+                # Reviews attest evidence quality; they do not have the
+                # authority to promote a candidate. Technical Confirmation is
+                # the sole candidate -> confirmed transition.
                 semantic_type = "candidate_finding"
             conn.execute(
                 "UPDATE facts SET semantic_type = ?, display_title = CASE "
                 "WHEN display_title IS NULL OR display_title IN ('Candidate finding', 'Confirmed finding') "
                 "THEN ? ELSE display_title END WHERE id = ? AND project_id = ?",
                 (
-                    semantic_type,
-                    "Confirmed finding" if semantic_type == "confirmed_finding" else "Candidate finding",
+                    semantic_type, "Candidate finding" if semantic_type == "candidate_finding" else "Rejected finding",
                     fact_id,
                     project_id,
                 ),

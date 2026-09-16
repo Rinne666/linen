@@ -188,8 +188,8 @@ def test_gate_checks_reviews_ancestors_and_open_intents(api):
     assert any(source in b for b in completion_blockers(client.get_project(pid), [terminal]))
 
 
-def test_server_rejects_audit_completion_until_terminal_fact_is_reviewed(api):
-    """The API boundary must reject the draft-terminal bypass, not only reason.py."""
+def test_server_rejects_audit_completion_until_terminal_fact_is_confirmed(api):
+    """A Review is not a substitute for Technical Confirmation."""
     _, client = api
     pid = project(api, audit_mode="hypothesis").project.id
     terminal = add_fact(client, pid)
@@ -199,8 +199,9 @@ def test_server_rejects_audit_completion_until_terminal_fact_is_reviewed(api):
     assert "unresolved status draft" in blocked.text
 
     assert client.create_review(pid, terminal, "VALID", "independent trace", confidence="certain").ok
-    completed = client.complete(pid, [terminal], "reviewed terminal", "reasoner")
-    assert completed.ok, completed.text
+    still_blocked = client.complete(pid, [terminal], "reviewed terminal", "reasoner")
+    assert still_blocked.status_code == 409
+    assert "confirmed finding" in still_blocked.text
 
 
 def test_server_rejects_scope_summary_that_omits_reviewed_fact(api):
