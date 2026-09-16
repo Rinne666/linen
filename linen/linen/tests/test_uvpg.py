@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 
 import pytest
 
@@ -20,6 +21,8 @@ from linen.server.uvpg import (
     validate_proof_payload,
 )
 from linen.server.routers.reviews import create_review
+from linen.server.dynamic_verification import evaluate_dynamic_verification, effective_verification_level
+from linen.server.routers.projects import finalize_dynamic_verification, get_dynamic_verification
 
 
 def _proof(*roles: str) -> dict:
@@ -367,3 +370,141 @@ def test_fingerprint_ignores_remote_mutation_but_tracks_local_review(tmp_path, m
         third = proof_graph_fingerprint(conn, "p", "candidate")
     assert first == second
     assert third != second
+
+
+def _dynamic_board(tmp_path, monkeypatch, *, include_negative=True, same_capability=False, unsafe=False):
+    candidate_id = _strict_board(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    positive_path = repo / "positive.log"
+    negative_path = repo / "negative.log"
+    positive_path.write_text("positive", encoding="utf-8")
+    negative_path.write_text("negative", encoding="utf-8")
+    with db.get_conn() as conn:
+        conn.execute("UPDATE projects SET repo_root = ? WHERE id = 'p'", (str(repo),))
+        generation = conn.execute("SELECT source_generation FROM projects WHERE id = 'p'").fetchone()[0]
+        for run_id, artifact_id, path in (("run-positive", "artifact-positive", positive_path), ("run-negative", "artifact-negative", negative_path)):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            conn.execute(
+                "INSERT INTO artifacts (artifact_id, project_id, kind, workspace_path, sha256, media_type, byte_size, producer_run_id, created_at) VALUES (?, 'p', 'dynamic-log', ?, ?, 'text/plain', ?, ?, 'now')",
+                (artifact_id, path.name, digest, path.stat().st_size, run_id),
+            )
+            task_type = "explore" if unsafe else "poc:isolated"
+            conn.execute(
+                "INSERT INTO runs (run_id, project_id, task_type, attempt, idempotency_key, graph_revision, source_generation, plan_revision, timeout_seconds, status, artifact_ids, created_at, updated_at) VALUES (?, 'p', ?, 1, ?, 1, ?, 1, 30, 'succeeded', ?, 'now', 'now')",
+                (run_id, task_type, run_id, generation, json.dumps([artifact_id])),
+            )
+        positive_capability = "protected:B" if not same_capability else "same"
+        negative_capability = "owned:A" if not same_capability else "same"
+        def proof(claim_kind, run_id, artifact_id, capability, outcome):
+            return json.dumps({
+                "claim_kind": claim_kind,
+                "subject_ids": [candidate_id],
+                "attributes": {
+                    "mode": "dynamic", "candidate_id": candidate_id, "run_id": run_id,
+                    "artifact_ids": [artifact_id], "oracle_kind": "resource_identity",
+                    "capability_observed": capability, "observed_outcome": outcome,
+                    "environment_fingerprint": "env-1", "harness_id": "idor-harness", "target_id": "target-1",
+                },
+            })
+        conn.execute("INSERT INTO facts (id, project_id, description, type, proof) VALUES ('dynamic-positive', 'p', 'positive reproduction', 'reproduction', ?)", (proof("reproduction", "run-positive", "artifact-positive", positive_capability, {"resource_identity": positive_capability}),))
+        if include_negative:
+            conn.execute("INSERT INTO facts (id, project_id, description, type, proof) VALUES ('dynamic-negative', 'p', 'negative baseline', 'negative_control', ?)", (proof("negative_control", "run-negative", "artifact-negative", negative_capability, {"resource_identity": negative_capability}),))
+        conn.execute("INSERT INTO reviews (id, project_id, fact_id, verdict, confidence, summary, created_at) VALUES ('dynamic-review-positive', 'p', 'dynamic-positive', 'VALID', 'firm', 'reviewed', 'now')")
+        if include_negative:
+            conn.execute("INSERT INTO reviews (id, project_id, fact_id, verdict, confidence, summary, created_at) VALUES ('dynamic-review-negative', 'p', 'dynamic-negative', 'VALID', 'firm', 'reviewed', 'now')")
+    confirm_technical_finding("p", candidate_id)
+    return candidate_id
+
+
+def test_valid_review_never_promotes_candidate(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    create_review("p", "candidate", CreateReviewRequest(
+        verdict="VALID", confidence="firm", summary="credible", created_by="reviewer",
+    ))
+    with db.get_conn() as conn:
+        row = conn.execute("SELECT semantic_type FROM facts WHERE id = 'candidate'").fetchone()
+        assert row["semantic_type"] == "candidate_finding"
+        assert conn.execute("SELECT COUNT(*) AS n FROM facts WHERE semantic_type = 'confirmed_finding'").fetchone()["n"] == 0
+        assert conn.execute("SELECT COUNT(*) AS n FROM graph_edges WHERE relation_type = 'promotes_to'").fetchone()["n"] == 0
+
+
+def test_static_confirmation_succeeds_without_dynamic_evidence(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    result = confirm_technical_finding("p", "candidate")
+    assert result["status"] == "confirmed"
+    assert result["verification_level"] == "static_confirmed"
+
+
+def test_dynamic_positive_without_negative_is_incomplete(tmp_path, monkeypatch):
+    _dynamic_board(tmp_path, monkeypatch, include_negative=False)
+    with db.get_conn() as conn:
+        result = evaluate_dynamic_verification(conn, "p", "candidate")
+    assert result.status == "incomplete"
+    assert "MISSING_DYNAMIC_NEGATIVE_CONTROL" in result.reason_codes
+
+
+def test_dynamic_verification_requires_capability_delta_and_passes_idor_fixture(tmp_path, monkeypatch):
+    _dynamic_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        result = evaluate_dynamic_verification(conn, "p", "candidate")
+    assert result.status == "PASS", result.reason_codes
+    receipt = finalize_dynamic_verification("p", "candidate")
+    assert receipt["status"] == "PASS"
+    assert receipt["effective_verification_level"] == "dynamic_confirmed"
+    second = finalize_dynamic_verification("p", "candidate")
+    assert second["receipt_sequence"] == receipt["receipt_sequence"]
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM audit_events WHERE event_type = 'dynamic_verification_pass'").fetchone()["n"] == 1
+        confirmed = conn.execute("SELECT id FROM facts WHERE semantic_type = 'confirmed_finding'").fetchone()["id"]
+        assert effective_verification_level(conn, "p", confirmed) == "dynamic_confirmed"
+
+
+def test_dynamic_equal_positive_negative_outcomes_fail_delta(tmp_path, monkeypatch):
+    _dynamic_board(tmp_path, monkeypatch, same_capability=True)
+    with db.get_conn() as conn:
+        result = evaluate_dynamic_verification(conn, "p", "candidate")
+    assert result.status == "FAIL"
+    assert "NO_DYNAMIC_CAPABILITY_DELTA" in result.reason_codes
+
+
+def test_dynamic_unisolated_run_cannot_upgrade_static_confirmation(tmp_path, monkeypatch):
+    _dynamic_board(tmp_path, monkeypatch, unsafe=True)
+    with db.get_conn() as conn:
+        result = evaluate_dynamic_verification(conn, "p", "candidate")
+    assert result.status == "FAIL"
+    assert "UNSAFE_DYNAMIC_EXECUTION" in result.reason_codes
+
+
+def test_dynamic_artifact_tampering_invalidates_effective_level(tmp_path, monkeypatch):
+    _dynamic_board(tmp_path, monkeypatch)
+    finalize_dynamic_verification("p", "candidate")
+    positive_path = tmp_path / "repo" / "positive.log"
+    positive_path.write_text("tampered", encoding="utf-8")
+    with db.get_conn() as conn:
+        confirmed = conn.execute("SELECT id FROM facts WHERE semantic_type = 'confirmed_finding'").fetchone()["id"]
+        result = evaluate_dynamic_verification(conn, "p", "candidate")
+        level = effective_verification_level(conn, "p", confirmed)
+    assert "DYNAMIC_ARTIFACT_HASH_MISMATCH" in result.reason_codes
+    assert level == "static_confirmed"
+
+
+def test_dynamic_receipt_does_not_carry_forward_to_new_generation(tmp_path, monkeypatch):
+    _dynamic_board(tmp_path, monkeypatch)
+    finalize_dynamic_verification("p", "candidate")
+    with db.get_conn() as conn:
+        confirmed = conn.execute("SELECT id FROM facts WHERE semantic_type = 'confirmed_finding'").fetchone()["id"]
+        conn.execute("UPDATE projects SET source_generation = 2 WHERE id = 'p'")
+        assert effective_verification_level(conn, "p", confirmed) == "static_confirmed"
+
+
+def test_dynamic_evidence_is_candidate_bound(tmp_path, monkeypatch):
+    _dynamic_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        row = conn.execute("SELECT proof FROM facts WHERE id = 'dynamic-negative'").fetchone()
+        proof = json.loads(row["proof"])
+        proof["attributes"]["candidate_id"] = "candidate-b"
+        conn.execute("UPDATE facts SET proof = ? WHERE id = 'dynamic-negative'", (json.dumps(proof),))
+        result = evaluate_dynamic_verification(conn, "p", "candidate")
+    assert result.status == "incomplete"
+    assert "MISSING_DYNAMIC_NEGATIVE_CONTROL" in result.reason_codes

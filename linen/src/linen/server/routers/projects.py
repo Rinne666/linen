@@ -135,6 +135,11 @@ from linen.server.uvpg import (
     NON_AUTOMATIC_REPAIR_GAPS,
     proof_graph_fingerprint,
 )
+from linen.server.dynamic_verification import (
+    DYNAMIC_GATE_VERSION,
+    effective_verification_level,
+    evaluate_dynamic_verification,
+)
 from linen.server.services import (
     build_intents,
     list_intent_errors,
@@ -375,7 +380,7 @@ def get_uvpg_shadow(project_id: str, fact_id: str):
         return evaluate_shadow_gate(conn, project_id, fact_id).as_dict()
 
 
-def _confirmation_result(result, *, status: str, candidate_id: str, confirmed_fact_id: str | None = None, fingerprint: str | None = None) -> dict:
+def _confirmation_result(result, *, status: str, candidate_id: str, confirmed_fact_id: str | None = None, fingerprint: str | None = None, verification_level: str = "static_confirmed") -> dict:
     payload = {
         "mode": "enforcement",
         "status": status,
@@ -383,6 +388,7 @@ def _confirmation_result(result, *, status: str, candidate_id: str, confirmed_fa
         "confirmed_fact_id": confirmed_fact_id,
         "gate_version": PROOF_GATE_VERSION,
         "proof_graph_sha256": fingerprint,
+        "verification_level": verification_level,
         "reason_codes": list(result.reason_codes),
         "proof_summary": result.proof_summary,
     }
@@ -396,12 +402,77 @@ def get_technical_confirmation(project_id: str, fact_id: str):
         get_project_or_404(conn, project_id)
         result = evaluate_proof_gate(conn, project_id, fact_id)
         fingerprint = proof_graph_fingerprint(conn, project_id, fact_id)
+        confirmed = conn.execute(
+            "SELECT f.id FROM facts f JOIN graph_edges e ON e.target_id = f.id "
+            "WHERE e.project_id = ? AND e.source_id = ? AND e.relation_type = 'promotes_to' "
+            "AND f.semantic_type = 'confirmed_finding' ORDER BY f.id LIMIT 1",
+            (project_id, fact_id),
+        ).fetchone()
         return _confirmation_result(
             result,
             status="eligible" if result.status == "PASS" else "not_confirmed",
             candidate_id=fact_id,
+            confirmed_fact_id=confirmed["id"] if confirmed else None,
             fingerprint=fingerprint,
+            verification_level=(effective_verification_level(conn, project_id, confirmed["id"]) if confirmed else "static_confirmed"),
         )
+
+
+@router.get("/projects/{project_id}/facts/{fact_id}/dynamic-verification")
+def get_dynamic_verification(project_id: str, fact_id: str):
+    """Evaluate optional dynamic evidence without executing a reproduction."""
+    with get_conn() as conn:
+        get_project_or_404(conn, project_id)
+        result = evaluate_dynamic_verification(conn, project_id, fact_id)
+        level = (
+            effective_verification_level(conn, project_id, result.confirmed_fact_id)
+            if result.confirmed_fact_id else "unconfirmed"
+        )
+        payload = result.as_dict()
+        payload["effective_verification_level"] = level
+        return payload
+
+
+@router.post("/projects/{project_id}/facts/{fact_id}/dynamic-verification")
+def finalize_dynamic_verification(project_id: str, fact_id: str):
+    """Persist one idempotent PASS receipt for already-produced evidence."""
+    with get_conn() as conn:
+        check_project_active(conn, project_id)
+        project = get_project_or_404(conn, project_id)
+        result = evaluate_dynamic_verification(conn, project_id, fact_id)
+        payload = result.as_dict()
+        if result.status != "PASS":
+            payload["effective_verification_level"] = (
+                effective_verification_level(conn, project_id, result.confirmed_fact_id)
+                if result.confirmed_fact_id else "unconfirmed"
+            )
+            return payload
+        if result.confirmed_fact_id is None:
+            payload["receipt_created"] = False
+            payload["receipt_reason"] = "technical_confirmation_required"
+            payload["effective_verification_level"] = "unconfirmed"
+            return payload
+        receipt = dict(result.receipt)
+        receipt["confirmed_fact_id"] = result.confirmed_fact_id
+        receipt["dynamic_verification_sha256"] = hashlib.sha256(json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        fingerprint = receipt["static_proof_graph_sha256"]
+        idempotency_key = (
+            f"dynamic:{fact_id}:g{project['source_generation']}:{fingerprint}:"
+            f"{receipt['positive_run_id']}:{receipt['negative_run_id']}:{DYNAMIC_GATE_VERSION}"
+        )
+        sequence = append_event(
+            conn, project_id, "dynamic_verification_pass", "dynamic_verification",
+            entity_kind="fact", entity_id=result.confirmed_fact_id,
+            run_id=receipt["positive_run_id"], idempotency_key=idempotency_key,
+            payload=receipt,
+        )
+        payload.update({
+            "receipt": receipt,
+            "receipt_created": True,
+            "receipt_sequence": sequence,
+            "effective_verification_level": "dynamic_confirmed",
+        })
+        return payload
 
 
 def _proof_status_payload(conn, project_id: str, fact_id: str) -> dict:
@@ -495,10 +566,11 @@ def confirm_technical_finding(project_id: str, fact_id: str):
         if existing is not None:
             fingerprint = proof_graph_fingerprint(conn, project_id, fact_id)
             result = evaluate_proof_gate(conn, project_id, fact_id)
-            return _confirmation_result(result, status="confirmed", candidate_id=fact_id, confirmed_fact_id=existing["id"], fingerprint=fingerprint)
+            return _confirmation_result(result, status="confirmed", candidate_id=fact_id, confirmed_fact_id=existing["id"], fingerprint=fingerprint, verification_level=effective_verification_level(conn, project_id, existing["id"]))
 
         result = evaluate_proof_gate(conn, project_id, fact_id)
         fingerprint = proof_graph_fingerprint(conn, project_id, fact_id)
+        dynamic_result = evaluate_dynamic_verification(conn, project_id, fact_id)
         if result.status != "PASS":
             return JSONResponse(
                 status_code=409,
@@ -519,7 +591,7 @@ def confirm_technical_finding(project_id: str, fact_id: str):
                 "candidate_id": fact_id,
                 "gate_version": PROOF_GATE_VERSION,
                 "proof_graph_sha256": fingerprint,
-                "verification_level": "static_confirmed",
+                "verification_level": "dynamic_confirmed" if dynamic_result.status == "PASS" else "static_confirmed",
                 "confirmed_at": now,
             },
         }
@@ -531,7 +603,19 @@ def confirm_technical_finding(project_id: str, fact_id: str):
         create_graph_edge(conn, project_id, source_kind="fact", source_id=fact_id, target_kind="fact", target_id=confirmed_id, relation_type="promotes_to", created_by="technical_confirmation", metadata={"gate_version": PROOF_GATE_VERSION, "proof_graph_sha256": fingerprint}, created_at=now)
         bump_graph_revision(conn, project_id)
         append_event(conn, project_id, "technical_confirmation", "technical_confirmation", entity_kind="fact", entity_id=confirmed_id, payload={"candidate_id": fact_id, "confirmed_fact_id": confirmed_id, "gate_version": PROOF_GATE_VERSION, "proof_graph_sha256": fingerprint}, created_at=now)
-        return _confirmation_result(result, status="confirmed", candidate_id=fact_id, confirmed_fact_id=confirmed_id, fingerprint=fingerprint)
+        if dynamic_result.status == "PASS":
+            receipt = dict(dynamic_result.receipt)
+            receipt["confirmed_fact_id"] = confirmed_id
+            receipt["dynamic_verification_sha256"] = hashlib.sha256(json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            append_event(
+                conn, project_id, "dynamic_verification_pass", "dynamic_verification",
+                entity_kind="fact", entity_id=confirmed_id, run_id=receipt.get("positive_run_id"),
+                idempotency_key=(
+                    f"dynamic:{fact_id}:g{project['source_generation']}:{fingerprint}:"
+                    f"{receipt.get('positive_run_id')}:{receipt.get('negative_run_id')}:{DYNAMIC_GATE_VERSION}"
+                ), payload=receipt, created_at=now,
+            )
+        return _confirmation_result(result, status="confirmed", candidate_id=fact_id, confirmed_fact_id=confirmed_id, fingerprint=fingerprint, verification_level="dynamic_confirmed" if dynamic_result.status == "PASS" else "static_confirmed")
 
 
 @router.delete("/projects/{project_id}", status_code=204)

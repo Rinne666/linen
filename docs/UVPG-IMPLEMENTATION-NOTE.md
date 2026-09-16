@@ -99,3 +99,27 @@ Golden tests cover strict PASS, disconnected/missing invariant, workflow and
 promotion-edge isolation, cross-candidate capability/negative-control
 contamination, targeted review progression, repair blockers, proof bounding,
 gap priority, planner deduplication, and canonical proof-edge production.
+
+## Static and dynamic verification
+
+Review is an evidence-quality decision only. A `VALID` decisive Review keeps a
+vulnerability candidate as `candidate_finding`; only Technical Confirmation can
+create the single authoritative `confirmed_finding` and its `promotes_to` edge.
+
+Technical Confirmation remains static by default and does not require a PoC.
+Its immutable creation proof records `verification_level=static_confirmed`.
+The optional dynamic layer is versioned separately as `uvpg-dynamic-v1` and
+evaluates existing `reproduction` and dynamic `negative_control` Facts. Each
+must bind the exact candidate, current generation, an authorized `poc:isolated`
+Run, hashed Artifacts, structured oracle observations, and decisive independent
+Reviews. Positive and negative observations must demonstrate a deterministic
+capability delta; a successful process exit or positive PoC alone is
+insufficient.
+
+`evaluate_dynamic_verification()` is read-only. The status and finalize
+endpoints never execute commands; finalization appends one idempotent
+`dynamic_verification_pass` audit event. `effective_verification_level()`
+derives `dynamic_confirmed` only while that current-generation receipt and its
+Run/Artifact hashes still validate; otherwise an authoritative confirmation
+remains `static_confirmed`. No second confirmed Fact is created and dynamic
+verification is not part of mandatory static ProofGap production.
