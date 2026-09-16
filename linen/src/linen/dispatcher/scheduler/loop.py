@@ -725,8 +725,8 @@ class DispatcherLoop:
         # Proof mode is candidate-centric and bounded: the server derives one
         # highest-value obligation and suppresses duplicate open Intents. It
         # never creates a Fact or calls Technical Confirmation here.
-        if hasattr(self.client, "plan_proof_gap") and not priority_scope_gate:
-            for fact in project.facts:
+        if hasattr(self.client, "plan_proof_gap") and proposal_limit > 0 and not priority_scope_gate:
+            for fact in sorted(project.facts, key=lambda item: item.id):
                 if fact.source_generation != project.project.source_generation or fact.semantic_type != "candidate_finding":
                     continue
                 response = self.client.plan_proof_gap(project.project.id, fact.id)

@@ -132,6 +132,7 @@ from linen.server.uvpg import (
     evaluate_shadow_gate,
     derive_proof_gaps,
     NON_INVESTIGATIVE_GAPS,
+    NON_AUTOMATIC_REPAIR_GAPS,
     proof_graph_fingerprint,
 )
 from linen.server.services import (
@@ -446,7 +447,7 @@ def plan_proof_gap(project_id: str, fact_id: str):
     with get_conn() as conn:
         project = check_project_active(conn, project_id)
         status = _proof_status_payload(conn, project_id, fact_id)
-        selected = next((gap for gap in derive_proof_gaps(conn, project_id, fact_id) if gap.code not in NON_INVESTIGATIVE_GAPS), None)
+        selected = next((gap for gap in derive_proof_gaps(conn, project_id, fact_id) if gap.code not in NON_INVESTIGATIVE_GAPS and gap.code not in NON_AUTOMATIC_REPAIR_GAPS), None)
         if selected is None:
             return {"created": False, "reason": "no_investigative_gap", **status}
         existing = conn.execute(
@@ -464,7 +465,8 @@ def plan_proof_gap(project_id: str, fact_id: str):
             "VALUES (?, ?, NULL, ?, ?, ?, 'audit_task', ?, 'verification', ?, ?, 'dispatcher.proof-gap', NULL, NULL, ?, NULL)",
             (intent_id, project_id, description, f"Proof obligation: {selected.code}", selected.suggested_intent_type, selected.suggested_relation_type or "supports", project["source_generation"], project["plan_revision"], now),
         )
-        conn.execute("INSERT INTO intent_sources (intent_id, project_id, fact_id) VALUES (?, ?, ?)", (intent_id, project_id, fact_id))
+        source_fact_id = selected.target_fact_id or fact_id
+        conn.execute("INSERT INTO intent_sources (intent_id, project_id, fact_id) VALUES (?, ?, ?)", (intent_id, project_id, source_fact_id))
         bump_graph_revision(conn, project_id)
         append_event(conn, project_id, "proof_gap_intent_created", "dispatcher.proof-gap", entity_kind="intent", entity_id=intent_id, payload={"candidate_id": fact_id, "gap": selected.as_dict()}, created_at=now)
         return {"created": True, "intent_id": intent_id, "gap": selected.as_dict(), **_proof_status_payload(conn, project_id, fact_id)}

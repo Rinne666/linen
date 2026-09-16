@@ -67,10 +67,14 @@ GAP_CONTRACTS = {
     "MISSING_IMPACT": ("impact_observation", "characterize", "observed_by", "Characterize the concrete security impact of the candidate."),
 }
 NON_INVESTIGATIVE_GAPS = frozenset({
+    "CONTRADICTED_EVIDENCE",
     "PROOF_CYCLE", "CROSS_CANDIDATE_EVIDENCE", "INVALID_EDGE_RELATION", "PROOF_GRAPH_TOO_LARGE",
     "PROOF_GRAPH_CHANGED",
 })
-_OBLIGATION_RE = re.compile(r"^@uvpg:proof:(?P<candidate>[^:]+):(?P<code>[A-Z0-9_]+):g(?P<generation>[0-9]+)\b")
+NON_AUTOMATIC_REPAIR_GAPS = frozenset({
+    "INVALID_PROVENANCE", "INVALID_SOURCE_EXCERPT", "STALE_PROOF_GENERATION", "ROLE_TYPE_MISMATCH",
+})
+_OBLIGATION_RE = re.compile(r"^@uvpg:proof:(?P<candidate>[^:]+):(?P<code>[A-Z0-9_]+)(?::f(?P<target>[^:]+))?:g(?P<generation>[0-9]+)\b")
 REVIEW_REQUIRED = frozenset({"candidate", "security_invariant", "security_boundary", "capability_delta", "impact_observation", "negative_control"})
 TERMINAL_BAD = frozenset({"false_positive", "fixed", "accepted_risk"})
 
@@ -115,6 +119,7 @@ class ProofGraphView:
     provenance_errors: list[str] = field(default_factory=list)
     cycle: bool = False
     too_large: bool = False
+    foreign_fact_ids: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -122,6 +127,8 @@ class ProofGraphView:
             "fact_ids": list(self.proof_fact_ids), "edge_ids": [edge.id for edge in self.edges],
             "reviewed_fact_ids": sorted(key for key, value in self.reviews_by_fact.items() if value),
             "missing_roles": list(self.missing_roles), "provenance_errors": list(self.provenance_errors),
+            "invalid_edge_ids": list(self.invalid_edges),
+            "foreign_fact_ids": list(self.foreign_fact_ids),
         }
 
 
@@ -138,10 +145,12 @@ class ProofGap:
     description: str
     status: str = "missing"
     source_generation: int = 0
+    target_fact_id: str | None = None
 
     @property
     def key(self) -> str:
-        return f"{self.candidate_id}:{self.code}:g{self.source_generation}"
+        target = f":f{self.target_fact_id}" if self.target_fact_id else ""
+        return f"{self.candidate_id}:{self.code}{target}:g{self.source_generation}"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -151,7 +160,50 @@ class ProofGap:
             "suggested_relation_type": self.suggested_relation_type,
             "expected_fact_type": self.expected_fact_type, "description": self.description,
             "status": self.status, "source_generation": self.source_generation, "key": self.key,
+            "target_fact_id": self.target_fact_id,
         }
+
+
+_IGNORED_BLACKBOARD_RELATIONS = frozenset({
+    "promotes_to", "produces", "reviews", "variant_of", "supersedes",
+})
+
+
+def _fact_roles(facts: dict[str, Fact], candidate_id: str) -> dict[str, str]:
+    roles: dict[str, str] = {}
+    for identifier, fact in facts.items():
+        if identifier == candidate_id:
+            roles[identifier] = "candidate"
+        elif fact.semantic_type in {"candidate_finding", "confirmed_finding", "rejected_finding"}:
+            roles[identifier] = "foreign_candidate"
+        elif fact.type in REQUIRED_ROLES:
+            roles[identifier] = fact.type
+    return roles
+
+
+def is_proof_edge(edge: GraphEdge, facts: dict[str, Fact], candidate_id: str) -> bool:
+    """Return whether a Blackboard edge belongs to this candidate's proof view."""
+    if edge.source_kind != "fact" or edge.target_kind != "fact":
+        return False
+    if edge.source_id not in facts or edge.target_id not in facts:
+        return False
+    edge_candidate = edge.metadata.get("candidate_id") if isinstance(edge.metadata, dict) else None
+    if edge_candidate is not None and edge_candidate != candidate_id:
+        return False
+    roles = _fact_roles(facts, candidate_id)
+    source = roles.get(edge.source_id)
+    target = roles.get(edge.target_id)
+    if "foreign_candidate" in {source, target}:
+        return False
+    return (source, target, edge.relation_type) in EDGE_MATRIX
+
+
+def _edge_is_uvpg_candidate_edge(edge: GraphEdge, roles: dict[str, str]) -> bool:
+    source = roles.get(edge.source_id)
+    target = roles.get(edge.target_id)
+    if source is None or target is None:
+        return False
+    return source in REQUIRED_ROLES or target in REQUIRED_ROLES or source in {"candidate", "foreign_candidate"} or target in {"candidate", "foreign_candidate"}
 
 
 def collect_candidate_proof_subgraph(conn: sqlite3.Connection, project_id: str, candidate_fact_id: str, *, max_nodes: int = MAX_NODES, max_edges: int = MAX_EDGES) -> ProofGraphView:
@@ -175,14 +227,38 @@ def collect_candidate_proof_subgraph(conn: sqlite3.Connection, project_id: str, 
         data = dict(row)
         data["metadata"] = _loads(row["metadata"], {})
         edges.append(GraphEdge(**data))
+    roles = _fact_roles(facts, candidate_fact_id)
     adjacency: dict[str, list[tuple[str, GraphEdge]]] = {}
+    invalid_edge_objects: list[GraphEdge] = []
     for edge in edges:
         if edge.source_kind != "fact" or edge.target_kind != "fact" or edge.source_id not in facts or edge.target_id not in facts:
             continue
-        adjacency.setdefault(edge.source_id, []).append((edge.target_id, edge))
-        adjacency.setdefault(edge.target_id, []).append((edge.source_id, edge))
+        if edge.relation_type in _IGNORED_BLACKBOARD_RELATIONS:
+            continue
+        edge_candidate = edge.metadata.get("candidate_id") if isinstance(edge.metadata, dict) else None
+        if edge_candidate and edge_candidate != candidate_fact_id:
+            if candidate_fact_id in {edge.source_id, edge.target_id}:
+                view.foreign_fact_ids.extend(
+                    identifier for identifier in (edge.source_id, edge.target_id)
+                    if identifier != candidate_fact_id and identifier in facts
+                )
+                if _edge_is_uvpg_candidate_edge(edge, roles):
+                    view.invalid_edges.append(edge.id)
+                    invalid_edge_objects.append(edge)
+            continue
+        if is_proof_edge(edge, facts, candidate_fact_id):
+            adjacency.setdefault(edge.source_id, []).append((edge.target_id, edge))
+            adjacency.setdefault(edge.target_id, []).append((edge.source_id, edge))
+            continue
+        if roles.get(edge.source_id) == "foreign_candidate" or roles.get(edge.target_id) == "foreign_candidate":
+            view.foreign_fact_ids.extend(
+                identifier for identifier in (edge.source_id, edge.target_id)
+                if roles.get(identifier) == "foreign_candidate"
+            )
+        if _edge_is_uvpg_candidate_edge(edge, roles):
+            view.invalid_edges.append(edge.id)
+            invalid_edge_objects.append(edge)
     seen = {candidate_fact_id}; queue = [candidate_fact_id]; used: dict[str, GraphEdge] = {}
-    parent: dict[str, str | None] = {candidate_fact_id: None}
     while queue:
         current = queue.pop(0)
         for other, edge in adjacency.get(current, []):
@@ -192,11 +268,11 @@ def collect_candidate_proof_subgraph(conn: sqlite3.Connection, project_id: str, 
             if len(seen) >= max_nodes:
                 view.too_large = True
                 return view
-            seen.add(other); parent[other] = current; queue.append(other)
+            seen.add(other); queue.append(other)
     view.proof_fact_ids = sorted(seen)
     view.edges = [used[key] for key in sorted(used)]
     directed: dict[str, list[str]] = {}
-    for edge in view.edges:
+    for edge in [*view.edges, *invalid_edge_objects]:
         if edge.source_id in seen and edge.target_id in seen:
             directed.setdefault(edge.source_id, []).append(edge.target_id)
     visiting: set[str] = set()
@@ -215,15 +291,45 @@ def collect_candidate_proof_subgraph(conn: sqlite3.Connection, project_id: str, 
     for identifier in sorted(seen):
         visit(identifier)
     for identifier in view.proof_fact_ids:
-        role = _role(facts[identifier], candidate_fact_id)
+        role = roles.get(identifier)
         if role:
+            if role == "foreign_candidate":
+                view.foreign_fact_ids.append(identifier)
+                continue
             view.facts_by_role.setdefault(role, []).append(identifier)
     for ids in view.facts_by_role.values():
         ids.sort()
+    view.foreign_fact_ids = sorted(set(view.foreign_fact_ids))
     for row in conn.execute("SELECT fact_id, verdict, confidence FROM reviews WHERE project_id = ? ORDER BY created_at, id", (project_id,)):
         if row["fact_id"] in seen:
             view.reviews_by_fact.setdefault(row["fact_id"], []).append(dict(row))
     return view
+
+
+_REVIEW_ROLE_ORDER = (
+    "candidate", "security_invariant", "security_boundary", "capability_delta",
+    "impact_observation", "negative_control",
+)
+
+
+def unreviewed_required_facts(view: ProofGraphView) -> list[str]:
+    """Return concrete proof Facts whose decisive review is missing."""
+    targets: list[str] = []
+    for role in _REVIEW_ROLE_ORDER:
+        for fact_id in sorted(view.facts_by_role.get(role, [])):
+            reviews = view.reviews_by_fact.get(fact_id, [])
+            latest = reviews[-1] if reviews else None
+            if latest is None or latest["verdict"] != "VALID" or latest["confidence"] not in {"firm", "certain"}:
+                targets.append(fact_id)
+    return targets
+
+
+def candidate_proof_facts(conn: sqlite3.Connection, project_id: str, candidate_id: str, role: str | None = None) -> list[str]:
+    """Return only Facts in the candidate's deterministic proof projection."""
+    view = collect_candidate_proof_subgraph(conn, project_id, candidate_id)
+    if role is not None:
+        return list(view.facts_by_role.get(role, []))
+    return list(view.proof_fact_ids)
 
 
 def _safe_artifact_path(project: sqlite3.Row, row: sqlite3.Row) -> Path:
@@ -350,9 +456,9 @@ def evaluate_shadow_gate(conn: sqlite3.Connection, project_id: str, fact_id: str
     rows = conn.execute("SELECT * FROM facts WHERE project_id = ?", (project_id,)).fetchall()
     facts = {row["id"]: Fact(**dict(row)) for row in rows}
     roles = {identifier: role for role, ids in view.facts_by_role.items() for identifier in ids}
-    if any(identifier != fact_id and facts[identifier].semantic_type in {"candidate_finding", "confirmed_finding", "rejected_finding"} for identifier in view.proof_fact_ids):
+    if view.foreign_fact_ids or any(identifier != fact_id and facts[identifier].semantic_type in {"candidate_finding", "confirmed_finding", "rejected_finding"} for identifier in view.proof_fact_ids):
         reasons.add("CROSS_CANDIDATE_EVIDENCE")
-    if any(not _edge_valid(edge, roles, fact_id) for edge in view.edges):
+    if view.invalid_edges:
         reasons.add("INVALID_EDGE_RELATION")
     for identifier in list(roles):
         if facts[identifier].status in TERMINAL_BAD:
@@ -372,11 +478,12 @@ def evaluate_shadow_gate(conn: sqlite3.Connection, project_id: str, fact_id: str
     candidate = facts.get(fact_id)
     hinted = {str(value) for value in (candidate.proof.attributes.get("proof_roles", []) if candidate and candidate.proof else [])}
     if hinted - connected: reasons.add("DISCONNECTED_PROOF_FACT")
-    for role in REVIEW_REQUIRED:
-        for proof_id in view.facts_by_role.get(role, []):
-            reviews = view.reviews_by_fact.get(proof_id, [])
-            if any(item["verdict"] == "INVALID" for item in reviews): reasons.add("CONTRADICTED_EVIDENCE")
-            if not reviews or reviews[-1]["verdict"] != "VALID" or reviews[-1]["confidence"] not in {"firm", "certain"}: reasons.add("UNREVIEWED_EVIDENCE")
+    for proof_id in unreviewed_required_facts(view):
+        reviews = view.reviews_by_fact.get(proof_id, [])
+        if any(item["verdict"] == "INVALID" for item in reviews):
+            reasons.add("CONTRADICTED_EVIDENCE")
+        else:
+            reasons.add("UNREVIEWED_EVIDENCE")
     for proof_id, reviews in view.reviews_by_fact.items():
         if any(item["verdict"] == "INVALID" for item in reviews): reasons.add("CONTRADICTED_EVIDENCE")
     for identifier in view.proof_fact_ids:
@@ -406,9 +513,17 @@ def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_
         if code in NON_INVESTIGATIVE_GAPS:
             role, intent_type, relation, description, expected = None, "blocked", None, "Repair the proof graph integrity before further investigation.", None
         elif code == "UNREVIEWED_EVIDENCE":
-            role, intent_type, relation, description, expected = None, "review:devils-advocate", "reviews", "Independently review the candidate-specific proof evidence.", None
-        elif code in {"INVALID_PROVENANCE", "INVALID_SOURCE_EXCERPT", "STALE_PROOF_GENERATION"}:
-            role, intent_type, relation, description, expected = None, "verify", None, "Reacquire or verify the current-generation frozen evidence.", None
+            targets = unreviewed_required_facts(view)
+            for target in targets:
+                role = next((candidate_role for candidate_role, ids in view.facts_by_role.items() if target in ids), None)
+                description = "Independently review this candidate-specific proof Fact."
+                gaps.append(ProofGap(
+                    candidate_fact_id, code, role, GAP_PRIORITY.get(code, 99), (target,),
+                    "review:devils-advocate", "reviews", None, description, "missing", generation, target,
+                ))
+            continue
+        elif code in NON_AUTOMATIC_REPAIR_GAPS:
+            role, intent_type, relation, description, expected = None, "blocked", None, "Repair this proof evidence manually before further investigation.", None
         elif code == "ROLE_TYPE_MISMATCH":
             role, intent_type, relation, description, expected = None, "validate", None, "Repair the proof claim type and re-verify its evidence.", None
         else:
@@ -417,16 +532,51 @@ def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_
                 continue
             role, intent_type, relation, description = contract
             expected = role
-        related = tuple(sorted(view.proof_fact_ids))
-        gaps.append(ProofGap(candidate_fact_id, code, role, GAP_PRIORITY.get(code, 99), related, intent_type, relation, expected, description, "missing", generation))
+        if code == "CONTRADICTED_EVIDENCE":
+            related = tuple(sorted(
+                fact_id for fact_id, reviews in view.reviews_by_fact.items()
+                if any(item["verdict"] == "INVALID" for item in reviews)
+            ))
+        elif code == "CROSS_CANDIDATE_EVIDENCE":
+            related = tuple(view.foreign_fact_ids)
+        elif code == "INVALID_EDGE_RELATION":
+            related = tuple(view.invalid_edges)
+        elif code in {"INVALID_PROVENANCE", "INVALID_SOURCE_EXCERPT", "STALE_PROOF_GENERATION", "ROLE_TYPE_MISMATCH"}:
+            rows = conn.execute(
+                "SELECT * FROM facts WHERE project_id = ? AND id IN ({}) ORDER BY id".format(",".join("?" for _ in view.proof_fact_ids)),
+                (project_id, *view.proof_fact_ids),
+            ).fetchall() if view.proof_fact_ids else []
+            related = tuple(
+                row["id"] for row in rows
+                if (code in validate_proof_payload(conn, project_id, Fact(**dict(row)).proof, subject_fact_id=row["id"]))
+                or (code == "ROLE_TYPE_MISMATCH" and Fact(**dict(row)).proof is not None and Fact(**dict(row)).proof.claim_kind in REQUIRED_ROLES and Fact(**dict(row)).type != Fact(**dict(row)).proof.claim_kind)
+            )
+        elif code == "AMBIGUOUS_CAPABILITY_DELTA":
+            related = tuple(sorted(view.facts_by_role.get("capability_delta", [])))
+        elif code.startswith("MISSING_"):
+            dependency_roles = {
+                "MISSING_ATTACKER_CONTROL": (), "MISSING_REACHABILITY": (),
+                "MISSING_INVARIANT": ("security_invariant",), "MISSING_BOUNDARY": ("security_boundary",),
+                "MISSING_CAPABILITY_BEFORE": ("capability_before",), "MISSING_CAPABILITY_AFTER": ("capability_after",),
+                "MISSING_CAPABILITY_DELTA": ("capability_before", "capability_after"),
+                "MISSING_NEGATIVE_CONTROL": ("capability_before",), "MISSING_IMPACT": ("impact_observation",),
+            }
+            related = tuple(sorted({candidate_fact_id, *(
+                identifier for dependency_role in dependency_roles.get(code, ())
+                for identifier in view.facts_by_role.get(dependency_role, [])
+            )}))
+        else:
+            related = tuple(sorted(view.proof_fact_ids))
+        gap_status = "blocked" if code in NON_INVESTIGATIVE_GAPS or code in NON_AUTOMATIC_REPAIR_GAPS else "missing"
+        gaps.append(ProofGap(candidate_fact_id, code, role, GAP_PRIORITY.get(code, 99), related, intent_type, relation, expected, description, gap_status, generation))
     return gaps
 
 
-def parse_proof_obligation(description: str) -> tuple[str, str, int] | None:
+def parse_proof_obligation(description: str) -> tuple[str, str, int, str | None] | None:
     match = _OBLIGATION_RE.match(description.strip())
     if match is None:
         return None
-    return match.group("candidate"), match.group("code"), int(match.group("generation"))
+    return match.group("candidate"), match.group("code"), int(match.group("generation")), match.group("target")
 
 
 def canonical_proof_edges(conn: sqlite3.Connection, project_id: str, candidate_id: str, fact_id: str, code: str, *, created_by: str, created_at: str) -> list[str]:
@@ -441,15 +591,19 @@ def canonical_proof_edges(conn: sqlite3.Connection, project_id: str, candidate_i
         edge_pairs.append((fact_id, candidate_id, relation))
     else:
         edge_pairs.append((candidate_id, fact_id, relation or "depends_on"))
+    view = collect_candidate_proof_subgraph(conn, project_id, candidate_id)
     if role == "capability_delta":
-        for other in conn.execute("SELECT id FROM facts WHERE project_id = ? AND type IN ('capability_before', 'capability_after') AND source_generation = ? ORDER BY id", (project_id, conn.execute("SELECT source_generation FROM projects WHERE id = ?", (project_id,)).fetchone()[0])):
-            edge_pairs.append((fact_id, other["id"], "depends_on"))
+        before = view.facts_by_role.get("capability_before", [])
+        after = view.facts_by_role.get("capability_after", [])
+        if len(before) == 1 and len(after) == 1:
+            edge_pairs.extend((fact_id, other, "depends_on") for other in (before[0], after[0]))
     if role in {"capability_before", "capability_after"}:
-        for delta in conn.execute("SELECT id FROM facts WHERE project_id = ? AND type = 'capability_delta' AND source_generation = ? ORDER BY id", (project_id, conn.execute("SELECT source_generation FROM projects WHERE id = ?", (project_id,)).fetchone()[0])):
-            edge_pairs.append((delta["id"], fact_id, "depends_on"))
+        for delta in view.facts_by_role.get("capability_delta", []):
+            edge_pairs.append((delta, fact_id, "depends_on"))
     if role == "negative_control":
-        for before in conn.execute("SELECT id FROM facts WHERE project_id = ? AND type = 'capability_before' AND source_generation = ? ORDER BY id", (project_id, conn.execute("SELECT source_generation FROM projects WHERE id = ?", (project_id,)).fetchone()[0])):
-            edge_pairs.append((fact_id, before["id"], "baseline_for"))
+        before = view.facts_by_role.get("capability_before", [])
+        if len(before) == 1:
+            edge_pairs.append((fact_id, before[0], "baseline_for"))
     edge_ids = []
     for source, target, edge_relation in sorted(set(edge_pairs)):
         edge_ids.append(create_graph_edge(conn, project_id, source_kind="fact", source_id=source, target_kind="fact", target_id=target, relation_type=edge_relation, created_by=created_by, metadata={"proof_gap_code": code, "candidate_id": candidate_id}, created_at=created_at))

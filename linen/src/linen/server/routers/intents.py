@@ -44,6 +44,7 @@ from linen.server.services import (
 )
 from linen.server.uvpg import (
     GAP_CONTRACTS,
+    candidate_proof_facts,
     canonical_proof_edges,
     parse_proof_obligation,
     validate_proof_payload,
@@ -459,7 +460,9 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
         fid = next_fact_id(conn, project_id)
         obligation = parse_proof_obligation(intent_row["description"])
         if obligation is not None:
-            candidate_id, gap_code, generation = obligation
+            candidate_id, gap_code, generation, target_fact_id = obligation
+            if gap_code == "UNREVIEWED_EVIDENCE":
+                raise HTTPException(409, {"code": "REVIEW_OBLIGATION_REQUIRES_REVIEW_ENDPOINT"})
             contract = GAP_CONTRACTS.get(gap_code)
             source_ids = {row["fact_id"] for row in conn.execute(
                 "SELECT fact_id FROM intent_sources WHERE project_id = ? AND intent_id = ?",
@@ -472,6 +475,11 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
                 raise HTTPException(422, {"code": "PROOF_OBLIGATION_FACT_TYPE_MISMATCH", "expected_fact_type": expected_type})
             if body.proof is None or body.proof.claim_kind != expected_type:
                 raise HTTPException(422, {"code": "PROOF_FACT_REQUIRES_PROVENANCE", "expected_claim_kind": expected_type})
+            if gap_code == "MISSING_CAPABILITY_DELTA":
+                before = candidate_proof_facts(conn, project_id, candidate_id, "capability_before")
+                after = candidate_proof_facts(conn, project_id, candidate_id, "capability_after")
+                if len(before) != 1 or len(after) != 1:
+                    raise HTTPException(409, {"code": "CAPABILITY_DELTA_REQUIRES_LOCAL_BEFORE_AFTER"})
         semantic_type = body.semantic_type or fact_semantic_type(fid, body.type, body.status)
         if semantic_type == "confirmed_finding" or body.type == "confirmed_finding":
             raise HTTPException(

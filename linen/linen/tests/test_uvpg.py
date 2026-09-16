@@ -5,12 +5,19 @@ import json
 import pytest
 
 from linen.server import db
-from linen.server.models import ConcludeRequest
+from linen.server.models import ConcludeRequest, CreateReviewRequest
 from linen.server.routers.projects import confirm_technical_finding
 from linen.server.routers.projects import plan_proof_gap
 from linen.server.routers.intents import conclude
 from linen.server.models import Fact, ProofPayload
-from linen.server.uvpg import evaluate_shadow_gate, load_invariant_library, validate_proof_payload
+from linen.server.uvpg import (
+    collect_candidate_proof_subgraph,
+    derive_proof_gaps,
+    evaluate_shadow_gate,
+    load_invariant_library,
+    validate_proof_payload,
+)
+from linen.server.routers.reviews import create_review
 
 
 def _proof(*roles: str) -> dict:
@@ -174,6 +181,9 @@ def test_technical_confirmation_promotes_once_and_is_idempotent(tmp_path, monkey
     assert first["gate_version"] == "uvpg-proof-v1"
     assert first["confirmed_fact_id"] == second["confirmed_fact_id"]
     with db.get_conn() as conn:
+        assert evaluate_shadow_gate(conn, "p", "candidate").status == "PASS"
+        assert "confirmed_finding" not in evaluate_shadow_gate(conn, "p", "candidate").proof_summary["fact_ids"]
+    with db.get_conn() as conn:
         assert conn.execute("SELECT COUNT(*) AS n FROM facts WHERE semantic_type = 'confirmed_finding'").fetchone()["n"] == 1
         assert conn.execute("SELECT COUNT(*) AS n FROM graph_edges WHERE relation_type = 'promotes_to'").fetchone()["n"] == 1
 
@@ -218,3 +228,69 @@ def test_proof_gap_conclusion_rejects_wrong_fact_role(tmp_path, monkeypatch):
     )
     with pytest.raises(Exception, match="PROOF_OBLIGATION_FACT_TYPE_MISMATCH"):
         conclude("p", planned["intent_id"], request)
+
+
+def test_blackboard_workflow_edges_are_not_proof_projection(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        conn.execute("INSERT INTO facts (id, project_id, description, type, semantic_type) VALUES ('hypothesis', 'p', 'workflow hypothesis', 'hypothesis', 'hypothesis')")
+        conn.execute("INSERT INTO graph_edges (id, project_id, source_kind, source_id, target_kind, target_id, relation_type, created_at, created_by) VALUES ('workflow', 'p', 'fact', 'hypothesis', 'fact', 'candidate', 'supports', 'now', 'test')")
+        view = collect_candidate_proof_subgraph(conn, "p", "candidate")
+        result = evaluate_shadow_gate(conn, "p", "candidate")
+    assert result.status == "PASS"
+    assert "hypothesis" not in view.proof_fact_ids
+
+
+def test_review_gap_targets_one_proof_fact_and_closes_after_review(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        conn.execute("DELETE FROM reviews WHERE fact_id = 'negative_control'")
+        gaps = derive_proof_gaps(conn, "p", "candidate")
+    review_gap = next(gap for gap in gaps if gap.code == "UNREVIEWED_EVIDENCE")
+    assert review_gap.target_fact_id == "negative_control"
+    planned = plan_proof_gap("p", "candidate")
+    assert planned["gap"]["target_fact_id"] == "negative_control"
+    with db.get_conn() as conn:
+        assert tuple(
+            row["fact_id"] for row in conn.execute(
+                "SELECT fact_id FROM intent_sources WHERE intent_id = ?", (planned["intent_id"],)
+            )
+        ) == ("negative_control",)
+    create_review("p", "negative_control", CreateReviewRequest(
+        verdict="VALID", confidence="firm", summary="reviewed", created_by="reviewer", intent_id=planned["intent_id"],
+    ))
+    with db.get_conn() as conn:
+        assert "UNREVIEWED_EVIDENCE" not in evaluate_shadow_gate(conn, "p", "candidate").reason_codes
+
+
+def test_repair_gap_is_blocked_without_auto_intent(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        conn.execute("UPDATE facts SET proof = ? WHERE id = 'security_invariant'", (json.dumps({
+            "claim_kind": "security_invariant", "subject_ids": ["security_invariant"],
+            "evidence_refs": [{"line_start": 1, "line_end": 1, "file": "proof.txt"}],
+        }),))
+        gaps = derive_proof_gaps(conn, "p", "candidate")
+    assert any(gap.code == "INVALID_SOURCE_EXCERPT" and gap.status == "blocked" for gap in gaps)
+    planned = plan_proof_gap("p", "candidate")
+    assert planned["created"] is False
+    assert planned["reason"] == "no_investigative_gap"
+
+
+def test_unrelated_candidate_canonical_edges_do_not_contaminate_projection(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        conn.execute("INSERT INTO facts (id, project_id, description, type, semantic_type) VALUES ('candidate-b', 'p', 'candidate b', 'vulnerability', 'candidate_finding')")
+        for role in ("capability_before", "capability_after", "capability_delta", "negative_control"):
+            conn.execute("INSERT INTO facts (id, project_id, description, type) VALUES (?, 'p', ?, ?)", (f"b-{role}", role, role))
+        for edge_id, source, target, relation in (
+            ("b-before", "candidate-b", "b-capability_before", "depends_on"),
+            ("b-after", "candidate-b", "b-capability_after", "depends_on"),
+            ("b-delta", "candidate-b", "b-capability_delta", "depends_on"),
+            ("b-negative", "candidate-b", "b-negative_control", "depends_on"),
+        ):
+            conn.execute("INSERT INTO graph_edges (id, project_id, source_kind, source_id, target_kind, target_id, relation_type, metadata, created_at, created_by) VALUES (?, 'p', 'fact', ?, 'fact', ?, ?, ?, 'now', 'test')", (edge_id, source, target, relation, json.dumps({"candidate_id": "candidate-b"})))
+        view = collect_candidate_proof_subgraph(conn, "p", "candidate")
+        result = evaluate_shadow_gate(conn, "p", "candidate")
+    assert result.status == "PASS"
+    assert not set(view.proof_fact_ids) & {"candidate-b", "b-capability_before", "b-capability_after", "b-capability_delta", "b-negative_control"}

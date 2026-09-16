@@ -50,12 +50,20 @@ policy; those remain downstream concerns.
 
 ## Proof-gap production
 
+This correctness phase hardens the existing projection and planner; it does
+not add a second proof database, lifecycle state machine, or confirmation
+authority. `ProofGraphView` is a deterministic projection of eligible UVPG
+Fact-to-Fact edges only. Process, discovery, review, lifecycle, and promotion
+edges are ignored, while malformed edges between recognized UVPG roles are
+reported as integrity blockers. In particular, `promotes_to` and workflow
+`supports` edges cannot contaminate a candidate's proof closure.
+
 Reason currently sees the Blackboard projection and creates ordinary bounded
 Intents through AuditGraph; before this phase it did not consume Technical Gate
 reason codes. Proof-gap planning derives a transient `ProofGap` list from the
 shared gate result and current-generation proof subgraph. No `proof_gaps` table
 or second graph is introduced. The deterministic key is
-`candidate_id:code:generation`; an open Intent with that key suppresses a
+`candidate_id:code[:target_fact_id]:generation`; an open Intent with that key suppresses a
 duplicate, while blocked/failed work remains subject to the existing Intent
 retry path.
 
@@ -65,8 +73,13 @@ invalid edge, and graph-size overflow) are non-investigative blockers and do
 not dispatch a Worker. Missing roles map to a bounded Intent with an expected
 Fact type and canonical relation. The Server validates that contract on
 conclusion and creates the canonical GraphEdge; the Worker cannot choose an
-arbitrary edge or close another candidate's gap. Evidence, not the planner,
-creates the proof Fact. Review gaps create candidate-specific review work.
+arbitrary edge or close another candidate's gap. Capability and negative-control
+edges resolve only against the same candidate's proof projection; a capability
+delta is not produced until exactly one local before and after Fact exists.
+Evidence, not the planner, creates the proof Fact. Review gaps identify the
+exact unreviewed Fact and use that Fact as the Review Intent source.
+Provenance/type/excerpt repair gaps remain non-automatic blockers until a
+complete replacement/rebinding lifecycle exists.
 
 `GET .../proof-status` is read-only. `POST .../proof-gaps/plan` creates only a
 bounded Intent and never creates a proof Fact, confirms a finding, or changes
@@ -75,6 +88,12 @@ subgraph, Gate summary, and derived gaps. Generation changes naturally remove
 old facts/edges from the current view; old proof work cannot close a new
 generation obligation.
 
-Golden tests cover strict PASS, disconnected/missing invariant, cross-candidate
-contamination, invalid/missing review, directed proof cycles, gap priority,
-planner deduplication, and canonical proof-edge production.
+Proof work is part of the existing managed ready window and is not planned when
+the window has no capacity. Candidate selection and review targets are sorted
+deterministically. Contradicted candidates and graph-integrity failures stop
+proof production and surface a blocker instead of dispatching a Worker.
+
+Golden tests cover strict PASS, disconnected/missing invariant, workflow and
+promotion-edge isolation, cross-candidate capability/negative-control
+contamination, targeted review progression, repair blockers, proof bounding,
+gap priority, planner deduplication, and canonical proof-edge production.

@@ -209,6 +209,7 @@ def managed_description(description: str) -> bool:
     value = description.strip()
     return (
         value.startswith("@analysis:")
+        or value.startswith("@uvpg:proof:")
         or value.startswith(coverage.CELL_PREFIX)
         or value.startswith(triage.TRIAGE_PREFIX)
         or value.startswith(triage.VERIFY_PREFIX)
