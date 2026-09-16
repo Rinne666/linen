@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from linen.server import db
+from linen.server.models import ConcludeRequest
 from linen.server.routers.projects import confirm_technical_finding
+from linen.server.routers.projects import plan_proof_gap
+from linen.server.routers.intents import conclude
 from linen.server.models import Fact, ProofPayload
 from linen.server.uvpg import evaluate_shadow_gate, load_invariant_library, validate_proof_payload
 
@@ -181,3 +186,35 @@ def test_failed_technical_confirmation_writes_nothing(tmp_path, monkeypatch):
     with db.get_conn() as conn:
         assert conn.execute("SELECT COUNT(*) AS n FROM facts WHERE semantic_type = 'confirmed_finding'").fetchone()["n"] == 0
         assert conn.execute("SELECT COUNT(*) AS n FROM graph_edges WHERE relation_type = 'promotes_to'").fetchone()["n"] == 0
+
+
+def test_proof_gap_planner_is_prioritized_deduplicated_and_server_binds_edge(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch, omit={"security_invariant"})
+    first = plan_proof_gap("p", "candidate")
+    second = plan_proof_gap("p", "candidate")
+    assert first["created"] is True
+    assert first["gap"]["code"] == "MISSING_INVARIANT"
+    assert second["created"] is False
+    assert second["reason"] == "duplicate_open_obligation"
+    intent_id = first["intent_id"]
+    request = ConcludeRequest(
+        worker="proof-worker", type="security_invariant", description="Object ownership must be enforced",
+        evidence="policy: ownership check", status="triaged",
+        proof={"claim_kind": "security_invariant", "subject_ids": ["candidate"]},
+    )
+    response = conclude("p", intent_id, request)
+    assert response.fact.type == "security_invariant"
+    with db.get_conn() as conn:
+        edge = conn.execute("SELECT source_id, target_id, relation_type FROM graph_edges WHERE target_id = 'candidate' AND relation_type = 'violates'").fetchone()
+        assert tuple(edge) == (response.fact.id, "candidate", "violates")
+
+
+def test_proof_gap_conclusion_rejects_wrong_fact_role(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch, omit={"security_invariant"})
+    planned = plan_proof_gap("p", "candidate")
+    request = ConcludeRequest(
+        worker="proof-worker", type="impact_observation", description="wrong role",
+        evidence="evidence", status="triaged",
+    )
+    with pytest.raises(Exception, match="PROOF_OBLIGATION_FACT_TYPE_MISMATCH"):
+        conclude("p", planned["intent_id"], request)

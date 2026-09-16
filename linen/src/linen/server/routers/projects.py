@@ -130,6 +130,8 @@ from linen.server.uvpg import (
     PROOF_GATE_VERSION,
     evaluate_proof_gate,
     evaluate_shadow_gate,
+    derive_proof_gaps,
+    NON_INVESTIGATIVE_GAPS,
     proof_graph_fingerprint,
 )
 from linen.server.services import (
@@ -399,6 +401,73 @@ def get_technical_confirmation(project_id: str, fact_id: str):
             candidate_id=fact_id,
             fingerprint=fingerprint,
         )
+
+
+def _proof_status_payload(conn, project_id: str, fact_id: str) -> dict:
+    result = evaluate_proof_gate(conn, project_id, fact_id)
+    gaps = derive_proof_gaps(conn, project_id, fact_id)
+    active = {}
+    for row in conn.execute(
+        "SELECT id, description, type, phase, source_generation FROM intents "
+        "WHERE project_id = ? AND to_fact_id IS NULL AND concluded_at IS NULL "
+        "AND description LIKE '@uvpg:proof:%' ORDER BY id", (project_id,),
+    ):
+        for gap in gaps:
+            if gap.key in row["description"]:
+                active[gap.key] = {"intent_id": row["id"], "status": "in_progress", "description": row["description"]}
+    serialized = []
+    for gap in gaps:
+        item = gap.as_dict()
+        item["status"] = "blocked" if gap.code in NON_INVESTIGATIVE_GAPS else active.get(gap.key, {}).get("status", "missing")
+        if gap.key in active:
+            item["intent_id"] = active[gap.key]["intent_id"]
+        serialized.append(item)
+    return {
+        "candidate_id": fact_id,
+        "gate": result.as_dict(),
+        "gate_status": result.status,
+        "proof_summary": result.proof_summary,
+        "gaps": serialized,
+        "active_gap_intents": sorted(active.values(), key=lambda item: item["intent_id"]),
+    }
+
+
+@router.get("/projects/{project_id}/facts/{fact_id}/proof-status")
+def get_proof_status(project_id: str, fact_id: str):
+    """Read-only candidate-centric gate and proof-gap projection."""
+    with get_conn() as conn:
+        get_project_or_404(conn, project_id)
+        return _proof_status_payload(conn, project_id, fact_id)
+
+
+@router.post("/projects/{project_id}/facts/{fact_id}/proof-gaps/plan")
+def plan_proof_gap(project_id: str, fact_id: str):
+    """Create at most one deterministic, candidate-bound proof obligation."""
+    with get_conn() as conn:
+        project = check_project_active(conn, project_id)
+        status = _proof_status_payload(conn, project_id, fact_id)
+        selected = next((gap for gap in derive_proof_gaps(conn, project_id, fact_id) if gap.code not in NON_INVESTIGATIVE_GAPS), None)
+        if selected is None:
+            return {"created": False, "reason": "no_investigative_gap", **status}
+        existing = conn.execute(
+            "SELECT id FROM intents WHERE project_id = ? AND to_fact_id IS NULL AND concluded_at IS NULL "
+            "AND source_generation = ? AND description LIKE ? ORDER BY id LIMIT 1",
+            (project_id, project["source_generation"], f"@uvpg:proof:{selected.key}:%"),
+        ).fetchone()
+        if existing is not None:
+            return {"created": False, "reason": "duplicate_open_obligation", "intent_id": existing["id"], **status}
+        now = utcnow()
+        intent_id = next_intent_id(conn, project_id)
+        description = f"@uvpg:proof:{selected.key}:{selected.suggested_intent_type}:{selected.expected_fact_type or 'evidence'} {selected.description}"
+        conn.execute(
+            "INSERT INTO intents (id, project_id, to_fact_id, description, display_title, type, semantic_type, relation_type, phase, source_generation, plan_revision, creator, worker, last_heartbeat_at, created_at, concluded_at) "
+            "VALUES (?, ?, NULL, ?, ?, ?, 'audit_task', ?, 'verification', ?, ?, 'dispatcher.proof-gap', NULL, NULL, ?, NULL)",
+            (intent_id, project_id, description, f"Proof obligation: {selected.code}", selected.suggested_intent_type, selected.suggested_relation_type or "supports", project["source_generation"], project["plan_revision"], now),
+        )
+        conn.execute("INSERT INTO intent_sources (intent_id, project_id, fact_id) VALUES (?, ?, ?)", (intent_id, project_id, fact_id))
+        bump_graph_revision(conn, project_id)
+        append_event(conn, project_id, "proof_gap_intent_created", "dispatcher.proof-gap", entity_kind="intent", entity_id=intent_id, payload={"candidate_id": fact_id, "gap": selected.as_dict()}, created_at=now)
+        return {"created": True, "intent_id": intent_id, "gap": selected.as_dict(), **_proof_status_payload(conn, project_id, fact_id)}
 
 
 @router.post("/projects/{project_id}/facts/{fact_id}/technical-confirmation")

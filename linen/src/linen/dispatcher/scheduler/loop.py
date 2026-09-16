@@ -720,7 +720,23 @@ class DispatcherLoop:
             )
         )
         if proposal_limit <= 0 and not legacy_overflow and not priority_scope_gate:
-            return False
+            proposal_limit = 0
+
+        # Proof mode is candidate-centric and bounded: the server derives one
+        # highest-value obligation and suppresses duplicate open Intents. It
+        # never creates a Fact or calls Technical Confirmation here.
+        if hasattr(self.client, "plan_proof_gap") and not priority_scope_gate:
+            for fact in project.facts:
+                if fact.source_generation != project.project.source_generation or fact.semantic_type != "candidate_finding":
+                    continue
+                response = self.client.plan_proof_gap(project.project.id, fact.id)
+                if response.ok and isinstance(response.data, dict) and response.data.get("created"):
+                    LOG.info("materialized proof-gap intent project=%s candidate=%s intent=%s", project.project.id, fact.id, response.data.get("intent_id"))
+                    return True
+                if response.status_code not in {200, 403, 409}:
+                    LOG.warning("proof-gap planning failed project=%s candidate=%s status=%s body=%s", project.project.id, fact.id, response.status_code, response.text)
+            if proposal_limit == 0:
+                return False
         proposals = audit_graph.required_intents(
             project, workdir, self.config.audit,
             limit=1 if legacy_overflow or priority_scope_gate else proposal_limit,

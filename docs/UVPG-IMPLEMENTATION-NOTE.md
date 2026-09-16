@@ -12,7 +12,7 @@ The current shadow increment adds:
 - a fixed relation matrix for candidate dependencies, invariant/boundary violations, impact observations, capability before/after/delta, and negative-control baselines;
 - deterministic provenance validation against existing snapshots, artifacts, runs and project nodes, including workspace confinement, artifact hashes, source-generation checks, and frozen excerpt hashes;
 - configurable `rules/invariant-library.yaml` metadata for common vulnerability classes;
-- a read-only `/projects/{project_id}/facts/{fact_id}/uvpg-shadow` endpoint and `evaluate_shadow_gate()` result. It reports `gate_version=uvpg-shadow-v2`, PASS/FAIL, deterministic reason codes, and a proof summary; it cannot create a confirmed finding, mutate state, or block completion;
+- a read-only `/projects/{project_id}/facts/{fact_id}/uvpg-shadow` endpoint and `evaluate_shadow_gate()` result. It reports `gate_version=uvpg-proof-v1`, PASS/FAIL, deterministic reason codes, and a proof summary; it cannot create a confirmed finding, mutate state, or block completion;
 - export-compatible `proof` data and a migration for legacy databases.
 
 The proof field is intentionally optional, so legacy Facts and exports continue to work. Legacy boards may receive a deterministic FAIL with missing closure reasons; their APIs remain readable. Large evidence remains in Artifact storage; `Fact.evidence` remains human-readable. `poc:isolated` and sandbox policy are untouched.
@@ -48,7 +48,33 @@ vulnerability Facts remain accepted only for compatibility. Technical
 Confirmation does not inspect bounty scope, CVE eligibility, or reporting
 policy; those remain downstream concerns.
 
+## Proof-gap production
+
+Reason currently sees the Blackboard projection and creates ordinary bounded
+Intents through AuditGraph; before this phase it did not consume Technical Gate
+reason codes. Proof-gap planning derives a transient `ProofGap` list from the
+shared gate result and current-generation proof subgraph. No `proof_gaps` table
+or second graph is introduced. The deterministic key is
+`candidate_id:code:generation`; an open Intent with that key suppresses a
+duplicate, while blocked/failed work remains subject to the existing Intent
+retry path.
+
+The planner emits at most one highest-priority investigative obligation per
+planning call. Integrity failures (`PROOF_CYCLE`, cross-candidate evidence,
+invalid edge, and graph-size overflow) are non-investigative blockers and do
+not dispatch a Worker. Missing roles map to a bounded Intent with an expected
+Fact type and canonical relation. The Server validates that contract on
+conclusion and creates the canonical GraphEdge; the Worker cannot choose an
+arbitrary edge or close another candidate's gap. Evidence, not the planner,
+creates the proof Fact. Review gaps create candidate-specific review work.
+
+`GET .../proof-status` is read-only. `POST .../proof-gaps/plan` creates only a
+bounded Intent and never creates a proof Fact, confirms a finding, or changes
+Completion. Candidate context is limited to the candidate's current proof
+subgraph, Gate summary, and derived gaps. Generation changes naturally remove
+old facts/edges from the current view; old proof work cannot close a new
+generation obligation.
+
 Golden tests cover strict PASS, disconnected/missing invariant, cross-candidate
-contamination, invalid/missing review, and directed proof cycles. The next safe
-increment is richer end-to-end fixtures for real frozen source manifests,
-without wiring the shadow result into completion or dispatcher authorization.
+contamination, invalid/missing review, directed proof cycles, gap priority,
+planner deduplication, and canonical proof-edge production.

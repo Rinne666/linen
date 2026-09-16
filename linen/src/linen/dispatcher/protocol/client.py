@@ -184,6 +184,12 @@ class LinenClient:
         response.raise_for_status()
         return CompletionGate.model_validate(response.json())
 
+    def get_proof_status(self, project_id: str, fact_id: str) -> ApiResult:
+        return self._request_json("GET", f"/projects/{project_id}/facts/{fact_id}/proof-status", json={})
+
+    def plan_proof_gap(self, project_id: str, fact_id: str) -> ApiResult:
+        return self._request_json("POST", f"/projects/{project_id}/facts/{fact_id}/proof-gaps/plan", json={})
+
     def upsert_audit_stage(
         self,
         project_id: str,

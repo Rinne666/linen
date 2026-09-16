@@ -42,7 +42,12 @@ from linen.server.services import (
     validate_intent_creator_worker,
     validate_goal_not_in_sources,
 )
-from linen.server.uvpg import validate_proof_payload
+from linen.server.uvpg import (
+    GAP_CONTRACTS,
+    canonical_proof_edges,
+    parse_proof_obligation,
+    validate_proof_payload,
+)
 
 router = APIRouter(tags=["intents"])
 
@@ -452,6 +457,21 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
 
         now = utcnow()
         fid = next_fact_id(conn, project_id)
+        obligation = parse_proof_obligation(intent_row["description"])
+        if obligation is not None:
+            candidate_id, gap_code, generation = obligation
+            contract = GAP_CONTRACTS.get(gap_code)
+            source_ids = {row["fact_id"] for row in conn.execute(
+                "SELECT fact_id FROM intent_sources WHERE project_id = ? AND intent_id = ?",
+                (project_id, intent_id),
+            )}
+            if generation != project["source_generation"] or candidate_id not in source_ids or contract is None:
+                raise HTTPException(409, {"code": "STALE_PROOF_OBLIGATION"})
+            expected_type = contract[0]
+            if body.type != expected_type:
+                raise HTTPException(422, {"code": "PROOF_OBLIGATION_FACT_TYPE_MISMATCH", "expected_fact_type": expected_type})
+            if body.proof is None or body.proof.claim_kind != expected_type:
+                raise HTTPException(422, {"code": "PROOF_FACT_REQUIRES_PROVENANCE", "expected_claim_kind": expected_type})
         semantic_type = body.semantic_type or fact_semantic_type(fid, body.type, body.status)
         if semantic_type == "confirmed_finding" or body.type == "confirmed_finding":
             raise HTTPException(
@@ -499,19 +519,25 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
             (project_id, intent_id),
         ).fetchall()
         relation_type = intent_row["relation_type"] if "relation_type" in intent_row.keys() else "produces"
-        for source in sources:
-            create_graph_edge(
-                conn,
-                project_id,
-                source_kind="fact",
-                source_id=source["fact_id"],
-                target_kind="fact",
-                target_id=fid,
-                relation_type=relation_type,
-                created_by=body.worker,
-                metadata={"intent_id": intent_id},
-                created_at=now,
+        if obligation is not None:
+            canonical_proof_edges(
+                conn, project_id, obligation[0], fid, obligation[1],
+                created_by="server.proof-contract", created_at=now,
             )
+        else:
+            for source in sources:
+                create_graph_edge(
+                    conn,
+                    project_id,
+                    source_kind="fact",
+                    source_id=source["fact_id"],
+                    target_kind="fact",
+                    target_id=fid,
+                    relation_type=relation_type,
+                    created_by=body.worker,
+                    metadata={"intent_id": intent_id},
+                    created_at=now,
+                )
         append_event(
             conn,
             project_id,
@@ -541,6 +567,7 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
                 type=body.type,
                 semantic_type=semantic_type,
                 evidence=body.evidence,
+                proof=body.proof,
                 source_generation=project["source_generation"],
                 status=body.status,
             ),

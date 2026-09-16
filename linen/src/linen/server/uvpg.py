@@ -46,6 +46,31 @@ REQUIRED_ROLES = {
     "capability_delta": "MISSING_CAPABILITY_DELTA", "negative_control": "MISSING_NEGATIVE_CONTROL",
     "impact_observation": "MISSING_IMPACT",
 }
+GAP_PRIORITY = {
+    "CONTRADICTED_EVIDENCE": 1, "INVALID_PROVENANCE": 2, "INVALID_SOURCE_EXCERPT": 2,
+    "STALE_PROOF_GENERATION": 2, "UNREVIEWED_EVIDENCE": 3,
+    "MISSING_ATTACKER_CONTROL": 4, "MISSING_INVARIANT": 5, "MISSING_BOUNDARY": 6,
+    "MISSING_REACHABILITY": 7, "MISSING_CAPABILITY_BEFORE": 9,
+    "MISSING_CAPABILITY_AFTER": 10, "MISSING_CAPABILITY_DELTA": 11,
+    "MISSING_NEGATIVE_CONTROL": 12, "MISSING_IMPACT": 13,
+    "AMBIGUOUS_CAPABILITY_DELTA": 11, "ROLE_TYPE_MISMATCH": 2,
+}
+GAP_CONTRACTS = {
+    "MISSING_ATTACKER_CONTROL": ("attacker_control", "verify", "depends_on", "Verify attacker-controlled input, identity, or state."),
+    "MISSING_REACHABILITY": ("reachability", "reach", "depends_on", "Verify that the candidate path is reachable by the relevant principal."),
+    "MISSING_INVARIANT": ("security_invariant", "validate", "violates", "Establish the security property the candidate path would violate."),
+    "MISSING_BOUNDARY": ("security_boundary", "characterize", "crosses", "Characterize the trust or authorization boundary crossed by the candidate."),
+    "MISSING_CAPABILITY_BEFORE": ("capability_before", "characterize", "depends_on", "Characterize the principal capability before the candidate path."),
+    "MISSING_CAPABILITY_AFTER": ("capability_after", "verify", "depends_on", "Verify the capability obtained if the candidate path succeeds."),
+    "MISSING_CAPABILITY_DELTA": ("capability_delta", "characterize", "depends_on", "Characterize the capability delta and cite its before/after facts."),
+    "MISSING_NEGATIVE_CONTROL": ("negative_control", "validate", "depends_on", "Establish a safe baseline, deny rule, or other negative control."),
+    "MISSING_IMPACT": ("impact_observation", "characterize", "observed_by", "Characterize the concrete security impact of the candidate."),
+}
+NON_INVESTIGATIVE_GAPS = frozenset({
+    "PROOF_CYCLE", "CROSS_CANDIDATE_EVIDENCE", "INVALID_EDGE_RELATION", "PROOF_GRAPH_TOO_LARGE",
+    "PROOF_GRAPH_CHANGED",
+})
+_OBLIGATION_RE = re.compile(r"^@uvpg:proof:(?P<candidate>[^:]+):(?P<code>[A-Z0-9_]+):g(?P<generation>[0-9]+)\b")
 REVIEW_REQUIRED = frozenset({"candidate", "security_invariant", "security_boundary", "capability_delta", "impact_observation", "negative_control"})
 TERMINAL_BAD = frozenset({"false_positive", "fixed", "accepted_risk"})
 
@@ -54,6 +79,7 @@ EDGE_MATRIX = frozenset({
     ("candidate", "attacker_control", "depends_on"), ("candidate", "reachability", "depends_on"),
     ("candidate", "security_invariant", "violates"), ("candidate", "security_boundary", "crosses"),
     ("candidate", "capability_delta", "depends_on"), ("candidate", "negative_control", "depends_on"),
+    ("candidate", "capability_before", "depends_on"), ("candidate", "capability_after", "depends_on"),
     ("candidate", "impact_observation", "observed_by"),
     ("security_invariant", "candidate", "violates"), ("security_boundary", "candidate", "crosses"),
     ("impact_observation", "candidate", "observed_by"),
@@ -96,6 +122,35 @@ class ProofGraphView:
             "fact_ids": list(self.proof_fact_ids), "edge_ids": [edge.id for edge in self.edges],
             "reviewed_fact_ids": sorted(key for key, value in self.reviews_by_fact.items() if value),
             "missing_roles": list(self.missing_roles), "provenance_errors": list(self.provenance_errors),
+        }
+
+
+@dataclass(frozen=True)
+class ProofGap:
+    candidate_id: str
+    code: str
+    role: str | None
+    priority: int
+    related_fact_ids: tuple[str, ...]
+    suggested_intent_type: str
+    suggested_relation_type: str | None
+    expected_fact_type: str | None
+    description: str
+    status: str = "missing"
+    source_generation: int = 0
+
+    @property
+    def key(self) -> str:
+        return f"{self.candidate_id}:{self.code}:g{self.source_generation}"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id, "code": self.code, "role": self.role,
+            "priority": self.priority, "related_fact_ids": list(self.related_fact_ids),
+            "suggested_intent_type": self.suggested_intent_type,
+            "suggested_relation_type": self.suggested_relation_type,
+            "expected_fact_type": self.expected_fact_type, "description": self.description,
+            "status": self.status, "source_generation": self.source_generation, "key": self.key,
         }
 
 
@@ -338,6 +393,67 @@ def evaluate_shadow_gate(conn: sqlite3.Connection, project_id: str, fact_id: str
 
 # Enforcement and shadow are intentionally aliases to one deterministic core.
 evaluate_proof_gate = evaluate_shadow_gate
+
+
+def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_id: str) -> list[ProofGap]:
+    """Derive bounded investigative obligations from the shared proof result."""
+    result = evaluate_proof_gate(conn, project_id, candidate_fact_id)
+    view = collect_candidate_proof_subgraph(conn, project_id, candidate_fact_id)
+    generation_row = conn.execute("SELECT source_generation FROM projects WHERE id = ?", (project_id,)).fetchone()
+    generation = generation_row["source_generation"] if generation_row else 0
+    gaps: list[ProofGap] = []
+    for code in sorted(set(result.reason_codes), key=lambda value: (GAP_PRIORITY.get(value, 99), value)):
+        if code in NON_INVESTIGATIVE_GAPS:
+            role, intent_type, relation, description, expected = None, "blocked", None, "Repair the proof graph integrity before further investigation.", None
+        elif code == "UNREVIEWED_EVIDENCE":
+            role, intent_type, relation, description, expected = None, "review:devils-advocate", "reviews", "Independently review the candidate-specific proof evidence.", None
+        elif code in {"INVALID_PROVENANCE", "INVALID_SOURCE_EXCERPT", "STALE_PROOF_GENERATION"}:
+            role, intent_type, relation, description, expected = None, "verify", None, "Reacquire or verify the current-generation frozen evidence.", None
+        elif code == "ROLE_TYPE_MISMATCH":
+            role, intent_type, relation, description, expected = None, "validate", None, "Repair the proof claim type and re-verify its evidence.", None
+        else:
+            contract = GAP_CONTRACTS.get(code)
+            if contract is None:
+                continue
+            role, intent_type, relation, description = contract
+            expected = role
+        related = tuple(sorted(view.proof_fact_ids))
+        gaps.append(ProofGap(candidate_fact_id, code, role, GAP_PRIORITY.get(code, 99), related, intent_type, relation, expected, description, "missing", generation))
+    return gaps
+
+
+def parse_proof_obligation(description: str) -> tuple[str, str, int] | None:
+    match = _OBLIGATION_RE.match(description.strip())
+    if match is None:
+        return None
+    return match.group("candidate"), match.group("code"), int(match.group("generation"))
+
+
+def canonical_proof_edges(conn: sqlite3.Connection, project_id: str, candidate_id: str, fact_id: str, code: str, *, created_by: str, created_at: str) -> list[str]:
+    """Create only the server-owned edges allowed by one obligation contract."""
+    from linen.server.audit_state import create_graph_edge
+    contract = GAP_CONTRACTS.get(code)
+    if contract is None:
+        return []
+    role, _intent, relation, _description = contract
+    edge_pairs: list[tuple[str, str, str]] = []
+    if role in {"security_invariant", "security_boundary", "impact_observation"}:
+        edge_pairs.append((fact_id, candidate_id, relation))
+    else:
+        edge_pairs.append((candidate_id, fact_id, relation or "depends_on"))
+    if role == "capability_delta":
+        for other in conn.execute("SELECT id FROM facts WHERE project_id = ? AND type IN ('capability_before', 'capability_after') AND source_generation = ? ORDER BY id", (project_id, conn.execute("SELECT source_generation FROM projects WHERE id = ?", (project_id,)).fetchone()[0])):
+            edge_pairs.append((fact_id, other["id"], "depends_on"))
+    if role in {"capability_before", "capability_after"}:
+        for delta in conn.execute("SELECT id FROM facts WHERE project_id = ? AND type = 'capability_delta' AND source_generation = ? ORDER BY id", (project_id, conn.execute("SELECT source_generation FROM projects WHERE id = ?", (project_id,)).fetchone()[0])):
+            edge_pairs.append((delta["id"], fact_id, "depends_on"))
+    if role == "negative_control":
+        for before in conn.execute("SELECT id FROM facts WHERE project_id = ? AND type = 'capability_before' AND source_generation = ? ORDER BY id", (project_id, conn.execute("SELECT source_generation FROM projects WHERE id = ?", (project_id,)).fetchone()[0])):
+            edge_pairs.append((fact_id, before["id"], "baseline_for"))
+    edge_ids = []
+    for source, target, edge_relation in sorted(set(edge_pairs)):
+        edge_ids.append(create_graph_edge(conn, project_id, source_kind="fact", source_id=source, target_kind="fact", target_id=target, relation_type=edge_relation, created_by=created_by, metadata={"proof_gap_code": code, "candidate_id": candidate_id}, created_at=created_at))
+    return edge_ids
 
 
 def load_invariant_library(path: Path | None = None) -> dict[str, Any]:
