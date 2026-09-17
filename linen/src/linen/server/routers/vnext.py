@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from linen.contracts import ArtifactMetadata, AuditEventEnvelope, BlackboardSnapshot, ContextProjection, RunEnvelope
 from linen.server.db import get_conn
 from linen.server.routers.executions import workspace_root
-from linen.server.vnext_repository import (
+from linen.server.store import (
     append_contract_event,
     artifact_from_row,
     context_from_row,

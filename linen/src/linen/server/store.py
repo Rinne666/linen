@@ -1,8 +1,10 @@
-"""SQLite repository and adapters for the versioned server contracts.
+"""SQLite persistence adapters for runtime contracts.
 
-The repository is intentionally small and synchronous like the existing
-server.  SQLite remains the source of truth; events are only an append-only
-trace of mutations.
+SQLite remains the current-state source of truth; events are only an
+append-only trace of mutations.  This module is the storage boundary for the
+runtime contract path.  The remaining validation in this compatibility path
+will move to ``server.kernel`` incrementally; no second repository or vNext
+storage path should be added.
 """
 from __future__ import annotations
 
