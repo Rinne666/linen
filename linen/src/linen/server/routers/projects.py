@@ -182,6 +182,7 @@ def list_projects():
                 (SELECT COUNT(*) FROM intents WHERE project_id = p.id AND concluded_at IS NULL AND worker IS NULL) AS unclaimed_intent_count,
                 (SELECT COUNT(*) FROM hints WHERE project_id = p.id) AS hint_count,
                 (SELECT COUNT(*) FROM reviews WHERE project_id = p.id) AS review_count,
+                (SELECT COALESCE(MAX(sequence), 0) FROM audit_events WHERE project_id = p.id) AS latest_event_seq,
                 (SELECT COUNT(*) FROM intent_errors e
                     JOIN intents i ON i.id = e.intent_id AND i.project_id = e.project_id
                     WHERE e.project_id = p.id AND e.resolved_at IS NULL
@@ -223,6 +224,9 @@ def list_projects():
                 source_generation=row["source_generation"] if "source_generation" in row.keys() else 1,
                 plan_revision=row["plan_revision"] if "plan_revision" in row.keys() else 1,
                 bootstrap_enabled=bool(row["bootstrap_enabled"]),
+                completion_policy=row["completion_policy"] if "completion_policy" in row.keys() else "goal_based",
+                reason_last_seen_event_seq=row["reason_last_seen_event_seq"] if "reason_last_seen_event_seq" in row.keys() else 0,
+                event_seq=row["latest_event_seq"] if "latest_event_seq" in row.keys() else 0,
                 audit_mode=row["audit_mode"] if "audit_mode" in row.keys() else "none",
                 created_at=row["created_at"],
                 reason=project_reason_from_row(row),
@@ -274,9 +278,9 @@ def create_project(body: CreateProjectRequest):
 
             conn.execute(
                 "INSERT INTO projects (id, title, status, graph_revision, source_generation, plan_revision, "
-                "bootstrap_enabled, audit_mode, created_at, repo_root) "
-                "VALUES (?, ?, 'active', 1, 1, 1, ?, ?, ?, ?)",
-                (pid, body.title, body.bootstrap_enabled, body.audit_mode, now, resolved_repo_root),
+                "bootstrap_enabled, completion_policy, audit_mode, created_at, repo_root) "
+                "VALUES (?, ?, 'active', 1, 1, 1, ?, ?, ?, ?, ?)",
+                (pid, body.title, body.bootstrap_enabled, body.completion_policy, body.audit_mode, now, resolved_repo_root),
             )
             conn.execute(
                 "INSERT INTO facts (id, project_id, description, display_title, semantic_type, source_generation) "
@@ -310,6 +314,7 @@ def create_project(body: CreateProjectRequest):
                     "title": body.title,
                     "audit_mode": body.audit_mode,
                     "bootstrap_enabled": body.bootstrap_enabled,
+                    "completion_policy": body.completion_policy,
                 },
                 created_at=now,
             )
@@ -323,6 +328,7 @@ def create_project(body: CreateProjectRequest):
                     source_generation=1,
                     plan_revision=1,
                     bootstrap_enabled=body.bootstrap_enabled,
+                    completion_policy=body.completion_policy,
                     audit_mode=body.audit_mode,
                     created_at=now,
                     reason=None,
@@ -348,7 +354,12 @@ def get_project(project_id: str):
     with get_conn() as conn:
         expire_workers(conn, project_id)
         expire_reason_leases(conn, project_id)
-        row = get_project_or_404(conn, project_id)
+        row = conn.execute(
+            "SELECT p.*, COALESCE((SELECT MAX(sequence) FROM audit_events WHERE project_id = p.id), 0) AS latest_event_seq "
+            "FROM projects p WHERE p.id = ?", (project_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "Project not found")
 
         facts = conn.execute(
             "SELECT * FROM facts WHERE project_id = ?", (project_id,)
@@ -731,6 +742,11 @@ def release_project_reason(project_id: str, body: ReasonHeartbeatRequest):
         if row["reason_lease_id"] != body.lease_id:
             raise HTTPException(409, "Project reason lease token does not match")
 
+        if body.seen_event_seq is not None:
+            conn.execute(
+                "UPDATE projects SET reason_last_seen_event_seq = MAX(reason_last_seen_event_seq, ?) WHERE id = ?",
+                (body.seen_event_seq, project_id),
+            )
         clear_project_reason(conn, project_id)
         updated = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         return project_meta_from_row(updated)
@@ -787,6 +803,23 @@ def complete_project(project_id: str, body: CompleteRequest):
                 metadata={"intent_id": iid},
                 created_at=now,
             )
+        if project["completion_policy"] == "goal_based":
+            redundant = conn.execute(
+                "SELECT id FROM intents WHERE project_id = ? AND concluded_at IS NULL AND id != ?",
+                (project_id, iid),
+            ).fetchall()
+            conn.execute(
+                "UPDATE intents SET worker = NULL, concluded_at = ? "
+                "WHERE project_id = ? AND concluded_at IS NULL AND id != ?",
+                (now, project_id, iid),
+            )
+            for row in redundant:
+                append_event(
+                    conn, project_id, "audit_task_cancelled", body.worker,
+                    entity_kind="intent", entity_id=row["id"],
+                    payload={"reason": "goal_satisfied", "completion_intent_id": iid},
+                    created_at=now,
+                )
         conn.execute(
             """
             UPDATE projects

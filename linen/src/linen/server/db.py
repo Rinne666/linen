@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS projects (
     -- state rather than graph knowledge.
     graph_revision INTEGER NOT NULL DEFAULT 0,
     bootstrap_enabled INTEGER NOT NULL DEFAULT 1,
+    completion_policy TEXT NOT NULL DEFAULT 'goal_based'
+        CHECK (completion_policy IN ('goal_based', 'exhaustive')),
     audit_mode TEXT NOT NULL DEFAULT 'none'
         CHECK (audit_mode IN ('none', 'hypothesis', 'scope')),
     -- Source and plan revisions are separate from graph_revision. A new
@@ -39,6 +41,7 @@ CREATE TABLE IF NOT EXISTS projects (
     reason_started_at TEXT,
     reason_last_heartbeat_at TEXT,
     reason_lease_id TEXT,
+    reason_last_seen_event_seq INTEGER NOT NULL DEFAULT 0,
     -- Optional per-project source tree override. When set, the dispatcher
     -- symlinks <workdir>/repo to this path; otherwise it falls back to the
     -- dispatcher's `local.repo_root` config, or no symlink at all. Set by
@@ -85,6 +88,7 @@ CREATE TABLE IF NOT EXISTS intents (
     last_heartbeat_at TEXT,
     created_at TEXT NOT NULL,
     concluded_at TEXT,
+    intent_key TEXT,
     PRIMARY KEY (id, project_id)
 );
 
@@ -410,6 +414,10 @@ def _ensure_project_columns(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE projects SET bootstrap_enabled = CASE WHEN bootstrap_mode = 'disabled' THEN 0 ELSE 1 END"
             )
+    if "completion_policy" not in columns:
+        conn.execute("ALTER TABLE projects ADD COLUMN completion_policy TEXT NOT NULL DEFAULT 'goal_based'")
+    if "reason_last_seen_event_seq" not in columns:
+        conn.execute("ALTER TABLE projects ADD COLUMN reason_last_seen_event_seq INTEGER NOT NULL DEFAULT 0")
     if "audit_mode" not in columns:
         conn.execute("ALTER TABLE projects ADD COLUMN audit_mode TEXT NOT NULL DEFAULT 'none'")
     if "graph_revision" not in columns:
@@ -621,6 +629,12 @@ def _ensure_intent_columns(conn: sqlite3.Connection) -> None:
     if "legacy" not in columns:
         conn.execute("ALTER TABLE intents ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0")
         conn.execute("UPDATE intents SET legacy = 1")
+    if "intent_key" not in columns:
+        conn.execute("ALTER TABLE intents ADD COLUMN intent_key TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS intents_project_key_idx "
+        "ON intents (project_id, intent_key) WHERE intent_key IS NOT NULL"
+    )
     conn.execute(
         "UPDATE intents SET "
         "semantic_type = CASE WHEN type LIKE 'review%' THEN 'review_task' ELSE semantic_type END, "

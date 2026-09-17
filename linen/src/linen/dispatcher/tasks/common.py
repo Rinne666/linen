@@ -1315,8 +1315,13 @@ def project_allows_conclude_fallback(client: LinenClient, project_id: str, *, wo
 
 def best_effort_release_reason(
     client: LinenClient, project_id: str, worker_name: str, lease_id: str,
+    seen_event_seq: int | None = None,
 ) -> None:
-    response = client.release_reason(project_id, worker_name, lease_id)
+    try:
+        response = client.release_reason(project_id, worker_name, lease_id, seen_event_seq)
+    except TypeError:
+        # Legacy protocol fakes do not expose the additive cursor field.
+        response = client.release_reason(project_id, worker_name, lease_id)
     if not response.ok and response.status_code not in (403, 409):
         LOG.warning(
             "reason release failed project=%s worker=%s status=%s",

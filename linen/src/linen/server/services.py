@@ -261,6 +261,7 @@ def intent_to_model(conn: sqlite3.Connection, row: sqlite3.Row, project_id: str)
         last_heartbeat_at=row["last_heartbeat_at"],
         created_at=row["created_at"],
         concluded_at=row["concluded_at"],
+        intent_key=row["intent_key"] if "intent_key" in row.keys() else None,
     )
 
 
@@ -353,6 +354,12 @@ def project_meta_from_row(row: sqlite3.Row) -> ProjectMeta:
         source_generation=row["source_generation"] if "source_generation" in row.keys() else 1,
         plan_revision=row["plan_revision"] if "plan_revision" in row.keys() else 1,
         bootstrap_enabled=bool(row["bootstrap_enabled"]),
+        completion_policy=row["completion_policy"] if "completion_policy" in row.keys() else "goal_based",
+        reason_last_seen_event_seq=(
+            row["reason_last_seen_event_seq"]
+            if "reason_last_seen_event_seq" in row.keys() else 0
+        ),
+        event_seq=row["latest_event_seq"] if "latest_event_seq" in row.keys() else 0,
         audit_mode=row["audit_mode"] if "audit_mode" in row.keys() else "none",
         created_at=row["created_at"],
         reason=project_reason_from_row(row),

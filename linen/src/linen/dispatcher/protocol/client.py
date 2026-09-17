@@ -359,11 +359,11 @@ class LinenClient:
             json={"worker": worker, "lease_id": lease_id},
         )
 
-    def release_reason(self, project_id: str, worker: str, lease_id: str) -> ApiResult:
+    def release_reason(self, project_id: str, worker: str, lease_id: str, seen_event_seq: int | None = None) -> ApiResult:
         return self._request_json(
             "POST",
             f"/projects/{project_id}/reason/release",
-            json={"worker": worker, "lease_id": lease_id},
+            json={"worker": worker, "lease_id": lease_id, "seen_event_seq": seen_event_seq},
         )
 
     def release(self, project_id: str, intent_id: str, worker: str) -> ApiResult:

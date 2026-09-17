@@ -27,7 +27,7 @@ from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.startup_healthcheck import format_failure_summary, run_startup_healthchecks
 from linen.dispatcher.scheduler.worker_select import choose_worker
 from linen.dispatcher.workers.registry import get_driver
-from linen.dispatcher.tasks.bootstrap import run_bootstrap_task
+from linen.dispatcher.tasks.bootstrap import run_bootstrap_task  # legacy historical rows only
 from linen.dispatcher.tasks.explore import run_explore_task
 from linen.dispatcher.tasks.reason import run_audit_graph_reason_task, run_reason_task
 from linen.dispatcher.tasks.review import run_review_task
@@ -38,8 +38,6 @@ UNHEALTHY_RETRY_AFTER_SECONDS = 5
 REJECTED_RETRY_AFTER_SECONDS = 5
 RATE_LIMIT_RETRY_AFTER_SECONDS = 300
 QUOTA_EXHAUSTED_RETRY_AFTER_SECONDS = 3600
-BOOTSTRAP_INTENT_DESCRIPTION = "bootstrap"
-BOOTSTRAP_INTENT_CREATOR = "dispatcher.bootstrap"
 
 
 @dataclass(slots=True)
@@ -454,12 +452,6 @@ class DispatcherLoop:
                 project.project.status,
             )
             return False
-        if self._is_initial_project(project):
-            if self._project_requires_bootstrap(project):
-                if project.project.reason is not None:
-                    return False
-                return self._dispatch_initial_project(project)
-
         # Managed audit mechanics are derived exclusively from the exported
         # graph and immutable project artifacts. Scope mode derives the full
         # coverage DAG; hypothesis mode derives only configured baseline scan
@@ -510,7 +502,6 @@ class DispatcherLoop:
                                               # intent every tick.
             and intent.worker is None
             and intent.id not in running_intent_ids
-            and not self._is_bootstrap_intent(intent)
         ]
         deferred_by_error = [
             intent for intent in unclaimed_intents
@@ -1507,64 +1498,37 @@ class DispatcherLoop:
     def _project_open_intent_count(self, project: ProjectDetail) -> int:
         return sum(1 for intent in project.intents if intent.to is None and intent.concluded_at is None)
 
-    def _is_bootstrap_intent(self, intent: Intent) -> bool:
+    # Read-only compatibility predicates for older embedders/tests.  The
+    # scheduler no longer calls these predicates to create or dispatch a
+    # bootstrap task; new projects go directly from project_created to
+    # Reason.  Keeping this narrow inspection avoids breaking clients that
+    # still display historical bootstrap rows during migration.
+    @staticmethod
+    def _is_bootstrap_intent(intent: Intent) -> bool:
         return (
-            intent.description == BOOTSTRAP_INTENT_DESCRIPTION
-            and intent.creator == BOOTSTRAP_INTENT_CREATOR
+            intent.description == "bootstrap"
+            and intent.creator == "dispatcher.bootstrap"
             and intent.from_ == ["origin"]
             and intent.to is None
         )
 
     def _get_bootstrap_intent(self, project: ProjectDetail) -> Intent | None:
-        intents = [intent for intent in project.intents if self._is_bootstrap_intent(intent)]
-        if not intents:
-            return None
-        if len(intents) > 1:
-            LOG.warning("project has multiple bootstrap intents project=%s intents=%s", project.project.id, [intent.id for intent in intents])
-        intents.sort(key=lambda intent: (intent.worker is not None, intent.created_at, intent.id))
-        return intents[0]
+        return next((intent for intent in project.intents if self._is_bootstrap_intent(intent)), None)
+
+    def _project_requires_bootstrap(self, project: ProjectDetail) -> bool:
+        return self._get_bootstrap_intent(project) is not None
 
     def _is_initial_project(self, project: ProjectDetail) -> bool:
         fact_ids = {fact.id for fact in project.facts}
         if fact_ids != {"origin", "goal"} or len(project.facts) != 2:
             return False
-        if not project.intents:
-            return True
-        return all(self._is_bootstrap_intent(intent) for intent in project.intents)
-
-    def _project_requires_bootstrap(self, project: ProjectDetail) -> bool:
-        if not project.project.bootstrap_enabled:
-            return False
-        if self._get_bootstrap_intent(project) is not None:
-            return True
-        return any("bootstrap" in worker.task_types for worker in self.config.workers)
-
-    def _create_bootstrap_intent(self, project_id: str) -> Intent | None:
-        response = self.client.create_intent(
-            project_id,
-            ["origin"],
-            BOOTSTRAP_INTENT_DESCRIPTION,
-            BOOTSTRAP_INTENT_CREATOR,
-        )
-        if response.status_code == 403:
-            LOG.info("project became inactive before bootstrap intent create project=%s", project_id)
-            return None
-        if not response.ok:
-            LOG.warning(
-                "bootstrap intent write failed project=%s status=%s body=%s",
-                project_id,
-                response.status_code,
-                response.text,
-            )
-            return None
-        if not isinstance(response.data, dict):
-            LOG.warning("bootstrap intent create returned empty body project=%s", project_id)
-            return None
-        intent = Intent.model_validate(response.data)
-        LOG.info("created bootstrap intent project=%s intent=%s", project_id, intent.id)
-        return intent
 
     def _reason_trigger(self, project: ProjectDetail) -> str | None:
+        if project.project.event_seq > project.project.reason_last_seen_event_seq:
+            return (
+                f"events:{project.project.reason_last_seen_event_seq}"
+                f"->{project.project.event_seq}"
+            )
         open_intent_count = self._project_open_intent_count(project)
         checkpoint = self.reason_checkpoints.get(project.project.id)
         if checkpoint is None:

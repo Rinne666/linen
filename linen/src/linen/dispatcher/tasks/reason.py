@@ -580,7 +580,7 @@ def run_audit_graph_reason_task(
         return "success"
     finally:
         lease.stop()
-        best_effort_release_reason(client, project.project.id, worker.name, lease_id)
+        best_effort_release_reason(client, project.project.id, worker.name, lease_id, project.project.event_seq)
 
 
 def run_reason_task(
@@ -966,4 +966,4 @@ def run_reason_task(
         return "success"
     finally:
         lease.stop()
-        best_effort_release_reason(client, project.project.id, worker.name, lease_id)
+        best_effort_release_reason(client, project.project.id, worker.name, lease_id, project.project.event_seq)

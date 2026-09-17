@@ -420,6 +420,7 @@ class Intent(BaseModel):
     last_heartbeat_at: str | None = None
     created_at: str
     concluded_at: str | None = None
+    intent_key: str | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -471,6 +472,9 @@ class ProjectMeta(BaseModel):
     source_generation: int = 1
     plan_revision: int = 1
     bootstrap_enabled: bool
+    completion_policy: Literal["goal_based", "exhaustive"] = "goal_based"
+    reason_last_seen_event_seq: int = 0
+    event_seq: int = 0
     # Server-side audit profile.  This is persisted with the project so a
     # client cannot bypass completion evidence checks merely by using a
     # different dispatcher configuration later.
@@ -723,6 +727,7 @@ class CreateProjectRequest(BaseModel):
     origin: str
     goal: str
     bootstrap_enabled: bool = True
+    completion_policy: Literal["goal_based", "exhaustive"] = "goal_based"
     audit_mode: Literal["none", "hypothesis", "scope"] = "none"
     hints: list[CreateHintInline] | None = None
     # Mutually exclusive. `clone_url` triggers a synchronous `git clone` on
@@ -802,6 +807,11 @@ class CreateIntentRequest(BaseModel):
     semantic_type: str | None = None
     relation_type: str | None = None
     phase: str | None = None
+    action: str | None = None
+    target: str | None = None
+    scope: str | None = None
+    rationale: str | None = None
+    reopen: bool = False
 
     model_config = {"populate_by_name": True}
 
@@ -927,6 +937,7 @@ class ReasonClaimRequest(BaseModel):
 class ReasonHeartbeatRequest(BaseModel):
     worker: str
     lease_id: str
+    seen_event_seq: int | None = Field(default=None, ge=0)
 
     @field_validator("worker", "lease_id")
     @classmethod

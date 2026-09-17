@@ -461,13 +461,18 @@ def completion_gate_from_db(
         "SELECT id FROM intents WHERE project_id = ? AND concluded_at IS NULL",
         (project_id,),
     ).fetchall()
+    exhaustive = (project["completion_policy"] if "completion_policy" in project.keys() else "goal_based") == "exhaustive"
     add(
         "open_work",
         "All audit tasks reached a terminal state",
-        not open_rows,
-        "No open audit tasks remain." if not open_rows
-        else f"{len(open_rows)} audit task(s) remain open.",
+        not open_rows if exhaustive else True,
+        "No open audit tasks remain." if not open_rows else (
+            f"{len(open_rows)} audit task(s) remain open." if exhaustive
+            else "Open work is allowed after the goal is satisfied."
+        ),
         evidence_ids=[row["id"] for row in open_rows],
+        blocking=exhaustive,
+        status="pass" if not open_rows or not exhaustive else "fail",
     )
 
     error_rows = conn.execute(

@@ -7,8 +7,10 @@ edge, and audit event cannot drift across endpoints.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import sqlite3
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 from linen.server.audit_state import append_event, create_graph_edge, intent_metadata
@@ -319,12 +321,41 @@ def create_intent(conn: sqlite3.Connection, project_id: str, body: CreateIntentR
     semantic_type = body.semantic_type or inferred_semantic_type
     relation_type = body.relation_type or inferred_relation
     phase = body.phase or inferred_phase
-    conn.execute(
-        "INSERT INTO intents (id, project_id, to_fact_id, description, display_title, type, semantic_type, relation_type, phase, source_generation, plan_revision, creator, worker, last_heartbeat_at, created_at, concluded_at) "
-        "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
-        (iid, project_id, body.description, display_title, body.type, semantic_type, relation_type, phase,
-         project["source_generation"], project["plan_revision"], body.creator, body.worker, now if claimed else None, now),
-    )
+    def canonical(value: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", value).strip().casefold().split())
+
+    action = body.action or body.type or semantic_type
+    target = body.target or body.description
+    scope = body.scope or ",".join(sorted(body.from_))
+    intent_key = hashlib.sha256(
+        json.dumps(
+            {"action": canonical(action), "target": canonical(target), "scope": canonical(scope)},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    existing = conn.execute(
+        "SELECT * FROM intents WHERE project_id = ? AND intent_key = ?",
+        (project_id, intent_key),
+    ).fetchone()
+    if existing is not None and not body.reopen:
+        return intent_to_model(conn, existing, project_id)
+    try:
+        conn.execute(
+            "INSERT INTO intents (id, project_id, to_fact_id, description, display_title, type, semantic_type, relation_type, phase, source_generation, plan_revision, creator, worker, last_heartbeat_at, created_at, concluded_at, intent_key) "
+            "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+            (iid, project_id, body.description, display_title, body.type, semantic_type, relation_type, phase,
+             project["source_generation"], project["plan_revision"], body.creator, body.worker, now if claimed else None, now, intent_key),
+        )
+    except sqlite3.IntegrityError:
+        # A concurrent creator may win the unique (project_id, intent_key)
+        # race.  The existing row is the idempotent result, not an error.
+        existing = conn.execute(
+            "SELECT * FROM intents WHERE project_id = ? AND intent_key = ?",
+            (project_id, intent_key),
+        ).fetchone()
+        if existing is None:
+            raise
+        return intent_to_model(conn, existing, project_id)
     for fact_id in body.from_:
         conn.execute("INSERT INTO intent_sources (intent_id, project_id, fact_id) VALUES (?, ?, ?)", (iid, project_id, fact_id))
     bump_graph_revision(conn, project_id)
