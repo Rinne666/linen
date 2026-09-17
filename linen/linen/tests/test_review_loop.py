@@ -42,11 +42,15 @@ def test_validate_reason_payload_preserves_intent_type():
             "intents": [
                 {
                     "from": ["f001"],
+                    "action": "review",
+                    "target": "candidate finding f001",
                     "type": "review",
                     "description": "Adversarially review f001",
                 },
                 {
                     "from": ["f002", "f003"],
+                    "action": "trace",
+                    "target": "f002 to f003",
                     "type": "trace",
                     "description": "Trace from f002 to f003",
                 },

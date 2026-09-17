@@ -131,8 +131,17 @@ def validate_reason_payload(
         if not isinstance(intents, list):
             raise ValueError("intents must be an array")
         for i, intent in enumerate(intents):
-            if not isinstance(intent, dict) or "from" not in intent or "description" not in intent:
+            if (
+                not isinstance(intent, dict)
+                or "from" not in intent
+                or "description" not in intent
+                or "action" not in intent
+                or "target" not in intent
+            ):
                 raise ValueError(f"invalid intent at index {i}")
+            for field in ("action", "target"):
+                if not isinstance(intent[field], str) or not intent[field].strip():
+                    raise ValueError(f"intent {field} must be a non-empty string at index {i}")
         if not intents and open_intents_empty:
             raise ValueError("intents must not be empty when open_intents is empty")
         intents = intents[:max_intents]

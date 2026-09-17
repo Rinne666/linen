@@ -43,6 +43,36 @@ def test_intent_creation_is_idempotent_by_stable_semantics(client) -> None:
     assert len(client.get(f"/projects/{project}").json()["intents"]) == 1
 
 
+def test_intent_identity_ignores_evidence_sources(client) -> None:
+    project = client.post(
+        "/projects",
+        json={"title": "semantic identity", "origin": "repo", "goal": "done"},
+    ).json()["project"]["id"]
+    first = client.post(
+        f"/projects/{project}/intents",
+        json={
+            "from": ["origin"],
+            "description": "Trace the request boundary",
+            "creator": "reasoner",
+            "action": "trace",
+            "target": "request boundary",
+        },
+    )
+    second = client.post(
+        f"/projects/{project}/intents",
+        json={
+            "from": ["origin"],
+            "description": "Same semantic task with another explanation",
+            "creator": "reasoner",
+            "action": "trace",
+            "target": "request boundary",
+        },
+    )
+
+    assert first.status_code == second.status_code == 201
+    assert first.json()["id"] == second.json()["id"]
+
+
 def test_concurrent_intent_creation_has_one_id(client) -> None:
     project = client.post(
         "/projects",

@@ -542,6 +542,8 @@ def run_audit_graph_reason_task(
                 proposal["from"],
                 proposal["description"],
                 audit_graph.MODEL_CREATOR,
+                action=proposal["type"],
+                target=proposal["description"],
                 intent_type=proposal["type"],
                 display_title=proposal.get("display_title"),
                 semantic_type=proposal.get("semantic_type"),
@@ -920,6 +922,8 @@ def run_reason_task(
                     intent_data["from"],
                     intent_data["description"],
                     worker.name,
+                    action=intent_data["action"],
+                    target=intent_data["target"],
                     intent_type=intent_type,
                 )
                 if response.status_code == 403:

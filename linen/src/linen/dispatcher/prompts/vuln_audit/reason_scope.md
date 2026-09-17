@@ -47,12 +47,12 @@ No new semantic work:
 `{"accepted":true,"data":{}}`
 
 Proposed work:
-`{"accepted":true,"data":{"intents":[{"from":["f001"],"type":"verify","description":"Verify the concrete security invariant, attacker precondition, reachable operation, and impact"}]}}`
+`{"accepted":true,"data":{"intents":[{"from":["f001"],"action":"verify","target":"the concrete security invariant","type":"verify","description":"Verify the concrete security invariant, attacker precondition, reachable operation, and impact"}]}}`
 
 Completion:
 `{"accepted":true,"data":{"complete":{"from":["f999"],"description":"Configured audit branches completed on the recorded frozen snapshot with the declared exclusions"}}}`
 
-Every Intent contains exactly `from`, `type`, and `description`, references only
+Every Intent contains `from`, `action`, `target`, `type`, and `description`; `action` + `target` define identity while `from` only lists evidence sources. It references only
 the valid Fact IDs below, and asks one bounded question.
 
 # Context

@@ -324,12 +324,14 @@ def create_intent(conn: sqlite3.Connection, project_id: str, body: CreateIntentR
     def canonical(value: str) -> str:
         return " ".join(unicodedata.normalize("NFKC", value).strip().casefold().split())
 
-    action = body.action or body.type or semantic_type
+    # New Reason callers provide the stable semantic identity explicitly.
+    # Legacy/manual callers remain compatible, but evidence provenance is
+    # never part of identity: ``from`` describes inputs, not the task.
+    action = body.action or body.type or semantic_type or "investigate"
     target = body.target or body.description
-    scope = body.scope or ",".join(sorted(body.from_))
     intent_key = hashlib.sha256(
         json.dumps(
-            {"action": canonical(action), "target": canonical(target), "scope": canonical(scope)},
+            {"action": canonical(action), "target": canonical(target)},
             ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()

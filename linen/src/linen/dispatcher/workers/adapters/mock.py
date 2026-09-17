@@ -82,7 +82,7 @@ if phase=="reason":
         intents=[]
         for idx in range(count):
             fi=[random.choice(fact_ids)] if fact_ids else []
-            intent={"from":fi,"description":f"mock intent {idx+1} from {fi[0] if fi else 'none'}"}
+            intent={"from":fi,"action":"inspect","target":f"mock target {idx+1}","description":f"mock intent {idx+1} from {fi[0] if fi else 'none'}"}
             if prompt.get("profile")=="audit_graph":
                 intent["type"]="search"
             intents.append(intent)

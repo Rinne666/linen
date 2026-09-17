@@ -91,9 +91,9 @@ After the chain-gap step above, scan the graph for any fact whose `status` is `d
 Emit a review intent for it. Pick the `<mode>` per the rules below and emit one of these concrete shapes:
 
 ```json
-{"from": ["<draft_fact_id>"], "type": "review:devils-advocate", "description": "Adversarially review candidate finding <draft_fact_id> (status=draft, no reviews yet)"}
-{"from": ["<draft_fact_id>"], "type": "review:cold-verifier", "description": "Cold-verify candidate finding <draft_fact_id> (terminal / long chain / possible confirmation bias)"}
-{"from": ["<draft_fact_id>"], "type": "review:contradiction-reasoner", "description": "Contradiction-check candidate finding <draft_fact_id> (prior NEEDS_REVIEW or chain conflict)"}
+{"from": ["<draft_fact_id>"], "action": "review", "target": "candidate finding <draft_fact_id>", "type": "review:devils-advocate", "description": "Adversarially review candidate finding <draft_fact_id> (status=draft, no reviews yet)"}
+{"from": ["<draft_fact_id>"], "action": "review", "target": "candidate finding <draft_fact_id>", "type": "review:cold-verifier", "description": "Cold-verify candidate finding <draft_fact_id> (terminal / long chain / possible confirmation bias)"}
+{"from": ["<draft_fact_id>"], "action": "review", "target": "candidate finding <draft_fact_id>", "type": "review:contradiction-reasoner", "description": "Contradiction-check candidate finding <draft_fact_id> (prior NEEDS_REVIEW or chain conflict)"}
 ```
 
 **Mode selection** — pick `<mode>` based on the candidate fact's characteristics. The review task loads a different prompt per mode (see `linen/src/linen/dispatcher/tasks/review.py::resolve_review_mode`):
@@ -131,11 +131,11 @@ Hypothesis REFUTED (chain is closed on counter-evidence, no other hypothesis to 
 {"accepted": true, "data": {}}
 ```
 
-Next verification steps proposed:
+Next verification steps proposed (the stable identity is the `action` + `target` pair; `from` only lists evidence sources):
 ```json
 {"accepted": true, "data": {"intents": [
-  {"from": ["f001", "f002"], "type": "trace", "description": "..."},
-  {"from": ["f003"], "type": "validate", "description": "..."}
+  {"from": ["f001", "f002"], "action": "trace", "target": "the source-to-sink dataflow", "type": "trace", "description": "..."},
+  {"from": ["f003"], "action": "validate", "target": "the sanitizer on the reachable path", "type": "validate", "description": "..."}
 ]}}
 ```
 

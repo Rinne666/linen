@@ -516,6 +516,8 @@ class LinenClient:
         description: str,
         creator: str,
         *,
+        action: str | None = None,
+        target: str | None = None,
         intent_type: str | None = None,
         display_title: str | None = None,
         semantic_type: str | None = None,
@@ -528,6 +530,10 @@ class LinenClient:
             "creator": creator,
             "worker": None,
         }
+        if action is not None:
+            body["action"] = action
+        if target is not None:
+            body["target"] = target
         if intent_type is not None:
             body["type"] = intent_type
         if display_title is not None:

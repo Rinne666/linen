@@ -19,7 +19,7 @@ If Goal has been satisfied, return:
 
 If Goal has not been satisfied but new intents should be proposed, return:
 ```json
-{"accepted": true, "data": {"intents": [{"from": ["f001"], "description": "..."}, {"from": ["f002", "f003"], "description": "..."}]}}
+{"accepted": true, "data": {"intents": [{"from": ["f001"], "action": "trace", "target": "the request value to its sink", "description": "..."}, {"from": ["f002", "f003"], "action": "verify", "target": "the authorization invariant", "description": "..."}]}}
 ```
 
 If Goal has not been satisfied and no new intent should currently be proposed, return:
@@ -34,6 +34,7 @@ If Goal has not been satisfied and no new intent should currently be proposed, r
 - If `Open Intents` is empty, you must propose new intents.
 - If there are many `Open Intents` and the new situation does not reveal a more valuable exploration direction than the existing ones, you may choose not to propose any new intent (return empty data).
 - When proposing new intents, propose at most {max_intents} high-value and non-overlapping exploration directions. Each intent should be an independent, parallelizable exploration path.
+- Every proposed intent must include a short stable `action` and `target`. These two fields define the intent's identity; `from` only lists evidence sources and must not be used to distinguish otherwise identical work.
 - Each Intent should be a high-value exploration direction. It does not need to be overly detailed. Focus on the core insight and a clear direction. Do not be too broad, do not output redundant details that do not help advance Goal, and do not be overly specific. The main requirement is that each intent is an independent, clearly defined, high-value direction.
 - An Intent may originate from multiple facts.
 - Different intents should cover different exploration dimensions and avoid duplication or heavy overlap.
