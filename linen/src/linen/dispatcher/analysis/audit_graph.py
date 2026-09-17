@@ -214,6 +214,8 @@ def validate_model_intents(
         choice = choices_by_id[skill_id]
         normalized.append({
             "from": list(choice["from"]),
+            "action": "run_skill",
+            "target": skill_id,
             "type": "search:skill",
             "description": choice["description"],
             "display_title": choice["label"],

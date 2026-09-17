@@ -167,6 +167,7 @@ def test_audit_graph_reason_selects_one_trusted_skill_and_records_why(monkeypatc
         "proj_001", ["origin"], "@analysis:semgrep",
         "dispatcher.audit-graph-model",
     )]
+    assert client.created_intent_semantics == [("run_skill", "security.semgrep")]
     assert client.created_hints == [(
         "proj_001",
         "AuditGraph selected security.semgrep from the trusted Skill registry. "

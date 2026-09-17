@@ -22,7 +22,6 @@ def make_config() -> DispatchConfig:
                 "prompt_group": "default",
             },
             "tasks": {
-                "bootstrap": {"timeout": 10, "conclude_timeout": 5},
                 "reason": {"timeout": 10, "max_intents": 3},
                 "explore": {"timeout": 10, "conclude_timeout": 5},
             },
@@ -30,7 +29,7 @@ def make_config() -> DispatchConfig:
                 {
                     "name": "test-worker",
                     "type": "mock",
-                    "task_types": ["bootstrap", "reason", "explore"],
+                    "task_types": ["reason", "explore"],
                     "max_running": 1,
                     "priority": 0,
                 }
@@ -45,7 +44,6 @@ def make_project(*, intents: list[Intent] | None = None) -> ProjectDetail:
             id="proj_001",
             title="test",
             status="active",
-            bootstrap_enabled=True,
             created_at="2026-01-01T00:00:00Z",
         ),
         facts=[
@@ -109,6 +107,7 @@ class FakeClient:
     concluded: list[tuple[str, str, str, str]] = field(default_factory=list)
     completed: list[tuple[str, list[str], str, str]] = field(default_factory=list)
     created_intents: list[tuple[str, list[str], str, str]] = field(default_factory=list)
+    created_intent_semantics: list[tuple[str, str]] = field(default_factory=list)
     created_hints: list[tuple[str, str, str]] = field(default_factory=list)
     released: list[tuple[str, str, str]] = field(default_factory=list)
     released_reasons: list[tuple[str, str]] = field(default_factory=list)
@@ -129,11 +128,14 @@ class FakeClient:
 
     def create_intent(
         self, project_id: str, from_ids: list[str], description: str, creator: str,
-        *, intent_type: str | None = None, worker: str | None = None,
+        *, action: str | None = None, target: str | None = None,
+        intent_type: str | None = None, worker: str | None = None,
         display_title: str | None = None, semantic_type: str | None = None,
         relation_type: str | None = None, phase: str | None = None,
     ) -> ApiResult:
         self.created_intents.append((project_id, from_ids, description, creator))
+        if action is not None and target is not None:
+            self.created_intent_semantics.append((action, target))
         return ApiResult(201, {})
 
     def create_hint(self, project_id: str, content: str, creator: str) -> ApiResult:
