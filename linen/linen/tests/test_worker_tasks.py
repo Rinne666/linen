@@ -8,6 +8,7 @@ from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.process import ProcessResult
 from linen.dispatcher.workers.health import HealthResult
 from linen.dispatcher.tasks import explore, reason
+from linen.dispatcher.analysis.external_scanners import TRIVY_INTENT
 
 from conftest import (
     FakeClient,
@@ -177,6 +178,47 @@ def test_audit_graph_reason_selects_one_trusted_skill_and_records_why(monkeypatc
     prompt = driver.execute_prompts[0]
     assert "security.semgrep" in prompt
     assert "Skill Selection Contract" in prompt
+
+
+def test_failed_scanner_keeps_intent_open_for_retry(monkeypatch, tmp_path) -> None:
+    config = make_config()
+    config.audit.enabled = True
+    config.audit.trivy.enabled = True
+    intent = make_intent()
+    intent.description = TRIVY_INTENT
+    intent.type = "search"
+    project = make_project(intents=[intent])
+    client = FakeClient(project)
+    containers = FakeContainerManager()
+    driver = FakeDriver()
+    lease = FakeLease()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "status": "failed",
+        "errors": [{"message": "scanner unavailable"}],
+        "scanner": {"name": "trivy"},
+    }))
+
+    monkeypatch.setattr(explore, "get_driver", lambda *_a, **_k: driver)
+    monkeypatch.setattr(explore.HeartbeatLease, "for_intent", _lease_factory(lease))
+    monkeypatch.setattr(
+        explore,
+        "run_external_scan",
+        lambda *_args, **_kwargs: {
+            "description": "Trivy scan failed",
+            "type": "scan_batch",
+            "evidence": f"artifact: {manifest}",
+        },
+    )
+
+    outcome = explore.run_explore_task(
+        config, client, containers, project, "graph", intent,
+        config.workers[0], TaskCancellation(),
+    )
+
+    assert outcome == "failed"
+    assert client.concluded == []
+    assert client.errors == [("proj_001", "i001", "scanner_failed", "transient")]
 
 
 def test_reason_uses_project_audit_mode_instead_of_global_scope_mode(monkeypatch) -> None:

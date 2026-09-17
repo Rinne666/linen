@@ -111,6 +111,7 @@ class FakeClient:
     created_hints: list[tuple[str, str, str]] = field(default_factory=list)
     released: list[tuple[str, str, str]] = field(default_factory=list)
     released_reasons: list[tuple[str, str]] = field(default_factory=list)
+    errors: list[tuple[str, str, str, str]] = field(default_factory=list)
 
     def get_project(self, _project_id: str) -> ProjectDetail:
         return self.project
@@ -141,6 +142,13 @@ class FakeClient:
     def create_hint(self, project_id: str, content: str, creator: str) -> ApiResult:
         self.created_hints.append((project_id, content, creator))
         return ApiResult(201, {})
+
+    def report_intent_error(
+        self, project_id: str, intent_id: str, worker: str, *, task_type: str,
+        code: str, classification: str, message: str, **_kwargs,
+    ) -> ApiResult:
+        self.errors.append((project_id, intent_id, code, classification))
+        return ApiResult(200, {})
 
     def release(self, project_id: str, intent_id: str, worker: str) -> ApiResult:
         self.released.append((project_id, intent_id, worker))

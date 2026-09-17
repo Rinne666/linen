@@ -97,11 +97,9 @@ def _scanner_receipt_finish(
     *,
     source_generation: int,
     plan_revision: int,
-) -> None:
+) -> str | None:
     """Verify the immutable manifest before finalizing a skill-run receipt."""
-    if started is None or not hasattr(client, "update_skill_run"):
-        return
-    skill, run_id = started
+    run_id = None
     try:
         artifact_line = next(
             (line for line in fact.get("evidence", "").splitlines() if line.startswith("artifact:")),
@@ -113,6 +111,9 @@ def _scanner_receipt_finish(
             raise ValueError("scanner fact did not include a manifest artifact")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         status = "not_applicable" if manifest.get("applicability", {}).get("status") == "not_applicable" else manifest.get("status")
+        if started is None or not hasattr(client, "update_skill_run"):
+            return status
+        skill, run_id = started
         command = manifest.get("command")
         detail = "; ".join(
             str(error.get("message", error)) for error in manifest.get("errors", [])
@@ -127,31 +128,34 @@ def _scanner_receipt_finish(
             allowed_root=analysis_root,
         )
         receipt = validate_receipt(receipt, allowed_root=analysis_root)
-        response = client.update_skill_run(
-            project_id,
-            str(run_id),
-            stage_id=receipt.stage_id,
-            skill_id=receipt.skill_id,
-            skill_version=receipt.skill_version,
-            capability=receipt.capability,
-            status=receipt.status,
-            intent_id=intent.id,
-            command=receipt.command,
-            artifact_ref=receipt.artifact_ref,
-            artifact_sha256=receipt.artifact_sha256,
-            detail=receipt.detail,
-            source_generation=source_generation,
-            plan_revision=plan_revision,
-        )
-        if not response.ok:
-            LOG.warning(
-                "scanner receipt finish failed project=%s intent=%s run=%s status=%s body=%s",
-                project_id, intent.id, run_id, response.status_code, response.text,
+        if started is not None and hasattr(client, "update_skill_run"):
+            response = client.update_skill_run(
+                project_id,
+                str(run_id),
+                stage_id=receipt.stage_id,
+                skill_id=receipt.skill_id,
+                skill_version=receipt.skill_version,
+                capability=receipt.capability,
+                status=receipt.status,
+                intent_id=intent.id,
+                command=receipt.command,
+                artifact_ref=receipt.artifact_ref,
+                artifact_sha256=receipt.artifact_sha256,
+                detail=receipt.detail,
+                source_generation=source_generation,
+                plan_revision=plan_revision,
             )
+            if not response.ok:
+                LOG.warning(
+                    "scanner receipt finish failed project=%s intent=%s run=%s status=%s body=%s",
+                    project_id, intent.id, run_id, response.status_code, response.text,
+                )
+        return status
     except Exception:
         # A malformed or moved artifact must never be reported as a completed
         # receipt. The scan Fact remains available for diagnosis/retry.
         LOG.exception("scanner receipt validation failed project=%s intent=%s run=%s", project_id, intent.id, run_id)
+        return None
 
 
 def run_explore_task(
@@ -319,7 +323,7 @@ def run_explore_task(
                 ),
                 canonical_snapshot=canonical_snapshot,
             )
-            _scanner_receipt_finish(
+            scanner_status = _scanner_receipt_finish(
                 client,
                 project.project.id,
                 intent,
@@ -329,6 +333,21 @@ def run_explore_task(
                 source_generation=project.project.source_generation,
                 plan_revision=project.project.plan_revision,
             )
+            if scanner_status not in {"completed", "not_applicable"}:
+                response = client.report_intent_error(
+                    project.project.id,
+                    intent.id,
+                    worker.name,
+                    task_type="explore",
+                    code="scanner_failed",
+                    classification="transient",
+                    message=f"Semgrep scan status: {scanner_status or 'unknown'}",
+                    remediation="Retry the same scanner Intent while attempts remain.",
+                    max_attempts=config.audit.semgrep.max_attempts,
+                ) if hasattr(client, "report_intent_error") else None
+                if response is None or not response.ok:
+                    best_effort_release(client, project.project.id, intent.id, worker.name)
+                return "failed"
             if cancellation.is_cancelled or lease.failure is not None:
                 best_effort_release(client, project.project.id, intent.id, worker.name)
                 return "cancelled" if cancellation.is_cancelled else "failed"
@@ -374,7 +393,7 @@ def run_explore_task(
                 ),
                 canonical_snapshot=canonical_snapshot,
             )
-            _scanner_receipt_finish(
+            scanner_status = _scanner_receipt_finish(
                 client,
                 project.project.id,
                 intent,
@@ -384,6 +403,21 @@ def run_explore_task(
                 source_generation=project.project.source_generation,
                 plan_revision=project.project.plan_revision,
             )
+            if scanner_status not in {"completed", "not_applicable"}:
+                response = client.report_intent_error(
+                    project.project.id,
+                    intent.id,
+                    worker.name,
+                    task_type="explore",
+                    code="scanner_failed",
+                    classification="transient",
+                    message=f"{external_scanner.label} scan status: {scanner_status or 'unknown'}",
+                    remediation="Retry the same scanner Intent while attempts remain.",
+                    max_attempts=external_scanner.config.max_attempts,
+                ) if hasattr(client, "report_intent_error") else None
+                if response is None or not response.ok:
+                    best_effort_release(client, project.project.id, intent.id, worker.name)
+                return "failed"
             if cancellation.is_cancelled or lease.failure is not None:
                 best_effort_release(client, project.project.id, intent.id, worker.name)
                 return "cancelled" if cancellation.is_cancelled else "failed"
