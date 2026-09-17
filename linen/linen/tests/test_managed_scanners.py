@@ -293,6 +293,42 @@ def test_legacy_pre_execution_scanner_failure_does_not_exhaust_retry_budget(
     assert retry["from"] == ["origin", previous]
 
 
+def test_repeated_skill_attempt_currently_reuses_completed_intent(api):
+    _, client = api
+    current = project(api, audit_mode="hypothesis")
+    pid = current.project.id
+    first = client.create_intent(
+        pid,
+        ["origin"],
+        TRIVY_INTENT,
+        "dispatcher.audit-graph-model",
+        action="run_skill",
+        target="security.trivy",
+        intent_type="search:skill",
+    )
+    assert first.ok
+    intent_id = first.data["id"]
+    assert client.heartbeat(pid, intent_id, "tester").ok
+    assert client.conclude(
+        pid, intent_id, "tester", "trivy attempt failed", fact_type="scan_batch",
+        evidence="scanner: trivy\nstatus: failed",
+    ).ok
+
+    second = client.create_intent(
+        pid,
+        ["origin"],
+        TRIVY_INTENT,
+        "dispatcher.audit-graph-model",
+        action="run_skill",
+        target="security.trivy",
+        intent_type="search:skill",
+    )
+
+    assert second.ok
+    assert second.data["id"] == intent_id
+    assert second.data["concluded_at"] is not None
+
+
 def test_scope_fans_out_and_gates_each_scanner_by_identity(api, configured_scanners, tmp_path):
     _, client = api
     current = project(api, audit_mode="scope")
