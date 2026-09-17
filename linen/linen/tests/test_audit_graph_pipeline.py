@@ -132,6 +132,8 @@ def test_audit_graph_model_validator_accepts_only_semantic_current_revision(tmp_
     )
     assert kind == "intents"
     assert proposals[0]["type"] == "trace"
+    assert proposals[0]["action"] == "trace"
+    assert proposals[0]["target"] == "the request value to the dynamic query sink"
 
     with pytest.raises(ValueError, match="cannot complete"):
         audit_graph.validate_model_intents(
@@ -156,6 +158,54 @@ def test_audit_graph_model_validator_accepts_only_semantic_current_revision(tmp_
             project_detail,
             expected_revision=6,
             max_intents=3,
+        )
+
+
+def test_audit_graph_batch_rejects_duplicate_action_target_but_not_history() -> None:
+    historical = Intent(
+        id="i001",
+        **{"from": ["f001"]},
+        description="An old wording for the same task",
+        type="trace",
+        creator="old-worker",
+        created_at="2026-01-01T00:00:00Z",
+    )
+    board = ProjectDetail(
+        project=ProjectMeta(
+            id="proj_001", title="audit", status="active", graph_revision=1,
+            created_at="2026-01-01T00:00:00Z",
+        ),
+        facts=[Fact(id="f001", description="source", status="triaged")],
+        intents=[historical], hints=[], reviews=[],
+    )
+
+    accepted_kind, proposals = audit_graph.validate_model_intents(
+        {"accepted": True, "data": {"intents": [{
+            "from": ["f001"], "action": "trace", "target": "same target",
+            "type": "trace", "description": "A new description for this task",
+        }]}},
+        board, expected_revision=1, max_intents=3,
+    )
+    assert accepted_kind == "intents"
+    assert proposals[0]["action"] == "trace"
+    assert proposals[0]["target"] == "same target"
+
+    with pytest.raises(ValueError, match="duplicates this proposal batch"):
+        audit_graph.validate_model_intents(
+            {"accepted": True, "data": {"intents": [
+                {
+                    "from": ["f001"], "action": "trace", "target": "same target",
+                    "type": "trace", "description": "First bounded question",
+                },
+                {
+                    "from": ["f001"], "action": "trace", "target": "same target",
+                    "type": "trace", "description": "Second bounded question",
+                },
+            ]}},
+            ProjectDetail(
+                project=board.project, facts=board.facts, intents=[], hints=[], reviews=[],
+            ),
+            expected_revision=1, max_intents=3,
         )
 
 

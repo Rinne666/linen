@@ -85,11 +85,6 @@ def validate_model_intents(
     facts = {fact.id: fact for fact in project.facts if fact.id != "goal"}
     def canonical(value: str) -> str:
         return " ".join(value.strip().casefold().split())
-
-    existing_identities = {
-        (canonical(intent.type or intent.semantic_type or "investigate"), canonical(intent.description))
-        for intent in project.intents
-    }
     reviews_by_fact: dict[str, list] = {}
     for review in project.reviews:
         reviews_by_fact.setdefault(review.fact_id, []).append(review)
@@ -138,8 +133,6 @@ def validate_model_intents(
         if managed_description(description):
             raise ValueError("reserved audit intents are derived by deterministic code")
         identity = (canonical(action), canonical(target))
-        if identity in existing_identities:
-            raise ValueError(f"intent at index {index} duplicates existing work")
         source_facts = [facts[fact_id] for fact_id in from_ids]
         if any(fact.status not in {"draft", "triaged"} for fact in source_facts):
             raise ValueError(f"intent at index {index} depends on a terminal fact")
@@ -189,7 +182,6 @@ def validate_model_intents(
         if key in seen:
             raise ValueError(f"intent at index {index} duplicates this proposal batch")
         seen.add(key)
-        existing_identities.add(identity)
         normalized.append({
             "from": list(from_ids),
             "action": action.strip(),
