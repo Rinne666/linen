@@ -24,10 +24,14 @@ from linen.server.store import (
     list_runs,
     register_artifact,
     register_context,
-    register_run,
-    recover_expired_runs,
     run_from_row,
     snapshot_from_db,
+)
+from linen.server.kernel import (
+    KernelConflict,
+    KernelNotFound,
+    recover_expired_runs,
+    register_run,
     transition_run,
 )
 from linen.server.services import get_project_or_404, utcnow
@@ -230,6 +234,10 @@ def post_run(project_id: str, body: RunEnvelope):
             return result
         except ValueError as exc:
             raise _value_error(exc) from exc
+        except KernelNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except KernelConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, "run_id or idempotency_key already exists") from exc
 
@@ -246,7 +254,12 @@ def get_runs(project_id: str):
 )
 def recover_runs(project_id: str):
     with get_conn() as conn:
-        return recover_expired_runs(conn, project_id)
+        try:
+            return recover_expired_runs(conn, project_id)
+        except KernelNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except KernelConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
 
 
 @router.get("/projects/{project_id}/runs/{run_id}", response_model=RunEnvelope)
@@ -279,6 +292,10 @@ def put_run(project_id: str, run_id: str, body: RunEnvelope):
             raise HTTPException(404, str(exc)) from exc
         except ValueError as exc:
             raise _value_error(exc) from exc
+        except KernelNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except KernelConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
 
 
 @router.post("/projects/{project_id}/context-projections", response_model=ContextProjection, status_code=status.HTTP_201_CREATED)

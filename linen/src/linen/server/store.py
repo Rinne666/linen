@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any
 
 from linen.contracts import (
@@ -24,23 +24,6 @@ from linen.contracts import (
 )
 from linen.server.audit_state import append_event
 from linen.server.services import get_project_or_404, utcnow
-
-
-TERMINAL_RUN_STATUSES = frozenset({
-    "completed", "succeeded", "failed", "cancelled", "timed_out", "interrupted", "blocked",
-})
-LEGAL_RUN_TRANSITIONS: dict[str, frozenset[str]] = {
-    "queued": frozenset({"queued", "running", "cancelled", "interrupted", "blocked"}),
-    "running": frozenset(TERMINAL_RUN_STATUSES | {"running"}),
-}
-for _status in TERMINAL_RUN_STATUSES:
-    LEGAL_RUN_TRANSITIONS[_status] = frozenset({_status})
-
-IMMUTABLE_RUN_FIELDS = (
-    "run_id", "project_id", "idempotency_key", "task_type", "intent_id", "stage", "attempt",
-    "graph_revision", "source_generation", "plan_revision", "context_projection_id",
-    "worker_manifest_digest", "timeout_seconds",
-)
 
 
 def _json(value: Any) -> str:
@@ -138,18 +121,6 @@ def list_artifacts(conn: sqlite3.Connection, project_id: str) -> list[ArtifactMe
 
 
 def register_run(conn: sqlite3.Connection, run: RunEnvelope) -> RunEnvelope:
-    get_project_or_404(conn, run.project_id)
-    if run.intent_id is not None and conn.execute(
-        "SELECT 1 FROM intents WHERE project_id = ? AND id = ?", (run.project_id, run.intent_id)
-    ).fetchone() is None:
-        raise ValueError("intent_id does not belong to this project")
-    if any(conn.execute("SELECT 1 FROM artifacts WHERE project_id = ? AND artifact_id = ?", (run.project_id, aid)).fetchone() is None for aid in run.artifact_ids):
-        raise ValueError("run references an unknown artifact")
-    if run.context_projection_id is not None and conn.execute(
-        "SELECT 1 FROM context_projections WHERE project_id = ? AND projection_id = ?",
-        (run.project_id, run.context_projection_id),
-    ).fetchone() is None:
-        raise ValueError("context_projection_id does not belong to this project")
     now = utcnow()
     value = run.model_dump(mode="json")
     conn.execute(
@@ -169,9 +140,6 @@ def register_run(conn: sqlite3.Connection, run: RunEnvelope) -> RunEnvelope:
     if existing is None:
         raise RuntimeError("run registration did not produce a row")
     current = run_from_row(existing)
-    for field in IMMUTABLE_RUN_FIELDS:
-        if getattr(current, field) != getattr(run, field):
-            raise ValueError(f"run {field} differs from the existing idempotent run")
     return current
 
 
@@ -182,106 +150,16 @@ def list_runs(conn: sqlite3.Connection, project_id: str) -> list[RunEnvelope]:
 
 def transition_run(conn: sqlite3.Connection, run: RunEnvelope) -> RunEnvelope:
     row = conn.execute("SELECT * FROM runs WHERE project_id = ? AND run_id = ?", (run.project_id, run.run_id)).fetchone()
-    if row is None:
-        raise KeyError("run not found")
-    current = run_from_row(row)
-    for field in IMMUTABLE_RUN_FIELDS:
-        if getattr(current, field) != getattr(run, field):
-            raise ValueError(f"run {field} cannot change")
-    if run.status not in LEGAL_RUN_TRANSITIONS[current.status]:
-        raise ValueError(f"illegal run transition: {current.status} -> {run.status}")
-    for artifact_id in run.artifact_ids:
-        if conn.execute(
-            "SELECT 1 FROM artifacts WHERE project_id = ? AND artifact_id = ?",
-            (run.project_id, artifact_id),
-        ).fetchone() is None:
-            raise ValueError("run references an unknown artifact")
-
-    if current.status in TERMINAL_RUN_STATUSES:
-        # Terminal records are immutable.  Timestamp fields may be omitted in
-        # a replay because the server can have assigned them during the first
-        # request; every other mutable field must match exactly.
-        if run.status != current.status:
-            raise ValueError(f"illegal run transition: {current.status} -> {run.status}")
-        for field in ("worker_name", "worker_type", "artifact_ids", "error_id"):
-            if getattr(run, field) != getattr(current, field):
-                raise ValueError("terminal run mutation is not allowed")
-        for field in ("started_at", "finished_at"):
-            requested = getattr(run, field)
-            if requested is not None and requested != getattr(current, field):
-                raise ValueError("terminal run mutation is not allowed")
-        return current
     now = utcnow()
+    current = run_from_row(row)
     started = run.started_at or (now if run.status == "running" else current.started_at)
-    finished = run.finished_at or (now if run.status in TERMINAL_RUN_STATUSES else current.finished_at)
+    finished = run.finished_at or (now if run.status in {"completed", "succeeded", "failed", "cancelled", "timed_out", "interrupted", "blocked"} else current.finished_at)
     conn.execute(
         "UPDATE runs SET status = ?, worker_name = ?, worker_type = ?, started_at = ?, finished_at = ?, "
         "artifact_ids = ?, error_id = ?, updated_at = ? WHERE project_id = ? AND run_id = ?",
         (run.status, run.worker_name, run.worker_type, started, finished, _json(run.artifact_ids), run.error_id, now, run.project_id, run.run_id),
     )
     return run_from_row(conn.execute("SELECT * FROM runs WHERE project_id = ? AND run_id = ?", (run.project_id, run.run_id)).fetchone())
-
-
-def _parse_utc_timestamp(value: str | None) -> datetime | None:
-    """Parse an ISO timestamp conservatively for timeout accounting."""
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def recover_expired_runs(
-    conn: sqlite3.Connection,
-    project_id: str,
-    *,
-    now: str | None = None,
-) -> list[RunEnvelope]:
-    """Mark only timed-out running runs as interrupted.
-
-    Missing or malformed ``started_at`` values are not guessed at: those runs
-    remain untouched until a dispatcher can provide a trustworthy timestamp.
-    The operation is naturally idempotent because recovered rows are no
-    longer in the ``running`` state.
-    """
-    get_project_or_404(conn, project_id)
-    now_text = now or utcnow()
-    current_time = _parse_utc_timestamp(now_text)
-    if current_time is None:
-        raise ValueError("recovery now must be a valid ISO timestamp")
-    recovered: list[RunEnvelope] = []
-    rows = conn.execute(
-        "SELECT * FROM runs WHERE project_id = ? AND status = 'running' ORDER BY run_id",
-        (project_id,),
-    ).fetchall()
-    for row in rows:
-        run = run_from_row(row)
-        started = _parse_utc_timestamp(run.started_at)
-        if started is None or started + timedelta(seconds=run.timeout_seconds) > current_time:
-            continue
-        interrupted = run.model_copy(update={"status": "interrupted", "finished_at": now_text})
-        result = transition_run(conn, interrupted)
-        append_contract_event(conn, AuditEventEnvelope(
-            event_id=f"run-{run.run_id}-orphan-recovery",
-            project_id=project_id,
-            run_id=run.run_id,
-            idempotency_key=f"run:{run.run_id}:orphan-recovery:{run.idempotency_key}",
-            event_type="run_orphan_recovered",
-            actor="server",
-            entity_kind="run",
-            entity_id=run.run_id,
-            graph_revision=result.graph_revision,
-            source_generation=result.source_generation,
-            plan_revision=result.plan_revision,
-            payload={"previous_status": "running", "status": "interrupted", "reason": "timeout"},
-            created_at=now_text,
-        ))
-        recovered.append(result)
-    return recovered
 
 
 def register_context(conn: sqlite3.Connection, projection: ContextProjection) -> ContextProjection:
