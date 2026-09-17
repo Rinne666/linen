@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 from fastapi.testclient import TestClient
 
 from linen.server import db
 from linen.server.app import app
+from linen.server.kernel import create_intent as create_intent_kernel
+from linen.server.models import CreateIntentRequest, ProjectDetail, ProjectMeta
 from linen.dispatcher.protocol.client import ApiResult
+from linen.dispatcher.scheduler.loop import DispatcherLoop
 from linen.dispatcher.tasks.common import best_effort_release_reason
 
 
@@ -35,6 +40,33 @@ def test_intent_creation_is_idempotent_by_stable_semantics(client) -> None:
 
     assert first.status_code == second.status_code == 201
     assert first.json()["id"] == second.json()["id"]
+    assert len(client.get(f"/projects/{project}").json()["intents"]) == 1
+
+
+def test_concurrent_intent_creation_has_one_id(client) -> None:
+    project = client.post(
+        "/projects",
+        json={"title": "concurrent idempotency", "origin": "repo", "goal": "done"},
+    ).json()["project"]["id"]
+    body = CreateIntentRequest(
+        **{
+            "from": ["origin"],
+            "description": "Inspect the request boundary",
+            "creator": "reasoner",
+            "action": "inspect",
+            "target": "request boundary",
+            "scope": "api",
+        }
+    )
+
+    def create() -> str:
+        with db.get_conn() as conn:
+            return create_intent_kernel(conn, project, body).id
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ids = list(pool.map(lambda _: create(), range(2)))
+
+    assert ids[0] == ids[1]
     assert len(client.get(f"/projects/{project}").json()["intents"]) == 1
 
 
@@ -68,3 +100,25 @@ def test_reason_release_only_advances_cursor_on_success() -> None:
     best_effort_release_reason(fake, "p", "w", "l", 12, ack=True)
 
     assert fake.payloads == [None, 12]
+
+
+def test_reason_failure_retries_same_event_sequence() -> None:
+    project = ProjectDetail(
+        project=ProjectMeta(
+            id="p",
+            title="retry",
+            status="active",
+            created_at="2026-01-01T00:00:00+00:00",
+            reason_last_seen_event_seq=3,
+            event_seq=4,
+        ),
+        facts=[],
+        intents=[],
+        hints=[],
+    )
+    scheduler = DispatcherLoop.__new__(DispatcherLoop)
+
+    first = scheduler._reason_trigger(project)
+    second = scheduler._reason_trigger(project)
+
+    assert first == second == "events:3->4"

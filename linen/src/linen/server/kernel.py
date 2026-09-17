@@ -337,7 +337,7 @@ def create_intent(conn: sqlite3.Connection, project_id: str, body: CreateIntentR
         "SELECT * FROM intents WHERE project_id = ? AND intent_key = ?",
         (project_id, intent_key),
     ).fetchone()
-    if existing is not None and not body.reopen:
+    if existing is not None:
         return intent_to_model(conn, existing, project_id)
     try:
         conn.execute(

@@ -446,9 +446,6 @@ class DispatcherLoop:
         if self._reconcile_audit_stages(project):
             project = self.client.get_project(summary.id)
 
-        if self._is_initial_project(project):
-            export_yaml = self.client.export_project(summary.id)
-            return self._dispatch_reason(project, export_yaml, "initial")
         has_managed_audit_work = any(
             audit_graph.managed_description(intent.description)
             and intent.to is None
@@ -1366,11 +1363,6 @@ class DispatcherLoop:
 
     def _project_open_intent_count(self, project: ProjectDetail) -> int:
         return sum(1 for intent in project.intents if intent.to is None and intent.concluded_at is None)
-
-    def _is_initial_project(self, project: ProjectDetail) -> bool:
-        fact_ids = {fact.id for fact in project.facts}
-        if fact_ids != {"origin", "goal"} or len(project.facts) != 2:
-            return False
 
     def _reason_trigger(self, project: ProjectDetail) -> str | None:
         if project.project.event_seq > project.project.reason_last_seen_event_seq:
