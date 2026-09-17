@@ -16,7 +16,7 @@ from linen.dispatcher.protocol.client import LinenClient
 from linen.dispatcher.runtime.backend import LocalBackend
 from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.process import ProcessResult
-from linen.dispatcher.tasks import bootstrap, explore, reason, review
+from linen.dispatcher.tasks import explore, reason, review
 from linen.dispatcher.tasks.common import run_worker_process
 from linen.dispatcher.workers.base import DriverResult
 from linen.server import db
@@ -40,8 +40,7 @@ def config(tmp_path, *, audit=True, scan=False, mode="hypothesis"):
         "server": "http://testserver",
         "runtime": {"interval": 60, "max_workers": 2, "max_running_projects": 1,
                     "max_project_workers": 1, "healthcheck_timeout": 5, "prompt_group": "vuln_audit"},
-        "tasks": {"bootstrap": {"timeout": 5, "conclude_timeout": 5},
-                  "reason": {"timeout": 5}, "explore": {"timeout": 5, "conclude_timeout": 5}},
+        "tasks": {"reason": {"timeout": 5}, "explore": {"timeout": 5, "conclude_timeout": 5}},
         "local": {"workspace_root": str(tmp_path / "work")},
         "workers": [{"name": "tester", "type": "mock", "task_types": ["reason", "explore", "review"],
                      "max_running": 1, "priority": 0}],
@@ -53,7 +52,7 @@ def config(tmp_path, *, audit=True, scan=False, mode="hypothesis"):
 def project(api, repo=None, *, audit_mode="none"):
     http, client = api
     body = {"title": "audit", "origin": "source", "goal": "verify hypothesis",
-            "bootstrap_enabled": False, "audit_mode": audit_mode}
+            "audit_mode": audit_mode}
     if repo:
         body["repo_root"] = str(repo)
     response = http.post("/projects", json=body)
@@ -229,67 +228,6 @@ def test_scope_is_the_default_audit_mode_and_recon_is_explicit(tmp_path):
     raw["audit"]["recon"] = {"enabled": True}
     assert DispatchConfig.model_validate(raw).audit.recon.enabled
 
-
-def test_audit_recon_records_non_authoritative_fact_without_completing(api, tmp_path, monkeypatch):
-    """Optional bootstrap is a recon record, never an audit completion path."""
-    _, client = api
-    cfg_raw = config(tmp_path, mode="scope").model_dump()
-    cfg_raw["audit"]["recon"] = {"enabled": True}
-    cfg_raw["workers"][0]["task_types"] = ["bootstrap", "reason", "explore", "review"]
-    cfg = DispatchConfig.model_validate(cfg_raw)
-    current = project(api, audit_mode="scope")
-    pid = current.project.id
-    intent_id = client.create_intent(pid, ["origin"], "bootstrap", "dispatcher.bootstrap").data["id"]
-    client.heartbeat(pid, intent_id, cfg.workers[0].name)
-    current = client.get_project(pid)
-    intent = next(intent for intent in current.intents if intent.id == intent_id)
-    driver = FakeDriver()
-    monkeypatch.setattr(bootstrap, "get_driver", lambda _: driver)
-    monkeypatch.setattr(bootstrap, "run_worker_process", lambda *a, **kw: ProcessResult(0, json.dumps({
-        "accepted": True,
-        "data": {"fact": {"description": "candidate map", "type": "source", "evidence": "repo/a.py:1"},
-                 "complete": {"description": "must be ignored"}},
-    }), ""))
-    assert bootstrap.run_bootstrap_task(
-        cfg, client, LocalBackend(cfg.local, client), current, intent, cfg.workers[0], TaskCancellation()
-    ) == "success"
-    final = client.get_project(pid)
-    recon = next(fact for fact in final.facts if fact.id not in {"origin", "goal"})
-    assert final.project.status == "active"
-    assert recon.type == "recon"
-    assert recon.status == "draft"
-    assert "candidate map" in recon.description
-
-
-def test_audit_dispatcher_keeps_non_audit_bootstrap_behavior(api, tmp_path, monkeypatch):
-    _, client = api
-    cfg_raw = config(tmp_path, mode="scope").model_dump()
-    cfg_raw["audit"]["recon"] = {"enabled": True}
-    cfg_raw["workers"][0]["task_types"] = ["bootstrap", "reason", "explore", "review"]
-    cfg = DispatchConfig.model_validate(cfg_raw)
-    current = project(api, audit_mode="none")
-    pid = current.project.id
-    intent_id = client.create_intent(pid, ["origin"], "bootstrap", "dispatcher.bootstrap").data["id"]
-    client.heartbeat(pid, intent_id, cfg.workers[0].name)
-    current = client.get_project(pid)
-    intent = next(item for item in current.intents if item.id == intent_id)
-    monkeypatch.setattr(bootstrap, "get_driver", lambda _: FakeDriver())
-    monkeypatch.setattr(bootstrap, "run_worker_process", lambda *a, **kw: ProcessResult(0, json.dumps({
-        "accepted": True,
-        "data": {
-            "fact": {"description": "ordinary bootstrap result"},
-            "complete": {"description": "ordinary project complete"},
-        },
-    }), ""))
-
-    assert bootstrap.run_bootstrap_task(
-        cfg, client, LocalBackend(cfg.local, client), current, intent,
-        cfg.workers[0], TaskCancellation(),
-    ) == "success"
-    final = client.get_project(pid)
-    produced = next(fact for fact in final.facts if fact.id not in {"origin", "goal"})
-    assert final.project.status == "completed"
-    assert produced.type != "recon"
 
 
 def test_worker_execution_records_preserve_replay_metadata_and_output(tmp_path):

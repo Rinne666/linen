@@ -5,7 +5,7 @@ import json
 from linen.dispatcher.protocol.client import ApiResult
 from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.process import ProcessResult
-from linen.dispatcher.tasks import bootstrap, review
+from linen.dispatcher.tasks import review
 
 from conftest import (
     FakeClient,
@@ -35,40 +35,6 @@ def _context_required() -> str:
             },
         },
     })
-
-
-def test_bootstrap_context_request_is_rejected_without_conclude(monkeypatch) -> None:
-    config = make_config()
-    project = make_project(intents=[make_intent()])
-    client = FakeClient(project)
-    backend = FakeContainerManager()
-    driver = FakeDriver()
-    lease = FakeLease()
-
-    monkeypatch.setattr(bootstrap, "get_driver", lambda *_args: driver)
-    monkeypatch.setattr(bootstrap.HeartbeatLease, "for_intent", _lease_factory(lease))
-    monkeypatch.setattr(
-        bootstrap,
-        "run_worker_process",
-        lambda *_args, **_kwargs: ProcessResult(0, _context_required(), ""),
-    )
-
-    outcome = bootstrap.run_bootstrap_task(
-        config,
-        client,
-        backend,
-        project,
-        project.intents[0],
-        config.workers[0],
-        TaskCancellation(),
-    )
-
-    assert outcome == "failed"
-    assert client.released == [("proj_001", "i001", "test-worker")]
-    assert client.concluded == []
-    assert client.completed == []
-    assert driver.conclude_prompts == []
-    assert lease.started and lease.stopped
 
 
 def test_review_context_request_is_rejected_and_sandbox_is_cleaned(monkeypatch) -> None:

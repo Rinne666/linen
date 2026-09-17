@@ -98,7 +98,6 @@ def _export_yaml(conn, project_id: str) -> str:
             "plan_revision": proj["plan_revision"],
             "origin": origin_desc,
             "goal": goal_desc,
-            "bootstrap_enabled": bool(proj["bootstrap_enabled"]),
             "audit_mode": proj["audit_mode"] if "audit_mode" in proj.keys() else "none",
         }
     }

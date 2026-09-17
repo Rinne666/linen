@@ -223,7 +223,6 @@ def list_projects():
                 graph_revision=row["graph_revision"],
                 source_generation=row["source_generation"] if "source_generation" in row.keys() else 1,
                 plan_revision=row["plan_revision"] if "plan_revision" in row.keys() else 1,
-                bootstrap_enabled=bool(row["bootstrap_enabled"]),
                 completion_policy=row["completion_policy"] if "completion_policy" in row.keys() else "goal_based",
                 reason_last_seen_event_seq=row["reason_last_seen_event_seq"] if "reason_last_seen_event_seq" in row.keys() else 0,
                 event_seq=row["latest_event_seq"] if "latest_event_seq" in row.keys() else 0,
@@ -278,9 +277,9 @@ def create_project(body: CreateProjectRequest):
 
             conn.execute(
                 "INSERT INTO projects (id, title, status, graph_revision, source_generation, plan_revision, "
-                "bootstrap_enabled, completion_policy, audit_mode, created_at, repo_root) "
-                "VALUES (?, ?, 'active', 1, 1, 1, ?, ?, ?, ?, ?)",
-                (pid, body.title, body.bootstrap_enabled, body.completion_policy, body.audit_mode, now, resolved_repo_root),
+                "completion_policy, audit_mode, created_at, repo_root) "
+                "VALUES (?, ?, 'active', 1, 1, 1, ?, ?, ?, ?)",
+                (pid, body.title, body.completion_policy, body.audit_mode, now, resolved_repo_root),
             )
             conn.execute(
                 "INSERT INTO facts (id, project_id, description, display_title, semantic_type, source_generation) "
@@ -313,7 +312,6 @@ def create_project(body: CreateProjectRequest):
                 payload={
                     "title": body.title,
                     "audit_mode": body.audit_mode,
-                    "bootstrap_enabled": body.bootstrap_enabled,
                     "completion_policy": body.completion_policy,
                 },
                 created_at=now,
@@ -327,7 +325,6 @@ def create_project(body: CreateProjectRequest):
                     graph_revision=1,
                     source_generation=1,
                     plan_revision=1,
-                    bootstrap_enabled=body.bootstrap_enabled,
                     completion_policy=body.completion_policy,
                     audit_mode=body.audit_mode,
                     created_at=now,

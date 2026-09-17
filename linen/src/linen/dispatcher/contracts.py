@@ -94,23 +94,6 @@ def _looks_like_reason_data(payload: dict[str, Any]) -> bool:
     return False
 
 
-def _looks_like_bootstrap_execute_data(payload: dict[str, Any]) -> bool:
-    if not isinstance(payload, dict) or set(payload) not in ({"fact"}, {"fact", "complete"}):
-        return False
-    return _is_dict(payload.get("fact")) and (
-        "complete" not in payload or _is_dict(payload.get("complete"))
-    )
-
-
-def _looks_like_bootstrap_conclude_data(payload: dict[str, Any]) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    keys = set(payload)
-    if keys not in ({"fact"}, {"fact", "complete"}):
-        return False
-    return _is_dict(payload.get("fact"))
-
-
 def _looks_like_explore_data(payload: dict[str, Any]) -> bool:
     return isinstance(payload, dict) and set(payload) == {"description"}
 
@@ -168,69 +151,6 @@ def _optional_text(value: Any) -> str | None:
         return None
     text = value.strip()
     return text or None
-
-
-def validate_bootstrap_execute_payload(payload: dict[str, Any]) -> tuple[str, dict[str, str | None] | None]:
-    accepted, data = _unwrap_wrapped_payload(payload)
-    if accepted is False:
-        return "rejected", None
-    if accepted is None:
-        if not _looks_like_bootstrap_execute_data(payload):
-            raise ValueError("accepted must be true or false")
-        data = payload
-    if not isinstance(data, dict):
-        raise ValueError("accepted must be true or false")
-
-    fact = data.get("fact")
-    if not isinstance(fact, dict):
-        raise ValueError("fact is required")
-    fact_description = fact.get("description")
-    if not isinstance(fact_description, str) or not fact_description.strip():
-        raise ValueError("fact.description is required")
-
-    result: dict[str, str | None] = {"fact_description": fact_description.strip()}
-    fact_type = _optional_text(fact.get("type"))
-    if fact.get("type") is not None and fact_type is None:
-        raise ValueError("fact.type must be a non-empty string when provided")
-    fact_evidence = _optional_text(fact.get("evidence"))
-    if fact.get("evidence") is not None and fact_evidence is None:
-        raise ValueError("fact.evidence must be a non-empty string when provided")
-    result["fact_type"] = fact_type
-    result["fact_evidence"] = fact_evidence
-
-    complete = data.get("complete")
-    if complete is None:
-        result["complete_description"] = None
-        return "fact", result
-    if not isinstance(complete, dict):
-        raise ValueError("complete must be an object")
-    complete_description = complete.get("description")
-    if not isinstance(complete_description, str) or not complete_description.strip():
-        raise ValueError("complete.description is required")
-    result["complete_description"] = complete_description.strip()
-    return "complete", result
-
-
-def validate_bootstrap_conclude_payload(payload: dict[str, Any]) -> tuple[str, str | None]:
-    accepted, data = _unwrap_wrapped_payload(payload)
-    if accepted is False:
-        return "rejected", None
-    if accepted is None:
-        if not _looks_like_bootstrap_conclude_data(payload):
-            raise ValueError("accepted must be true or false")
-        data = payload
-    if not isinstance(data, dict):
-        raise ValueError("accepted must be true or false")
-    extra_keys = set(data) - {"fact", "complete"}
-    if extra_keys:
-        raise ValueError("unexpected keys in conclude payload")
-    fact = data.get("fact")
-    if not isinstance(fact, dict):
-        raise ValueError("fact is required")
-    fact_description = fact.get("description")
-    if not isinstance(fact_description, str) or not fact_description.strip():
-        raise ValueError("fact.description is required")
-    return "fact", fact_description.strip()
 
 
 def validate_explore_payload(payload: dict[str, Any]) -> tuple[str, dict[str, str | None] | None]:

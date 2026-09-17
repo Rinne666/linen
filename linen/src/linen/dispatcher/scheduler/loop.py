@@ -20,14 +20,13 @@ from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, scop
 from linen.dispatcher.analysis.external_scanners import scanner_for_intent, scanner_specs
 from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
-from linen.dispatcher.models import AuditGraphCheckpoint, ReasonCheckpoint, RunningTask
+from linen.dispatcher.models import AuditGraphCheckpoint, RunningTask
 from linen.dispatcher.protocol.client import LinenClient
 from linen.dispatcher.runtime.backend import LocalBackend
 from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.startup_healthcheck import format_failure_summary, run_startup_healthchecks
 from linen.dispatcher.scheduler.worker_select import choose_worker
 from linen.dispatcher.workers.registry import get_driver
-from linen.dispatcher.tasks.bootstrap import run_bootstrap_task  # legacy historical rows only
 from linen.dispatcher.tasks.explore import run_explore_task
 from linen.dispatcher.tasks.reason import run_audit_graph_reason_task, run_reason_task
 from linen.dispatcher.tasks.review import run_review_task
@@ -59,7 +58,6 @@ class DispatcherLoop:
         self.cleanup_executor = ThreadPoolExecutor(max_workers=max(1, min(8, self.config.runtime.max_workers)))
         self.futures: dict[Future[str], RunningTask] = {}
         self.cleanup_futures: dict[Future[bool], tuple[str, str | None, str | None]] = {}
-        self.reason_checkpoints: dict[str, ReasonCheckpoint] = {}
         self.audit_graph_checkpoints: dict[str, AuditGraphCheckpoint] = {}
         self.runtime_project_ids: set[str] = set()
         self.worker_unhealthy_until: dict[str, float] = {}
@@ -100,7 +98,6 @@ class DispatcherLoop:
                     self._reap_cleanup_futures()
                     summaries = self.client.list_projects()
                     self._recover_orphan_runs(summaries)
-                    self._initialize_reason_checkpoints(summaries)
                     self._refresh_runtime_projects(summaries)
                     self._cancel_inactive_tasks(summaries)
                     self._queue_container_cleanups(summaries)
@@ -295,27 +292,10 @@ class DispatcherLoop:
                         attempts=max(prior_attempts, attempt),
                     )
                 elif task_type in {"reason", "reason_execute"}:
-                    checkpoints = getattr(self, "reason_checkpoints", None)
-                    if checkpoints is None:
-                        checkpoints = {}
-                        self.reason_checkpoints = checkpoints
-                    prior = checkpoints.get(project_id)
-                    if prior is None or prior.graph_revision != graph_revision:
-                        checkpoints[project_id] = ReasonCheckpoint(
-                            fact_count=summary.fact_count,
-                            hint_count=summary.hint_count,
-                            open_intent_count=(
-                                summary.working_intent_count
-                                + summary.unclaimed_intent_count
-                            ),
-                            graph_revision=graph_revision,
-                            attempts=attempt,
-                            last_attempt_failed=True,
-                            review_count=summary.review_count,
-                        )
-                    else:
-                        prior.attempts = max(prior.attempts, attempt)
-                        prior.last_attempt_failed = True
+                    LOG.info(
+                        "reason run recovered project=%s event_seq=%s attempt=%s; cursor remains unacknowledged",
+                        project_id, graph_revision, attempt,
+                    )
 
     def _report_orphan_intent_error(
         self,
@@ -328,7 +308,6 @@ class DispatcherLoop:
         if reporter is None:
             return
         normalized_type = {
-            "bootstrap": "bootstrap",
             "explore": "explore",
             "explore_execute": "explore",
             "review": "review",
@@ -804,32 +783,6 @@ class DispatcherLoop:
             )
         return written
 
-    def _dispatch_initial_project(self, project: ProjectDetail) -> bool:
-        intent = self._get_bootstrap_intent(project)
-        if intent is None:
-            intent = self._create_bootstrap_intent(project.project.id)
-            if intent is None:
-                return False
-        if self._project_has_running_bootstrap(project.project.id):
-            self._log_changed(
-                f"project:{project.project.id}:skip:bootstrap_running",
-                logging.DEBUG,
-                "skip bootstrap project=%s because bootstrap task is already running locally",
-                project.project.id,
-            )
-            return False
-        if intent.worker is not None:
-            self._log_changed(
-                f"project:{project.project.id}:skip:bootstrap_claimed",
-                logging.DEBUG,
-                "skip bootstrap project=%s because bootstrap intent=%s is already claimed by %s",
-                project.project.id,
-                intent.id,
-                intent.worker,
-            )
-            return False
-        return self._dispatch_bootstrap(project, intent)
-
     @staticmethod
     def _intent_attempt(
         project: ProjectDetail,
@@ -868,14 +821,6 @@ class DispatcherLoop:
         match = re.search(r"(?:^|:)attempt:(\d+)(?:$|,)", trigger)
         if match is not None:
             return max(1, int(match.group(1)))
-        checkpoint = self.reason_checkpoints.get(project.project.id)
-        if (
-            profile == "default"
-            and checkpoint is not None
-            and checkpoint.last_attempt_failed
-            and checkpoint.graph_revision == project.project.graph_revision
-        ):
-            return max(1, checkpoint.attempts + 1)
         return 1
 
     def _submit_task_runner(self, runner, *args, **kwargs):
@@ -987,9 +932,6 @@ class DispatcherLoop:
             worker.name,
             cancellation,
             intent_id=None,
-            fact_count=len(project.facts),
-            hint_count=len(project.hints),
-            open_intent_count=self._project_open_intent_count(project),
             intent_count=len(project.intents),
             reason_profile=profile,
             graph_revision=project.project.graph_revision,
@@ -1002,76 +944,6 @@ class DispatcherLoop:
             "dispatched reason project=%s worker=%s profile=%s trigger=%s",
             project.project.id, worker.name, profile, trigger,
         )
-        return True
-
-    def _dispatch_bootstrap(self, project: ProjectDetail, intent: Intent) -> bool:
-        selection = self._select_worker(project.project.id, "bootstrap")
-        worker = selection.worker
-        if worker is None:
-            self._log_changed(
-                f"project:{project.project.id}:worker:bootstrap",
-                logging.INFO,
-                "no worker available for bootstrap project=%s intent=%s blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s",
-                project.project.id,
-                intent.id,
-                selection.blocked_busy,
-                selection.blocked_unhealthy,
-                selection.blocked_rejected,
-            )
-            return False
-        self._clear_log_state(f"project:{project.project.id}:worker:bootstrap")
-        trigger = f"bootstrap:intent:{intent.id}"
-        attempt = self._intent_attempt(project, intent, task_type="bootstrap")
-        claim = self.client.heartbeat(project.project.id, intent.id, worker.name)
-        if claim.status_code in (403, 409):
-            level = logging.INFO if claim.status_code == 403 else logging.WARNING
-            LOG.log(
-                level,
-                "bootstrap claim failed project=%s intent=%s worker=%s status=%s",
-                project.project.id,
-                intent.id,
-                worker.name,
-                claim.status_code,
-            )
-            return False
-        if not claim.ok:
-            LOG.warning(
-                "bootstrap claim failed project=%s intent=%s worker=%s status=%s",
-                project.project.id,
-                intent.id,
-                worker.name,
-                claim.status_code,
-            )
-            return False
-        try:
-            future = self._submit_task_runner(
-                run_bootstrap_task,
-                self.config,
-                self.client,
-                self.container_manager,
-                project,
-                intent,
-                worker,
-                cancellation := TaskCancellation(),
-                trigger=trigger,
-                attempt=attempt,
-            )
-        except Exception:
-            LOG.exception("failed to submit bootstrap task project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
-            self._best_effort_release(project.project.id, intent.id, worker.name)
-            return False
-        self.futures[future] = RunningTask(
-            project.project.id,
-            "bootstrap",
-            worker.name,
-            cancellation,
-            intent_id=intent.id,
-            attempt=attempt,
-            trigger=trigger,
-        )
-        self.runtime_project_ids.add(project.project.id)
-        self._clear_project_log_state(project.project.id)
-        LOG.info("dispatched bootstrap project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
         return True
 
     def _dispatch_explore(self, project: ProjectDetail, export_yaml: str, intent: Intent) -> bool:
@@ -1478,9 +1350,6 @@ class DispatcherLoop:
         summary.sort()
         return summary
 
-    def _project_has_running_bootstrap(self, project_id: str) -> bool:
-        return any(task.project_id == project_id and task.task_type == "bootstrap" for task in self.futures.values())
-
     def _project_has_running_reason(self, project_id: str) -> bool:
         return any(task.project_id == project_id and task.task_type == "reason" for task in self.futures.values())
 
@@ -1498,26 +1367,6 @@ class DispatcherLoop:
     def _project_open_intent_count(self, project: ProjectDetail) -> int:
         return sum(1 for intent in project.intents if intent.to is None and intent.concluded_at is None)
 
-    # Read-only compatibility predicates for older embedders/tests.  The
-    # scheduler no longer calls these predicates to create or dispatch a
-    # bootstrap task; new projects go directly from project_created to
-    # Reason.  Keeping this narrow inspection avoids breaking clients that
-    # still display historical bootstrap rows during migration.
-    @staticmethod
-    def _is_bootstrap_intent(intent: Intent) -> bool:
-        return (
-            intent.description == "bootstrap"
-            and intent.creator == "dispatcher.bootstrap"
-            and intent.from_ == ["origin"]
-            and intent.to is None
-        )
-
-    def _get_bootstrap_intent(self, project: ProjectDetail) -> Intent | None:
-        return next((intent for intent in project.intents if self._is_bootstrap_intent(intent)), None)
-
-    def _project_requires_bootstrap(self, project: ProjectDetail) -> bool:
-        return self._get_bootstrap_intent(project) is not None
-
     def _is_initial_project(self, project: ProjectDetail) -> bool:
         fact_ids = {fact.id for fact in project.facts}
         if fact_ids != {"origin", "goal"} or len(project.facts) != 2:
@@ -1529,38 +1378,7 @@ class DispatcherLoop:
                 f"events:{project.project.reason_last_seen_event_seq}"
                 f"->{project.project.event_seq}"
             )
-        open_intent_count = self._project_open_intent_count(project)
-        checkpoint = self.reason_checkpoints.get(project.project.id)
-        if checkpoint is None:
-            return "initial"
-        changes: list[str] = []
-        if project.project.graph_revision > checkpoint.graph_revision:
-            changes.append(
-                f"graph_revision:{checkpoint.graph_revision}->{project.project.graph_revision}"
-            )
-        if len(project.facts) > checkpoint.fact_count:
-            changes.append(f"facts:{checkpoint.fact_count}->{len(project.facts)}")
-        if len(project.hints) > checkpoint.hint_count:
-            changes.append(f"hints:{checkpoint.hint_count}->{len(project.hints)}")
-        if checkpoint.open_intent_count > 0 and open_intent_count == 0:
-            changes.append(f"open_intents:{checkpoint.open_intent_count}->0")
-        if len(project.reviews) > checkpoint.review_count:
-            changes.append(f"reviews:{checkpoint.review_count}->{len(project.reviews)}")
-        if not changes:
-            # A failed ordinary Reason execution is retried once after the
-            # persisted retry window.  The second failure is promoted to a
-            # blocked intent by the server's error ledger.
-            if (
-                checkpoint.last_attempt_failed
-                and checkpoint.graph_revision == project.project.graph_revision
-                and checkpoint.attempts < 2
-            ):
-                return (
-                    f"reason:revision:{project.project.graph_revision}:"
-                    f"attempt:{checkpoint.attempts + 1}"
-                )
-            return None
-        return ",".join(changes)
+        return None
 
     def _audit_graph_reason_trigger(self, project: ProjectDetail) -> str | None:
         graph_config = self.config.audit.graph_reason
@@ -1673,20 +1491,6 @@ class DispatcherLoop:
                             graph_revision=fresh.project.graph_revision,
                             attempts=self.config.audit.graph_reason.max_attempts_per_revision,
                         )
-                        # When the interpretation pass created work, establish
-                        # the normal Reason baseline too. This lets Explore
-                        # consume the new intents before ordinary Reason runs.
-                        if (
-                            task.intent_count is not None
-                            and len(fresh.intents) > task.intent_count
-                        ):
-                            self.reason_checkpoints[task.project_id] = ReasonCheckpoint(
-                                fact_count=len(fresh.facts),
-                                hint_count=len(fresh.hints),
-                                open_intent_count=self._project_open_intent_count(fresh),
-                                graph_revision=fresh.project.graph_revision,
-                                review_count=len(fresh.reviews),
-                            )
                     elif outcome != "cancelled":
                         attempts = (
                             prior.attempts + 1
@@ -1705,34 +1509,6 @@ class DispatcherLoop:
                             self.config.audit.graph_reason.max_attempts_per_revision,
                             outcome,
                         )
-                elif (
-                    task.task_type == "reason"
-                    and task.reason_profile != "audit_graph"
-                    and outcome != "cancelled"
-                ):
-                    fresh = self.client.get_project(task.project_id)
-                    checkpoint = ReasonCheckpoint(
-                        fact_count=len(fresh.facts),
-                        hint_count=len(fresh.hints),
-                        open_intent_count=self._project_open_intent_count(fresh),
-                        graph_revision=fresh.project.graph_revision,
-                        review_count=len(fresh.reviews),
-                        # Keep successful checkpoints compatible with the
-                        # legacy value (zero); retry state is only meaningful
-                        # after a failed execution.
-                        attempts=(task.attempt or 1) if outcome != "success" else 0,
-                        last_attempt_failed=outcome not in {"success", "blocked"},
-                    )
-                    self.reason_checkpoints[task.project_id] = checkpoint
-                    LOG.debug(
-                        "reason checkpoint updated project=%s revision=%s facts=%s hints=%s reviews=%s open_intents=%s",
-                        task.project_id,
-                        checkpoint.graph_revision,
-                        checkpoint.fact_count,
-                        checkpoint.hint_count,
-                        checkpoint.review_count,
-                        checkpoint.open_intent_count,
-                    )
             except Exception as exc:
                 LOG.exception("task crashed project=%s task=%s worker=%s", task.project_id, task.task_type, task.worker_name)
                 self._record_intent_error(task, "task_crashed", detail=str(exc))
@@ -1924,32 +1700,6 @@ class DispatcherLoop:
                     task.worker_name,
                     status,
                 )
-
-    def _initialize_reason_checkpoints(self, summaries: list[ProjectSummary]) -> None:
-        for summary in summaries:
-            if summary.status != "active":
-                continue
-            if summary.id in self.reason_checkpoints:
-                continue
-            open_intent_count = summary.working_intent_count + summary.unclaimed_intent_count
-            if open_intent_count == 0:
-                continue
-            self.reason_checkpoints[summary.id] = ReasonCheckpoint(
-                fact_count=summary.fact_count,
-                hint_count=summary.hint_count,
-                open_intent_count=open_intent_count,
-                graph_revision=summary.graph_revision,
-                review_count=summary.review_count,
-            )
-            LOG.debug(
-                "reason checkpoint initialized project=%s revision=%s facts=%s hints=%s reviews=%s open_intents=%s",
-                summary.id,
-                summary.graph_revision,
-                summary.fact_count,
-                summary.hint_count,
-                summary.review_count,
-                open_intent_count,
-            )
 
     def _best_effort_release(self, project_id: str, intent_id: str, worker_name: str) -> None:
         response = self.client.release(project_id, intent_id, worker_name)

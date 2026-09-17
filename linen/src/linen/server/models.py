@@ -471,7 +471,6 @@ class ProjectMeta(BaseModel):
     graph_revision: int = 0
     source_generation: int = 1
     plan_revision: int = 1
-    bootstrap_enabled: bool
     completion_policy: Literal["goal_based", "exhaustive"] = "goal_based"
     reason_last_seen_event_seq: int = 0
     event_seq: int = 0
@@ -726,7 +725,6 @@ class CreateProjectRequest(BaseModel):
     title: str
     origin: str
     goal: str
-    bootstrap_enabled: bool = True
     completion_policy: Literal["goal_based", "exhaustive"] = "goal_based"
     audit_mode: Literal["none", "hypothesis", "scope"] = "none"
     hints: list[CreateHintInline] | None = None

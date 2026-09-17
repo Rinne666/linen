@@ -353,7 +353,6 @@ def project_meta_from_row(row: sqlite3.Row) -> ProjectMeta:
         graph_revision=row["graph_revision"],
         source_generation=row["source_generation"] if "source_generation" in row.keys() else 1,
         plan_revision=row["plan_revision"] if "plan_revision" in row.keys() else 1,
-        bootstrap_enabled=bool(row["bootstrap_enabled"]),
         completion_policy=row["completion_policy"] if "completion_policy" in row.keys() else "goal_based",
         reason_last_seen_event_seq=(
             row["reason_last_seen_event_seq"]

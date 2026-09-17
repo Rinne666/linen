@@ -11,7 +11,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-TaskType = Literal["reason", "explore", "bootstrap", "review"]
+TaskType = Literal["reason", "explore", "review"]
 WorkerType = Literal["claudecode", "codex", "pi", "mock"]
 WorkerHealthcheckMode = Literal["startup_and_task", "startup_only", "disabled"]
 LocalCompletedAction = Literal["keep", "remove"]
@@ -31,8 +31,6 @@ DEFAULT_PROMPT_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
     "review.md": ("{graph_yaml}", "{intent_id}", "{fact_block}", "{intent_description}"),
     "review_cold_verifier.md": ("{graph_yaml}", "{intent_id}", "{fact_block}", "{intent_description}"),
     "review_contradiction_reasoner.md": ("{graph_yaml}", "{intent_id}", "{fact_block}", "{intent_description}"),
-    "bootstrap.md": ("{origin}", "{goal}", "{hints}"),
-    "bootstrap_conclude.md": ("{origin}", "{goal}", "{hints}"),
 }
 
 PROMPT_REQUIRED_TOKENS_BY_GROUP: dict[str, dict[str, tuple[str, ...]]] = {
@@ -46,8 +44,6 @@ PROMPT_REQUIRED_TOKENS_BY_GROUP: dict[str, dict[str, tuple[str, ...]]] = {
         "review.md": ("{intent_id}", "{fact_block}", "{intent_description}"),
         "review_cold_verifier.md": ("{intent_id}", "{fact_block}", "{intent_description}"),
         "review_contradiction_reasoner.md": ("{intent_id}", "{fact_block}", "{intent_description}"),
-        "bootstrap.md": ("{origin}", "{goal}", "{hints}"),
-        "bootstrap_conclude.md": ("{origin}", "{goal}", "{hints}"),
     },
     "vuln_audit": {
         **DEFAULT_PROMPT_REQUIRED_TOKENS,
@@ -62,8 +58,6 @@ MOCK_ALLOWED_OUTCOMES: dict[str, frozenset[str]] = {
     "reason": frozenset({"complete", "intent", "noop", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
     "explore_execute": frozenset({"fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
     "explore_conclude": frozenset({"fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
-    "bootstrap": frozenset({"complete", "fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
-    "bootstrap_conclude": frozenset({"fact", "rejected", "invalid_json", "invalid_payload", "command_fail"}),
 }
 
 MOCK_DEFAULT_BEHAVIOR: dict[str, dict[str, Any]] = {
@@ -103,27 +97,6 @@ MOCK_DEFAULT_BEHAVIOR: dict[str, dict[str, Any]] = {
             "command_fail": "0.0",
         },
     },
-    "bootstrap": {
-        "delay": [0.05, 0.3],
-        "outcomes": {
-            "complete": "1.0",
-            "fact": "0.0",
-            "rejected": "0.0",
-            "invalid_json": "0.0",
-            "invalid_payload": "0.0",
-            "command_fail": "0.0",
-        },
-    },
-    "bootstrap_conclude": {
-        "delay": [0.05, 0.3],
-        "outcomes": {
-            "fact": "1.0",
-            "rejected": "0.0",
-            "invalid_json": "0.0",
-            "invalid_payload": "0.0",
-            "command_fail": "0.0",
-        },
-    },
 }
 
 MOCK_ALLOWED_ENV_KEYS = frozenset(
@@ -137,11 +110,6 @@ class ReasonTaskConfig(BaseModel):
 
 
 class ExploreTaskConfig(BaseModel):
-    timeout: int = Field(gt=0)
-    conclude_timeout: int = Field(gt=0)
-
-
-class BootstrapTaskConfig(BaseModel):
     timeout: int = Field(gt=0)
     conclude_timeout: int = Field(gt=0)
 

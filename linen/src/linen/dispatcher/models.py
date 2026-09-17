@@ -12,9 +12,6 @@ class RunningTask:
     worker_name: str
     cancellation: TaskCancellation
     intent_id: str | None = None
-    fact_count: int | None = None
-    hint_count: int | None = None
-    open_intent_count: int | None = None
     intent_count: int | None = None
     reason_profile: str = "default"
     graph_revision: int | None = None
@@ -28,19 +25,6 @@ class RunningTask:
     worker_manifest_digest: str | None = None
     # Stable scheduler cause used to reconstruct the same logical run.
     trigger: str | None = None
-
-
-@dataclass(slots=True)
-class ReasonCheckpoint:
-    fact_count: int
-    hint_count: int
-    open_intent_count: int
-    graph_revision: int = 0
-    review_count: int = 0
-    # Scheduler-owned retry state.  Defaults preserve compatibility with
-    # checkpoints persisted/constructed before vNext retry wiring.
-    attempts: int = 0
-    last_attempt_failed: bool = False
 
 
 @dataclass(slots=True)

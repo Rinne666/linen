@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS projects (
     -- updates deliberately do not advance it because they are control-plane
     -- state rather than graph knowledge.
     graph_revision INTEGER NOT NULL DEFAULT 0,
+    -- Legacy storage column retained only for additive migration; runtime no
+    -- longer reads it and new APIs do not expose bootstrap.
     bootstrap_enabled INTEGER NOT NULL DEFAULT 1,
     completion_policy TEXT NOT NULL DEFAULT 'goal_based'
         CHECK (completion_policy IN ('goal_based', 'exhaustive')),
@@ -407,13 +409,15 @@ def _ensure_project_columns(conn: sqlite3.Connection) -> None:
         if name not in columns:
             conn.execute(f"ALTER TABLE projects ADD COLUMN {name} TEXT")
     if "bootstrap_enabled" not in columns:
+        # Historical storage compatibility only. Runtime no longer exposes
+        # or consults this field.
         conn.execute("ALTER TABLE projects ADD COLUMN bootstrap_enabled INTEGER NOT NULL DEFAULT 1")
-    if "repo_root" not in columns:
-        conn.execute("ALTER TABLE projects ADD COLUMN repo_root TEXT")
         if "bootstrap_mode" in columns:
             conn.execute(
                 "UPDATE projects SET bootstrap_enabled = CASE WHEN bootstrap_mode = 'disabled' THEN 0 ELSE 1 END"
             )
+    if "repo_root" not in columns:
+        conn.execute("ALTER TABLE projects ADD COLUMN repo_root TEXT")
     if "completion_policy" not in columns:
         conn.execute("ALTER TABLE projects ADD COLUMN completion_policy TEXT NOT NULL DEFAULT 'goal_based'")
     if "reason_last_seen_event_seq" not in columns:

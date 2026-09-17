@@ -141,8 +141,6 @@ def fact_display_title(
 
 def intent_metadata(description: str, intent_type: str | None) -> tuple[str, str, str, str]:
     value = (description or "").strip()
-    if value == "bootstrap":
-        return "Prepare audit context", "audit_task", "scope", "produces"
     for exact, title, phase, relation in INTENT_METADATA:
         if value == exact:
             return title, "audit_task", phase, relation

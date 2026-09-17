@@ -344,6 +344,7 @@ def run_audit_graph_reason_task(
     dispatcher as ordinary blackboard intents.
     """
     lease_id = lease_id or uuid.uuid4().hex
+    ack_event_seq: int | None = None
     driver = get_driver(worker.type)
     task_started = time.perf_counter()
     graph_config = config.audit.graph_reason
@@ -577,10 +578,14 @@ def run_audit_graph_reason_task(
             execute_ms,
             total_ms,
         )
+        ack_event_seq = project.project.event_seq
         return "success"
     finally:
         lease.stop()
-        best_effort_release_reason(client, project.project.id, worker.name, lease_id, project.project.event_seq)
+        best_effort_release_reason(
+            client, project.project.id, worker.name, lease_id, ack_event_seq,
+            ack=ack_event_seq is not None,
+        )
 
 
 def run_reason_task(
@@ -596,6 +601,7 @@ def run_reason_task(
     attempt: int = 1,
 ) -> str:
     lease_id = lease_id or uuid.uuid4().hex
+    ack_event_seq: int | None = None
     driver = get_driver(worker.type)
     task_started = time.perf_counter()
     healthcheck_timeout = config.runtime.healthcheck_timeout
@@ -860,10 +866,12 @@ def run_reason_task(
                         response = client.create_hint(project.project.id, message, "audit-policy")
                         if not response.ok:
                             return "failed"
+                    ack_event_seq = project.project.event_seq
                     return "success"
             response = client.complete(project.project.id, data["from"], data["description"], worker.name)
             if response.status_code == 403:
                 LOG.info("project became inactive during reason complete project=%s worker=%s", project.project.id, worker.name)
+                ack_event_seq = project.project.event_seq
                 return "success"
             if not response.ok:
                 LOG.warning(
@@ -882,6 +890,7 @@ def run_reason_task(
                 execute_ms,
                 total_ms,
             )
+            ack_event_seq = project.project.event_seq
             return "success"
         if kind == "intents":
             created = 0
@@ -915,6 +924,7 @@ def run_reason_task(
                 )
                 if response.status_code == 403:
                     LOG.info("project became inactive during reason intent create project=%s worker=%s created=%s", project.project.id, worker.name, created)
+                    ack_event_seq = project.project.event_seq
                     return "success"
                 if response.status_code == 409:
                     LOG.info("reason intent lost race project=%s worker=%s from=%s", project.project.id, worker.name, intent_data["from"])
@@ -955,6 +965,7 @@ def run_reason_task(
                     total_ms,
                 )
                 return "failed"
+            ack_event_seq = project.project.event_seq
             return "success"
         LOG.info(
             "reason finished without graph change project=%s worker=%s execute_ms=%s total_ms=%s",
@@ -963,7 +974,11 @@ def run_reason_task(
             execute_ms,
             total_ms,
         )
+        ack_event_seq = project.project.event_seq
         return "success"
     finally:
         lease.stop()
-        best_effort_release_reason(client, project.project.id, worker.name, lease_id, project.project.event_seq)
+        best_effort_release_reason(
+            client, project.project.id, worker.name, lease_id, ack_event_seq,
+            ack=ack_event_seq is not None,
+        )

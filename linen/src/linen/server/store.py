@@ -215,7 +215,6 @@ def list_contexts(conn: sqlite3.Connection, project_id: str) -> list[ContextProj
 def snapshot_from_db(conn: sqlite3.Connection, project_id: str) -> BlackboardSnapshot:
     project = get_project_or_404(conn, project_id)
     project_payload = {column: project[column] for column in project.keys() if column != "reason_worker"}
-    project_payload["bootstrap_enabled"] = bool(project_payload.get("bootstrap_enabled"))
     # Lease columns are operational state and are intentionally not exposed
     # as part of the graph snapshot.  This keeps snapshots stable across
     # heartbeats while preserving all semantic ProjectMeta revisions.

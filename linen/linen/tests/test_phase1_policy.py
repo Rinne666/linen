@@ -5,6 +5,8 @@ from fastapi.testclient import TestClient
 
 from linen.server import db
 from linen.server.app import app
+from linen.dispatcher.protocol.client import ApiResult
+from linen.dispatcher.tasks.common import best_effort_release_reason
 
 
 @pytest.fixture
@@ -50,3 +52,19 @@ def test_goal_based_completion_does_not_require_empty_queue(client) -> None:
     open_work = next(check for check in gate["checks"] if check["id"] == "open_work")
     assert open_work["status"] == "pass"
     assert open_work["blocking"] is False
+
+
+def test_reason_release_only_advances_cursor_on_success() -> None:
+    class FakeClient:
+        def __init__(self):
+            self.payloads = []
+
+        def release_reason(self, project_id, worker, lease_id, seen_event_seq=None):
+            self.payloads.append(seen_event_seq)
+            return ApiResult(200, {})
+
+    fake = FakeClient()
+    best_effort_release_reason(fake, "p", "w", "l", 12)
+    best_effort_release_reason(fake, "p", "w", "l", 12, ack=True)
+
+    assert fake.payloads == [None, 12]

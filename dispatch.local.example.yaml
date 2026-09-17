@@ -25,9 +25,6 @@ runtime:
   prompt_group: "default"
 
 tasks:
-  bootstrap:
-    timeout: 120
-    conclude_timeout: 30
   reason:
     timeout: 45
   explore:
@@ -58,7 +55,7 @@ local:
 workers:
   - name: "local-claude"
     type: "claudecode"
-    task_types: [bootstrap, reason, explore]
+    task_types: [reason, explore]
     max_running: 1
     priority: 0
 

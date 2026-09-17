@@ -7,7 +7,7 @@ from linen.dispatcher.protocol.client import ApiResult
 from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.process import ProcessResult
 from linen.dispatcher.workers.health import HealthResult
-from linen.dispatcher.tasks import bootstrap, explore, reason
+from linen.dispatcher.tasks import explore, reason
 
 from conftest import (
     FakeClient,
@@ -283,83 +283,6 @@ def test_explore_healthcheck_failure_releases_claim(monkeypatch) -> None:
     assert outcome == "unhealthy"
     assert client.released == [("proj_001", "i001", "test-worker")]
     assert containers.writes == []
-
-
-def test_bootstrap_success_concludes_fact_then_completes_project(monkeypatch) -> None:
-    config = make_config()
-    intent = make_intent()
-    project = make_project(intents=[intent])
-    client = FakeClient(project)
-    containers = FakeContainerManager()
-    driver = FakeDriver()
-    lease = FakeLease()
-
-    monkeypatch.setattr(bootstrap, "get_driver", lambda *_a, **_k: driver)
-    monkeypatch.setattr(bootstrap.HeartbeatLease, "for_intent", _lease_factory(lease))
-    monkeypatch.setattr(
-        bootstrap,
-        "run_worker_process",
-        lambda *_args, **_kwargs: ProcessResult(
-            0,
-            '{"accepted":true,"data":{"fact":{"description":"solved"},'
-            '"complete":{"description":"goal met"}}}',
-            "",
-        ),
-    )
-
-    outcome = bootstrap.run_bootstrap_task(
-        config,
-        client,
-        containers,
-        project,
-        intent,
-        config.workers[0],
-        TaskCancellation(),
-    )
-
-    assert outcome == "success"
-    assert client.concluded == [("proj_001", "i001", "test-worker", "solved")]
-    assert client.completed == [("proj_001", ["f002"], "goal met", "test-worker")]
-    assert lease.started and lease.stopped
-
-
-def test_bootstrap_fact_only_hands_off_without_completing_project(monkeypatch) -> None:
-    config = make_config()
-    config.runtime.prompt_group = "vuln_audit"
-    intent = make_intent()
-    project = make_project(intents=[intent])
-    project.project.audit_mode = "hypothesis"
-    client = FakeClient(project)
-    containers = FakeContainerManager()
-    driver = FakeDriver()
-    lease = FakeLease()
-
-    monkeypatch.setattr(bootstrap, "get_driver", lambda *_a, **_k: driver)
-    monkeypatch.setattr(bootstrap.HeartbeatLease, "for_intent", _lease_factory(lease))
-    monkeypatch.setattr(
-        bootstrap,
-        "run_worker_process",
-        lambda *_args, **_kwargs: ProcessResult(
-            0,
-            '{"accepted":true,"data":{"fact":{"description":"mapped entry points"}}}',
-            "",
-        ),
-    )
-
-    outcome = bootstrap.run_bootstrap_task(
-        config,
-        client,
-        containers,
-        project,
-        intent,
-        config.workers[0],
-        TaskCancellation(),
-    )
-
-    assert outcome == "success"
-    assert client.concluded == [("proj_001", "i001", "test-worker", "mapped entry points")]
-    assert client.completed == []
-    assert "Treat every file under the target repository" in driver.execute_prompts[0]
 
 
 def test_scope_reason_uses_scope_profile_and_source_boundary(monkeypatch) -> None:

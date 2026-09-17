@@ -31,7 +31,6 @@ def _create_project(client: TestClient) -> str:
         },
     )
     assert response.status_code == 201
-    assert response.json()["project"]["bootstrap_enabled"] is True
     assert response.json()["project"]["audit_mode"] == "none"
     return response.json()["project"]["id"]
 
@@ -625,10 +624,9 @@ def test_project_creation_persists_audit_profile_and_exports_it(client: TestClie
     response = client.post(
         "/projects",
         json={
-            "title": "no bootstrap",
+            "title": "audit profile",
             "origin": "start",
             "goal": "finish",
-            "bootstrap_enabled": False,
             "audit_mode": "scope",
         },
     )
@@ -636,25 +634,9 @@ def test_project_creation_persists_audit_profile_and_exports_it(client: TestClie
     assert response.status_code == 201
     project_id = response.json()["project"]["id"]
     project = client.get(f"/projects/{project_id}").json()["project"]
-    assert project["bootstrap_enabled"] is False
     assert project["audit_mode"] == "scope"
     exported = client.get(f"/projects/{project_id}/export?format=yaml").text
-    assert "bootstrap_enabled: false" in exported
     assert "audit_mode: scope" in exported
-
-
-def test_project_creation_rejects_invalid_bootstrap_enabled(client: TestClient) -> None:
-    response = client.post(
-        "/projects",
-        json={
-            "title": "invalid bootstrap",
-            "origin": "start",
-            "goal": "finish",
-            "bootstrap_enabled": "sometimes",
-        },
-    )
-
-    assert response.status_code == 422
 
 
 def test_git_project_skips_retained_clone_targets_and_advances_counter(

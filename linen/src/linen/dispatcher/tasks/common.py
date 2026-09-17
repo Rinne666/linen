@@ -427,10 +427,8 @@ def prepare_intent_projection(
         project.project.id, intent_id, phase,
     )
     try:
-        # The scheduler may create the bootstrap Intent and dispatch it using
-        # the pre-create ProjectDetail it already fetched.  Legacy clients
-        # cannot refresh a canonical snapshot, so add only that explicit seed
-        # to the local compatibility view; never widen this into a graph dump.
+        # Legacy clients cannot refresh a canonical snapshot, so add only the
+        # explicit seed intent to the local compatibility view.
         if not any(item.id == intent_id for item in project.intents):
             fact_ids = {item.id for item in project.facts}
             compatibility_intent = Intent(
@@ -1316,7 +1314,11 @@ def project_allows_conclude_fallback(client: LinenClient, project_id: str, *, wo
 def best_effort_release_reason(
     client: LinenClient, project_id: str, worker_name: str, lease_id: str,
     seen_event_seq: int | None = None,
+    *,
+    ack: bool = False,
 ) -> None:
+    if not ack:
+        seen_event_seq = None
     try:
         response = client.release_reason(project_id, worker_name, lease_id, seen_event_seq)
     except TypeError:
