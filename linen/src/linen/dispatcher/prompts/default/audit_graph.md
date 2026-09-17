@@ -62,9 +62,9 @@ No new semantic work:
 `{"accepted":true,"data":{}}`
 
 Proposed work:
-`{"accepted":true,"data":{"intents":[{"from":["f001"],"type":"trace","description":"Trace the request parameter from the controller boundary to the dynamic query construction and determine whether every path is parameterized"}]}}`
+`{"accepted":true,"data":{"intents":[{"from":["f001"],"action":"trace","target":"the request parameter to the dynamic query sink","type":"trace","description":"Trace the request parameter from the controller boundary to the dynamic query construction and determine whether every path is parameterized"}]}}`
 
-Every Intent object must contain exactly `from`, `type`, and `description`.
+Every Intent object must contain exactly `from`, `action`, `target`, `type`, and `description`. `action` + `target` define identity; `from` only lists evidence sources.
 
 Select one pending Skill:
 `{"accepted":true,"data":{"skills":[{"skill_id":"security.semgrep","reason":"Establish the static-analysis baseline before narrowing the next hypothesis."}]}}`

@@ -723,6 +723,8 @@ class DispatcherLoop:
                 proposal["from"],
                 proposal["description"],
                 audit_graph.CREATOR,
+                action=proposal.get("action") or proposal.get("type"),
+                target=proposal.get("target") or proposal["description"],
                 intent_type=proposal.get("type"),
             )
             if response.status_code in {403, 409}:

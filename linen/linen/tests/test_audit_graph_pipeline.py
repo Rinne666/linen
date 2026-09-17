@@ -120,6 +120,8 @@ def test_audit_graph_model_validator_accepts_only_semantic_current_revision(tmp_
             "accepted": True,
             "data": {"intents": [{
                 "from": ["f001"],
+                "action": "trace",
+                "target": "the request value to the dynamic query sink",
                 "type": "trace",
                 "description": "Trace the request value to the dynamic query sink",
             }]},
@@ -141,7 +143,7 @@ def test_audit_graph_model_validator_accepts_only_semantic_current_revision(tmp_
     with pytest.raises(ValueError, match="reserved audit intents"):
         audit_graph.validate_model_intents(
             {"accepted": True, "data": {"intents": [{
-                "from": ["origin"], "type": "search",
+                "from": ["origin"], "action": "search", "target": "the semgrep baseline", "type": "search",
                 "description": "@analysis:semgrep baseline",
             }]}},
             project_detail,

@@ -71,9 +71,9 @@ No new semantic work and no pending Skill:
 `{"accepted":true,"data":{}}`
 
 Proposed work:
-`{"accepted":true,"data":{"intents":[{"from":["f001","f004"],"type":"trace","description":"Trace the externally controlled identifier from its HTTP binding to the query sink and verify whether parameterization holds on every branch"}]}}`
+`{"accepted":true,"data":{"intents":[{"from":["f001","f004"],"action":"trace","target":"the externally controlled identifier to the query sink","type":"trace","description":"Trace the externally controlled identifier from its HTTP binding to the query sink and verify whether parameterization holds on every branch"}]}}`
 
-Each Intent must contain exactly `from`, `type`, and `description`.
+Each Intent must contain exactly `from`, `action`, `target`, `type`, and `description`. `action` + `target` define identity; `from` only lists evidence sources.
 
 Select one pending Skill:
 `{"accepted":true,"data":{"skills":[{"skill_id":"security.semgrep","reason":"Establish a broad static-analysis baseline before narrowing the next hypothesis."}]}}`

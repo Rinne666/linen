@@ -83,8 +83,12 @@ def validate_model_intents(
         raise ValueError(f"combined intents and skills exceed configured maximum of {max_intents}")
 
     facts = {fact.id: fact for fact in project.facts if fact.id != "goal"}
-    existing_descriptions = {
-        " ".join(intent.description.split()).casefold() for intent in project.intents
+    def canonical(value: str) -> str:
+        return " ".join(value.strip().casefold().split())
+
+    existing_identities = {
+        (canonical(intent.type or intent.semantic_type or "investigate"), canonical(intent.description))
+        for intent in project.intents
     }
     reviews_by_fact: dict[str, list] = {}
     for review in project.reviews:
@@ -104,11 +108,13 @@ def validate_model_intents(
     normalized: list[dict[str, Any]] = []
     seen: set[tuple[str, tuple[str, ...], str]] = set()
     for index, item in enumerate(raw_intents):
-        if not isinstance(item, dict) or set(item) != {"from", "type", "description"}:
+        if not isinstance(item, dict) or set(item) != {"from", "action", "target", "type", "description"}:
             raise ValueError(
-                f"intent at index {index} requires exactly from, type and description"
+                f"intent at index {index} requires exactly from, action, target, type and description"
             )
         from_ids = item["from"]
+        action = item["action"]
+        target = item["target"]
         intent_type = item["type"]
         description = item["description"]
         if (
@@ -120,6 +126,10 @@ def validate_model_intents(
             raise ValueError(f"intent at index {index} has invalid fact references")
         if not isinstance(intent_type, str) or intent_type not in MODEL_INTENT_TYPES:
             raise ValueError(f"intent at index {index} has unsupported type")
+        if not isinstance(action, str) or not action.strip():
+            raise ValueError(f"intent at index {index} action must be non-empty text")
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError(f"intent at index {index} target must be non-empty text")
         if not isinstance(description, str):
             raise ValueError(f"intent at index {index} description must be text")
         description = " ".join(description.split())
@@ -127,8 +137,8 @@ def validate_model_intents(
             raise ValueError(f"intent at index {index} description length is invalid")
         if managed_description(description):
             raise ValueError("reserved audit intents are derived by deterministic code")
-        folded = description.casefold()
-        if folded in existing_descriptions:
+        identity = (canonical(action), canonical(target))
+        if identity in existing_identities:
             raise ValueError(f"intent at index {index} duplicates existing work")
         source_facts = [facts[fact_id] for fact_id in from_ids]
         if any(fact.status not in {"draft", "triaged"} for fact in source_facts):
@@ -175,13 +185,15 @@ def validate_model_intents(
                     raise ValueError(
                         f"unresolved review requires one new {allowed_followup} follow-up"
                     )
-        key = (intent_type, tuple(sorted(from_ids)), folded)
+        key = identity
         if key in seen:
             raise ValueError(f"intent at index {index} duplicates this proposal batch")
         seen.add(key)
-        existing_descriptions.add(folded)
+        existing_identities.add(identity)
         normalized.append({
             "from": list(from_ids),
+            "action": action.strip(),
+            "target": target.strip(),
             "type": intent_type,
             "description": description,
         })

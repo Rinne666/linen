@@ -807,8 +807,6 @@ class CreateIntentRequest(BaseModel):
     phase: str | None = None
     action: str | None = None
     target: str | None = None
-    scope: str | None = None
-    rationale: str | None = None
 
     model_config = {"populate_by_name": True}
 
