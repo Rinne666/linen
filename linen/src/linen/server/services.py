@@ -631,6 +631,11 @@ def aggregate_fact_status_from_reviews(
 def list_reviews_for_fact(
     conn: sqlite3.Connection, project_id: str, fact_id: str
 ) -> list[Review]:
+    get_project_or_404(conn, project_id)
+    if conn.execute(
+        "SELECT 1 FROM facts WHERE project_id = ? AND id = ?", (project_id, fact_id)
+    ).fetchone() is None:
+        raise HTTPException(404, f"fact {fact_id} not found in project {project_id}")
     rows = conn.execute(
         "SELECT * FROM reviews WHERE project_id = ? AND fact_id = ? ORDER BY created_at, id",
         (project_id, fact_id),

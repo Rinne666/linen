@@ -9,7 +9,11 @@ from linen.server.models import (
     Review,
 )
 from linen.server.kernel import KernelConflict, KernelForbidden, KernelNotFound, create_review as create_review_kernel
-from linen.server.services import get_project_or_404
+from linen.server.services import (
+    get_project_or_404,
+    list_reviews_for_fact,
+    list_reviews_for_project,
+)
 
 router = APIRouter()
 
@@ -42,15 +46,7 @@ def create_review(project_id: str, fact_id: str, body: CreateReviewRequest):
 )
 def list_reviews_for_fact_endpoint(project_id: str, fact_id: str):
     with get_conn() as conn:
-        get_project_or_404(conn, project_id)
-        fact_row = conn.execute(
-            "SELECT 1 FROM facts WHERE id = ? AND project_id = ?",
-            (fact_id, project_id),
-        ).fetchone()
-        if fact_row is None:
-            raise HTTPException(404, f"fact {fact_id} not found in project {project_id}")
-        from linen.server.services import list_reviews_for_fact as _list
-        return _list(conn, project_id, fact_id)
+        return list_reviews_for_fact(conn, project_id, fact_id)
 
 
 @router.get(
@@ -60,5 +56,4 @@ def list_reviews_for_fact_endpoint(project_id: str, fact_id: str):
 def list_reviews_for_project_endpoint(project_id: str):
     with get_conn() as conn:
         get_project_or_404(conn, project_id)
-        from linen.server.services import list_reviews_for_project as _list_proj
-        return _list_proj(conn, project_id)
+        return list_reviews_for_project(conn, project_id)
