@@ -140,6 +140,23 @@ def validate_model_intents(
             prior = sorted(
                 reviews_by_fact.get(fact_id, []), key=lambda review: (review.created_at, review.id),
             )
+            unified_candidate_review = (
+                fact_id in facts
+                and facts[fact_id].type == "vulnerability"
+                and facts[fact_id].semantic_type == "candidate_finding"
+                and item["description"].endswith(":vulnerability-proof")
+            )
+            if unified_candidate_review:
+                if intent_type != "review:cold-verifier":
+                    raise ValueError("vulnerability proof reviews require cold-verifier")
+                # Legacy per-Fact reviews do not consume the single unified
+                # candidate-proof review opportunity.
+                if any(
+                    (review.cold_verification or {}).get("review_kind") == "vulnerability_proof"
+                    for review in prior
+                ):
+                    raise ValueError("candidate already has a unified proof review")
+                continue
             if not prior:
                 if source_facts[0].status != "draft":
                     raise ValueError("initial review intents require one draft fact")
@@ -238,6 +255,22 @@ def _result(project: ProjectDetail, description: str) -> Fact | None:
 
 def _reviewed(project: ProjectDetail, fact_id: str) -> bool:
     return coverage.reviewed(project, fact_id)
+
+
+def _has_unified_vulnerability_review(project: ProjectDetail, fact_id: str) -> bool:
+    """Whether a candidate has the candidate-local proof attestation."""
+    for review in project.reviews:
+        if review.fact_id != fact_id:
+            continue
+        diagnostics = review.cold_verification or {}
+        if (
+            diagnostics.get("review_kind") == "vulnerability_proof"
+            and diagnostics.get("candidate_id") == fact_id
+            and review.verdict == "VALID"
+            and review.confidence in {"firm", "certain"}
+        ):
+            return True
+    return False
 
 
 def _completed_sources(project: ProjectDetail, workdir: Path, fact_type: str) -> list[Fact]:
@@ -403,6 +436,20 @@ def _review_proposals(project: ProjectDetail) -> list[dict]:
                 proposals.append({
                     "from": [fact.id],
                     "type": "review:devils-advocate",
+                    "description": description,
+                })
+            continue
+        if (
+            fact.type == "vulnerability"
+            and fact.semantic_type == "candidate_finding"
+            and not _has_unified_vulnerability_review(project, fact.id)
+            and fact.id not in open_reviews
+        ):
+            description = f"@analysis:review:{fact.id}:vulnerability-proof"
+            if not _proposal_exists(project, description):
+                proposals.append({
+                    "from": [fact.id],
+                    "type": "review:cold-verifier",
                     "description": description,
                 })
             continue

@@ -358,7 +358,7 @@ def test_local_malformed_edge_is_not_silently_ignored(tmp_path, monkeypatch):
     assert "INVALID_EDGE_RELATION" in result.reason_codes
 
 
-def test_fingerprint_ignores_remote_mutation_but_tracks_local_review(tmp_path, monkeypatch):
+def test_fingerprint_ignores_remote_and_review_mutation(tmp_path, monkeypatch):
     _strict_board(tmp_path, monkeypatch)
     with db.get_conn() as conn:
         first = proof_graph_fingerprint(conn, "p", "candidate")
@@ -369,7 +369,25 @@ def test_fingerprint_ignores_remote_mutation_but_tracks_local_review(tmp_path, m
         conn.execute("INSERT INTO reviews (id, project_id, fact_id, verdict, confidence, summary, created_at) VALUES ('local-review', 'p', 'attacker_control', 'VALID', 'firm', 'local', 'later')")
         third = proof_graph_fingerprint(conn, "p", "candidate")
     assert first == second
-    assert third != second
+    # Reviews attest to this digest; they are not part of the evidence being
+    # attested, otherwise recording a review would invalidate itself.
+    assert third == second
+
+
+def test_unified_candidate_review_is_one_gate_and_stales_on_proof_change(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        conn.execute("DELETE FROM reviews")
+    create_review("p", "candidate", CreateReviewRequest(
+        verdict="VALID", confidence="firm", summary="whole proof reviewed", created_by="reviewer",
+        cold_verification={"review_kind": "vulnerability_proof", "candidate_id": "candidate"},
+    ))
+    with db.get_conn() as conn:
+        assert evaluate_shadow_gate(conn, "p", "candidate").status == "PASS"
+        conn.execute("UPDATE facts SET description = 'changed proof claim' WHERE id = 'security_invariant'")
+        stale = evaluate_shadow_gate(conn, "p", "candidate")
+    assert stale.status == "FAIL"
+    assert "PROOF_GRAPH_CHANGED" in stale.reason_codes
 
 
 def _dynamic_board(tmp_path, monkeypatch, *, include_negative=True, same_capability=False, unsafe=False):

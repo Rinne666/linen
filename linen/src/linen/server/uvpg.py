@@ -75,7 +75,11 @@ NON_AUTOMATIC_REPAIR_GAPS = frozenset({
     "INVALID_PROVENANCE", "INVALID_SOURCE_EXCERPT", "STALE_PROOF_GENERATION", "ROLE_TYPE_MISMATCH",
 })
 _OBLIGATION_RE = re.compile(r"^@uvpg:proof:(?P<candidate>[^:]+):(?P<code>[A-Z0-9_]+)(?::f(?P<target>[^:]+))?:g(?P<generation>[0-9]+)\b")
-REVIEW_REQUIRED = frozenset({"candidate", "security_invariant", "security_boundary", "capability_delta", "impact_observation", "negative_control"})
+UNIFIED_REVIEW_KIND = "vulnerability_proof"
+# Kept as a compatibility marker for callers that imported the old constant.
+# New gates require one candidate-local proof-package review instead of this
+# collection of per-role reviews.
+REVIEW_REQUIRED = frozenset({"candidate"})
 TERMINAL_BAD = frozenset({"false_positive", "fixed", "accepted_risk"})
 
 # The relation matrix is intentionally closed: arbitrary edges cannot close a proof.
@@ -337,6 +341,43 @@ def unreviewed_required_facts(view: ProofGraphView) -> list[str]:
     return targets
 
 
+def _review_diagnostics(row: sqlite3.Row) -> dict[str, Any]:
+    return _loads(row["diagnostics"] if "diagnostics" in row.keys() else None, {})
+
+
+def candidate_proof_review(
+    conn: sqlite3.Connection, project_id: str, candidate_id: str,
+) -> tuple[bool, str | None, dict[str, Any] | None]:
+    """Return whether the candidate has one current unified proof review.
+
+    The digest is calculated from Facts and proof edges only. Reviews,
+    promotion edges, workflow edges, and dynamic receipts are deliberately
+    excluded so recording or invalidating a review cannot change the thing
+    that the review attests.
+    """
+    current_digest = proof_graph_fingerprint(conn, project_id, candidate_id)
+    rows = conn.execute(
+        "SELECT * FROM reviews WHERE project_id = ? AND fact_id = ? "
+        "ORDER BY created_at, id", (project_id, candidate_id),
+    ).fetchall()
+    latest_unified: tuple[sqlite3.Row, dict[str, Any]] | None = None
+    for row in rows:
+        diagnostics = _review_diagnostics(row)
+        verification = diagnostics.get("cold_verification")
+        if isinstance(verification, dict) and verification.get("review_kind") == UNIFIED_REVIEW_KIND:
+            latest_unified = (row, verification)
+    if latest_unified is None:
+        return False, "MISSING_UNIFIED_REVIEW", None
+    row, verification = latest_unified
+    if row["verdict"] != "VALID" or row["confidence"] not in {"firm", "certain"}:
+        return False, "CONTRADICTED_EVIDENCE", verification
+    if verification.get("candidate_id") != candidate_id:
+        return False, "CROSS_CANDIDATE_EVIDENCE", verification
+    if verification.get("proof_evidence_sha256") != current_digest:
+        return False, "PROOF_GRAPH_CHANGED", verification
+    return True, None, verification
+
+
 def candidate_proof_facts(conn: sqlite3.Connection, project_id: str, candidate_id: str, role: str | None = None) -> list[str]:
     """Return only Facts in the candidate's deterministic proof projection."""
     view = collect_candidate_proof_subgraph(conn, project_id, candidate_id)
@@ -423,7 +464,7 @@ def proof_graph_fingerprint(conn: sqlite3.Connection, project_id: str, candidate
     facts = []
     for identifier in view.proof_fact_ids:
         row = conn.execute(
-            "SELECT id, source_generation, type, semantic_type, status, proof FROM facts "
+            "SELECT id, source_generation, type, semantic_type, status, description, evidence, proof FROM facts "
             "WHERE project_id = ? AND id = ?", (project_id, identifier),
         ).fetchone()
         if row is not None and row["semantic_type"] != "confirmed_finding":
@@ -438,15 +479,7 @@ def proof_graph_fingerprint(conn: sqlite3.Connection, project_id: str, candidate
         if row["source_id"] in view.proof_fact_ids and row["target_id"] in view.proof_fact_ids
     ]
     generation = conn.execute("SELECT source_generation FROM projects WHERE id = ?", (project_id,)).fetchone()[0]
-    reviews = [
-        {key: row[key] for key in row.keys()}
-        for row in conn.execute(
-            "SELECT id, fact_id, verdict, confidence, source_generation FROM reviews "
-            "WHERE project_id = ? AND fact_id IN ({}) ORDER BY id".format(",".join("?" for _ in view.proof_fact_ids)),
-            (project_id, *view.proof_fact_ids),
-        )
-    ] if view.proof_fact_ids else []
-    payload = {"candidate_id": candidate_fact_id, "generation": generation, "gate_version": PROOF_GATE_VERSION, "facts": facts, "edges": edges, "reviews": reviews}
+    payload = {"candidate_id": candidate_fact_id, "generation": generation, "gate_version": PROOF_GATE_VERSION, "facts": facts, "edges": edges}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
 
 
@@ -491,14 +524,26 @@ def evaluate_shadow_gate(conn: sqlite3.Connection, project_id: str, fact_id: str
     candidate = facts.get(fact_id)
     hinted = {str(value) for value in (candidate.proof.attributes.get("proof_roles", []) if candidate and candidate.proof else [])}
     if hinted - connected: reasons.add("DISCONNECTED_PROOF_FACT")
-    for proof_id in unreviewed_required_facts(view):
-        reviews = view.reviews_by_fact.get(proof_id, [])
-        if any(item["verdict"] == "INVALID" for item in reviews):
-            reasons.add("CONTRADICTED_EVIDENCE")
+    unified_review, unified_reason, _ = candidate_proof_review(conn, project_id, fact_id)
+    if not unified_review:
+        # Existing projects may still be midway through migration. Preserve
+        # legacy per-Fact semantics until their candidate receives the new
+        # proof-package review; all newly planned review work uses the new
+        # single candidate review.
+        if any(
+            view.reviews_by_fact.get(identifier)
+            for identifier in view.facts_by_role.get("candidate", [])
+        ):
+            for proof_id in unreviewed_required_facts(view):
+                reviews = view.reviews_by_fact.get(proof_id, [])
+                if any(item["verdict"] == "INVALID" for item in reviews):
+                    reasons.add("CONTRADICTED_EVIDENCE")
+                else:
+                    reasons.add("UNREVIEWED_EVIDENCE")
         else:
             reasons.add("UNREVIEWED_EVIDENCE")
-    for proof_id, reviews in view.reviews_by_fact.items():
-        if any(item["verdict"] == "INVALID" for item in reviews): reasons.add("CONTRADICTED_EVIDENCE")
+        if unified_reason in {"CONTRADICTED_EVIDENCE", "CROSS_CANDIDATE_EVIDENCE", "PROOF_GRAPH_CHANGED"}:
+            reasons.add(unified_reason)
     for identifier in view.proof_fact_ids:
         proof = facts[identifier].proof
         if proof is not None and proof.claim_kind in REQUIRED_ROLES and facts[identifier].type != proof.claim_kind:
@@ -526,7 +571,20 @@ def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_
         if code in NON_INVESTIGATIVE_GAPS:
             role, intent_type, relation, description, expected = None, "blocked", None, "Repair the proof graph integrity before further investigation.", None
         elif code == "UNREVIEWED_EVIDENCE":
-            targets = unreviewed_required_facts(view)
+            # A candidate without a unified review gets exactly one
+            # candidate-local cold-verifier obligation. Legacy candidates
+            # that already have a candidate review retain their old targeted
+            # obligations until the unified review is recorded.
+            has_candidate_review = bool(view.reviews_by_fact.get(candidate_fact_id))
+            targets = unreviewed_required_facts(view) if has_candidate_review else [candidate_fact_id]
+            if not has_candidate_review:
+                gaps.append(ProofGap(
+                    candidate_fact_id, code, "candidate", GAP_PRIORITY.get(code, 99),
+                    (candidate_fact_id,), "review:cold-verifier", "reviews", None,
+                    "Independently falsify or validate the complete current candidate-local vulnerability proof.",
+                    "missing", generation, candidate_fact_id,
+                ))
+                continue
             for target in targets:
                 role = next((candidate_role for candidate_role, ids in view.facts_by_role.items() if target in ids), None)
                 description = "Independently review this candidate-specific proof Fact."

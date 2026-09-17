@@ -19,10 +19,15 @@ The proof field is intentionally optional, so legacy Facts and exports continue 
 
 The strict closure requires independent Facts for attacker control, reachability,
 security invariant, security boundary, capability before/after/delta, negative
-control, and impact observation. Candidate, invariant, boundary, delta, impact,
-and negative-control Facts require the existing decisive review quality
-(`VALID` plus `firm`/`certain`); any invalid review is a contradiction. A
-candidate review does not attest its ancestors.
+control, and impact observation. New vulnerability candidates receive one
+`review:cold-verifier` Intent for the complete candidate-local proof package.
+The Review is stored on the candidate with `review_kind=vulnerability_proof`,
+the candidate id, and a server-computed `proof_evidence_sha256`; it is accepted
+only when it is `VALID`, `firm`/`certain`, and still matches the current proof
+Facts and edges. Reviews do not enter that fingerprint, so recording a Review
+cannot invalidate itself. A proof mutation makes the old Review stale and
+requires another whole-package review. Existing per-Fact review boards remain
+readable through a compatibility path while they migrate.
 
 Finding lifecycle is now explicitly split:
 
@@ -78,8 +83,12 @@ conclusion and creates the canonical GraphEdge; the Worker cannot choose an
 arbitrary edge or close another candidate's gap. Capability and negative-control
 edges resolve only against the same candidate's proof projection; a capability
 delta is not produced until exactly one local before and after Fact exists.
-Evidence, not the planner, creates the proof Fact. Review gaps identify the
-exact unreviewed Fact and use that Fact as the Review Intent source.
+Evidence, not the planner, creates the proof Fact. For a new candidate review
+gap, the planner creates exactly one candidate-sourced cold-verifier Intent
+(`UNREVIEWED_EVIDENCE`) rather than one Intent per proof role. Deterministic
+code checks graph structure, provenance, generation, and hashes; the cold
+verifier handles only semantic falsification such as attacker control,
+reachability, defenses, and capability change.
 Provenance/type/excerpt repair gaps remain non-automatic blockers until a
 complete replacement/rebinding lifecycle exists.
 

@@ -22,6 +22,7 @@ from linen.server.services import (
     check_project_active,
     get_project_or_404,
 )
+from linen.server.uvpg import UNIFIED_REVIEW_KIND, proof_graph_fingerprint
 
 router = APIRouter()
 
@@ -50,6 +51,21 @@ def create_review(project_id: str, fact_id: str, body: CreateReviewRequest):
         if fact_row is None:
             raise HTTPException(404, f"fact {fact_id} not found in project {project_id}")
 
+        diagnostics = body.model_dump(include=set(REVIEW_DIAGNOSTIC_FIELDS), exclude_none=True)
+        verification = diagnostics.get("cold_verification")
+        if (
+            fact_row["type"] == "vulnerability"
+            and isinstance(verification, dict)
+            and verification.get("review_kind") == UNIFIED_REVIEW_KIND
+        ):
+            if verification.get("candidate_id") not in (None, fact_id):
+                raise HTTPException(409, "unified proof review is bound to another candidate")
+            verification = dict(verification)
+            verification["review_kind"] = UNIFIED_REVIEW_KIND
+            verification["candidate_id"] = fact_id
+            verification["proof_evidence_sha256"] = proof_graph_fingerprint(conn, project_id, fact_id)
+            diagnostics["cold_verification"] = verification
+
         rid = next_review_id(conn, project_id)
         now = utcnow()
         conn.execute(
@@ -67,7 +83,7 @@ def create_review(project_id: str, fact_id: str, body: CreateReviewRequest):
                 body.reasoning,
                 now,
                 body.created_by,
-                json.dumps(body.model_dump(include=set(REVIEW_DIAGNOSTIC_FIELDS), exclude_none=True)),
+                json.dumps(diagnostics),
                 fact_row["source_generation"] if "source_generation" in fact_row.keys() else 1,
             ),
         )
