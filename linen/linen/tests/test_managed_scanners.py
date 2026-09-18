@@ -61,7 +61,11 @@ def configured_scanners(tmp_path):
     cfg.audit.spotbugs = SpotBugsConfig(enabled=True, plugin=plugin, cache=False)
     cfg.audit.osv = OsvScannerConfig(enabled=True, cache=False)
     cfg.audit.gitleaks = GitleaksConfig(enabled=True, cache=False)
-    cfg.audit.trivy = TrivyConfig(enabled=True, cache=False)
+    cfg.audit.trivy = TrivyConfig(
+        enabled=True,
+        cache=False,
+        db_repository=["ghcr.io/aquasecurity/trivy-db:2", "public.ecr.aws/aquasecurity/trivy-db:2"],
+    )
     return cfg
 
 
@@ -125,6 +129,40 @@ def test_external_scanners_emit_uniform_scan_batches(
         assert "findsecbugs-plugin.jar" in record["artifact_hashes"]
 
 
+def test_osv_scanner_uses_flag_for_version_probe(configured_scanners):
+    spec = next(spec for spec in scanner_specs(configured_scanners.audit) if spec.name == "osv-scanner")
+
+    assert spec.version_args == ("--version",)
+
+
+def test_trivy_uses_configured_database_repositories(configured_scanners, tmp_path, monkeypatch):
+    repo = tmp_path / "trivy-repo"
+    repo.mkdir()
+    spec = next(spec for spec in scanner_specs(configured_scanners.audit) if spec.name == "trivy")
+    monkeypatch.setattr(
+        "linen.dispatcher.analysis.external_scanners.shutil.which", lambda _: "/fake/trivy",
+    )
+    monkeypatch.setattr(
+        "linen.dispatcher.analysis.external_scanners.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="Trivy 1.0", stderr=""),
+    )
+
+    captured = {}
+
+    def execute(_source: Path, argv: list[str]) -> ProcessResult:
+        captured["argv"] = argv
+        report = argv[argv.index("--output") + 1]
+        Path(report).write_text(json.dumps({"version": "2.1.0", "runs": []}))
+        return ProcessResult(0, "", "")
+
+    run_scan(repo, tmp_path / "analysis-trivy-repositories", spec, execute)
+
+    argv = captured["argv"]
+    assert argv[argv.index("--db-repository") + 1] == "ghcr.io/aquasecurity/trivy-db:2"
+    second = argv.index("--db-repository", argv.index("--db-repository") + 1)
+    assert argv[second + 1] == "public.ecr.aws/aquasecurity/trivy-db:2"
+
+
 def test_spotbugs_never_builds_target_and_reports_missing_bytecode(configured_scanners, tmp_path, monkeypatch):
     repo = tmp_path / "source-only"
     repo.mkdir()
@@ -186,46 +224,6 @@ def test_spotbugs_non_jvm_snapshot_is_explicitly_not_applicable(
     assert json.loads((path.parent / "candidates.json").read_text()) == []
 
 
-def test_hypothesis_scanners_are_selected_from_a_bounded_trusted_registry(api, configured_scanners):
-    _, client = api
-    board = project(api, audit_mode="hypothesis")
-    loop = DispatcherLoop.__new__(DispatcherLoop)
-    loop.config = configured_scanners
-    loop.client = client
-    loop.container_manager = LocalBackend(configured_scanners.local, client)
-
-    assert not loop._materialize_audit_intents(board)
-    choices = audit_graph.selectable_skill_choices(
-        board,
-        Path(loop.container_manager.ensure_running(board.project.id)),
-        configured_scanners.audit,
-    )
-    assert {choice["skill_id"] for choice in choices} == {
-        "security.semgrep",
-        "security.spotbugs-findsecbugs",
-        "security.osv-scanner",
-        "security.gitleaks",
-        "security.trivy",
-    }
-    _, proposals = audit_graph.validate_model_intents(
-        {
-            "accepted": True,
-            "data": {
-                "skills": [{
-                    "skill_id": "security.semgrep",
-                    "reason": "Run the broad static baseline before deeper hypothesis tracing.",
-                }],
-            },
-        },
-        board,
-        expected_revision=board.project.graph_revision,
-        max_intents=2,
-        skill_choices=choices,
-    )
-    assert proposals[0]["description"] == SCAN_INTENT_DESCRIPTION
-    assert proposals[0]["type"] == "search:skill"
-
-
 def test_failed_scanner_preserves_root_error_without_missing_sarif_noise(
     configured_scanners, tmp_path, monkeypatch,
 ):
@@ -254,43 +252,6 @@ def test_failed_scanner_preserves_root_error_without_missing_sarif_noise(
     assert "Bad Gateway" in record["errors"][0]["message"]
     assert all("raw.sarif" not in error["message"] for error in record["errors"])
     assert json.loads((path.parent / "candidates.json").read_text()) == []
-
-
-def test_legacy_pre_execution_scanner_failure_does_not_exhaust_retry_budget(
-    api, configured_scanners, tmp_path,
-):
-    _, client = api
-    current = project(api, audit_mode="hypothesis")
-    pid = current.project.id
-    workdir = Path(LocalBackend(configured_scanners.local, client).ensure_running(pid))
-    previous = "origin"
-    for index in range(configured_scanners.audit.trivy.max_attempts):
-        run = workdir / ".linen-analysis" / f"legacy-trivy-{index}"
-        run.mkdir(parents=True)
-        record = {
-            "schema_version": 1,
-            "status": "failed",
-            "scanner": {"name": "trivy", "label": "Trivy"},
-            "command": ["trivy", "fs", "."],
-            "errors": [{"message": "raw.sarif does not exist"}],
-            "artifact_hashes": {},
-        }
-        (run / "manifest.json").write_text(json.dumps(record))
-        evidence = (
-            f"artifact: {run / 'manifest.json'}\n"
-            f"manifest_sha256: {digest((run / 'manifest.json').read_bytes())}\n"
-            "scanner: trivy\nstatus: failed"
-        )
-        previous = _conclude(
-            client, pid, [previous], TRIVY_INTENT, "scan_batch", evidence,
-        )
-        _approve(client, pid, previous)
-
-    choices = audit_graph.selectable_skill_choices(
-        client.get_project(pid), workdir, configured_scanners.audit,
-    )
-    retry = next(item for item in choices if item["description"] == TRIVY_INTENT)
-    assert retry["from"] == ["origin", previous]
 
 
 def test_repeated_skill_attempt_currently_reuses_completed_intent(api):

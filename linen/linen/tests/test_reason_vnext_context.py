@@ -595,60 +595,6 @@ def test_reason_context_continuation_stale_snapshot_is_controlled_failure(tmp_pa
     assert client.created_intents == []
 
 
-def test_audit_graph_reason_context_required_uses_independent_run_and_final_schema(tmp_path, monkeypatch) -> None:
-    config = make_config()
-    config.audit.enabled = True
-    config.audit.graph_reason.enabled = True
-    project = _project_with_two_edges()
-    project.project.audit_mode = "hypothesis"
-    client = _CatalogClient(project)
-    backend = FakeContainerManager()
-    driver = _SequenceDriver()
-    lease = FakeLease()
-    calls = []
-    results = iter([
-        ProcessResult(
-            0,
-            '{"accepted":true,"data":{"status":"context_required",'
-            '"context_request":{"node_ids":["f002"],"relation_types":["supports"],'
-            '"reason":"need audit evidence"}}}',
-            "",
-        ),
-        ProcessResult(
-            0,
-            '{"accepted":true,"data":{"intents":[{"from":["f001"],"type":"trace",'
-            '"description":"Trace the known request value to its dangerous operation"}]}}',
-            "",
-        ),
-    ])
-    monkeypatch.setattr(reason, "get_driver", lambda *_a, **_k: driver)
-    monkeypatch.setattr(reason.HeartbeatLease, "for_reason", lambda *_a, **_k: lease)
-    monkeypatch.setattr(
-        reason,
-        "run_worker_process",
-        lambda *_args, **kwargs: (calls.append(kwargs) or next(results)),
-    )
-
-    assert reason.run_audit_graph_reason_task(
-        config, client, backend, project, "FULL-EXPORT", config.workers[0],
-        reason.TaskCancellation(), trigger="manual", attempt=4,
-    ) == "success"
-    assert len(calls) == 2
-    assert [call["phase"] for call in calls] == [
-        "audit_graph_reason", "audit_graph_reason_context_continuation",
-    ]
-    assert calls[0]["run_envelope"].run_id != calls[1]["run_envelope"].run_id
-    assert calls[0]["run_envelope"].attempt == calls[1]["run_envelope"].attempt == 4
-    assert driver.sessions == ["session-1", "session-2"]
-    assert client.created_intents == [(
-        "proj_001", ["f001"],
-        "Trace the known request value to its dangerous operation",
-        "dispatcher.audit-graph-model",
-    )]
-    assert "FULL-EXPORT" not in driver.execute_prompts[1]
-    assert "context_required" in driver.execute_prompts[1]
-
-
 def test_reason_prompt_filters_open_intents_to_projected_frontier(monkeypatch) -> None:
     project = make_project(intents=[make_intent(f"i{index:03d}") for index in range(40)])
     client = FakeClient(project)

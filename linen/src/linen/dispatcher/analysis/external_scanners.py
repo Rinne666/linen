@@ -57,7 +57,7 @@ def scanner_specs(config: AuditConfig, *, enabled_only: bool = True) -> list[Sca
         ),
         ScannerSpec(
             "osv-scanner", "OSV-Scanner", OSV_INTENT, "osv_scan",
-            config.osv, ("version",), (0, 1),
+            config.osv, ("--version",), (0, 1),
         ),
         ScannerSpec(
             "gitleaks", "Gitleaks", GITLEAKS_INTENT, "gitleaks_scan",
@@ -204,10 +204,17 @@ def _prepare_command(spec: ScannerSpec, source: Path, run_dir: Path) -> tuple[li
         command.append(".")
         return command, extra_hashes
     if spec.name == "trivy":
-        return [
+        command = [
             executable, "fs", "--quiet", "--format", "sarif", "--output", str(report),
             "--exit-code", "0", "--scanners", ",".join(spec.config.scanners), ".",
-        ], extra_hashes
+        ]
+        if spec.config.db_repository:
+            command[1:1] = [
+                argument
+                for repository in spec.config.db_repository
+                for argument in ("--db-repository", repository)
+            ]
+        return command, extra_hashes
     raise ValueError(f"Unsupported external scanner: {spec.name}")
 
 

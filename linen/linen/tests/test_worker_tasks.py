@@ -41,7 +41,7 @@ def test_reason_writes_graph_snapshot_and_creates_intent(monkeypatch) -> None:
         "run_worker_process",
         lambda *_args, **_kwargs: ProcessResult(
             0,
-            '{"accepted":true,"data":{"intents":[{"from":["f001"],"description":"next step"}]}}',
+            '{"accepted":true,"data":{"intents":[{"from":["f001"],"action":"investigate","target":"next step","description":"next step"}]}}',
             "",
         ),
     )
@@ -70,114 +70,6 @@ def test_reason_writes_graph_snapshot_and_creates_intent(monkeypatch) -> None:
     assert graph_yaml not in content
     assert graph_yaml not in driver.execute_prompts[0]
     assert path in driver.execute_prompts[0]
-
-
-def test_audit_graph_reason_uses_fresh_profile_and_validated_writer(monkeypatch) -> None:
-    config = make_config()
-    config.audit.enabled = True
-    config.audit.graph_reason.enabled = True
-    project = make_project()
-    project.project.audit_mode = "hypothesis"
-    client = FakeClient(project)
-    containers = FakeContainerManager()
-    driver = FakeDriver()
-    lease = FakeLease()
-
-    monkeypatch.setattr(reason, "get_driver", lambda *_a, **_k: driver)
-    monkeypatch.setattr(reason.HeartbeatLease, "for_reason", _lease_factory(lease))
-    monkeypatch.setattr(
-        reason,
-        "run_worker_process",
-        lambda *_args, **_kwargs: ProcessResult(
-            0,
-            '{"accepted":true,"data":{"intents":[{"from":["f001"],"type":"trace","description":"Trace the known request value to its dangerous operation"}]}}',
-            "",
-        ),
-    )
-
-    outcome = reason.run_audit_graph_reason_task(
-        config,
-        client,
-        containers,
-        project,
-        "graph",
-        config.workers[0],
-        TaskCancellation(),
-    )
-
-    assert outcome == "success"
-    assert client.created_intents == [(
-        "proj_001",
-        ["f001"],
-        "Trace the known request value to its dangerous operation",
-        "dispatcher.audit-graph-model",
-    )]
-    assert containers.writes[0][1].startswith("/tmp/linen-prompts/audit_graph_reason-")
-    assert "Do not return `complete`" in driver.execute_prompts[0]
-    assert client.released_reasons == [("proj_001", "test-worker")]
-
-
-def test_audit_graph_reason_selects_one_trusted_skill_and_records_why(monkeypatch) -> None:
-    config = make_config()
-    config.audit.enabled = True
-    config.audit.graph_reason.enabled = True
-    project = make_project()
-    project.project.audit_mode = "hypothesis"
-    client = FakeClient(project)
-    containers = FakeContainerManager()
-    driver = FakeDriver()
-    lease = FakeLease()
-    choices = [{
-        "skill_id": "security.semgrep",
-        "version": "1",
-        "capability": "security.static-analysis",
-        "stage_id": "semgrep",
-        "label": "Semgrep",
-        "description": "@analysis:semgrep",
-        "from": ["origin"],
-    }]
-
-    monkeypatch.setattr(reason, "get_driver", lambda *_a, **_k: driver)
-    monkeypatch.setattr(reason.HeartbeatLease, "for_reason", _lease_factory(lease))
-    monkeypatch.setattr(
-        reason.audit_graph, "selectable_skill_choices", lambda *_a, **_k: choices,
-    )
-    monkeypatch.setattr(
-        reason,
-        "run_worker_process",
-        lambda *_args, **_kwargs: ProcessResult(
-            0,
-            '{"accepted":true,"data":{"skills":[{"skill_id":"security.semgrep",'
-            '"reason":"Establish the static-analysis baseline first."}]}}',
-            "",
-        ),
-    )
-
-    outcome = reason.run_audit_graph_reason_task(
-        config,
-        client,
-        containers,
-        project,
-        "graph",
-        config.workers[0],
-        TaskCancellation(),
-    )
-
-    assert outcome == "success"
-    assert client.created_intents == [(
-        "proj_001", ["origin"], "@analysis:semgrep",
-        "dispatcher.audit-graph-model",
-    )]
-    assert client.created_intent_semantics == [("run_skill", "security.semgrep")]
-    assert client.created_hints == [(
-        "proj_001",
-        "AuditGraph selected security.semgrep from the trusted Skill registry. "
-        "Reason: Establish the static-analysis baseline first.",
-        "dispatcher.audit-graph-model",
-    )]
-    prompt = driver.execute_prompts[0]
-    assert "security.semgrep" in prompt
-    assert "Skill Selection Contract" in prompt
 
 
 def test_failed_scanner_keeps_intent_open_for_retry(monkeypatch, tmp_path) -> None:
@@ -239,7 +131,7 @@ def test_reason_uses_project_audit_mode_instead_of_global_scope_mode(monkeypatch
         "run_worker_process",
         lambda *_args, **_kwargs: ProcessResult(
             0,
-            '{"accepted":true,"data":{"intents":[{"from":["f001"],"description":"trace candidate"}]}}',
+            '{"accepted":true,"data":{"intents":[{"from":["f001"],"action":"trace","target":"candidate","description":"trace candidate"}]}}',
             "",
         ),
     )
@@ -335,7 +227,6 @@ def test_scope_reason_uses_scope_profile_and_source_boundary(monkeypatch) -> Non
     config.runtime.prompt_group = "vuln_audit"
     project = make_project()
     project.project.audit_mode = "scope"
-    project.project.bootstrap_enabled = False
     client = FakeClient(project)
     containers = FakeContainerManager()
     driver = FakeDriver()
@@ -348,7 +239,7 @@ def test_scope_reason_uses_scope_profile_and_source_boundary(monkeypatch) -> Non
         "run_worker_process",
         lambda *_args, **_kwargs: ProcessResult(
             0,
-            '{"accepted":true,"data":{"intents":[{"from":["f001"],"type":"verify","description":"Verify the concrete authorization invariant"}]}}',
+            '{"accepted":true,"data":{"intents":[{"from":["f001"],"action":"verify","target":"authorization invariant","type":"verify","description":"Verify the concrete authorization invariant"}]}}',
             "",
         ),
     )
@@ -426,7 +317,7 @@ def test_reason_startup_only_mode_skips_task_healthcheck(monkeypatch) -> None:
         "run_worker_process",
         lambda *_args, **_kwargs: ProcessResult(
             0,
-            '{"accepted":true,"data":{"intents":[{"from":["f001"],"description":"next"}]}}',
+            '{"accepted":true,"data":{"intents":[{"from":["f001"],"action":"investigate","target":"next","description":"next"}]}}',
             "",
         ),
     )

@@ -12,7 +12,6 @@ from pydantic import TypeAdapter
 import pytest
 
 from linen.dispatcher.config import DispatchConfig
-from linen.dispatcher.models import ReasonCheckpoint
 from linen.dispatcher.protocol.client import ApiResult
 from linen.dispatcher.runtime.process import ProcessResult
 from linen.dispatcher.scheduler.loop import DispatcherLoop
@@ -306,7 +305,6 @@ def _loop(config: DispatchConfig, client: InProcessClient, containers: LocalCont
     loop.cleanup_executor = ThreadPoolExecutor(max_workers=1)
     loop.futures = {}
     loop.cleanup_futures = {}
-    loop.reason_checkpoints = {}
     loop.runtime_project_ids = set()
     loop.worker_unhealthy_until = {}
     loop.worker_rejected_until = {}
@@ -320,7 +318,6 @@ def _loop(config: DispatchConfig, client: InProcessClient, containers: LocalCont
 def _dispatch_and_wait(loop: DispatcherLoop) -> None:
     loop._reap_futures()
     summaries = loop.client.list_projects()
-    loop._initialize_reason_checkpoints(summaries)
     loop._refresh_runtime_projects(summaries)
     loop._cancel_inactive_tasks(summaries)
     loop._queue_container_cleanups(summaries)
@@ -338,106 +335,6 @@ def _create_project(http: TestClient) -> str:
     )
     assert response.status_code == 201
     return response.json()["project"]["id"]
-
-
-def test_mock_scheduler_bootstrap_completes_project_end_to_end(http_client: TestClient) -> None:
-    client = InProcessClient(http_client)
-    containers = LocalContainerManager()
-    loop = _loop(
-        _config(
-            bootstrap=_phase("complete"),
-            reason=_phase("complete", zero_outcomes=["intent"]),
-            explore=_phase("fact"),
-        ),
-        client,
-        containers,
-    )
-    project_id = _create_project(http_client)
-
-    try:
-        _dispatch_and_wait(loop)
-        project = client.get_project(project_id)
-    finally:
-        loop.close()
-
-    assert project.project.status == "completed"
-    assert [fact.id for fact in project.facts] == ["origin", "goal", "f001"]
-    assert [(intent.id, intent.to) for intent in project.intents] == [("i001", "f001"), ("i002", "goal")]
-
-
-def test_mock_scheduler_runs_reason_explore_reason_complete_chain(http_client: TestClient) -> None:
-    client = InProcessClient(http_client)
-    containers = LocalContainerManager()
-    loop = _loop(
-        _config(
-            bootstrap=_phase("complete"),
-            reason=_phase("intent", rules=[{"fact_ids_gte": 3, "force": "complete"}]),
-            explore=_phase("fact"),
-        ),
-        client,
-        containers,
-    )
-    project_id = _create_project(http_client)
-    seed = client.create_intent(project_id, ["origin"], "seed", "seed-worker")
-    assert seed.ok
-    assert client.heartbeat(project_id, "i001", "seed-worker").ok
-    assert client.conclude(project_id, "i001", "seed-worker", "seed fact").ok
-
-    try:
-        _dispatch_and_wait(loop)
-        assert loop.reason_checkpoints[project_id] == ReasonCheckpoint(
-            fact_count=3,
-            hint_count=0,
-            open_intent_count=1,
-            graph_revision=4,
-            review_count=0,
-        )
-        _dispatch_and_wait(loop)
-        _dispatch_and_wait(loop)
-        project = client.get_project(project_id)
-    finally:
-        loop.close()
-
-    assert project.project.status == "completed"
-    assert [fact.id for fact in project.facts] == ["origin", "goal", "f001", "f002"]
-    assert [(intent.id, intent.to) for intent in project.intents] == [
-        ("i001", "f001"),
-        ("i002", "f002"),
-        ("i003", "goal"),
-    ]
-    assert any("/reason_execute-" in path and "f002" in content for _, path, content in containers.writes)
-    # Explore workers receive only their bounded projection, not the complete
-    # graph export that used to contain unrelated f001 data.
-    assert any("/explore_execute-" in path and "i002" in content for _, path, content in containers.writes)
-
-
-def test_mock_scheduler_enabled_project_skips_bootstrap_when_worker_does_not_support_it(
-    http_client: TestClient,
-) -> None:
-    client = InProcessClient(http_client)
-    containers = LocalContainerManager()
-    loop = _loop(
-        _config(
-            bootstrap=_phase("complete"),
-            reason=_phase("complete", zero_outcomes=["intent"]),
-            explore=_phase("fact"),
-            task_types=["reason", "explore"],
-        ),
-        client,
-        containers,
-    )
-    project_id = _create_project(http_client)
-
-    try:
-        _dispatch_and_wait(loop)
-        project = client.get_project(project_id)
-    finally:
-        loop.close()
-
-    assert project.project.status == "completed"
-    assert [(intent.description, intent.to) for intent in project.intents] == [
-        ("mock complete from origin", "goal")
-    ]
 
 
 def test_task_healthcheck_healthy_worker_completes_end_to_end(http_client: TestClient) -> None:

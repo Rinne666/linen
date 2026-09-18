@@ -4,7 +4,7 @@ from concurrent.futures import Future
 import json
 
 from linen.dispatcher.analysis import coverage
-from linen.dispatcher.models import ReasonCheckpoint, RunningTask
+from linen.dispatcher.models import RunningTask
 from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.process import ProcessResult
 from linen.dispatcher.scheduler.loop import DispatcherLoop
@@ -17,7 +17,6 @@ from conftest import make_config, make_intent, make_project
 
 def _loop() -> DispatcherLoop:
     loop = DispatcherLoop.__new__(DispatcherLoop)
-    loop.reason_checkpoints = {}
     loop.runtime_project_ids = set()
     loop.cleanup_futures = {}
     loop._cleanup_pending = set()
@@ -44,57 +43,6 @@ def _summary(project_id: str, status: str) -> ProjectSummary:
         unclaimed_intent_count=0,
         hint_count=0,
     )
-
-
-def test_reason_trigger_detects_new_facts_and_open_intent_completion() -> None:
-    loop = _loop()
-    project = make_project(intents=[make_intent()])
-    loop.reason_checkpoints["proj_001"] = ReasonCheckpoint(
-        fact_count=3,
-        hint_count=1,
-        open_intent_count=1,
-    )
-    project.facts.append(Fact(id="f002", description="new"))
-    project.intents = []
-
-    assert loop._reason_trigger(project) == "facts:3->4,open_intents:1->0"
-
-
-def test_reason_trigger_returns_none_when_graph_is_unchanged() -> None:
-    loop = _loop()
-    project = make_project(intents=[make_intent()])
-    loop.reason_checkpoints["proj_001"] = ReasonCheckpoint(
-        fact_count=3,
-        hint_count=1,
-        open_intent_count=1,
-    )
-
-    assert loop._reason_trigger(project) is None
-
-
-def test_reason_trigger_detects_review_only_blackboard_change() -> None:
-    loop = _loop()
-    project = make_project()
-    project.project.graph_revision = 8
-    project.reviews.append(
-        Review(
-            id="r001",
-            fact_id="f001",
-            verdict="VALID",
-            confidence="certain",
-            summary="confirmed",
-            created_at="2026-01-01T00:00:03Z",
-        )
-    )
-    loop.reason_checkpoints["proj_001"] = ReasonCheckpoint(
-        fact_count=3,
-        hint_count=1,
-        open_intent_count=0,
-        graph_revision=7,
-        review_count=0,
-    )
-
-    assert loop._reason_trigger(project) == "graph_revision:7->8,reviews:0->1"
 
 
 def test_dispatch_reason_refuses_duplicate_local_reason_task() -> None:
@@ -164,137 +112,6 @@ def test_choose_worker_prefers_priority_then_lower_running_count() -> None:
     assert [worker.name for worker in ordered] == ["first", "busy", "lower"]
 
 
-def test_new_fact_dispatches_reason_before_unclaimed_explore_intent() -> None:
-    loop = _loop()
-    loop.config = make_config()
-    loop.futures = {}
-    project = make_project(intents=[make_intent()])
-    project.intents[0].worker = None
-    project.facts.append(Fact(id="f002", description="new"))
-    loop.reason_checkpoints["proj_001"] = ReasonCheckpoint(
-        fact_count=3,
-        hint_count=1,
-        open_intent_count=1,
-    )
-    loop.container_manager = type("Containers", (), {"container_name": lambda _self, project_id: project_id})()
-    loop.client = type(
-        "Client",
-        (),
-        {
-            "get_project": lambda _self, _project_id: project,
-            "export_project": lambda _self, _project_id: "graph",
-        },
-    )()
-    dispatched: list[tuple[str, str]] = []
-    loop._dispatch_reason = lambda _project, _graph, trigger: dispatched.append(("reason", trigger)) or True
-    loop._dispatch_explore = lambda *_args: dispatched.append(("explore", "")) or True
-
-    assert loop._try_dispatch_project(_summary("proj_001", "active"))
-    assert dispatched == [("reason", "facts:3->4")]
-
-
-def test_initial_enabled_project_without_bootstrap_worker_dispatches_reason() -> None:
-    loop = _loop()
-    config = make_config()
-    loop.config = config.model_copy(
-        update={
-            "workers": [
-                config.workers[0].model_copy(update={"task_types": ["reason", "explore"]})
-            ]
-        }
-    )
-    loop.futures = {}
-    project = make_project()
-    project.facts = project.facts[:2]
-    loop.container_manager = type("Containers", (), {"container_name": lambda _self, project_id: project_id})()
-    loop.client = type(
-        "Client",
-        (),
-        {
-            "get_project": lambda _self, _project_id: project,
-            "export_project": lambda _self, _project_id: "graph",
-        },
-    )()
-    dispatched: list[tuple[str, str]] = []
-    loop._dispatch_initial_project = lambda _project: dispatched.append(("bootstrap", "")) or True
-    loop._dispatch_reason = lambda _project, _graph, trigger: dispatched.append(("reason", trigger)) or True
-
-    assert loop._try_dispatch_project(_summary("proj_001", "active"))
-    assert dispatched == [("reason", "initial")]
-
-
-def test_idle_hypothesis_audit_commits_when_completion_gate_is_ready() -> None:
-    from linen.dispatcher.protocol.client import ApiResult
-
-    loop = _loop()
-    config = make_config()
-    loop.config = config.model_copy(
-        update={"audit": config.audit.model_copy(update={"enabled": True})}
-    )
-    loop.futures = {}
-    project = make_project()
-    project.project.audit_mode = "hypothesis"
-    project.facts[-1] = project.facts[-1].model_copy(
-        update={
-            "type": "negative_assurance",
-            "semantic_type": "negative_assurance",
-            "status": "triaged",
-        }
-    )
-    loop.reason_checkpoints[project.project.id] = ReasonCheckpoint(
-        fact_count=len(project.facts),
-        hint_count=len(project.hints),
-        open_intent_count=0,
-        graph_revision=project.project.graph_revision,
-        review_count=len(project.reviews),
-    )
-
-    class Client:
-        def __init__(self) -> None:
-            self.completed: list[tuple[str, list[str], str, str]] = []
-
-        def get_project(self, _project_id: str):
-            return project
-
-        def get_completion_gate(self, _project_id: str) -> CompletionGate:
-            return CompletionGate(
-                project_id=project.project.id,
-                lifecycle_status="active",
-                execution_status="idle",
-                audit_mode="hypothesis",
-                source_generation=1,
-                plan_revision=1,
-                ready=True,
-                checks=[],
-                blockers=[],
-            )
-
-        def complete(self, project_id, from_ids, description, worker):
-            self.completed.append((project_id, from_ids, description, worker))
-            return ApiResult(200, {})
-
-    class Containers:
-        def container_name(self, project_id: str) -> str:
-            return project_id
-
-        def ensure_running(self, project_id: str) -> str:
-            return project_id
-
-    loop.client = Client()
-    loop.container_manager = Containers()
-
-    assert loop._try_dispatch_project(_summary(project.project.id, "active"))
-    assert loop.client.completed == [
-        (
-            project.project.id,
-            ["f001"],
-            "Audit pipeline converged: required stages, managed Skill receipts, "
-            "independent reviews, and terminal evidence passed the Completion Gate.",
-            "dispatcher.completion-gate",
-        )
-    ]
-
-
 def test_completion_sources_ignore_stale_generations_and_nonterminal_facts() -> None:
     project = make_project()
     project.project.audit_mode = "hypothesis"
@@ -317,67 +134,6 @@ def test_completion_sources_ignore_stale_generations_and_nonterminal_facts() -> 
     assert DispatcherLoop._completion_sources(project) == ["f004"]
 
 
-def test_initial_disabled_project_skips_configured_bootstrap_worker() -> None:
-    loop = _loop()
-    loop.config = make_config()
-    loop.futures = {}
-    project = make_project()
-    project.project.bootstrap_enabled = False
-    project.facts = project.facts[:2]
-    loop.container_manager = type("Containers", (), {"container_name": lambda _self, project_id: project_id})()
-    loop.client = type(
-        "Client",
-        (),
-        {
-            "get_project": lambda _self, _project_id: project,
-            "export_project": lambda _self, _project_id: "graph",
-        },
-    )()
-    dispatched: list[tuple[str, str]] = []
-    loop._dispatch_initial_project = lambda _project: dispatched.append(("bootstrap", "")) or True
-    loop._dispatch_reason = lambda _project, _graph, trigger: dispatched.append(("reason", trigger)) or True
-
-    assert loop._try_dispatch_project(_summary("proj_001", "active"))
-    assert dispatched == [("reason", "initial")]
-
-
-def test_initial_enabled_project_without_bootstrap_worker_skips_bootstrap() -> None:
-    loop = _loop()
-    config = make_config()
-    loop.config = config.model_copy(
-        update={
-            "workers": [
-                config.workers[0].model_copy(update={"task_types": ["reason", "explore"]})
-            ]
-        }
-    )
-    project = make_project()
-    project.project.bootstrap_enabled = True
-    project.facts = project.facts[:2]
-
-    assert not loop._project_requires_bootstrap(project)
-
-
-def test_initial_enabled_project_keeps_existing_bootstrap_intent_when_workers_change() -> None:
-    loop = _loop()
-    config = make_config()
-    loop.config = config.model_copy(
-        update={
-            "workers": [
-                config.workers[0].model_copy(update={"task_types": ["reason", "explore"]})
-            ]
-        }
-    )
-    project = make_project(intents=[make_intent()])
-    project.project.bootstrap_enabled = True
-    project.facts = project.facts[:2]
-    project.intents[0].description = "bootstrap"
-    project.intents[0].creator = "dispatcher.bootstrap"
-    project.intents[0].from_ = ["origin"]
-
-    assert loop._project_requires_bootstrap(project)
-
-
 def test_cancel_inactive_tasks_marks_stopped_and_deleted_projects() -> None:
     loop = _loop()
     stopped = TaskCancellation()
@@ -391,24 +147,6 @@ def test_cancel_inactive_tasks_marks_stopped_and_deleted_projects() -> None:
 
     assert stopped.reason == "stopped"
     assert deleted.reason == "deleted"
-
-
-def test_initialize_reason_checkpoint_only_for_active_projects_with_open_intents() -> None:
-    loop = _loop()
-    active = _summary("active", "active")
-    active.unclaimed_intent_count = 1
-
-    loop._initialize_reason_checkpoints(
-        [
-            active,
-            _summary("idle", "active"),
-            _summary("stopped", "stopped"),
-        ]
-    )
-
-    assert loop.reason_checkpoints == {
-        "active": ReasonCheckpoint(fact_count=2, hint_count=0, open_intent_count=1)
-    }
 
 
 def test_select_worker_reports_busy_unhealthy_rejected_and_unsupported_workers(monkeypatch) -> None:

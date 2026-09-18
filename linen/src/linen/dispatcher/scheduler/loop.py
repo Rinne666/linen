@@ -20,7 +20,7 @@ from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, scop
 from linen.dispatcher.analysis.external_scanners import scanner_for_intent, scanner_specs
 from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
-from linen.dispatcher.models import AuditGraphCheckpoint, RunningTask
+from linen.dispatcher.models import RunningTask
 from linen.dispatcher.protocol.client import LinenClient
 from linen.dispatcher.runtime.backend import LocalBackend
 from linen.dispatcher.runtime.cancellation import TaskCancellation
@@ -28,7 +28,7 @@ from linen.dispatcher.runtime.startup_healthcheck import format_failure_summary,
 from linen.dispatcher.scheduler.worker_select import choose_worker
 from linen.dispatcher.workers.registry import get_driver
 from linen.dispatcher.tasks.explore import run_explore_task
-from linen.dispatcher.tasks.reason import run_audit_graph_reason_task, run_reason_task
+from linen.dispatcher.tasks.reason import run_reason_task
 from linen.dispatcher.tasks.review import run_review_task
 from linen.server.models import Intent, ProjectDetail, ProjectSummary
 
@@ -58,7 +58,6 @@ class DispatcherLoop:
         self.cleanup_executor = ThreadPoolExecutor(max_workers=max(1, min(8, self.config.runtime.max_workers)))
         self.futures: dict[Future[str], RunningTask] = {}
         self.cleanup_futures: dict[Future[bool], tuple[str, str | None, str | None]] = {}
-        self.audit_graph_checkpoints: dict[str, AuditGraphCheckpoint] = {}
         self.runtime_project_ids: set[str] = set()
         self.worker_unhealthy_until: dict[str, float] = {}
         self.worker_rejected_until: dict[tuple[str, str, str], float] = {}
@@ -276,21 +275,6 @@ class DispatcherLoop:
                     self._report_orphan_intent_error(
                         project_id, str(intent_id), worker or "dispatcher.recovery", task_type,
                     )
-                elif task_type in {"audit_graph_reason", "audit_graph"}:
-                    checkpoints = getattr(self, "audit_graph_checkpoints", None)
-                    if checkpoints is None:
-                        checkpoints = {}
-                        self.audit_graph_checkpoints = checkpoints
-                    prior = checkpoints.get(project_id)
-                    prior_attempts = (
-                        prior.attempts
-                        if prior is not None and prior.graph_revision == graph_revision
-                        else 0
-                    )
-                    checkpoints[project_id] = AuditGraphCheckpoint(
-                        graph_revision=graph_revision,
-                        attempts=max(prior_attempts, attempt),
-                    )
                 elif task_type in {"reason", "reason_execute"}:
                     LOG.info(
                         "reason run recovered project=%s event_seq=%s attempt=%s; cursor remains unacknowledged",
@@ -446,25 +430,11 @@ class DispatcherLoop:
         if self._reconcile_audit_stages(project):
             project = self.client.get_project(summary.id)
 
-        has_managed_audit_work = any(
-            audit_graph.managed_description(intent.description)
-            and intent.to is None
-            and intent.concluded_at is None
-            for intent in project.intents
-        )
-        if project.project.reason is None and not has_managed_audit_work:
-            audit_graph_trigger = self._audit_graph_reason_trigger(project)
-            if audit_graph_trigger is not None:
-                export_yaml = self.client.export_project(summary.id)
-                return self._dispatch_reason(
-                    project,
-                    export_yaml,
-                    audit_graph_trigger,
-                    profile="audit_graph",
-                )
+        if project.project.reason is None:
             reason_trigger = self._reason_trigger(project)
             if reason_trigger is not None:
                 export_yaml = self.client.export_project(summary.id)
+                return self._dispatch_reason(project, export_yaml, reason_trigger)
                 return self._dispatch_reason(project, export_yaml, reason_trigger)
         running_intent_ids = self._project_running_explore_intents(summary.id)
         unclaimed_intents = [
@@ -813,8 +783,6 @@ class DispatcherLoop:
         self,
         project: ProjectDetail,
         trigger: str,
-        *,
-        profile: str,
     ) -> int:
         """Return the attempt encoded by a deterministic reason trigger."""
         match = re.search(r"(?:^|:)attempt:(\d+)(?:$|,)", trigger)
@@ -856,8 +824,6 @@ class DispatcherLoop:
         project: ProjectDetail,
         export_yaml: str,
         trigger: str,
-        *,
-        profile: str = "default",
     ) -> bool:
         if self._project_has_running_reason(project.project.id):
             self._log_changed(
@@ -882,7 +848,7 @@ class DispatcherLoop:
             return False
         self._clear_log_state(f"project:{project.project.id}:worker:reason")
         lease_id = uuid.uuid4().hex
-        attempt = self._reason_attempt(project, trigger, profile=profile)
+        attempt = self._reason_attempt(project, trigger)
         claim = self.client.claim_reason(project.project.id, worker.name, lease_id, trigger)
         if claim.status_code in (403, 409):
             level = logging.INFO if claim.status_code == 403 else logging.WARNING
@@ -903,13 +869,8 @@ class DispatcherLoop:
             )
             return False
         try:
-            task_runner = (
-                run_audit_graph_reason_task
-                if profile == "audit_graph"
-                else run_reason_task
-            )
             future = self._submit_task_runner(
-                task_runner,
+                run_reason_task,
                 self.config,
                 self.client,
                 self.container_manager,
@@ -932,7 +893,6 @@ class DispatcherLoop:
             cancellation,
             intent_id=None,
             intent_count=len(project.intents),
-            reason_profile=profile,
             graph_revision=project.project.graph_revision,
             attempt=attempt,
             trigger=trigger,
@@ -940,8 +900,8 @@ class DispatcherLoop:
         self.runtime_project_ids.add(project.project.id)
         self._clear_project_log_state(project.project.id)
         LOG.info(
-            "dispatched reason project=%s worker=%s profile=%s trigger=%s",
-            project.project.id, worker.name, profile, trigger,
+            "dispatched reason project=%s worker=%s trigger=%s",
+            project.project.id, worker.name, trigger,
         )
         return True
 
@@ -1374,26 +1334,6 @@ class DispatcherLoop:
             )
         return None
 
-    def _audit_graph_reason_trigger(self, project: ProjectDetail) -> str | None:
-        graph_config = self.config.audit.graph_reason
-        if (
-            not self.config.audit.enabled
-            or not graph_config.enabled
-            or project.project.audit_mode == "none"
-        ):
-            return None
-        checkpoints = getattr(self, "audit_graph_checkpoints", {})
-        checkpoint = checkpoints.get(project.project.id)
-        revision = project.project.graph_revision
-        if checkpoint is None or checkpoint.graph_revision != revision:
-            return f"audit_graph:revision:{revision}:attempt:1"
-        if checkpoint.attempts < graph_config.max_attempts_per_revision:
-            return (
-                f"audit_graph:revision:{revision}:"
-                f"attempt:{checkpoint.attempts + 1}"
-            )
-        return None
-
     def _reap_futures(self) -> None:
         # Some embedders and older tests construct the loop without calling
         # ``__init__``; lazily establish the new circuit state for backwards
@@ -1472,37 +1412,6 @@ class DispatcherLoop:
                     self.worker_rejected_until.pop(rejection_key, None)
                 if outcome not in {"success", "cancelled", "blocked"}:
                     self._record_intent_error(task, outcome)
-                if task.task_type == "reason" and task.reason_profile == "audit_graph":
-                    checkpoints = getattr(self, "audit_graph_checkpoints", None)
-                    if checkpoints is None:
-                        checkpoints = {}
-                        self.audit_graph_checkpoints = checkpoints
-                    start_revision = task.graph_revision or 0
-                    prior = checkpoints.get(task.project_id)
-                    if outcome == "success":
-                        fresh = self.client.get_project(task.project_id)
-                        checkpoints[task.project_id] = AuditGraphCheckpoint(
-                            graph_revision=fresh.project.graph_revision,
-                            attempts=self.config.audit.graph_reason.max_attempts_per_revision,
-                        )
-                    elif outcome != "cancelled":
-                        attempts = (
-                            prior.attempts + 1
-                            if prior is not None and prior.graph_revision == start_revision
-                            else 1
-                        )
-                        checkpoints[task.project_id] = AuditGraphCheckpoint(
-                            graph_revision=start_revision,
-                            attempts=attempts,
-                        )
-                        LOG.info(
-                            "audit graph checkpoint updated project=%s revision=%s attempts=%s/%s outcome=%s",
-                            task.project_id,
-                            start_revision,
-                            attempts,
-                            self.config.audit.graph_reason.max_attempts_per_revision,
-                            outcome,
-                        )
             except Exception as exc:
                 LOG.exception("task crashed project=%s task=%s worker=%s", task.project_id, task.task_type, task.worker_name)
                 self._record_intent_error(task, "task_crashed", detail=str(exc))

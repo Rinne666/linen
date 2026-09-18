@@ -169,9 +169,9 @@ def _reason_contracts(
         attempt=attempt,
         logical_scope=scope,
         context_projection_id=projection.projection_id,
-        recipe_id="audit_graph_reason" if phase.startswith("audit_graph_reason") else "reason",
+        recipe_id="reason",
         recipe_version=1,
-        recipe_label="AuditGraph Reason" if phase.startswith("audit_graph_reason") else "Reason",
+        recipe_label="Reason",
         prompt=prompt,
     )
 
@@ -191,7 +191,6 @@ def _run_context_continuation(
     request: object,
     timeout_seconds: int,
     attempt: int,
-    audit_graph_reason: bool,
 ) -> tuple[str, dict[str, object] | None]:
     """Run the sole allowed ContextRequest continuation pass.
 
@@ -208,11 +207,7 @@ def _run_context_continuation(
             initial_run.run_id,
         )
         return "failed", None
-    continuation_phase = (
-        "audit_graph_reason_context_continuation"
-        if audit_graph_reason
-        else "reason_context_continuation"
-    )
+    continuation_phase = "reason_context_continuation"
     try:
         context_reference = write_context_projection_reference(
             backend,
@@ -240,7 +235,7 @@ def _run_context_continuation(
     logical_scope = (
         f"{continuation_phase}:initial-run-{initial_run.run_id}:request-{request_digest}"
     )
-    label = "AuditGraph Reason" if audit_graph_reason else "Reason"
+    label = "Reason"
     continuation_prompt = (
         "The previous pass requested one bounded context expansion. Use only the "
         "expanded ContextProjection at this dispatcher-managed path:\n\n"
@@ -322,272 +317,6 @@ def _run_context_continuation(
         )
         return "failed", None
     return "success", payload
-
-
-def run_audit_graph_reason_task(
-    config: DispatchConfig,
-    client: LinenClient,
-    backend: ExecutionBackend,
-    project: ProjectDetail,
-    export_yaml: str,
-    worker: WorkerConfig,
-    cancellation: TaskCancellation,
-    lease_id: str | None = None,
-    trigger: str | None = None,
-    attempt: int = 1,
-) -> str:
-    """Run a fresh, constrained Reason conversation over one graph revision.
-
-    The model never receives protocol credentials or write authority. Its
-    output is parsed against the same revision it read, validated by
-    ``audit_graph.validate_model_intents``, and only then written by the
-    dispatcher as ordinary blackboard intents.
-    """
-    lease_id = lease_id or uuid.uuid4().hex
-    ack_event_seq: int | None = None
-    driver = get_driver(worker.type)
-    task_started = time.perf_counter()
-    graph_config = config.audit.graph_reason
-    lease = HeartbeatLease.for_reason(
-        client, project.project.id, worker.name, lease_id, config.runtime.interval,
-    )
-    lease.start()
-    try:
-        container_name = backend.ensure_running(project.project.id)
-        if task_healthcheck_enabled(config):
-            health = driver.check_health(worker, timeout=config.runtime.healthcheck_timeout)
-            if cancellation.is_cancelled:
-                return "cancelled"
-            if lease.failure is not None:
-                return "failed"
-            if not health.ok:
-                LOG.warning(
-                    "audit graph worker unhealthy project=%s worker=%s status=%s detail=%s",
-                    project.project.id, worker.name, health.status, health.detail,
-                )
-                return "unhealthy"
-
-        prepared_contracts = _prepare_reason_contracts(
-            client,
-            backend,
-            project,
-            container_name,
-            phase="audit_graph_reason",
-        )
-        if prepared_contracts is None:
-            return "failed"
-        projection = prepared_contracts
-        try:
-            context_reference = write_context_projection_reference(
-                backend, container_name, projection, phase="audit_graph_reason",
-            )
-        except Exception as exc:
-            LOG.error(
-                "context projection reference write failed project=%s phase=%s error=%s",
-                project.project.id, "audit_graph_reason", exc,
-            )
-            return "failed"
-        projected_ids = set(projection.node_ids)
-
-        open_intents = [
-            {
-                "id": intent.id,
-                "from": [source_id for source_id in intent.from_ if source_id in projected_ids],
-                "type": intent.type,
-                "description": intent.description,
-                "worker": intent.worker,
-            }
-            for intent in project.intents
-            if intent.to is None and intent.concluded_at is None and intent.id in projected_ids
-        ]
-        allowed_fact_ids = [
-            fact.id for fact in project.facts
-            if fact.id != "goal" and fact.id in projected_ids
-        ]
-        skill_choices = audit_graph.selectable_skill_choices(
-            project, Path(container_name), config.audit,
-        )
-        skill_contract_path = Path(__file__).resolve().parents[1] / "skills" / "SKILL.md"
-        skill_contract = skill_contract_path.read_text(encoding="utf-8")
-        public_skill_choices = [
-            {
-                "skill_id": choice["skill_id"],
-                "version": choice["version"],
-                "capability": choice["capability"],
-                "label": choice["label"],
-            }
-            for choice in skill_choices
-        ]
-        prompt = render_prompt(
-            load_prompt(config.runtime.prompt_group, "audit_graph.md"),
-            {
-                "graph_yaml": context_reference,
-                "graph_revision": str(projection.graph_revision),
-                "fact_ids": format_fact_ids(allowed_fact_ids),
-                "open_intents": format_open_intents(open_intents),
-                "max_intents": str(graph_config.max_intents),
-                "skill_contract": skill_contract,
-                "available_skills": json.dumps(public_skill_choices, ensure_ascii=False),
-            },
-        )
-        prompt += "\n" + SOURCE_DATA_BOUNDARY
-
-        worker_manifest, run_envelope = _reason_contracts(
-            project,
-            worker,
-            projection,
-            phase="audit_graph_reason",
-            timeout_seconds=graph_config.timeout,
-            trigger=trigger,
-            attempt=attempt,
-            prompt=prompt,
-        )
-
-        # Every audit-graph pass is deliberately cold-started. Drivers that
-        # need an explicit seed/session id create one here; drivers whose
-        # execute command starts a conversation leave this as None.
-        session = driver.prepare_session()
-        command = driver.build_execute(worker, prompt, session)
-        execute_started = time.perf_counter()
-        result = run_worker_process(
-            backend,
-            container_name,
-            worker,
-            command.argv,
-            phase="audit_graph_reason",
-            timeout_seconds=graph_config.timeout,
-            lease=lease,
-            cancellation=cancellation,
-            client=client,
-            run_envelope=run_envelope,
-            worker_manifest=worker_manifest,
-            context_projection_id=run_envelope.context_projection_id,
-            recipe_content_digest=worker_manifest.recipe.digest,
-        )
-        execute_ms = int((time.perf_counter() - execute_started) * 1000)
-        total_ms = int((time.perf_counter() - task_started) * 1000)
-        cancelled = cancel_reason(result, cancellation)
-        if cancelled is not None:
-            return "cancelled"
-        if lease.failure is not None:
-            return "failed"
-        provider_failure = classify_provider_failure(result)
-        if provider_failure is not None:
-            LOG.warning(
-                "audit graph provider unavailable project=%s worker=%s outcome=%s",
-                project.project.id, worker.name, provider_failure,
-            )
-            return provider_failure
-        if did_timeout(result):
-            LOG.warning(
-                "audit graph reason timed out project=%s worker=%s execute_ms=%s total_ms=%s",
-                project.project.id, worker.name, execute_ms, total_ms,
-            )
-            return "failed"
-        if result.returncode != 0:
-            LOG.warning(
-                "audit graph reason command failed project=%s worker=%s code=%s stderr_preview=%s",
-                project.project.id, worker.name, result.returncode, preview(result.stderr),
-            )
-            return "failed"
-        continuation_used = False
-        try:
-            payload = parse_json_output(driver.extract_response_text(result.stdout, result.stderr))
-            context_request = extract_context_request(payload)
-            if context_request is not None:
-                continuation_used = True
-                continuation_status, continuation_payload = _run_context_continuation(
-                    client=client,
-                    backend=backend,
-                    project=project,
-                    container_name=container_name,
-                    worker=worker,
-                    driver=driver,
-                    lease=lease,
-                    cancellation=cancellation,
-                    initial_run=run_envelope,
-                    projection=projection,
-                    request=context_request,
-                    timeout_seconds=graph_config.timeout,
-                    attempt=attempt,
-                    audit_graph_reason=True,
-                )
-                if continuation_status != "success" or continuation_payload is None:
-                    return continuation_status
-                payload = continuation_payload
-            fresh = client.get_project(project.project.id)
-            kind, proposals = audit_graph.validate_model_intents(
-                payload,
-                fresh,
-                expected_revision=run_envelope.graph_revision,
-                max_intents=graph_config.max_intents,
-                skill_choices=skill_choices,
-            )
-        except Exception as exc:
-            LOG.warning(
-                "audit graph reason validation failed project=%s worker=%s error=%s stdout_preview=%s",
-                project.project.id,
-                worker.name,
-                exc,
-                None if continuation_used else preview(result.stdout),
-            )
-            return "failed"
-        if kind == "rejected":
-            return "rejected"
-
-        created = 0
-        for proposal in proposals:
-            response = client.create_intent(
-                project.project.id,
-                proposal["from"],
-                proposal["description"],
-                audit_graph.MODEL_CREATOR,
-                action=proposal["action"],
-                target=proposal["target"],
-                intent_type=proposal["type"],
-                display_title=proposal.get("display_title"),
-                semantic_type=proposal.get("semantic_type"),
-                relation_type=proposal.get("relation_type"),
-                phase=proposal.get("phase"),
-            )
-            if response.status_code in {403, 409}:
-                continue
-            if not response.ok:
-                LOG.warning(
-                    "audit graph intent write failed project=%s worker=%s status=%s body=%s",
-                    project.project.id, worker.name, response.status_code, response.text,
-                )
-                continue
-            created += 1
-            if proposal.get("skill_id"):
-                client.create_hint(
-                    project.project.id,
-                    (
-                        f"AuditGraph selected {proposal['skill_id']} from the trusted Skill registry. "
-                        f"Reason: {proposal['selection_reason']}"
-                    ),
-                    audit_graph.MODEL_CREATOR,
-                )
-        if proposals and created == 0:
-            return "failed"
-        LOG.info(
-            "audit graph reason finished project=%s worker=%s revision=%s created_intents=%s/%s execute_ms=%s total_ms=%s",
-            project.project.id,
-            worker.name,
-            project.project.graph_revision,
-            created,
-            len(proposals),
-            execute_ms,
-            total_ms,
-        )
-        ack_event_seq = project.project.event_seq
-        return "success"
-    finally:
-        lease.stop()
-        best_effort_release_reason(
-            client, project.project.id, worker.name, lease_id, ack_event_seq,
-            ack=ack_event_seq is not None,
-        )
 
 
 def run_reason_task(
@@ -679,6 +408,11 @@ def run_reason_task(
             for intent in project.intents
             if intent.to is None and intent.concluded_at is None and intent.id in projected_ids
         ]
+        skill_choices = (
+            audit_graph.selectable_skill_choices(project, Path(container_name), config.audit)
+            if config.audit.enabled and project.project.audit_mode != "none"
+            else []
+        )
         allowed_fact_ids = [
             fact.id for fact in project.facts
             if fact.id != "goal" and fact.id in projected_ids
@@ -708,6 +442,13 @@ def run_reason_task(
                 "max_intents": str(config.tasks.reason.max_intents),
             },
         )
+        if skill_choices:
+            prompt += (
+                "\nTrusted Skill choices (select by emitting a normal Intent with "
+                "action=run_skill, target=skill_id, type=search:skill, and the "
+                "choice's exact description):\n"
+                + json.dumps(skill_choices, ensure_ascii=False, sort_keys=True)
+            )
         if audit_enabled:
             prompt += "\n" + SOURCE_DATA_BOUNDARY
 
@@ -824,11 +565,19 @@ def run_reason_task(
                     request=context_request,
                     timeout_seconds=config.tasks.reason.timeout,
                     attempt=attempt,
-                    audit_graph_reason=False,
                 )
                 if continuation_status != "success" or continuation_payload is None:
                     return continuation_status
                 payload = continuation_payload
+            fresh = client.get_project(project.project.id)
+            if fresh.project.graph_revision != run_envelope.graph_revision:
+                LOG.info(
+                    "reason output stale project=%s expected_revision=%s current_revision=%s",
+                    project.project.id,
+                    run_envelope.graph_revision,
+                    fresh.project.graph_revision,
+                )
+                return "failed"
             kind, data = validate_reason_payload(
                 payload, open_intents_empty=not open_intents, max_intents=config.tasks.reason.max_intents,
             )
@@ -917,6 +666,27 @@ def run_reason_task(
                 # scheduler can route review intents to the review dispatcher
                 # (loop.py: `if intent.type == "review"`).
                 intent_type = intent_data.get("type")
+                if intent_type == "search:skill":
+                    skill_id = intent_data.get("target")
+                    selected_skill = next(
+                        (choice for choice in skill_choices if choice["skill_id"] == skill_id),
+                        None,
+                    )
+                    if (
+                        intent_data.get("action") != "run_skill"
+                        or selected_skill is None
+                        or intent_data.get("description") != selected_skill["description"]
+                    ):
+                        LOG.warning(
+                            "reason skill intent rejected project=%s worker=%s target=%s",
+                            project.project.id, worker.name, skill_id,
+                        )
+                        continue
+                    intent_data = {
+                        **intent_data,
+                        "description": selected_skill["description"],
+                        "from": selected_skill["from"],
+                    }
                 response = client.create_intent(
                     project.project.id,
                     intent_data["from"],

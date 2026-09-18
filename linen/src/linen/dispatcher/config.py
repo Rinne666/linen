@@ -19,13 +19,6 @@ LocalCompletedAction = Literal["keep", "remove"]
 
 DEFAULT_PROMPT_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
     "reason.md": ("{graph_yaml}", "{fact_ids}", "{open_intents}", "{max_intents}"),
-    "audit_graph.md": (
-        "{graph_yaml}",
-        "{graph_revision}",
-        "{fact_ids}",
-        "{open_intents}",
-        "{max_intents}",
-    ),
     "explore.md": ("{graph_yaml}", "{intent_id}", "{intent_description}"),
     "explore_conclude.md": ("{graph_yaml}", "{intent_id}", "{intent_description}"),
     "review.md": ("{graph_yaml}", "{intent_id}", "{fact_block}", "{intent_description}"),
@@ -36,9 +29,6 @@ DEFAULT_PROMPT_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
 PROMPT_REQUIRED_TOKENS_BY_GROUP: dict[str, dict[str, tuple[str, ...]]] = {
     "mock": {
         "reason.md": ("{fact_ids}", "{open_intents}", "{max_intents}"),
-        "audit_graph.md": (
-            "{graph_revision}", "{fact_ids}", "{open_intents}", "{max_intents}",
-        ),
         "explore.md": ("{intent_id}",),
         "explore_conclude.md": ("{intent_id}",),
         "review.md": ("{intent_id}", "{fact_block}", "{intent_description}"),
@@ -133,7 +123,6 @@ class ReviewTaskConfig(BaseModel):
 
 
 class TasksConfig(BaseModel):
-    bootstrap: BootstrapTaskConfig
     reason: ReasonTaskConfig
     explore: ExploreTaskConfig
     # Optional for backwards-compat. If absent, the review task reuses
@@ -274,6 +263,10 @@ class TrivyConfig(ManagedScannerConfig):
     executable: str = "trivy"
     # Trivy manages its own vulnerability DB cache; do not cache final results.
     cache: bool = False
+    # Keep database locations configurable because the default mirror may be
+    # unavailable in restricted networks. Trivy accepts repeated flags and
+    # tries repositories in the supplied order.
+    db_repository: list[str] = Field(default_factory=list)
     scanners: list[Literal["vuln", "misconfig", "secret"]] = Field(
         default_factory=lambda: ["vuln", "misconfig", "secret"]
     )
@@ -283,6 +276,13 @@ class TrivyConfig(ManagedScannerConfig):
     def unique_scanners(cls, value: list[str]) -> list[str]:
         if not value or len(value) != len(set(value)):
             raise ValueError("trivy.scanners must contain unique scanner names")
+        return value
+
+    @field_validator("db_repository")
+    @classmethod
+    def valid_db_repositories(cls, value: list[str]) -> list[str]:
+        if any(not repository.strip() for repository in value):
+            raise ValueError("trivy.db_repository entries must not be empty")
         return value
 
 
@@ -445,22 +445,6 @@ class PocSandboxConfig(ReviewSandboxConfig):
     """Disposable isolation used by ``poc:isolated`` explore intents."""
 
 
-class AuditGraphReasonConfig(BaseModel):
-    """Optional LLM interpretation pass over the deterministic audit graph.
-
-    This is an execution profile of the existing Reason worker, not a new
-    worker role. The model may only propose semantic verification intents;
-    code remains responsible for validation and protocol writes.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False
-    timeout: int = Field(default=120, gt=0)
-    max_intents: int = Field(default=3, gt=0, le=8)
-    max_attempts_per_revision: int = Field(default=2, gt=0, le=5)
-
-
 class SemanticAuditConfig(BaseModel):
     """LLM recipe passes materialized as ordinary blackboard work.
 
@@ -512,7 +496,6 @@ class AuditConfig(BaseModel):
     scope_adjudication: ScopeAdjudicationConfig = Field(
         default_factory=ScopeAdjudicationConfig
     )
-    graph_reason: AuditGraphReasonConfig = Field(default_factory=AuditGraphReasonConfig)
     semantic: SemanticAuditConfig = Field(default_factory=SemanticAuditConfig)
 
 
@@ -565,9 +548,6 @@ class DispatchConfig(BaseModel):
         if not self.workers:
             raise ValueError("workers must not be empty")
         if self.audit.enabled:
-            has_bootstrap = any("bootstrap" in worker.task_types for worker in self.workers)
-            if has_bootstrap and not self.audit.recon.enabled:
-                raise ValueError("audit mode requires recon.enabled for bootstrap workers")
             if self.audit.recon.enabled and self.audit.mode != "scope":
                 raise ValueError("audit recon requires scope mode")
             if not any("review" in worker.task_types for worker in self.workers):

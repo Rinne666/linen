@@ -13,7 +13,6 @@ class RunningTask:
     cancellation: TaskCancellation
     intent_id: str | None = None
     intent_count: int | None = None
-    reason_profile: str = "default"
     graph_revision: int | None = None
     provider_required: bool = True
     # Optional vNext execution identity.  Kept additive so older scheduler
@@ -25,9 +24,3 @@ class RunningTask:
     worker_manifest_digest: str | None = None
     # Stable scheduler cause used to reconstruct the same logical run.
     trigger: str | None = None
-
-
-@dataclass(slots=True)
-class AuditGraphCheckpoint:
-    graph_revision: int
-    attempts: int

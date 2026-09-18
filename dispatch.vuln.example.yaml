@@ -19,13 +19,12 @@
 #   uv run --project linen linen serve                           # one terminal
 #   uv run --project linen linen dispatch --config dispatch.yaml # another
 #
-# Then create a project with bootstrap_enabled=false and a scope-audit target:
+# Then create a project with a scope-audit target:
 #   curl -X POST http://127.0.0.1:9000/projects -H "Content-Type: application/json" \
 #     -d '{
 #       "title": "audit-todoapp",
 #       "origin": "/Users/you/code/todoapp",
 #       "goal": "SQL injection in any user-input -> DB query path; also XSS in any HTML render",
-#       "bootstrap_enabled": false,
 #       "audit_mode": "scope"
 #     }'
 
@@ -55,14 +54,6 @@ audit:
     fetch_timeout: 15
     max_documents: 64
     max_document_bytes: 1000000
-  # Uses the existing Reason worker and lock, but starts an independent
-  # conversation for each changed graph revision. The model can only propose
-  # semantic verification intents; dispatcher validation owns all writes.
-  graph_reason:
-    enabled: true
-    timeout: 120
-    max_intents: 3
-    max_attempts_per_revision: 2
   # Existing Explore workers run these as isolated conversations. The
   # dispatcher selects one recipe per graph-derived Intent and validates its
   # cited result before it may become a Fact.
@@ -133,6 +124,8 @@ audit:
   trivy:
     enabled: false
     executable: "trivy"
+    # Override the default mirror when mirror.gcr.io is unavailable.
+    db_repository: ["ghcr.io/aquasecurity/trivy-db:2", "public.ecr.aws/aquasecurity/trivy-db:2"]
     scanners: [vuln, misconfig, secret]
     timeout: 600
 

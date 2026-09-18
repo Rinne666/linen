@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 from types import SimpleNamespace
 
-from linen.dispatcher.models import ReasonCheckpoint, RunningTask
+from linen.dispatcher.models import RunningTask
 from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.scheduler.loop import DispatcherLoop, WorkerSelection
 from linen.dispatcher.scheduler import loop as scheduler_module
@@ -44,7 +44,6 @@ def _base_loop() -> DispatcherLoop:
     loop.worker_unhealthy_until = {}
     loop.worker_provider_until = {}
     loop.worker_provider_reason = {}
-    loop.reason_checkpoints = {}
     loop._log_state = {}
     loop._clear_log_state = lambda *_args: None
     loop._clear_project_log_state = lambda *_args: None
@@ -72,17 +71,6 @@ def test_reason_dispatch_passes_stable_trigger_and_attempt(monkeypatch) -> None:
     task = next(iter(loop.futures.values()))
     assert task.attempt == 1
     assert task.trigger == "initial"
-
-
-def test_audit_graph_attempt_is_reconstructed_from_trigger(monkeypatch) -> None:
-    loop = _base_loop()
-    project = make_project()
-    runner = lambda *args, **kwargs: "success"
-    monkeypatch.setattr(scheduler_module, "run_audit_graph_reason_task", runner)
-
-    trigger = "audit_graph:revision:0:attempt:2"
-    assert loop._dispatch_reason(project, "graph", trigger, profile="audit_graph")
-    assert loop.executor.calls[0][2]["attempt"] == 2
 
 
 def test_legacy_fake_runner_does_not_receive_contract_keywords() -> None:
@@ -165,23 +153,6 @@ def test_resolved_or_other_task_errors_do_not_advance_new_attempt() -> None:
         )
         == 1
     )
-
-
-def test_reason_failure_retries_once_then_stops() -> None:
-    loop = _base_loop()
-    project = make_project()
-    loop.reason_checkpoints[project.project.id] = ReasonCheckpoint(
-        fact_count=len(project.facts),
-        hint_count=len(project.hints),
-        open_intent_count=0,
-        graph_revision=project.project.graph_revision,
-        attempts=1,
-        last_attempt_failed=True,
-    )
-
-    assert loop._reason_trigger(project) == "reason:revision:0:attempt:2"
-    loop.reason_checkpoints[project.project.id].attempts = 2
-    assert loop._reason_trigger(project) is None
 
 
 def test_ordinary_failure_error_budget_is_two_and_provider_budget_is_preserved() -> None:
@@ -296,57 +267,11 @@ def test_orphan_recovery_retries_after_network_error_then_reports_once() -> None
     assert loop._orphan_recovery_done == {summary.id}
 
 
-def test_orphan_reason_and_audit_graph_recovery_restore_next_attempt() -> None:
-    loop = _base_loop()
-    loop.audit_graph_checkpoints = {}
-    summary = _active_summary()
-    summary.graph_revision = 3
-    summary.fact_count = 3
-    summary.hint_count = 1
-    runs = [
-        SimpleNamespace(
-            run_id="run-reason",
-            project_id="proj_001",
-            intent_id=None,
-            task_type="reason_execute",
-            attempt=1,
-            status="interrupted",
-            graph_revision=3,
-        ),
-        SimpleNamespace(
-            run_id="run-graph",
-            project_id="proj_001",
-            intent_id=None,
-            task_type="audit_graph_reason",
-            attempt=2,
-            status="interrupted",
-            graph_revision=7,
-        ),
-    ]
-
-    class Client(_ClaimClient):
-        def recover_runs(self, _project_id: str):
-            return runs
-
-    loop.client = Client()
-    loop._recover_orphan_runs([summary])
-
-    assert loop.reason_checkpoints["proj_001"].attempts == 1
-    assert loop.reason_checkpoints["proj_001"].last_attempt_failed
-    project = make_project()
-    project.project.graph_revision = 3
-    trigger = loop._reason_trigger(project)
-    assert trigger == "reason:revision:3:attempt:2"
-    assert loop._reason_attempt(project, trigger, profile="default") == 2
-    assert loop.audit_graph_checkpoints["proj_001"].attempts == 2
-
-
 def test_orphan_recovery_is_noop_for_legacy_client_and_empty_response() -> None:
     loop = _base_loop()
     summary = _active_summary()
     loop._recover_orphan_runs([summary])
     assert loop._orphan_recovery_done == {summary.id}
-    assert loop.reason_checkpoints == {}
 
     class EmptyClient(_ClaimClient):
         def recover_runs(self, _project_id: str):
@@ -355,4 +280,3 @@ def test_orphan_recovery_is_noop_for_legacy_client_and_empty_response() -> None:
     loop = _base_loop()
     loop.client = EmptyClient()
     loop._recover_orphan_runs([summary])
-    assert loop.reason_checkpoints == {}

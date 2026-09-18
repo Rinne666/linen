@@ -318,6 +318,12 @@
     background: #eef2ff;
     color: #4338ca;
   }
+  .graph-view-status {
+    border: 1px solid #dbe3ee;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.94);
+    box-shadow: 0 4px 14px rgba(16, 24, 40, 0.06);
+  }
   .outline-row {
     border: 1px solid #e4e7ec;
     border-radius: 8px;
@@ -802,13 +808,15 @@
     <!-- Graph -->
     <div class="graph-canvas flex-1 relative min-w-0 min-h-0">
       <div class="workbench-toolbar absolute top-3 left-3 z-10 flex max-w-[calc(100%-24px)] items-center gap-1 p-1 overflow-x-auto">
-        <button @click="setWorkspaceMode('graph')" class="workbench-tab" :aria-selected="workspaceMode === 'graph'">Graph</button>
-        <button @click="setWorkspaceMode('outline')" class="workbench-tab" :aria-selected="workspaceMode === 'outline'">Outline</button>
+        <button type="button" @click="setGraphView('current')" class="workbench-tab" :aria-selected="graphView === 'current'" aria-label="Show current execution focus">Current</button>
+        <button type="button" @click="setGraphView('findings')" class="workbench-tab" :aria-selected="graphView === 'findings'" aria-label="Show finding chains">Findings</button>
+        <button type="button" @click="setGraphView('full')" class="workbench-tab" :aria-selected="graphView === 'full'" aria-label="Show full blackboard map">Full map</button>
+        <button type="button" @click="setGraphView('list')" class="workbench-tab" :aria-selected="graphView === 'list'" aria-label="Show blackboard list">List</button>
         <span class="mx-1 h-5 w-px bg-slate-200 shrink-0"></span>
-        <button x-show="workspaceMode === 'graph'" @click="fitGraph()" class="h-7 w-7 rounded-md text-slate-500 hover:text-slate-700 hover:bg-slate-50 transition inline-flex items-center justify-center shrink-0" title="Fit graph" aria-label="Fit graph">
+        <button x-show="workspaceMode === 'graph' && graphView !== 'list'" @click="fitGraph()" class="h-7 w-7 rounded-md text-slate-500 hover:text-slate-700 hover:bg-slate-50 transition inline-flex items-center justify-center shrink-0" title="Fit graph" aria-label="Fit graph">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
         </button>
-        <select x-model="graphKindFilter" @change="changeGraphFilters()" aria-label="Filter graph by evidence kind"
+        <select x-show="graphView === 'full'" x-model="graphKindFilter" @change="changeGraphFilters()" aria-label="Filter graph by evidence kind"
           class="graph-inline-filter h-7 rounded-md border-0 bg-slate-50 px-2 text-[11px] font-medium text-slate-600 focus:ring-2 focus:ring-brand-100">
           <option value="all">All evidence</option>
           <option value="findings">Hypothesis chain</option>
@@ -817,7 +825,7 @@
           <option value="coverage">Coverage and summaries</option>
           <option value="semantic">Semantic recipes</option>
         </select>
-        <select x-model="graphStateFilter" @change="changeGraphFilters()" aria-label="Filter graph by lifecycle state"
+        <select x-show="graphView === 'full'" x-model="graphStateFilter" @change="changeGraphFilters()" aria-label="Filter graph by lifecycle state"
           class="graph-inline-filter h-7 rounded-md border-0 bg-slate-50 px-2 text-[11px] font-medium text-slate-600 focus:ring-2 focus:ring-brand-100">
           <option value="all">All states</option>
           <option value="open">Open work</option>
@@ -826,35 +834,45 @@
           <option value="invalid">Invalid</option>
         </select>
         <span class="mx-1 h-5 w-px bg-slate-200 shrink-0"></span>
-        <button type="button" @click.stop="nodeLegendOpen = !nodeLegendOpen"
+        <button x-show="graphView === 'full'" type="button" @click.stop="nodeLegendOpen = !nodeLegendOpen"
           class="workbench-tab shrink-0" :aria-selected="nodeLegendOpen" :aria-expanded="nodeLegendOpen">
           Legend
         </button>
-        <button type="button" @click.stop="viewOptionsOpen = !viewOptionsOpen"
+        <button x-show="graphView !== 'list'" type="button" @click.stop="viewOptionsOpen = !viewOptionsOpen"
           class="workbench-tab shrink-0" :aria-selected="viewOptionsOpen" :aria-expanded="viewOptionsOpen">View</button>
+      </div>
+
+      <div x-show="graphView !== 'full' && graphView !== 'list'" x-cloak
+        class="graph-view-status absolute left-3 top-[4.35rem] z-10 max-w-[min(430px,calc(100%-24px))] px-3 py-2 text-[11px] text-slate-600"
+        role="status" aria-live="polite">
+        <span class="font-semibold text-slate-700" x-text="graphViewLabel()"></span>
+        <span class="mx-1 text-slate-300">·</span>
+        <span x-text="graphViewSummary()"></span>
       </div>
 
       <div x-show="viewOptionsOpen" x-cloak @click.outside="viewOptionsOpen = false"
         class="view-options-panel absolute z-20 space-y-3 p-3">
-        <label class="block text-[10px] font-bold uppercase tracking-wider text-slate-400">Evidence</label>
-        <select x-model="graphKindFilter" @change="changeGraphFilters()"
-          class="h-8 w-full rounded-lg border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-600 focus:ring-2 focus:ring-brand-100">
-          <option value="all">All evidence</option>
-          <option value="findings">Hypothesis chain</option>
-          <option value="scanners">Scanner evidence</option>
-          <option value="scope">Scope and trust</option>
-          <option value="coverage">Coverage and summaries</option>
-          <option value="semantic">Semantic recipes</option>
-        </select>
-        <label class="block text-[10px] font-bold uppercase tracking-wider text-slate-400">Lifecycle</label>
-        <select x-model="graphStateFilter" @change="changeGraphFilters()"
-          class="h-8 w-full rounded-lg border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-600 focus:ring-2 focus:ring-brand-100">
-          <option value="all">All states</option>
-          <option value="open">Open work</option>
-          <option value="draft">Draft</option>
-          <option value="confirmed">Confirmed</option>
-          <option value="invalid">Invalid</option>
-        </select>
+        <div x-show="graphView === 'full'" class="space-y-3">
+          <label class="block text-[10px] font-bold uppercase tracking-wider text-slate-400">Evidence</label>
+          <select x-model="graphKindFilter" @change="changeGraphFilters()"
+            class="h-8 w-full rounded-lg border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-600 focus:ring-2 focus:ring-brand-100">
+            <option value="all">All evidence</option>
+            <option value="findings">Hypothesis chain</option>
+            <option value="scanners">Scanner evidence</option>
+            <option value="scope">Scope and trust</option>
+            <option value="coverage">Coverage and summaries</option>
+            <option value="semantic">Semantic recipes</option>
+          </select>
+          <label class="block text-[10px] font-bold uppercase tracking-wider text-slate-400">Lifecycle</label>
+          <select x-model="graphStateFilter" @change="changeGraphFilters()"
+            class="h-8 w-full rounded-lg border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-600 focus:ring-2 focus:ring-brand-100">
+            <option value="all">All states</option>
+            <option value="open">Open work</option>
+            <option value="draft">Draft</option>
+            <option value="confirmed">Confirmed</option>
+            <option value="invalid">Invalid</option>
+          </select>
+        </div>
         <label class="block text-[10px] font-bold uppercase tracking-wider text-slate-400">Layout engine</label>
         <select x-model="layoutMode" @change="applySelectedLayout()"
           class="h-8 w-full rounded-lg border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-600 focus:ring-2 focus:ring-brand-100">
@@ -1441,7 +1459,6 @@
             <option value="">All phases</option>
             <option value="bootstrap">Bootstrap</option>
             <option value="bootstrap_conclude">Bootstrap conclude</option>
-            <option value="audit_graph_reason">Audit graph</option>
             <option value="reason_execute">Reason</option>
             <option value="explore_execute">Explore</option>
             <option value="explore_conclude">Explore conclude</option>
@@ -2004,6 +2021,7 @@ function linenApp() {
     cy: null,
     sideTab: 'detail',
     workspaceMode: 'graph',
+    graphView: 'current',
     graphKindFilter: 'all',
     graphStateFilter: 'all',
     nodeLegendOpen: false,
@@ -2102,6 +2120,7 @@ function linenApp() {
     _timelineEventsCacheProject: null,
     _timelineEventsCache: [],
     _centerAnimation: null,
+    _currentFocusSignature: '',
     projectListScrollTop: 0,
     shouldRestoreProjectListScroll: false,
     isStoppingAllProjects: false,
@@ -2363,6 +2382,7 @@ function linenApp() {
     setWorkspaceMode(mode) {
       if (!['graph', 'outline'].includes(mode)) return;
       this.workspaceMode = mode;
+      this.graphView = mode === 'outline' ? 'list' : (this.graphView === 'list' ? 'current' : this.graphView);
       if (mode === 'graph') {
         this.$nextTick(() => {
           if (!this.cy) return;
@@ -2373,12 +2393,191 @@ function linenApp() {
       }
     },
 
+    graphViewLabel() {
+      return ({ current: 'Current focus', findings: 'Finding chain', full: 'Full blackboard map', list: 'Blackboard list' })[this.graphView] || 'Graph';
+    },
+
+    graphViewSummary() {
+      if (!this.project) return 'Loading blackboard…';
+      if (this.graphView === 'findings') return `${this.findingFactCount()} finding-related facts`;
+      if (this.graphView === 'current') {
+        const focus = this.currentGraphFocus();
+        const intents = this.currentFocusIntents();
+        const runningCount = intents.filter(intent => Boolean(intent.worker)).length;
+        const blockedCount = intents.filter(intent => this.intentError(intent.id)?.classification === 'blocked').length;
+        const retryingCount = intents.filter(intent => this.intentError(intent.id)?.classification === 'transient').length;
+        if (runningCount) return `${runningCount} running work item${runningCount === 1 ? '' : 's'}`;
+        if (blockedCount) return `${blockedCount} blocked work item${blockedCount === 1 ? '' : 's'}`;
+        if (retryingCount) return `${retryingCount} retrying work item${retryingCount === 1 ? '' : 's'}`;
+        if (intents.length) return `${intents.length} queued work item${intents.length === 1 ? '' : 's'}`;
+        return focus.primaryNodeIds.size ? `${focus.primaryNodeIds.size} recent evidence item${focus.primaryNodeIds.size === 1 ? '' : 's'}` : 'Origin and goal context';
+      }
+      return 'All facts, work and decisions';
+    },
+
+    setGraphView(view) {
+      if (!['current', 'findings', 'full', 'list'].includes(view)) return;
+      this.graphView = view;
+      this.workspaceMode = view === 'list' ? 'outline' : 'graph';
+      if (view !== 'full') this.nodeLegendOpen = false;
+      this.viewOptionsOpen = false;
+      if (this.workspaceMode !== 'graph') return;
+      this.$nextTick(() => {
+        if (!this.cy) return;
+        this.cy.resize();
+        this.applyGraphFilters();
+        this.layoutVisibleGraph(false);
+        this.pulseActive();
+      });
+    },
+
+    isOpenIntent(intent) {
+      return Boolean(intent && !intent.to && !intent.concluded_at);
+    },
+
+    findingFactTypes() {
+      return new Set([
+        'hypothesis', 'candidate', 'candidate_triage', 'candidate_disposition',
+        'hypothesis_batch', 'variant_batch', 'finding', 'source', 'sink',
+        'dataflow', 'sanitizer', 'validation', 'reachability', 'vulnerability',
+        'confirmed_finding',
+      ]);
+    },
+
+    isFindingFact(fact) {
+      if (!fact) return false;
+      const types = this.findingFactTypes();
+      return types.has(fact.type) || types.has(fact.semantic_type)
+        || ['candidate', 'hypothesis', 'confirmed_finding'].includes(fact.semantic_type);
+    },
+
+    findingFactCount() {
+      return this.project?.facts?.filter(fact => this.isFindingFact(fact)).length || 0;
+    },
+
+    isCurrentFallbackFact(fact) {
+      if (!fact || !this.isFindingFact(fact)) return false;
+      const kind = fact.type || fact.semantic_type;
+      const candidate = ['candidate', 'candidate_triage', 'candidate_disposition', 'hypothesis', 'hypothesis_batch', 'variant_batch'].includes(kind);
+      const confirmed = fact.semantic_type === 'confirmed_finding'
+        || (fact.type === 'vulnerability' && ['triaged', 'fixed', 'confirmed'].includes(fact.status || 'triaged'))
+        || fact.status === 'confirmed';
+      return candidate || confirmed;
+    },
+
+    currentFocusIntents() {
+      if (!this.project) return [];
+      const open = this.project.intents.filter(intent => this.isOpenIntent(intent));
+      const running = open.filter(intent => Boolean(intent.worker));
+      if (running.length) return running;
+      const blockedOrRetrying = open.filter(intent => {
+        const error = this.intentError(intent.id);
+        return ['blocked', 'transient'].includes(error?.classification);
+      });
+      if (blockedOrRetrying.length) return blockedOrRetrying.slice(0, 3);
+      const queued = open.filter(intent => !intent.worker).slice(0, 3);
+      if (queued.length) return queued;
+      return [];
+    },
+
+    currentGraphFocus() {
+      const nodeIds = new Set();
+      const primaryNodeIds = new Set();
+      const contextNodeIds = new Set();
+      const edgeIds = new Set();
+      const intentIds = this.currentFocusIntents().map(intent => intent.id);
+      const factsById = new Map((this.project?.facts || []).map(fact => [fact.id, fact]));
+
+      for (const intentId of intentIds) {
+        const intent = this.project.intents.find(item => item.id === intentId);
+        if (!intent) continue;
+        const placeholderId = `_ph_${intent.id}`;
+        nodeIds.add(placeholderId);
+        primaryNodeIds.add(placeholderId);
+        for (const sourceId of intent.from || []) {
+          nodeIds.add(sourceId);
+          contextNodeIds.add(sourceId);
+          edgeIds.add(`${intent.id}_${sourceId}`);
+        }
+        if (this.isBootstrapIntent(intent)) {
+          nodeIds.add('goal');
+          contextNodeIds.add('goal');
+          edgeIds.add(`${intent.id}_goal`);
+        }
+      }
+
+      if (!intentIds.length) {
+        const fallbackFacts = (this.project?.facts || []).filter(fact => this.isCurrentFallbackFact(fact)).slice(-4);
+        for (const fact of fallbackFacts) {
+          nodeIds.add(fact.id);
+          primaryNodeIds.add(fact.id);
+          const producer = this.project.intents.find(intent => intent.to === fact.id);
+          if (producer) {
+            for (const sourceId of producer.from || []) {
+              nodeIds.add(sourceId);
+              contextNodeIds.add(sourceId);
+              edgeIds.add(`${producer.id}_${sourceId}`);
+            }
+          }
+        }
+      }
+
+      // Anchors are the last idle-board fallback. Keep them out of an active
+      // or evidence-focused projection unless the visible chain references them.
+      if (!intentIds.length && !nodeIds.size) {
+        for (const anchor of ['origin', 'goal']) {
+          if (factsById.has(anchor)) {
+            nodeIds.add(anchor);
+            if (!primaryNodeIds.has(anchor)) contextNodeIds.add(anchor);
+          }
+        }
+      }
+      if (!nodeIds.size) {
+        for (const fact of (this.project?.facts || []).slice(0, 4)) {
+          nodeIds.add(fact.id);
+          primaryNodeIds.add(fact.id);
+        }
+      }
+      const signature = [this.graphView, ...Array.from(nodeIds).sort(), ...Array.from(edgeIds).sort()].join('|');
+      return { nodeIds, primaryNodeIds, contextNodeIds, edgeIds, intentIds, signature };
+    },
+
+    findingsGraphFocus() {
+      const nodeIds = new Set(['origin', 'goal']);
+      const edgeIds = new Set();
+      if (!this.project) return { nodeIds, edgeIds };
+      const findingIds = new Set(this.project.facts.filter(fact => this.isFindingFact(fact)).map(fact => fact.id));
+      for (const intent of this.project.intents) {
+        const related = findingIds.has(intent.to) || (intent.from || []).some(id => findingIds.has(id));
+        if (!related) continue;
+        if (intent.to) nodeIds.add(intent.to);
+        else nodeIds.add(`_ph_${intent.id}`);
+        for (const sourceId of intent.from || []) {
+          nodeIds.add(sourceId);
+          edgeIds.add(`${intent.id}_${sourceId}`);
+        }
+        if (this.isBootstrapIntent(intent)) {
+          nodeIds.add('goal');
+          edgeIds.add(`${intent.id}_goal`);
+        }
+      }
+      for (const decision of (this.project.decisions || [])) {
+        const targetId = decision.target_kind === 'fact' ? decision.target_id : `_ph_${decision.target_id}`;
+        if (!findingIds.has(decision.target_id) && !nodeIds.has(targetId)) continue;
+        const decisionNodeId = `_decision_${decision.id}`;
+        nodeIds.add(decisionNodeId);
+        nodeIds.add(targetId);
+        edgeIds.add(`decision_${decision.id}_${decision.target_id}`);
+      }
+      return { nodeIds, edgeIds };
+    },
+
     graphFactMatchesKind(fact) {
       if (fact.id === 'origin' || fact.id === 'goal') return true;
       if (this.graphKindFilter === 'all') return true;
       const type = fact.type || '';
       if (this.graphKindFilter === 'findings') {
-        return ['source', 'sink', 'dataflow', 'sanitizer', 'validation', 'reachability', 'vulnerability'].includes(type);
+        return this.isFindingFact(fact);
       }
       if (this.graphKindFilter === 'scanners') {
         return ['scan_batch', 'route_scan', 'candidate_triage', 'candidate_disposition'].includes(type);
@@ -2450,7 +2649,12 @@ function linenApp() {
     },
 
     applyGraphFilters() {
-      if (!this.cy || !this.project) return;
+      if (!this.cy || !this.project) return false;
+      const currentFocus = this.graphView === 'current' ? this.currentGraphFocus() : null;
+      const findingsFocus = this.graphView === 'findings' ? this.findingsGraphFocus() : null;
+      const nextFocusSignature = currentFocus?.signature || '';
+      const focusChanged = nextFocusSignature !== this._currentFocusSignature;
+      this._currentFocusSignature = nextFocusSignature;
       this.cy.nodes().forEach(node => {
         const intentId = node.data('intentId');
         const decisionId = node.data('decisionId');
@@ -2459,20 +2663,49 @@ function linenApp() {
           : intentId
           ? this.project.intents.find(intent => intent.id === intentId)
           : this.project.facts.find(fact => fact.id === node.id());
-        const visible = decisionId
+        const filterVisible = this.graphView !== 'full'
+          ? Boolean(record)
+          : decisionId
           ? Boolean(record && this.graphStateFilter === 'all')
           : intentId
           ? Boolean(record && this.graphIntentMatchesFilters(record))
           : Boolean(record && this.graphFactMatchesKind(record) && this.graphFactMatchesState(record));
+        const viewVisible = this.graphView === 'current'
+          ? Boolean(currentFocus?.nodeIds.has(node.id()))
+          : this.graphView === 'findings'
+          ? Boolean(findingsFocus?.nodeIds.has(node.id()))
+          : true;
+        const visible = filterVisible && viewVisible;
         node.toggleClass('filtered-out', !visible);
+        node.removeClass('current-focus current-primary current-context');
+        if (visible && currentFocus?.primaryNodeIds.has(node.id())) node.addClass('current-primary');
+        if (visible && currentFocus?.primaryNodeIds.has(node.id()) && intentId && record?.worker) node.addClass('current-focus');
+        if (visible && currentFocus?.contextNodeIds.has(node.id())) node.addClass('current-context');
       });
       this.cy.edges().forEach(edge => {
         const intentId = edge.data('intentId');
         const intent = intentId ? this.project.intents.find(item => item.id === intentId) : null;
         const endpointsVisible = !edge.source().hasClass('filtered-out') && !edge.target().hasClass('filtered-out');
-        const visible = intentId ? Boolean(intent && this.graphIntentMatchesFilters(intent)) : true;
-        edge.toggleClass('filtered-out', !(visible && endpointsVisible));
+        const filterVisible = this.graphView !== 'full'
+          ? Boolean(intentId ? intent : true)
+          : intentId
+          ? Boolean(intent && this.graphIntentMatchesFilters(intent))
+          : true;
+        const viewVisible = this.graphView === 'current'
+          ? Boolean(currentFocus?.edgeIds.has(edge.id()))
+          : this.graphView === 'findings'
+          ? Boolean(findingsFocus?.edgeIds.has(edge.id()))
+          : true;
+        edge.toggleClass('filtered-out', !(filterVisible && viewVisible && endpointsVisible));
+        const showEdgeLabel = this.graphView === 'current'
+          ? filterVisible && viewVisible && endpointsVisible
+          : this.graphView === 'findings'
+          ? filterVisible && viewVisible && endpointsVisible
+          : this.graphView === 'full';
+        edge.toggleClass('current-edge', showEdgeLabel);
       });
+      this.refreshGraphDecorations();
+      return focusChanged;
     },
 
     changeGraphFilters() {
@@ -3445,7 +3678,6 @@ function linenApp() {
       const labels = {
         bootstrap: 'Bootstrap',
         bootstrap_conclude: 'Bootstrap conclude',
-        audit_graph_reason: 'Audit graph',
         reason_execute: 'Reason',
         explore_execute: 'Explore',
         explore_conclude: 'Explore conclude',
@@ -4026,6 +4258,8 @@ function linenApp() {
       this.sideTab = 'detail';
       this.resetPiExecutionState();
       this.workspaceMode = 'graph';
+      this.graphView = 'current';
+      this._currentFocusSignature = '';
       this.graphKindFilter = 'all';
       this.graphStateFilter = 'all';
       this.nodeLegendOpen = false;
@@ -4219,6 +4453,7 @@ function linenApp() {
       rawCy.on('tap', 'edge', e => self.onEdgeTap(e));
       rawCy.on('tap', e => { if (e.target === rawCy) self.clearSelection(); });
       this.applyGraphFilters();
+      this.layoutVisibleGraph(false);
       this.pulseActive();
       this.setupAutoFit();
     },
@@ -4300,10 +4535,15 @@ function linenApp() {
         { selector: 'edge[status="bootstrap_running"]', style: { width:2.5,'line-color':'#fb923c','line-style':'dashed','line-dash-pattern':[10,4],'line-dash-offset':0,'target-arrow-color':'#fb923c','target-arrow-shape':'triangle','curve-style':'bezier',label:'data(label)','font-size':'7px',color:'#c2410c','text-rotation':'autorotate','text-margin-y':-9,'text-max-width':'88px','text-wrap':'ellipsis','text-background-color':'#fff7ed','text-background-opacity':0.92,'text-background-padding':'2px','text-events':'yes','arrow-scale':0.95 }},
         { selector: 'edge[edgeType="bootstrap_scope"]', style: { label:'data(label)',width:1.8,'curve-style':'bezier','line-style':'dotted','line-dash-pattern':[2,5],'target-arrow-shape':'triangle-backcurve','arrow-scale':0.75,'target-distance-from-node':2 }},
         { selector: 'edge', style: { label:'data(label)','font-size':'9px','font-weight':'600',color:'#475569','text-rotation':'none','text-margin-y':-9,'text-max-width':'92px','text-wrap':'wrap','text-background-color':'#ffffff','text-background-opacity':0.94,'text-background-padding':'3px','text-events':'yes' }},
+        { selector: 'edge:not(.current-edge):not(.focus)', style: { label:'' }},
+        { selector: 'edge.current-edge, edge.focus', style: { label:'data(label)' }},
 
         { selector: '.highlight', style: { 'z-index':999 }},
         { selector: 'edge.highlight', style: { 'z-index':999 }},
         { selector: 'node.focus', style: { 'border-width':3,'border-color':'#312e81','border-opacity':0.95,'z-index':1000 }},
+        { selector: 'node.current-primary', style: { 'underlay-color':'#a5b4fc','underlay-padding':6,'underlay-opacity':0.3,'z-index':850 }},
+        { selector: 'node.current-focus', style: { 'background-color':'#4f46e5','color':'#ffffff','border-width':3,'border-color':'#312e81','border-style':'solid','z-index':900 }},
+        { selector: 'node.current-context', style: { 'background-color':'#f8fafc','color':'#667085','border-color':'#cbd5e1','border-width':1.2,'opacity':0.82,'z-index':700 }},
         { selector: 'edge.focus', style: { 'z-index':1000,'overlay-color':'#93c5fd','overlay-opacity':0.22,'overlay-padding':5 }},
         { selector: 'node.selected-fact', style: { 'border-width':0,'underlay-color':'#93c5fd','underlay-padding':8,'underlay-opacity':0.28,'z-index':1001 }},
         { selector: '.faded', style: { opacity:0.5 }},
@@ -4369,6 +4609,20 @@ function linenApp() {
         animationDuration: 400,
         animationEasing: 'ease-in-out-cubic',
       };
+    },
+
+    layoutVisibleGraph(animate = false) {
+      if (!this.cy) return;
+      const visible = this.cy.elements(':visible');
+      if (!visible.nodes().length) return;
+      const options = this.layoutOpts(animate);
+      options.fit = false;
+      visible.layout(options).run();
+      this.cy.fit(visible, 50);
+      requestAnimationFrame(() => {
+        if (!this.cy) return;
+        this.cy.fit(this.cy.elements(':visible'), 50);
+      });
     },
 
     snapshotNodePositions() {
@@ -4480,14 +4734,31 @@ function linenApp() {
           changed = true;
         }
       }
-      if (changed) this.cy.layout(this.layoutOpts()).run();
-      this.applyGraphFilters();
+      const focusChanged = this.applyGraphFilters();
+      if (focusChanged && this.graphView === 'current') {
+        this.layoutVisibleGraph();
+      } else if (changed && this.graphView !== 'current') {
+        this.layoutVisibleGraph();
+      }
       this.pulseActive();
       this.refreshGraphDecorations();
     },
 
     pulseActive() {
       if (!this.cy) return;
+      if (this.graphView === 'current') {
+        this.cy.nodes('[nodeType="in_progress"], [nodeType="bootstrap_running"], [nodeType="audit_running"]').forEach(node => {
+          node.stop();
+          node.removeScratch('_pulseActive');
+          node.removeStyle('background-opacity');
+        });
+        this.cy.edges().forEach(edge => {
+          edge.stop();
+          edge.removeScratch('_flowActive');
+          edge.removeStyle('line-dash-offset');
+        });
+        return;
+      }
       this.cy.nodes('[nodeType="in_progress"], [nodeType="bootstrap_running"], [nodeType="audit_running"]').forEach(node => {
         if (node.scratch('_pulseActive')) return;
         node.scratch('_pulseActive', true);
@@ -4536,7 +4807,7 @@ function linenApp() {
       });
     },
 
-    fitGraph() { if (this.cy) this.cy.fit(undefined, 50); },
+    fitGraph() { if (this.cy) this.cy.fit(this.cy.elements(':visible'), 50); },
 
     centerGraphOnElements(eles) {
       if (!this.cy || !eles || eles.length === 0) return;
@@ -4638,7 +4909,7 @@ function linenApp() {
               }
             }
             this.cy.resize();
-            this.cy.fit(undefined, 50);
+            this.cy.fit(this.cy.elements(':visible'), 50);
           }
         }, 200);
       });
@@ -4655,7 +4926,7 @@ function linenApp() {
       this.layoutMode = this.isValidLayoutMode(this.layoutMode) ? this.layoutMode : 'dagre_tb';
       this.localPrefs.layout_mode = this.layoutMode;
       this.saveLocalPrefs();
-      if (this.cy) this.cy.layout(this.layoutOpts()).run();
+      this.layoutVisibleGraph();
     },
 
     clampPanelWidth(width) {
@@ -5750,7 +6021,7 @@ function linenApp() {
         this.localPrefs.layout_mode = this.isValidLayoutMode(this.localPrefs.layout_mode) ? this.localPrefs.layout_mode : 'dagre_tb';
         this.layoutMode = this.localPrefs.layout_mode;
         this.saveLocalPrefs();
-        if (this.cy) this.cy.layout(this.layoutOpts()).run();
+        this.layoutVisibleGraph();
         this.showLocalPrefs = false;
         this.showToast('Local preferences saved');
       } catch(e) { this.showToast(e.message, 'error'); }
