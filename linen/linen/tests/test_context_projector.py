@@ -10,7 +10,7 @@ from linen.dispatcher.context import (
     StaleContextRevision,
 )
 from linen.dispatcher.contract_adapters import project_detail_to_snapshot
-from linen.server.models import Fact, GraphEdge, Hint, Intent, ProjectDetail, ProjectMeta
+from linen.server.models import Fact, GraphEdge, Hint, Intent, IntentError, ProjectDetail, ProjectMeta
 
 
 def _snapshot(*, neighbor_count: int = 3, graph_revision: int = 4, with_edges: bool = True) -> BlackboardSnapshot:
@@ -285,3 +285,39 @@ def test_many_auto_related_artifacts_are_stably_truncated() -> None:
     assert first.context["artifact_available_count"] == 25
     assert first.artifact_ids == ["art-22", "art-23", "art-24"]
     assert [item["artifact_id"] for item in first.context["artifacts"]] == first.artifact_ids
+
+
+def test_blocked_intent_frontier_includes_unresolved_error_details() -> None:
+    project = ProjectDetail(
+        project=ProjectMeta(
+            id="p1", title="blocked", status="active", graph_revision=4,
+            created_at="2026-01-01T00:00:00Z",
+        ),
+        facts=[Fact(id="origin", description="source")],
+        intents=[Intent(
+            id="i1", from_=["origin"], description="inspect", creator="reasoner",
+            created_at="2026-01-01T00:00:00Z",
+        )],
+        hints=[],
+        errors=[IntentError(
+            id="e1", intent_id="i1", task_type="explore", worker="worker-a",
+            code="source_missing", classification="blocked", message="source is unavailable",
+            remediation="attach the source before retrying", attempt_count=3,
+            first_failed_at="2026-01-01T00:00:01Z", last_failed_at="2026-01-01T00:00:02Z",
+        )],
+        edges=[GraphEdge(
+            id="edge-error", source_kind="error", source_id="e1",
+            target_kind="intent", target_id="i1", relation_type="blocks",
+            created_at="2026-01-01T00:00:02Z", created_by="worker-a",
+        )],
+    )
+    projection = ContextProjector().project_frontier(
+        project, ["i1"], current_graph_revision=4,
+    )
+    assert "e1" in projection.node_ids
+    error_nodes = [node for node in projection.context["nodes"] if node["id"] == "e1"]
+    assert error_nodes[0]["payload"]["code"] == "source_missing"
+    assert error_nodes[0]["payload"]["classification"] == "blocked"
+    assert error_nodes[0]["payload"]["message"] == "source is unavailable"
+    assert error_nodes[0]["payload"]["remediation"] == "attach the source before retrying"
+    assert error_nodes[0]["payload"]["attempt_count"] == 3

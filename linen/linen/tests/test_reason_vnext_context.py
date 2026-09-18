@@ -193,7 +193,8 @@ def test_reason_uses_registered_projection_and_vnext_execution_record(tmp_path, 
         tmp_path,
         ProcessResult(
             0,
-            '{"accepted":true,"data":{"intents":[{"from":["f001"],"description":"next"}]}}',
+            '{"accepted":true,"data":{"intents":[{"from":["f001"],'
+            '"action":"inspect","target":"next","description":"next"}]}}',
             "",
         ),
     )
@@ -444,6 +445,7 @@ def test_reason_context_required_runs_one_cold_continuation_without_writing_befo
         ProcessResult(
             0,
             '{"accepted":true,"data":{"intents":[{"from":["f001"],'
+            '"action":"inspect","target":"final-continuation",'
             '"description":"final continuation intent"}]}}',
             "",
         ),

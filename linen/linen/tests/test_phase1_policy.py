@@ -152,6 +152,14 @@ def test_blocked_intent_can_be_resolved_by_retry_or_abandon(client) -> None:
     )
     assert retry.status_code == 200
     assert retry.json()["concluded_at"] is None
+    assert client.post(
+        f"/projects/{project}/intents/{retry_id}/heartbeat",
+        json={"worker": "worker-b"},
+    ).status_code == 200
+    assert client.post(
+        f"/projects/{project}/intents/{retry_id}/resolve",
+        json={"actor": "reason-worker", "action": "retry"},
+    ).status_code == 409
 
     abandon_id = blocked_intent("abandon this")
     abandon = client.post(
@@ -160,6 +168,67 @@ def test_blocked_intent_can_be_resolved_by_retry_or_abandon(client) -> None:
     )
     assert abandon.status_code == 200
     assert abandon.json()["concluded_at"] is not None
+
+
+def test_resolve_rejects_intents_without_an_open_blocked_error(client) -> None:
+    project = client.post(
+        "/projects",
+        json={"title": "invalid resolution", "origin": "repo", "goal": "done"},
+    ).json()["project"]["id"]
+    intent = client.post(
+        f"/projects/{project}/intents",
+        json={"from": ["origin"], "description": "not blocked", "creator": "reasoner", "action": "inspect", "target": "not-blocked"},
+    ).json()
+    resolve_url = f"/projects/{project}/intents/{intent['id']}/resolve"
+    assert client.post(resolve_url, json={"actor": "reason-worker", "action": "retry"}).status_code == 409
+
+    assert client.post(
+        f"/projects/{project}/intents/{intent['id']}/heartbeat",
+        json={"worker": "worker-a"},
+    ).status_code == 200
+    assert client.post(
+        f"/projects/{project}/intents/{intent['id']}/fail",
+        json={
+            "worker": "worker-a", "task_type": "explore", "code": "blocked",
+            "classification": "blocked", "message": "permanent failure",
+        },
+    ).status_code == 200
+    assert client.post(resolve_url, json={"actor": "reason-worker", "action": "abandon"}).status_code == 200
+    assert client.post(resolve_url, json={"actor": "reason-worker", "action": "retry"}).status_code == 409
+
+
+def test_blocked_resolution_survives_server_restart(client) -> None:
+    project = client.post(
+        "/projects",
+        json={"title": "restart recovery", "origin": "repo", "goal": "done"},
+    ).json()["project"]["id"]
+    intent = client.post(
+        f"/projects/{project}/intents",
+        json={"from": ["origin"], "description": "recover", "creator": "reasoner", "action": "inspect", "target": "recover"},
+    ).json()
+    intent_id = intent["id"]
+    assert client.post(
+        f"/projects/{project}/intents/{intent_id}/heartbeat",
+        json={"worker": "worker-a"},
+    ).status_code == 200
+    assert client.post(
+        f"/projects/{project}/intents/{intent_id}/fail",
+        json={
+            "worker": "worker-a", "task_type": "explore", "code": "blocked",
+            "classification": "blocked", "message": "restart me",
+        },
+    ).status_code == 200
+
+    with TestClient(app) as restarted:
+        resolved = restarted.post(
+            f"/projects/{project}/intents/{intent_id}/resolve",
+            json={"actor": "reason-worker", "action": "retry"},
+        )
+    assert resolved.status_code == 200
+    assert client.post(
+        f"/projects/{project}/intents/{intent_id}/heartbeat",
+        json={"worker": "worker-b"},
+    ).status_code == 200
 
 
 def test_reason_release_only_advances_cursor_on_success() -> None:
@@ -198,3 +267,74 @@ def test_reason_failure_retries_same_event_sequence() -> None:
     second = scheduler._reason_trigger(project)
 
     assert first == second == "events:3->4"
+
+
+def test_events_created_during_reason_round_remain_pending_for_next_round(client) -> None:
+    project = client.post(
+        "/projects",
+        json={"title": "event wakeup", "origin": "repo", "goal": "done"},
+    ).json()["project"]["id"]
+    before = client.get(f"/projects/{project}").json()["project"]
+    assert client.post(
+        f"/projects/{project}/reason/claim",
+        json={"worker": "reasoner", "lease_id": "round-1", "trigger": "events"},
+    ).status_code == 200
+
+    def create(index: int) -> int:
+        response = client.post(
+            f"/projects/{project}/intents",
+            json={
+                "from": ["origin"], "description": f"event {index}",
+                "creator": "reasoner", "action": "inspect", "target": f"event-{index}",
+            },
+        )
+        assert response.status_code == 201
+        return response.json()["id"]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(create, range(4)))
+
+    during = client.get(f"/projects/{project}").json()["project"]
+    assert during["event_seq"] > before["event_seq"]
+    released = client.post(
+        f"/projects/{project}/reason/release",
+        json={"worker": "reasoner", "lease_id": "round-1", "seen_event_seq": before["event_seq"]},
+    )
+    assert released.status_code == 200
+    after = client.get(f"/projects/{project}").json()["project"]
+    assert after["reason_last_seen_event_seq"] == before["event_seq"]
+    assert after["event_seq"] == during["event_seq"]
+    assert after["event_seq"] > after["reason_last_seen_event_seq"]
+
+
+def test_concurrent_blocked_resolve_allows_only_one_transition(client) -> None:
+    project = client.post(
+        "/projects",
+        json={"title": "resolve race", "origin": "repo", "goal": "done"},
+    ).json()["project"]["id"]
+    intent = client.post(
+        f"/projects/{project}/intents",
+        json={"from": ["origin"], "description": "race", "creator": "reasoner", "action": "inspect", "target": "race"},
+    ).json()
+    intent_id = intent["id"]
+    assert client.post(
+        f"/projects/{project}/intents/{intent_id}/heartbeat",
+        json={"worker": "worker-a"},
+    ).status_code == 200
+    assert client.post(
+        f"/projects/{project}/intents/{intent_id}/fail",
+        json={
+            "worker": "worker-a", "task_type": "explore", "code": "blocked",
+            "classification": "blocked", "message": "permanent failure",
+        },
+    ).status_code == 200
+
+    def resolve(action: str) -> int:
+        return client.post(
+            f"/projects/{project}/intents/{intent_id}/resolve",
+            json={"actor": action, "action": action},
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = list(pool.map(resolve, ["retry", "abandon"]))
+    assert sorted(statuses) == [200, 409]

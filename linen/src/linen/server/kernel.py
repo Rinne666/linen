@@ -404,7 +404,11 @@ def resolve_intent(
 
     now = utcnow()
     resolution = f"{body.action} requested by {body.actor}"
-    resolve_intent_errors(conn, project_id, intent_id, resolution=resolution, resolved_at=now)
+    resolved = resolve_intent_errors(
+        conn, project_id, intent_id, resolution=resolution, resolved_at=now,
+    )
+    if resolved != 1:
+        raise KernelConflict("Intent blocked error was already resolved")
     if body.action == "abandon":
         conn.execute(
             "UPDATE intents SET worker = NULL, last_heartbeat_at = ?, concluded_at = ? "
