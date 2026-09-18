@@ -52,6 +52,12 @@ Proposed work:
 Completion:
 `{"accepted":true,"data":{"complete":{"from":["f999"],"description":"Configured audit branches completed on the recorded frozen snapshot with the declared exclusions"}}}`
 
+For an open Intent with an unresolved blocked execution error, choose one
+control action instead of leaving it permanently blocked:
+`{"accepted":true,"data":{"resolve":[{"intent_id":"i123","action":"retry"}]}}`
+Use `abandon` when the work is no longer valuable. Use only blocked open
+Intent IDs present in the graph.
+
 Every Intent contains `from`, `action`, `target`, `type`, and `description`; `action` + `target` define identity while `from` only lists evidence sources. It references only
 the valid Fact IDs below, and asks one bounded question.
 

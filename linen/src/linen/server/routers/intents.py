@@ -22,6 +22,7 @@ from linen.server.models import (
     Intent,
     IntentError,
     ReportIntentErrorRequest,
+    ResolveIntentRequest,
     RetryIntentRequest,
 )
 from linen.server.services import (
@@ -56,6 +57,7 @@ from linen.server.kernel import (
     create_intent as create_intent_kernel,
     heartbeat_intent as heartbeat_intent_kernel,
     release_intent as release_intent_kernel,
+    resolve_intent as resolve_intent_kernel,
 )
 
 router = APIRouter(tags=["intents"])
@@ -375,6 +377,22 @@ def retry_intent(
             payload={"resolved_error_count": resolved},
         )
         return intent_to_model(conn, row, project_id)
+
+
+@router.post(
+    "/projects/{project_id}/intents/{intent_id}/resolve",
+    response_model=Intent,
+)
+def resolve(project_id: str, intent_id: str, body: ResolveIntentRequest):
+    with get_conn() as conn:
+        try:
+            return resolve_intent_kernel(conn, project_id, intent_id, body)
+        except KernelNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except KernelForbidden as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except KernelConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
 
 
 @router.post(

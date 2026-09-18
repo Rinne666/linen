@@ -112,6 +112,7 @@ class FakeClient:
     released: list[tuple[str, str, str]] = field(default_factory=list)
     released_reasons: list[tuple[str, str]] = field(default_factory=list)
     errors: list[tuple[str, str, str, str]] = field(default_factory=list)
+    resolved_intents: list[tuple[str, str, str, str]] = field(default_factory=list)
 
     def get_project(self, _project_id: str) -> ProjectDetail:
         return self.project
@@ -148,6 +149,12 @@ class FakeClient:
         code: str, classification: str, message: str, **_kwargs,
     ) -> ApiResult:
         self.errors.append((project_id, intent_id, code, classification))
+        return ApiResult(200, {})
+
+    def resolve_intent(
+        self, project_id: str, intent_id: str, actor: str, action: str,
+    ) -> ApiResult:
+        self.resolved_intents.append((project_id, intent_id, actor, action))
         return ApiResult(200, {})
 
     def release(self, project_id: str, intent_id: str, worker: str) -> ApiResult:

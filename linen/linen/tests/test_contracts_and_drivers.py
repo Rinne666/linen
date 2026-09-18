@@ -83,8 +83,8 @@ def test_reason_payload_limits_number_of_intents() -> None:
             "accepted": True,
             "data": {
                 "intents": [
-                    {"from": ["f001"], "description": "one"},
-                    {"from": ["f001"], "description": "two"},
+                    {"from": ["f001"], "action": "trace", "target": "one", "description": "one"},
+                    {"from": ["f001"], "action": "trace", "target": "two", "description": "two"},
                 ]
             },
         },
@@ -93,7 +93,29 @@ def test_reason_payload_limits_number_of_intents() -> None:
     )
 
     assert kind == "intents"
-    assert intents == [{"from": ["f001"], "description": "one"}]
+    assert intents == [{"from": ["f001"], "action": "trace", "target": "one", "description": "one"}]
+
+
+def test_reason_payload_validates_blocked_intent_resolution() -> None:
+    kind, actions = validate_reason_payload(
+        {
+            "accepted": True,
+            "data": {"resolve": [{"intent_id": "i123", "action": "abandon"}]},
+        },
+        open_intents_empty=False,
+        max_intents=3,
+    )
+    assert kind == "resolve"
+    assert actions == [{"intent_id": "i123", "action": "abandon"}]
+
+
+def test_reason_payload_rejects_unknown_resolution_action() -> None:
+    with pytest.raises(ValueError, match="invalid resolve action"):
+        validate_reason_payload(
+            {"accepted": True, "data": {"resolve": [{"intent_id": "i123", "action": "replace"}]}},
+            open_intents_empty=False,
+            max_intents=3,
+        )
 
 
 def test_reason_payload_requires_intent_when_none_are_open() -> None:

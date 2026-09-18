@@ -139,6 +139,14 @@ Next verification steps proposed (the stable identity is the `action` + `target`
 ]}}
 ```
 
+If an open Intent is blocked by an unresolved execution error, the kernel
+cannot dispatch it until you choose a control action. Return only this shape:
+```json
+{"accepted": true, "data": {"resolve": [{"intent_id": "i123", "action": "retry"}]}}
+```
+Choose `retry` for a recoverable failure and `abandon` for work that should be
+closed. Use only blocked open Intent IDs visible in the graph.
+
 No new direction right now (existing open intents already cover the highest-value next steps):
 ```json
 {"accepted": true, "data": {}}

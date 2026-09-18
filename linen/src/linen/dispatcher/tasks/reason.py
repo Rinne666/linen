@@ -603,6 +603,27 @@ def run_reason_task(
                 preview(result.stdout),
             )
             return "rejected"
+        if kind == "resolve":
+            for resolution in data:
+                response = client.resolve_intent(
+                    project.project.id,
+                    resolution["intent_id"],
+                    worker.name,
+                    resolution["action"],
+                )
+                if not response.ok:
+                    LOG.warning(
+                        "reason intent resolution failed project=%s intent=%s action=%s "
+                        "status=%s body=%s",
+                        project.project.id,
+                        resolution["intent_id"],
+                        resolution["action"],
+                        response.status_code,
+                        response.text,
+                    )
+                    return "failed"
+            ack_event_seq = project.project.event_seq
+            return "success"
         if kind == "complete":
             if audit_enabled:
                 fresh = client.get_project(project.project.id)

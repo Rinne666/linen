@@ -88,6 +88,8 @@ def _looks_like_reason_data(payload: dict[str, Any]) -> bool:
         return isinstance(complete, dict) and "from" in complete and "description" in complete
     if keys == {"intents"}:
         return isinstance(payload["intents"], list)
+    if keys == {"resolve"}:
+        return isinstance(payload["resolve"], list)
     if keys == {"intent"}:
         intent = payload["intent"]
         return isinstance(intent, dict) and "from" in intent and "description" in intent
@@ -112,6 +114,18 @@ def validate_reason_payload(
         raise ValueError("accepted must be true or false")
     complete = data.get("complete")
     intents = data.get("intents")
+    resolve = data.get("resolve")
+    if resolve is not None:
+        if set(data) != {"resolve"} or not isinstance(resolve, list) or not resolve:
+            raise ValueError("resolve must be a non-empty array by itself")
+        for i, item in enumerate(resolve):
+            if not isinstance(item, dict) or set(item) != {"intent_id", "action"}:
+                raise ValueError(f"invalid resolve action at index {i}")
+            if not isinstance(item["intent_id"], str) or not item["intent_id"].strip():
+                raise ValueError(f"resolve intent_id must be non-empty at index {i}")
+            if item["action"] not in {"retry", "abandon"}:
+                raise ValueError(f"invalid resolve action at index {i}")
+        return "resolve", resolve
     # backward compat: accept singular "intent" key from LLMs
     if intents is None:
         singular = data.get("intent")

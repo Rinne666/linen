@@ -22,6 +22,15 @@ If Goal has not been satisfied but new intents should be proposed, return:
 {"accepted": true, "data": {"intents": [{"from": ["f001"], "action": "trace", "target": "the request value to its sink", "description": "..."}, {"from": ["f002", "f003"], "action": "verify", "target": "the authorization invariant", "description": "..."}]}}
 ```
 
+If an open Intent has an unresolved blocked error, decide whether to retry it
+or abandon it. Return only these control actions in that case:
+```json
+{"accepted": true, "data": {"resolve": [{"intent_id": "i123", "action": "retry"}, {"intent_id": "i456", "action": "abandon"}]}}
+```
+Use `retry` only when the recorded error is plausibly recoverable. Use
+`abandon` when the work is no longer valuable or its precondition cannot be
+repaired. Do not invent intent IDs; use IDs shown in the graph.
+
 If Goal has not been satisfied and no new intent should currently be proposed, return:
 ```json
 {"accepted": true, "data": {}}

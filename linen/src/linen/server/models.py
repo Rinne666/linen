@@ -902,6 +902,19 @@ class RetryIntentRequest(BaseModel):
         return text
 
 
+class ResolveIntentRequest(BaseModel):
+    actor: str
+    action: Literal["retry", "abandon"]
+
+    @field_validator("actor")
+    @classmethod
+    def validate_actor(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("must not be empty")
+        return text
+
+
 class CompactCoverageIntentsRequest(BaseModel):
     keep: int = Field(default=4, ge=0, le=100)
     dry_run: bool = True

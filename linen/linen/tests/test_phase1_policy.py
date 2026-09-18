@@ -116,6 +116,52 @@ def test_goal_based_completion_does_not_require_empty_queue(client) -> None:
     assert open_work["blocking"] is False
 
 
+def test_blocked_intent_can_be_resolved_by_retry_or_abandon(client) -> None:
+    project = client.post(
+        "/projects",
+        json={"title": "blocked resolution", "origin": "repo", "goal": "done"},
+    ).json()["project"]["id"]
+
+    def blocked_intent(target: str) -> str:
+        intent = client.post(
+            f"/projects/{project}/intents",
+            json={
+                "from": ["origin"], "description": target, "creator": "reasoner",
+                "action": "inspect", "target": target,
+            },
+        ).json()
+        intent_id = intent["id"]
+        assert client.post(
+            f"/projects/{project}/intents/{intent_id}/heartbeat",
+            json={"worker": "worker-a"},
+        ).status_code == 200
+        assert client.post(
+            f"/projects/{project}/intents/{intent_id}/fail",
+            json={
+                "worker": "worker-a", "task_type": "explore", "code": "no_route",
+                "classification": "transient", "message": "cannot reach target",
+                "max_attempts": 1,
+            },
+        ).status_code == 200
+        return intent_id
+
+    retry_id = blocked_intent("retry this")
+    retry = client.post(
+        f"/projects/{project}/intents/{retry_id}/resolve",
+        json={"actor": "reason-worker", "action": "retry"},
+    )
+    assert retry.status_code == 200
+    assert retry.json()["concluded_at"] is None
+
+    abandon_id = blocked_intent("abandon this")
+    abandon = client.post(
+        f"/projects/{project}/intents/{abandon_id}/resolve",
+        json={"actor": "reason-worker", "action": "abandon"},
+    )
+    assert abandon.status_code == 200
+    assert abandon.json()["concluded_at"] is not None
+
+
 def test_reason_release_only_advances_cursor_on_success() -> None:
     class FakeClient:
         def __init__(self):

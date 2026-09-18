@@ -15,7 +15,8 @@ from datetime import datetime, timedelta, timezone
 
 from linen.server.audit_state import append_event, create_graph_edge, intent_metadata
 from linen.server.models import (
-    CreateIntentRequest, CreateReviewRequest, HeartbeatRequest, Intent, REVIEW_DIAGNOSTIC_FIELDS, Review,
+    CreateIntentRequest, CreateReviewRequest, HeartbeatRequest, Intent, ResolveIntentRequest,
+    REVIEW_DIAGNOSTIC_FIELDS, Review,
 )
 from linen.server.services import (
     aggregate_fact_status_from_reviews,
@@ -341,6 +342,8 @@ def create_intent(conn: sqlite3.Connection, project_id: str, body: CreateIntentR
     ).fetchone()
     if existing is not None:
         return intent_to_model(conn, existing, project_id)
+
+
     try:
         conn.execute(
             "INSERT INTO intents (id, project_id, to_fact_id, description, display_title, type, semantic_type, relation_type, phase, source_generation, plan_revision, creator, worker, last_heartbeat_at, created_at, concluded_at, intent_key) "
@@ -366,6 +369,73 @@ def create_intent(conn: sqlite3.Connection, project_id: str, body: CreateIntentR
                           "phase": phase, "from": body.from_}, created_at=now)
     row = conn.execute("SELECT * FROM intents WHERE id = ? AND project_id = ?", (iid, project_id)).fetchone()
     return intent_to_model(conn, row, project_id)
+
+
+def resolve_intent(
+    conn: sqlite3.Connection,
+    project_id: str,
+    intent_id: str,
+    body: ResolveIntentRequest,
+) -> Intent:
+    """Apply one LLM-selected action to an open blocked Intent."""
+    project = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+    if project is None:
+        raise KernelNotFound(f"Project {project_id} not found")
+    if project["status"] != "active":
+        raise KernelForbidden(f"Project is {project['status']}")
+    row = conn.execute(
+        "SELECT * FROM intents WHERE project_id = ? AND id = ?",
+        (project_id, intent_id),
+    ).fetchone()
+    if row is None:
+        raise KernelNotFound(f"intent {intent_id} not found")
+    if row["to_fact_id"] is not None or row["concluded_at"] is not None:
+        raise KernelConflict("Intent is not open")
+    if row["worker"] is not None:
+        raise KernelConflict(f"Intent is currently claimed by {row['worker']}")
+    blocked = conn.execute(
+        "SELECT id FROM intent_errors WHERE project_id = ? AND intent_id = ? "
+        "AND classification = 'blocked' AND resolved_at IS NULL "
+        "ORDER BY last_failed_at DESC, id DESC LIMIT 1",
+        (project_id, intent_id),
+    ).fetchone()
+    if blocked is None:
+        raise KernelConflict("Intent has no unresolved blocked error")
+
+    now = utcnow()
+    resolution = f"{body.action} requested by {body.actor}"
+    resolve_intent_errors(conn, project_id, intent_id, resolution=resolution, resolved_at=now)
+    if body.action == "abandon":
+        conn.execute(
+            "UPDATE intents SET worker = NULL, last_heartbeat_at = ?, concluded_at = ? "
+            "WHERE project_id = ? AND id = ?",
+            (now, now, project_id, intent_id),
+        )
+        event_type = "audit_task_abandoned"
+    else:
+        conn.execute(
+            "UPDATE intents SET worker = NULL, last_heartbeat_at = ? "
+            "WHERE project_id = ? AND id = ?",
+            (now, project_id, intent_id),
+        )
+        event_type = "audit_task_retry_requested"
+    bump_graph_revision(conn, project_id)
+    append_event(
+        conn,
+        project_id,
+        event_type,
+        body.actor,
+        entity_kind="intent",
+        entity_id=intent_id,
+        payload={"action": body.action, "error_id": blocked["id"]},
+        created_at=now,
+    )
+    updated = conn.execute(
+        "SELECT * FROM intents WHERE project_id = ? AND id = ?",
+        (project_id, intent_id),
+    ).fetchone()
+    assert updated is not None
+    return intent_to_model(conn, updated, project_id)
 
 
 def _claimable_intent(conn: sqlite3.Connection, project_id: str, intent_id: str, worker: str) -> sqlite3.Row:

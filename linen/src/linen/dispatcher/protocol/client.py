@@ -415,6 +415,15 @@ class LinenClient:
             json={"actor": actor},
         )
 
+    def resolve_intent(
+        self, project_id: str, intent_id: str, actor: str, action: str,
+    ) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/intents/{intent_id}/resolve",
+            json={"actor": actor, "action": action},
+        )
+
     def compact_coverage_intents(
         self,
         project_id: str,
