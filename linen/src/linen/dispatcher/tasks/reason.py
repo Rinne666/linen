@@ -604,7 +604,7 @@ def run_reason_task(
             )
             return "rejected"
         if kind == "complete":
-            if config.audit.enabled:
+            if audit_enabled:
                 fresh = client.get_project(project.project.id)
                 blockers = (
                     audit_graph.scope_blockers(fresh, Path(container_name), config.audit, data["from"])

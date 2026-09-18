@@ -569,9 +569,9 @@ def required_intents(
         return reviews[:limit]
 
     if project.project.audit_mode == "hypothesis":
-        # Baseline execution order is selected by the cold AuditGraph model
-        # from the trusted Skill registry. The deterministic Gate still
-        # requires every configured stage and a validated receipt.
+        # Baseline execution is selected by the unified Reason loop from the
+        # trusted Skill registry. The deterministic gate still requires every
+        # configured stage and a validated receipt.
         return []
 
     proposals: list[dict] = []

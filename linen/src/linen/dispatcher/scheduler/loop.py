@@ -435,7 +435,6 @@ class DispatcherLoop:
             if reason_trigger is not None:
                 export_yaml = self.client.export_project(summary.id)
                 return self._dispatch_reason(project, export_yaml, reason_trigger)
-                return self._dispatch_reason(project, export_yaml, reason_trigger)
         running_intent_ids = self._project_running_explore_intents(summary.id)
         unclaimed_intents = [
             intent
