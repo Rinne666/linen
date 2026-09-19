@@ -116,6 +116,42 @@ uv run --project linen linen dispatch \
 Create a project in the UI by supplying an origin and a goal. The Dispatcher
 will schedule reasoning, exploration, and review work as the graph evolves.
 
+### One-command local deployment
+
+After installing and authenticating at least one supported worker CLI, start
+both the Server and Dispatcher in the background with:
+
+```bash
+./deploy.sh
+```
+
+On its first run, the script syncs Python dependencies and creates
+`dispatch.yaml` for the first available `claude`, `codex`, or `pi` CLI. An
+existing configuration is preserved. Manage the deployment with:
+
+```bash
+./deploy.sh status
+./deploy.sh logs
+./deploy.sh restart
+./deploy.sh stop
+```
+
+The defaults bind the UI to <http://127.0.0.1:9000>. Environment variables can
+override deployment settings, for example:
+
+```bash
+LINEN_HOST=0.0.0.0 LINEN_PORT=8080 ./deploy.sh
+LINEN_SKIP_DISPATCHER=1 ./deploy.sh
+```
+
+Linen does not add an authentication layer to the web UI. Keep the default
+loopback binding unless access is protected by a trusted network or reverse
+proxy. When `dispatch.yaml` already exists, its `server` URL must match
+`LINEN_SERVER_URL`.
+
+Run `./deploy.sh --help` for all supported overrides. Runtime PID and log files
+are stored in the ignored `.linen-runtime/` directory.
+
 ## Source-code audit mode
 
 Linen includes a coverage-driven audit mode for authorized source trees:
