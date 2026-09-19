@@ -77,8 +77,8 @@ def canonical_vulnerability_trace(
     """Validate trace structure and frozen-source citation bindings only."""
     if not isinstance(raw, list) or len(raw) > 100:
         raise ValueError("Vulnerability trace must be a bounded ordered array")
-    if outcome == "confirmed" and len(raw) < 4:
-        raise ValueError("Confirmed vulnerability requires a closed trace")
+    if outcome == "confirmed" and not raw:
+        raise ValueError("Confirmed vulnerability requires a trace")
     if outcome == "refuted" and not raw:
         raise ValueError("Refuted vulnerability requires its decisive protection path")
     citation_by_id = {citation["id"]: citation for citation in citations}
@@ -131,23 +131,11 @@ def canonical_vulnerability_trace(
             "observation": observation.strip(),
             "citation_id": citation_id,
         })
-    if outcome == "confirmed":
-        relations = [step["relation"] for step in normalized]
-        if (
-            relations[0] != "entry"
-            or relations[-1] != "impact"
-            or "reaches" not in relations[1:-1]
-            or not any(value in {"calls", "flows_to", "crosses", "guards"}
-                       for value in relations[1:-1])
-        ):
-            raise ValueError(
-                "Confirmed trace must order entry, an intermediate hop, reaches, and impact"
-            )
     return normalized
 
 
 def vulnerability_trace_proof(
-    trace: list[dict[str, Any]], endpoint_id: str, outcome: str, snapshot_id: str,
+    trace: list[dict[str, Any]], endpoint_id: str | None, outcome: str, snapshot_id: str,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,

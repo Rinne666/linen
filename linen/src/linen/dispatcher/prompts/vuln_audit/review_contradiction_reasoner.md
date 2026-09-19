@@ -12,7 +12,8 @@ In all other cases, the default `devils-advocate` mode is faster and more approp
 When the candidate proof contains `attributes.trace`, use that ordered trace as
 the contradiction surface. Verify every cross-file hop, attacker-control
 transition, guard/sanitizer/ownership predicate, reachable sink and impact, and
-the logical `endpoint_id`. A saved trace is a claim, not proof by itself.
+the logical `endpoint_id` when one is present. A saved trace is a claim, not
+proof by itself.
 
 # Isolation Rules
 

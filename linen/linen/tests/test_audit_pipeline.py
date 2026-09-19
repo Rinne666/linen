@@ -482,7 +482,7 @@ def test_sarif_keeps_flows_and_deduplicates_identical_alerts():
         "Controller.java", "UserService.java", "UserRepository.java",
     ]
     assert [step["relation"] for step in seed["trace"]] == [
-        "entry", "flows_to", "reaches",
+        "flows_to", "flows_to", "flows_to",
     ]
     assert all("citation_id" not in step for step in seed["trace"])
     without_flow = sarif()

@@ -394,6 +394,32 @@ def test_triage_kept_candidate_becomes_independent_verification_branch(api, tmp_
     assert proposals[0]["description"] == triage.verify_description(source_id, "keep-me", 1)
     assert "drop-me" not in proposals[0]["description"]
 
+    verify_id = client.create_intent(
+        pid, proposals[0]["from"], proposals[0]["description"], "dispatcher.audit",
+        intent_type=proposals[0]["type"],
+    ).data["id"]
+    current = client.get_project(pid)
+    verify_intent = next(item for item in current.intents if item.id == verify_id)
+    outcome = triage.verification_outcome_fact({"data": {
+        "description": "scanner candidate confirmed without a logical endpoint",
+        "type": "vulnerability",
+        "evidence": "App.java:1 reaches the operation",
+        "endpoint_id": None,
+        "citations": [
+            {"id": "c1", "file": "App.java", "line": 1, "code": "danger();"},
+        ],
+        "trace": [{
+            "file": "App.java", "line": 1, "symbol": "danger",
+            "relation": "flows_to", "observation": "scanner location verified",
+            "citation_id": "c1",
+        }],
+        "candidate_disposition": {
+            "fingerprint": "keep-me", "outcome": "confirmed",
+            "rationale": "the finding has no HTTP, RPC, or queue entry",
+        },
+    }}, current, verify_intent, workdir)
+    assert outcome["proof"]["attributes"]["endpoint_id"] is None
+
 
 def test_isolated_poc_uses_sandbox_backend_without_host_fallback(api, tmp_path, monkeypatch):
     _, client = api

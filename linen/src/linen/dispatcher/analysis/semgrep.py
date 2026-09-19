@@ -84,9 +84,6 @@ def code_flow_trace_seeds(flows: Any, message: Any) -> list[dict]:
                 if step is not None:
                     steps.append(step)
             if steps:
-                steps[0]["relation"] = "entry"
-                if len(steps) > 1:
-                    steps[-1]["relation"] = "reaches"
                 seeds.append({"status": "unverified", "source": "semgrep", "trace": steps})
     return seeds
 

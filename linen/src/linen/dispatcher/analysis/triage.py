@@ -233,15 +233,18 @@ Independently verify this one candidate end to end. Return accepted:true with th
 data.description/type/evidence fields plus data.candidate_disposition containing:
 {fingerprint, outcome, rationale}. outcome must be confirmed, refuted, or blocked.
 Also return data.endpoint_id, data.citations, and data.trace. endpoint_id is the
-stable logical entry identity (for example http:DELETE:/users/{id}). citations
-use exact frozen-source {id, file, line, code} objects. trace is an ordered array
-of {file, line, symbol, relation, observation, citation_id}; scanner trace_seeds
-are unverified hints and every retained step must be independently checked.
+stable logical entry identity (for example http:DELETE:/users/{id}) when the
+candidate has a logical HTTP, RPC, queue, or similar entry; otherwise return
+null. citations use exact frozen-source {id, file, line, code} objects. trace is
+an ordered array of {file, line, symbol, relation, observation, citation_id};
+scanner trace_seeds are unverified hints and every retained step must be
+independently checked.
 confirmed means the worker believes a vulnerability candidate is ready for the
 server-side Technical Confirmation Gate; it does not create a confirmed finding.
-Use type=vulnerability for compatibility and provide the closed source/reachability/
-guard/sink/impact chain. refuted preserves the decisive protection path. blocked
-may use a partial or empty trace but its rationale must name the missing hop.
+Use type=vulnerability for compatibility and provide the independently verified
+relevant path without adding steps merely to fit a fixed topology. refuted
+preserves the decisive protection path. blocked may use a partial or empty trace
+but its rationale must name the missing hop.
 refuted requires type=candidate_disposition and decisive counter-evidence. blocked is
 reserved for missing build/runtime/dependency evidence and also uses candidate_disposition.
 Do not silently switch to another candidate.
@@ -291,7 +294,10 @@ def verification_outcome_fact(
     )
     if not citations:
         raise ValueError("Candidate verification requires at least one frozen-source citation")
-    endpoint_id = canonical_endpoint_id(data.get("endpoint_id"))
+    raw_endpoint_id = data.get("endpoint_id")
+    endpoint_id = (
+        None if raw_endpoint_id is None else canonical_endpoint_id(raw_endpoint_id)
+    )
     trace = canonical_vulnerability_trace(
         data.get("trace"), citations, path.parent / "source", snapshot, outcome=outcome,
     )

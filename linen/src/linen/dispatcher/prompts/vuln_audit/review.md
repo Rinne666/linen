@@ -17,8 +17,9 @@ If `proof.attributes.trace` is present, treat it as an ordered claim to falsify,
 not as established truth. Check every cross-file hop against source, verify that
 attacker control survives transformations, search for omitted guards,
 sanitizers, ownership and tenant predicates, verify sink/impact reachability,
-and confirm `endpoint_id` identifies the actual logical entry. Name the first
-unsupported or contradicted trace step in the verdict summary.
+and, when `endpoint_id` is present, confirm it identifies the actual logical
+entry. Name the first unsupported or contradicted trace step in the verdict
+summary.
 
 # 5-Layer Protection Search
 

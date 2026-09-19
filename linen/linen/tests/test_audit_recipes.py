@@ -267,8 +267,6 @@ def test_semantic_recipe_result_is_cited_then_verified_and_summarized(tmp_path):
                      "relation": "calls", "observation": "id crosses into service", "citation_id": "t2"},
                     {"file": "Repository.java", "line": 1, "symbol": "Repository.delete",
                      "relation": "reaches", "observation": "id selects the delete target", "citation_id": "t3"},
-                    {"file": "Repository.java", "line": 1, "symbol": "Repository.delete",
-                     "relation": "impact", "observation": "arbitrary user is deleted", "citation_id": "t3"},
                 ],
                 "candidate_disposition": {
                     "fingerprint": candidate["fingerprint"],
@@ -285,7 +283,7 @@ def test_semantic_recipe_result_is_cited_then_verified_and_summarized(tmp_path):
     disposition_fact = Fact(id="f-disposition", status="triaged", **disposition)
     assert disposition_fact.proof is not None
     assert [step["symbol"] for step in disposition_fact.proof.attributes["trace"]] == [
-        "Controller.delete", "Service.delete", "Repository.delete", "Repository.delete",
+        "Controller.delete", "Service.delete", "Repository.delete",
     ]
     verify_intent.to = disposition_fact.id
     verify_intent.concluded_at = NOW
@@ -309,6 +307,27 @@ def test_semantic_recipe_result_is_cited_then_verified_and_summarized(tmp_path):
     )
     summary = audit_recipes.summary_fact(board, summary_intent, workdir, config)
     assert summary["type"] == "semantic_summary"
+
+
+def test_confirmed_trace_has_no_deterministic_topology_requirement(tmp_path):
+    board, workdir, _ = _board_with_plan(tmp_path)
+    _, source, plan = audit_recipes._plan_context(board, workdir)
+    citations = [{
+        "id": "c1", "file": "Controller.java", "line": 1,
+        "code": "class Controller { void delete(String id) { service.delete(id); } }",
+    }]
+    trace = [{
+        "file": "Controller.java", "line": 1, "symbol": "Controller.delete",
+        "relation": "flows_to", "observation": "direct flow", "citation_id": "c1",
+    }]
+
+    assert canonical_vulnerability_trace(
+        trace, citations, source, plan["snapshot"], outcome="confirmed",
+    ) == trace
+    with pytest.raises(ValueError, match="requires a trace"):
+        canonical_vulnerability_trace(
+            [], citations, source, plan["snapshot"], outcome="confirmed",
+        )
 
 
 @pytest.mark.parametrize(
