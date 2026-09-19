@@ -88,7 +88,6 @@ def test_run_reason_task_passes_intent_type_to_create_intent(monkeypatch):
                 "prompt_group": "vuln_audit",
             },
             "tasks": {
-                "bootstrap": {"timeout": 10, "conclude_timeout": 5},
                 "reason": {"timeout": 10, "max_intents": 3},
                 "explore": {"timeout": 10, "conclude_timeout": 5},
                 "review": {"timeout": 10, "conclude_timeout": 5},
@@ -98,7 +97,7 @@ def test_run_reason_task_passes_intent_type_to_create_intent(monkeypatch):
                 {
                     "name": "test-worker",
                     "type": "pi",
-                    "task_types": ["bootstrap", "reason", "explore", "review"],
+                    "task_types": ["reason", "explore", "review"],
                     "max_running": 1,
                     "priority": 0,
                 }
@@ -127,6 +126,9 @@ def test_run_reason_task_passes_intent_type_to_create_intent(monkeypatch):
     captured: list[dict[str, Any]] = []
 
     class _Client:
+        def get_project(self, _project_id):
+            return project
+
         def create_intent(self, project_id, from_ids, description, creator, **kw):
             captured.append({
                 "project_id": project_id,
@@ -160,8 +162,10 @@ def test_run_reason_task_passes_intent_type_to_create_intent(monkeypatch):
     # trace intent. Both should pass through with their `type` intact.
     worker_stdout = (
         '{"accepted":true,"data":{"intents":['
-        '{"from":["f001"],"type":"review","description":"Review f001"},'
-        '{"from":["f002"],"type":"trace","description":"Trace f002"}'
+        '{"from":["f001"],"action":"review","target":"f001",'
+        '"type":"review","description":"Review f001"},'
+        '{"from":["f002"],"action":"trace","target":"f002",'
+        '"type":"trace","description":"Trace f002"}'
         ']}}'
     )
 

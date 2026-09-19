@@ -301,6 +301,10 @@ def test_events_created_during_reason_round_remain_pending_for_next_round(client
         json={"worker": "reasoner", "lease_id": "round-1", "seen_event_seq": before["event_seq"]},
     )
     assert released.status_code == 200
+    release_project = released.json()
+    assert release_project["reason_last_seen_event_seq"] == before["event_seq"]
+    assert release_project["event_seq"] == during["event_seq"]
+    assert release_project["event_seq"] > release_project["reason_last_seen_event_seq"]
     after = client.get(f"/projects/{project}").json()["project"]
     assert after["reason_last_seen_event_seq"] == before["event_seq"]
     assert after["event_seq"] == during["event_seq"]

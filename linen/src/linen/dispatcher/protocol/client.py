@@ -449,6 +449,7 @@ class LinenClient:
         status: str = "draft",
         display_title: str | None = None,
         semantic_type: str | None = None,
+        proof: dict[str, Any] | None = None,
     ) -> ApiResult:
         body: dict[str, Any] = {
             "worker": worker,
@@ -463,6 +464,8 @@ class LinenClient:
             body["display_title"] = display_title
         if semantic_type is not None:
             body["semantic_type"] = semantic_type
+        if proof is not None:
+            body["proof"] = proof
         return self._request_json(
             "POST",
             f"/projects/{project_id}/intents/{intent_id}/conclude",

@@ -116,7 +116,11 @@ recipes:
       component, entrypoint, identity, asset, trust_boundary, data_flow,
       external_integration, security_assumption, or coverage_gap. For data_flow
       items also include from, via, and to. For entrypoint items include
-      transport and handler. Do not create vulnerability findings in this pass.
+      transport, handler, and endpoint_id. endpoint_id is a stable logical
+      identity such as http:POST:/users/{id}, rpc:UserService.UpdateUser,
+      graphql:Mutation.updateUser, or queue:user.updated; it excludes source
+      locations and implementation details. Do not create vulnerability findings
+      in this pass.
 
   authz_matrix:
     version: 1
@@ -140,8 +144,10 @@ recipes:
       optional identity, and internal-only exposure.
 
       Each item contains: id, kind="authorization_surface", title, summary,
-      transport, operation, handler, expected_scope, guards, object_identifier,
-      ownership_check, tenant_filter, candidate, next_step, citations. guards is
+      endpoint_id, transport, operation, handler, expected_scope, guards,
+      object_identifier, ownership_check, tenant_filter, candidate, next_step,
+      citations. Reuse architecture_map endpoint_id values for the same logical
+      boundary and normalize sibling operations consistently. guards is
       an object with declarative, in_body, router, and hidden_channels arrays.
       ownership_check and tenant_filter are present, missing, not_applicable, or
       unknown. candidate is boolean. A candidate is not a confirmed finding.
@@ -247,7 +253,8 @@ recipes:
 
       Each item contains: id, kind="hypothesis", title, summary, category,
       reasoning_model, attacker_capability, trust_boundary, violated_invariant,
-      entry_point, operation, consequence, confidence, next_step, citations.
+      endpoint_id, entry_point, operation, consequence, confidence, next_step,
+      citations. Reuse the mapped endpoint_id for the logical entry.
       reasoning_model is pre_mortem, abductive, or both. confidence is low,
       medium, or high and measures investigation priority, not truth.
 
@@ -274,7 +281,8 @@ recipes:
 
       Each item contains: id, kind="hypothesis", title, summary, category,
       reasoning_model, attacker_capability, trust_boundary, violated_invariant,
-      entry_point, operation, consequence, confidence, next_step, citations.
+      endpoint_id, entry_point, operation, consequence, confidence, next_step,
+      citations. Reuse the mapped endpoint_id for the logical entry.
       reasoning_model is triz, game_theory, or both.
 
   hypothesis_attack_composition:
@@ -298,7 +306,8 @@ recipes:
 
       Each item contains: id, kind="hypothesis", title, summary, category,
       reasoning_model, attacker_capability, trust_boundary, violated_invariant,
-      entry_point, operation, consequence, confidence, next_step, citations.
+      endpoint_id, entry_point, operation, consequence, confidence, next_step,
+      citations. Reuse the mapped endpoint_id for the logical entry.
       reasoning_model names one or more of chaining, business_logic, race,
       second_order, trust_confusion, parser_differential, state_machine, or
       supply_chain_interaction.
@@ -323,8 +332,10 @@ recipes:
 
       Each item contains: id, kind="variant", title, summary, category,
       reasoning_model="variant", attacker_capability, trust_boundary,
-      violated_invariant, entry_point, operation, consequence, confidence,
-      next_step, similarity, parent_vulnerability, citations. similarity
+      violated_invariant, endpoint_id, entry_point, operation, consequence,
+      confidence, next_step, similarity, parent_vulnerability, citations.
+      Reuse the parent or mapped endpoint_id when the logical entry is the same.
+      similarity
       explains exactly which root-cause features match.
 
   hypothesis_verify:
@@ -356,9 +367,15 @@ recipes:
           "description": "source-grounded outcome",
           "type": "vulnerability | candidate_disposition",
           "evidence": "exact file:line trace and protection analysis",
+          "endpoint_id": "http:POST:/users/{id}",
           "citations": [
             {"id": "c1", "file": "src/App.java", "line": 10,
              "code": "exact source excerpt"}
+          ],
+          "trace": [
+            {"file": "src/App.java", "line": 10, "symbol": "App.update",
+             "relation": "entry", "observation": "attacker controls id",
+             "citation_id": "c1"}
           ],
           "candidate_disposition": {
             "fingerprint": "the assigned fingerprint",
@@ -370,8 +387,11 @@ recipes:
 
       confirmed means the worker believes a vulnerability candidate is ready for
       the server-side Technical Confirmation Gate; it does not create a confirmed
-      finding. Use type=vulnerability for compatibility and provide a closed,
-      externally reachable chain with concrete impact. refuted and blocked require
-      type=candidate_disposition. blocked is only for evidence that cannot be
-      resolved through permitted read-only inspection. Include at least one
-      exact frozen-source citation for every outcome.
+      finding. Use type=vulnerability for compatibility. Its ordered trace must
+      close attacker capability -> entry -> intermediate code or trust boundary
+      -> security-sensitive operation -> impact, using only entry, calls,
+      flows_to, crosses, guards, reaches, and impact relations. refuted preserves
+      the decisive protection path. blocked may return a partial or empty trace,
+      but its rationale must name the missing hop. refuted and blocked require
+      type=candidate_disposition. Include at least one exact frozen-source
+      citation for every outcome and bind every trace step to one citation_id.

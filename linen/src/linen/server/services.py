@@ -113,7 +113,12 @@ def next_report_snapshot_id(conn: sqlite3.Connection, project_id: str) -> str:
 
 
 def get_project_or_404(conn: sqlite3.Connection, project_id: str) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+    row = conn.execute(
+        "SELECT p.*, COALESCE((SELECT MAX(sequence) FROM audit_events "
+        "WHERE project_id = p.id), 0) AS latest_event_seq "
+        "FROM projects p WHERE p.id = ?",
+        (project_id,),
+    ).fetchone()
     if row is None:
         raise HTTPException(404, "Project not found")
     return row

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage
+from linen.dispatcher.analysis.artifacts import canonical_vulnerability_trace
 from linen.dispatcher.config import AuditConfig, CoverageConfig, SemanticAuditConfig
 from linen.server.models import Fact, Intent, ProjectDetail, ProjectMeta, Review
 
@@ -57,6 +58,18 @@ def _board_with_plan(tmp_path: Path) -> tuple[ProjectDetail, Path, str]:
     workdir.mkdir()
     (source / "Api.java").write_text(
         'class Api { void remove(String owner) { authorize(owner); delete(owner); } }\n',
+        encoding="utf-8",
+    )
+    (source / "Controller.java").write_text(
+        "class Controller { void delete(String id) { service.delete(id); } }\n",
+        encoding="utf-8",
+    )
+    (source / "Service.java").write_text(
+        "class Service { void delete(String id) { repository.delete(id); } }\n",
+        encoding="utf-8",
+    )
+    (source / "Repository.java").write_text(
+        "class Repository { void delete(String id) { db.delete(id); } }\n",
         encoding="utf-8",
     )
     plan = coverage.create_plan(
@@ -199,6 +212,7 @@ def test_semantic_recipe_result_is_cited_then_verified_and_summarized(tmp_path):
                         "attacker_capability": "supply owner",
                         "trust_boundary": "API input",
                         "violated_invariant": "only owners delete",
+                        "endpoint_id": "http:DELETE:/users/{id}",
                         "entry_point": "remove",
                         "operation": "delete",
                         "consequence": "cross-owner deletion",
@@ -234,14 +248,32 @@ def test_semantic_recipe_result_is_cited_then_verified_and_summarized(tmp_path):
         {
             "accepted": True,
             "data": {
-                "description": "authorization is enforced before deletion",
-                "type": "candidate_disposition",
-                "evidence": "the same owner value is checked and deleted",
-                "citations": [citation],
+                "description": "attacker-selected user reaches deletion",
+                "type": "vulnerability",
+                "evidence": "traced the request through controller, service, and repository",
+                "endpoint_id": "http:DELETE:/users/{id}",
+                "citations": [
+                    {"id": "t1", "file": "Controller.java", "line": 1,
+                     "code": "class Controller { void delete(String id) { service.delete(id); } }"},
+                    {"id": "t2", "file": "Service.java", "line": 1,
+                     "code": "class Service { void delete(String id) { repository.delete(id); } }"},
+                    {"id": "t3", "file": "Repository.java", "line": 1,
+                     "code": "class Repository { void delete(String id) { db.delete(id); } }"},
+                ],
+                "trace": [
+                    {"file": "Controller.java", "line": 1, "symbol": "Controller.delete",
+                     "relation": "entry", "observation": "id is request controlled", "citation_id": "t1"},
+                    {"file": "Service.java", "line": 1, "symbol": "Service.delete",
+                     "relation": "calls", "observation": "id crosses into service", "citation_id": "t2"},
+                    {"file": "Repository.java", "line": 1, "symbol": "Repository.delete",
+                     "relation": "reaches", "observation": "id selects the delete target", "citation_id": "t3"},
+                    {"file": "Repository.java", "line": 1, "symbol": "Repository.delete",
+                     "relation": "impact", "observation": "arbitrary user is deleted", "citation_id": "t3"},
+                ],
                 "candidate_disposition": {
                     "fingerprint": candidate["fingerprint"],
-                    "outcome": "refuted",
-                    "rationale": "the operation uses the value accepted by authorize",
+                    "outcome": "confirmed",
+                    "rationale": "no ownership predicate exists on the closed path",
                 },
             },
         },
@@ -251,11 +283,20 @@ def test_semantic_recipe_result_is_cited_then_verified_and_summarized(tmp_path):
         config,
     )
     disposition_fact = Fact(id="f-disposition", status="triaged", **disposition)
+    assert disposition_fact.proof is not None
+    assert [step["symbol"] for step in disposition_fact.proof.attributes["trace"]] == [
+        "Controller.delete", "Service.delete", "Repository.delete", "Repository.delete",
+    ]
     verify_intent.to = disposition_fact.id
     verify_intent.concluded_at = NOW
     board.facts.append(disposition_fact)
     board.intents.append(verify_intent)
     board.reviews.append(_review(disposition_fact.id))
+    follow_up = _intent(
+        "i-follow-up", [disposition_fact.id], "verify the missing sibling hop", "trace",
+    )
+    source_context = audit_recipes._source_context(board, follow_up, workdir)
+    assert source_context[0]["proof"]["attributes"]["trace"] == disposition_fact.proof.attributes["trace"]
 
     inputs = audit_recipes.semantic_summary_inputs(board, workdir, config)
     assert inputs == sorted([architecture_fact.id, batch.id, disposition_fact.id])
@@ -268,6 +309,32 @@ def test_semantic_recipe_result_is_cited_then_verified_and_summarized(tmp_path):
     )
     summary = audit_recipes.summary_fact(board, summary_intent, workdir, config)
     assert summary["type"] == "semantic_summary"
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"file": "Outside.java"}, "Invalid vulnerability trace step"),
+        ({"line": 99}, "conflicts with its frozen-source citation"),
+        ({"citation_id": "missing"}, "Invalid vulnerability trace step"),
+    ],
+)
+def test_cross_file_trace_rejects_invalid_source_bindings(tmp_path, change, message):
+    board, workdir, _ = _board_with_plan(tmp_path)
+    _, source, plan = audit_recipes._plan_context(board, workdir)
+    citations = [{
+        "id": "c1", "file": "Controller.java", "line": 1,
+        "code": "class Controller { void delete(String id) { service.delete(id); } }",
+    }]
+    step = {
+        "file": "Controller.java", "line": 1, "symbol": "Controller.delete",
+        "relation": "guards", "observation": "decisive ownership check", "citation_id": "c1",
+        **change,
+    }
+    with pytest.raises(ValueError, match=message):
+        canonical_vulnerability_trace(
+            [step], citations, source, plan["snapshot"], outcome="refuted",
+        )
 
 
 def test_semantic_recipe_rejects_citation_not_in_frozen_snapshot(tmp_path):
@@ -302,6 +369,85 @@ def test_semantic_recipe_rejects_citation_not_in_frozen_snapshot(tmp_path):
             workdir,
             config,
         )
+
+
+def test_sibling_endpoints_keep_stable_identities_for_hypotheses(tmp_path):
+    board, workdir, plan_id = _board_with_plan(tmp_path)
+    config = _semantic_config()
+    citation = {
+        "id": "c1", "file": "Api.java", "line": 1,
+        "code": 'class Api { void remove(String owner) { authorize(owner); delete(owner); } }',
+    }
+    endpoint_ids = [
+        "http:GET:/users/{id}",
+        "http:PUT:/users/{id}",
+        "http:DELETE:/users/{id}",
+    ]
+    authz_intent = _intent(
+        "i-authz", [plan_id], audit_recipes.recipe_description("authz_matrix"), "verify",
+    )
+    authz = audit_recipes.outcome_fact({
+        "accepted": True,
+        "data": {
+            "description": "three sibling user endpoints",
+            "type": "authz_matrix",
+            "evidence": "compared sibling operations",
+            "recipe_result": {
+                "coverage": {"status": "complete", "summary": "siblings", "gaps": []},
+                "citations": [citation],
+                "items": [{
+                    "id": f"endpoint-{index}",
+                    "kind": "authorization_surface",
+                    "title": endpoint_id,
+                    "summary": "ownership present" if index < 2 else "ownership missing",
+                    "endpoint_id": endpoint_id,
+                    "transport": "http",
+                    "operation": endpoint_id.split(":", 2)[1],
+                    "handler": "Api.remove",
+                    "expected_scope": "owner",
+                    "guards": {"declarative": [], "in_body": [], "router": [], "hidden_channels": []},
+                    "object_identifier": "id",
+                    "ownership_check": "present" if index < 2 else "missing",
+                    "tenant_filter": "not_applicable",
+                    "candidate": index == 2,
+                    "next_step": "verify delete" if index == 2 else "none",
+                    "citations": ["c1"],
+                } for index, endpoint_id in enumerate(endpoint_ids)],
+            },
+        },
+    }, board, authz_intent, workdir, config)
+    authz_fact = Fact(id="f-authz", **authz)
+    _, authz_record = audit_recipes.load_artifact(authz_fact, workdir)
+    assert [item["endpoint_id"] for item in authz_record["items"]] == endpoint_ids
+
+    hypothesis_intent = _intent(
+        "i-delete-hypothesis", [plan_id],
+        audit_recipes.recipe_description("hypothesis_backward"), "search",
+    )
+    hypothesis = audit_recipes.outcome_fact({
+        "accepted": True,
+        "data": {
+            "description": "delete ownership hypothesis",
+            "type": "hypothesis_batch",
+            "evidence": "compared the delete sibling",
+            "recipe_result": {
+                "coverage": {"status": "complete", "summary": "delete", "gaps": []},
+                "citations": [citation],
+                "items": [{
+                    "id": "delete-missing-owner", "kind": "hypothesis",
+                    "title": "delete lacks ownership", "summary": "DELETE differs from siblings",
+                    "category": "authorization", "reasoning_model": "abductive",
+                    "attacker_capability": "choose id", "trust_boundary": "HTTP request",
+                    "violated_invariant": "owner-only mutation",
+                    "endpoint_id": "http:DELETE:/users/{id}", "entry_point": "Api.remove",
+                    "operation": "delete", "consequence": "cross-user deletion",
+                    "confidence": "high", "next_step": "trace DELETE", "citations": ["c1"],
+                }],
+            },
+        },
+    }, board, hypothesis_intent, workdir, config)
+    hypothesis_fact = Fact(id="f-delete-hypothesis", **hypothesis)
+    assert audit_recipes.candidate_items(hypothesis_fact, workdir)[0]["endpoint_id"] == endpoint_ids[2]
 
 
 def test_audit_graph_materializes_semantic_recipe_without_a_new_worker_role(tmp_path):

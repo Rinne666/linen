@@ -161,6 +161,35 @@ def test_review_prompts_have_mode_specific_content():
     assert "Contradiction Reasoner" in cr or "contradiction reasoner" in cr
 
 
+def test_review_fact_block_includes_structured_trace_and_citations():
+    from linen.dispatcher.tasks.review import format_review_fact
+
+    evidence = json.dumps({
+        "citations": [{"id": "c1", "file": "Controller.java", "line": 1,
+                       "code": "controller.delete(id)"}],
+        "trace": [{"file": "Controller.java", "line": 1,
+                   "symbol": "Controller.delete", "relation": "entry",
+                   "observation": "id is attacker controlled", "citation_id": "c1"}],
+    })
+    fact = Fact(
+        id="f-trace", description="cross-file delete", type="vulnerability",
+        evidence=evidence,
+        proof={
+            "claim_kind": "vulnerability_trace",
+            "attributes": {
+                "endpoint_id": "http:DELETE:/users/{id}",
+                "trace": [{"file": "Controller.java", "line": 1,
+                           "symbol": "Controller.delete", "relation": "entry",
+                           "observation": "id is attacker controlled", "citation_id": "c1"}],
+            },
+        },
+    )
+    block = format_review_fact(fact)
+    assert "Controller.delete" in block
+    assert '"citation_id": "c1"' in block
+    assert '"endpoint_id": "http:DELETE:/users/{id}"' in block
+
+
 # ---- validate_review_payload: mode-specific extras ----------------------
 
 
@@ -370,7 +399,6 @@ def test_review_task_config_default_mode():
                 "prompt_group": "vuln_audit",
             },
             "tasks": {
-                "bootstrap": {"timeout": 10, "conclude_timeout": 5},
                 "reason": {"timeout": 10, "max_intents": 3},
                 "explore": {"timeout": 10, "conclude_timeout": 5},
                 "review": {"timeout": 10, "conclude_timeout": 5},
@@ -380,7 +408,7 @@ def test_review_task_config_default_mode():
             "workers": [
                 {
                     "name": "w", "type": "pi",
-                    "task_types": ["bootstrap", "reason", "explore", "review"],
+                    "task_types": ["reason", "explore", "review"],
                     "max_running": 1, "priority": 0,
                 }
             ],
@@ -404,7 +432,6 @@ def test_review_task_config_rejects_unknown_mode():
                     "prompt_group": "vuln_audit",
                 },
                 "tasks": {
-                    "bootstrap": {"timeout": 10, "conclude_timeout": 5},
                     "reason": {"timeout": 10, "max_intents": 3},
                     "explore": {"timeout": 10, "conclude_timeout": 5},
                     "review": {
@@ -416,7 +443,7 @@ def test_review_task_config_rejects_unknown_mode():
                 "workers": [
                     {
                         "name": "w", "type": "pi",
-                        "task_types": ["bootstrap", "reason", "explore", "review"],
+                    "task_types": ["reason", "explore", "review"],
                         "max_running": 1, "priority": 0,
                     }
                 ],

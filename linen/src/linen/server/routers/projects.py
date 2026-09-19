@@ -316,21 +316,10 @@ def create_project(body: CreateProjectRequest):
                 },
                 created_at=now,
             )
+            project_row = get_project_or_404(conn, pid)
 
             return ProjectDetail(
-                project=ProjectMeta(
-                    id=pid,
-                    title=body.title,
-                    status="active",
-                    graph_revision=1,
-                    source_generation=1,
-                    plan_revision=1,
-                    completion_policy=body.completion_policy,
-                    audit_mode=body.audit_mode,
-                    created_at=now,
-                    reason=None,
-                    repo_root=resolved_repo_root,
-                ),
+                project=project_meta_from_row(project_row),
                 facts=[
                     Fact(
                         id="origin", description=body.origin, display_title="Audit target",
@@ -642,8 +631,7 @@ def update_project_title(project_id: str, body: UpdateProjectTitleRequest):
             (body.title, project_id),
         )
         bump_graph_revision(conn, project_id)
-        updated = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
-        return project_meta_from_row(updated)
+        return project_meta_from_row(get_project_or_404(conn, project_id))
 
 
 @router.put("/projects/{project_id}/status", response_model=ProjectMeta)
@@ -668,8 +656,7 @@ def update_project_status(project_id: str, body: UpdateProjectStatusRequest):
                 (project_id,),
             )
             clear_project_reason(conn, project_id)
-        updated = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
-        return project_meta_from_row(updated)
+        return project_meta_from_row(get_project_or_404(conn, project_id))
 
 
 @router.post("/projects/{project_id}/reason/claim", response_model=ProjectMeta)
@@ -698,8 +685,7 @@ def claim_project_reason(project_id: str, body: ReasonClaimRequest):
             """,
             (body.worker, body.lease_id, body.trigger, now, now, project_id),
         )
-        updated = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
-        return project_meta_from_row(updated)
+        return project_meta_from_row(get_project_or_404(conn, project_id))
 
 
 @router.post("/projects/{project_id}/reason/heartbeat", response_model=ProjectMeta)
@@ -721,8 +707,7 @@ def heartbeat_project_reason(project_id: str, body: ReasonHeartbeatRequest):
             "UPDATE projects SET reason_last_heartbeat_at = ? WHERE id = ?",
             (now, project_id),
         )
-        updated = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
-        return project_meta_from_row(updated)
+        return project_meta_from_row(get_project_or_404(conn, project_id))
 
 
 @router.post("/projects/{project_id}/reason/release", response_model=ProjectMeta)
@@ -745,8 +730,7 @@ def release_project_reason(project_id: str, body: ReasonHeartbeatRequest):
                 (body.seen_event_seq, project_id),
             )
         clear_project_reason(conn, project_id)
-        updated = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
-        return project_meta_from_row(updated)
+        return project_meta_from_row(get_project_or_404(conn, project_id))
 
 
 @router.post("/projects/{project_id}/complete", response_model=Intent)
@@ -930,7 +914,7 @@ def reopen_project(project_id: str, body: ReopenRequest):
             (project_id,),
         )
 
-        updated_project = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        updated_project = get_project_or_404(conn, project_id)
         updated_intent = conn.execute(
             "SELECT * FROM intents WHERE id = ? AND project_id = ?",
             (intent_id, project_id),

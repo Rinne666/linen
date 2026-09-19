@@ -253,7 +253,6 @@ def _phase(
 
 def _config(
     *,
-    bootstrap: str,
     reason: str,
     explore: str,
     task_types: list[str] | None = None,
@@ -273,7 +272,6 @@ def _config(
                 "prompt_group": "mock",
             },
             "tasks": {
-                "bootstrap": {"timeout": 2, "conclude_timeout": 2},
                 "reason": {"timeout": 2, "max_intents": 1},
                 "explore": {"timeout": 2, "conclude_timeout": 2},
             },
@@ -281,12 +279,11 @@ def _config(
                 {
                     "name": "mock-worker",
                     "type": "mock",
-                    "task_types": task_types or ["bootstrap", "reason", "explore"],
+                    "task_types": task_types or ["reason", "explore"],
                     "max_running": 1,
                     "priority": 0,
                     "env": {
                         "MOCK_HEALTHCHECK": healthcheck or _phase("ok"),
-                        "MOCK_BOOTSTRAP": bootstrap,
                         "MOCK_REASON": reason,
                         "MOCK_EXPLORE_EXECUTE": explore,
                     },
@@ -342,7 +339,6 @@ def test_task_healthcheck_healthy_worker_completes_end_to_end(http_client: TestC
     containers = LocalContainerManager()
     loop = _loop(
         _config(
-            bootstrap=_phase("complete"),
             reason=_phase("complete", zero_outcomes=["intent"]),
             explore=_phase("fact"),
             worker_healthcheck="startup_and_task",
@@ -358,7 +354,7 @@ def test_task_healthcheck_healthy_worker_completes_end_to_end(http_client: TestC
     finally:
         loop.close()
 
-    # code-based check_health runs before the task, passes, and the bootstrap completes
+    # code-based check_health runs before the first Reason task and passes.
     assert project.project.status == "completed"
 
 
@@ -367,7 +363,6 @@ def test_task_healthcheck_failure_aborts_task_and_cools_down_worker(http_client:
     containers = LocalContainerManager()
     loop = _loop(
         _config(
-            bootstrap=_phase("complete"),
             reason=_phase("complete", zero_outcomes=["intent"]),
             explore=_phase("fact"),
             worker_healthcheck="startup_and_task",
@@ -395,12 +390,11 @@ def _failover_config() -> DispatchConfig:
         return {
             "name": name,
             "type": "mock",
-            "task_types": ["bootstrap", "reason", "explore"],
+            "task_types": ["reason", "explore"],
             "max_running": 1,
             "priority": priority,
             "env": {
                 "MOCK_HEALTHCHECK": healthcheck,
-                "MOCK_BOOTSTRAP": _phase("complete"),
                 "MOCK_REASON": _phase("complete", zero_outcomes=["intent"]),
                 "MOCK_EXPLORE_EXECUTE": _phase("fact"),
             },
@@ -419,7 +413,6 @@ def _failover_config() -> DispatchConfig:
                 "prompt_group": "mock",
             },
             "tasks": {
-                "bootstrap": {"timeout": 2, "conclude_timeout": 2},
                 "reason": {"timeout": 2, "max_intents": 1},
                 "explore": {"timeout": 2, "conclude_timeout": 2},
             },

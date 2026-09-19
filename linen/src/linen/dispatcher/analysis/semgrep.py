@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Callable
+from typing import Any, Callable
 
 from linen.dispatcher.config import SemgrepConfig
 from linen.dispatcher.runtime.process import ProcessResult
@@ -21,6 +21,74 @@ def digest(data: bytes) -> str:
 
 def write_json(path: Path, data: object) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _trace_location(raw: Any, relation: str, fallback_message: str) -> dict | None:
+    location = raw.get("location") if isinstance(raw, dict) else None
+    if not isinstance(location, dict):
+        return None
+    physical = location.get("physicalLocation")
+    if not isinstance(physical, dict):
+        return None
+    artifact = physical.get("artifactLocation")
+    region = physical.get("region")
+    if not isinstance(artifact, dict) or not isinstance(region, dict):
+        return None
+    filename = artifact.get("uri")
+    line = region.get("startLine")
+    relative = PurePosixPath(filename) if isinstance(filename, str) else None
+    if (
+        relative is None
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or "\\" in filename
+        or type(line) is not int
+        or line < 1
+    ):
+        return None
+    logical = location.get("logicalLocations")
+    logical_location = logical[0] if isinstance(logical, list) and logical else {}
+    symbol = (
+        logical_location.get("fullyQualifiedName")
+        or logical_location.get("name")
+        or "(scanner location)"
+    ) if isinstance(logical_location, dict) else "(scanner location)"
+    message = location.get("message")
+    observation = message.get("text") if isinstance(message, dict) else None
+    return {
+        "file": relative.as_posix(),
+        "line": line,
+        "symbol": str(symbol),
+        "relation": relation,
+        "observation": observation or fallback_message or "Semgrep code-flow location",
+    }
+
+
+def code_flow_trace_seeds(flows: Any, message: Any) -> list[dict]:
+    """Adapt SARIF codeFlows without interpreting their business semantics."""
+    if not isinstance(flows, list):
+        return []
+    fallback = message.get("text", "") if isinstance(message, dict) else ""
+    seeds: list[dict] = []
+    for flow in flows:
+        thread_flows = flow.get("threadFlows") if isinstance(flow, dict) else None
+        if not isinstance(thread_flows, list):
+            continue
+        for thread_flow in thread_flows:
+            locations = thread_flow.get("locations") if isinstance(thread_flow, dict) else None
+            if not isinstance(locations, list) or not locations:
+                continue
+            steps = []
+            for raw in locations:
+                step = _trace_location(raw, "flows_to", fallback)
+                if step is not None:
+                    steps.append(step)
+            if steps:
+                steps[0]["relation"] = "entry"
+                if len(steps) > 1:
+                    steps[-1]["relation"] = "reaches"
+                seeds.append({"status": "unverified", "source": "semgrep", "trace": steps})
+    return seeds
 
 
 def normalize_sarif(document: dict) -> list[dict]:
@@ -58,10 +126,11 @@ def normalize_sarif(document: dict) -> list[dict]:
             if fingerprint in candidates:
                 candidates[fingerprint]["occurrences"] += 1
                 continue
-            candidates[fingerprint] = {
+            message = result.get("message", {})
+            candidate = {
                 "fingerprint": fingerprint,
                 "rule_id": rule_id,
-                "message": result.get("message", {}),
+                "message": message,
                 "level": result.get("level"),
                 "locations": locations,
                 "code_flows": flows,
@@ -70,6 +139,10 @@ def normalize_sarif(document: dict) -> list[dict]:
                 "occurrences": 1,
                 "status": "unverified",
             }
+            trace_seeds = code_flow_trace_seeds(flows, message)
+            if trace_seeds:
+                candidate["trace_seeds"] = trace_seeds
+            candidates[fingerprint] = candidate
     return list(candidates.values())
 
 

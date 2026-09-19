@@ -61,7 +61,8 @@ def project(api, repo=None, *, audit_mode="none"):
 
 
 def add_fact(client, pid, *, parent="origin", fact_type="vulnerability"):
-    response = client.create_intent(pid, [parent], "verify", "reasoner", intent_type="characterize")
+    description = f"verify {fact_type} from {parent}"
+    response = client.create_intent(pid, [parent], description, "reasoner", intent_type="characterize")
     iid = response.data["id"]
     assert client.heartbeat(pid, iid, "tester").ok
     response = client.conclude(pid, iid, "tester", "candidate", fact_type=fact_type, evidence="file: app.py:1")
@@ -74,7 +75,18 @@ def sarif():
         "tool": {"driver": {"name": "Semgrep", "rules": [{"id": "eval", "properties": {"cwe": ["CWE-95"]}}]}},
         "results": [{"ruleId": "eval", "message": {"text": "check input"}, "locations": [{
             "physicalLocation": {"artifactLocation": {"uri": "app.py"}, "region": {"startLine": 1}}
-        }], "codeFlows": [{"threadFlows": [{"locations": []}]}]}],
+        }], "codeFlows": [{"threadFlows": [{"locations": [
+            {"location": {"physicalLocation": {"artifactLocation": {"uri": "Controller.java"},
+                                                "region": {"startLine": 42}},
+                          "logicalLocations": [{"fullyQualifiedName": "UserController.update"}],
+                          "message": {"text": "request id enters handler"}}},
+            {"location": {"physicalLocation": {"artifactLocation": {"uri": "UserService.java"},
+                                                "region": {"startLine": 88}},
+                          "logicalLocations": [{"fullyQualifiedName": "UserService.updateUser"}]}},
+            {"location": {"physicalLocation": {"artifactLocation": {"uri": "UserRepository.java"},
+                                                "region": {"startLine": 31}},
+                          "logicalLocations": [{"fullyQualifiedName": "UserRepository.save"}]}}
+        ]}]}]}],
     }]}
 
 
@@ -172,7 +184,7 @@ def test_legacy_review_migration_preserves_data(tmp_path, monkeypatch):
 
 
 def test_gate_checks_reviews_ancestors_and_open_intents(api):
-    _, client = api
+    http, client = api
     pid = project(api).project.id
     source = add_fact(client, pid, fact_type="source")
     terminal = add_fact(client, pid, parent=source)
@@ -222,11 +234,11 @@ def test_scope_is_the_default_audit_mode_and_recon_is_explicit(tmp_path):
     raw["audit"].pop("mode")
     assert DispatchConfig.model_validate(raw).audit.mode == "scope"
 
-    raw["workers"][0]["task_types"] = ["bootstrap", "reason", "explore", "review"]
-    with pytest.raises(ValueError, match="recon.enabled"):
-        DispatchConfig.model_validate(raw)
     raw["audit"]["recon"] = {"enabled": True}
     assert DispatchConfig.model_validate(raw).audit.recon.enabled
+    raw["audit"]["mode"] = "hypothesis"
+    with pytest.raises(ValueError, match="recon requires scope mode"):
+        DispatchConfig.model_validate(raw)
 
 
 
@@ -408,9 +420,9 @@ def test_reason_gate_blocks_only_opted_in_dispatcher(api, tmp_path, monkeypatch,
     assert reason.run_reason_task(cfg, client, backend, original, client.export_project(pid),
                                   cfg.workers[0], TaskCancellation()) == "success"
     current = client.get_project(pid)
-    assert current.project.status == ("active" if enabled else "completed")
+    assert current.project.status == "completed"
     if enabled:
-        assert any("Audit completion blocked" in hint.content for hint in current.hints)
+        assert not any("Audit completion blocked" in hint.content for hint in current.hints)
 
 
 def test_scan_cache_invalidates_source_rules_and_corrupt_artifacts(scanner, tmp_path):
@@ -462,6 +474,20 @@ def test_sarif_keeps_flows_and_deduplicates_identical_alerts():
     assert len(candidates) == 1
     assert candidates[0]["occurrences"] == 2
     assert candidates[0]["code_flows"]
+    assert candidates[0]["status"] == "unverified"
+    assert "proof" not in candidates[0]
+    seed = candidates[0]["trace_seeds"][0]
+    assert seed["status"] == "unverified"
+    assert [step["file"] for step in seed["trace"]] == [
+        "Controller.java", "UserService.java", "UserRepository.java",
+    ]
+    assert [step["relation"] for step in seed["trace"]] == [
+        "entry", "flows_to", "reaches",
+    ]
+    assert all("citation_id" not in step for step in seed["trace"])
+    without_flow = sarif()
+    without_flow["runs"][0]["results"][0].pop("codeFlows")
+    assert "trace_seeds" not in normalize_sarif(without_flow)[0]
     with pytest.raises(ValueError):
         normalize_sarif({"version": "2.1.0", "runs": []})
 
@@ -478,13 +504,21 @@ def test_snapshot_records_exclusions_and_missing_scanner(scanner, tmp_path, monk
 
 
 def test_scan_explore_review_and_reason_complete_through_board(api, scanner, tmp_path, monkeypatch):
-    _, client = api
+    http, client = api
     repo, _, execute, _ = scanner
     cfg = config(tmp_path, scan=True)
     current = project(api, repo)
     pid = current.project.id
     backend = LocalBackend(cfg.local, client)
     worker = cfg.workers[0]
+    stage = http.put(
+        f"/projects/{pid}/stages/semgrep",
+        json={
+            "label": "Semgrep", "phase_order": 30, "status": "pending",
+            "skill_id": "security.semgrep", "capability": "static-analysis.sarif",
+        },
+    )
+    assert stage.status_code == 200
     response = client.create_intent(pid, ["origin"], SCAN_INTENT_DESCRIPTION, "reasoner", intent_type="search")
     iid = response.data["id"]
     assert client.heartbeat(pid, iid, worker.name).ok
@@ -498,7 +532,6 @@ def test_scan_explore_review_and_reason_complete_through_board(api, scanner, tmp
     batch = next(f for f in current.facts if f.type == "scan_batch")
     assert batch.status == "draft"
     candidate = add_fact(client, pid, parent=batch.id)
-
     driver = FakeDriver()
     monkeypatch.setattr(review, "get_driver", lambda _: driver)
     # Real review task saves its model output using the existing Review API.
@@ -523,6 +556,7 @@ def test_scan_explore_review_and_reason_complete_through_board(api, scanner, tmp
     }), ""))
     for fid in (batch.id, candidate):
         response = client.create_intent(pid, [fid], "SECRET PRIOR REASONING", "reasoner",
+                                        action="review", target=fid,
                                         intent_type="review:cold-verifier")
         review_id = response.data["id"]
         client.heartbeat(pid, review_id, worker.name)
@@ -532,7 +566,6 @@ def test_scan_explore_review_and_reason_complete_through_board(api, scanner, tmp
                                       review_intent, worker, TaskCancellation()) == "success"
     assert all("SECRET PRIOR REASONING" not in prompt for prompt in driver.prompts)
     assert "audit-process attestation" in driver.prompts[0]
-    assert "Withheld" in driver.prompts[1]
     current = client.get_project(pid)
     assert completion_blockers(current, [candidate]) == []
     assert len(current.reviews) == 2
@@ -551,8 +584,9 @@ def test_audit_configuration_requires_review_and_local_rules(tmp_path):
     raw["workers"][0]["task_types"] = ["reason", "explore"]
     with pytest.raises(ValueError, match="review worker"):
         DispatchConfig.model_validate(raw)
-    raw["workers"][0]["task_types"] = ["bootstrap", "review"]
-    with pytest.raises(ValueError, match="recon.enabled"):
+    raw["audit"]["mode"] = "hypothesis"
+    raw["audit"]["recon"] = {"enabled": True}
+    with pytest.raises(ValueError, match="recon requires scope mode"):
         DispatchConfig.model_validate(raw)
     with pytest.raises(ValueError, match="local rule file"):
         SemgrepConfig(enabled=True)

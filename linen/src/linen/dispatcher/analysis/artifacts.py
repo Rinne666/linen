@@ -1,11 +1,165 @@
-"""Resolve board-referenced snapshots without exposing other host directories."""
+"""Validate frozen-source evidence and resolve board-referenced artifacts."""
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from linen.dispatcher.analysis.semgrep import digest
 from linen.server.models import Fact, ProjectDetail
+
+
+TRACE_RELATIONS = frozenset({
+    "entry", "calls", "flows_to", "crosses", "guards", "reaches", "impact",
+})
+_ENDPOINT_ID = re.compile(r"^[a-z][a-z0-9+.-]*:\S{1,191}$")
+_CITATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def canonical_endpoint_id(value: Any) -> str:
+    """Validate an LLM-normalized logical endpoint identity."""
+    if not isinstance(value, str) or not _ENDPOINT_ID.fullmatch(value.strip()):
+        raise ValueError("endpoint_id must be a compact scheme-prefixed identity")
+    return value.strip()
+
+
+def canonical_source_citations(
+    raw: Any, source: Path, snapshot: dict, *, label: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        raise ValueError(f"{label} result requires citations")
+    if len(raw) > 2000:
+        raise ValueError(f"{label} citation limit exceeded")
+    result = []
+    ids: set[str] = set()
+    files = snapshot.get("files", {})
+    for citation in raw:
+        if not isinstance(citation, dict) or set(citation) != {"id", "file", "line", "code"}:
+            raise ValueError(f"Every {label.lower()} citation requires exactly id, file, line, and code")
+        citation_id = citation["id"]
+        filename = citation["file"]
+        line = citation["line"]
+        code = citation["code"]
+        if (
+            not isinstance(citation_id, str)
+            or not _CITATION_ID.fullmatch(citation_id)
+            or citation_id in ids
+            or not isinstance(filename, str)
+            or filename not in files
+            or type(line) is not int
+            or line < 1
+            or not isinstance(code, str)
+            or not code.strip()
+            or len(code) > 8000
+        ):
+            raise ValueError(f"Invalid {label.lower()} citation")
+        content = source_bytes(source, filename, files[filename]).decode(
+            "utf-8", errors="replace",
+        )
+        lines = content.splitlines()
+        excerpt = code.splitlines()
+        if line > len(lines) or lines[line - 1:line - 1 + len(excerpt)] != excerpt:
+            raise ValueError(f"{label} citation does not match frozen source: {filename}:{line}")
+        ids.add(citation_id)
+        result.append({"id": citation_id, "file": filename, "line": line, "code": code})
+    return result
+
+
+def canonical_vulnerability_trace(
+    raw: Any,
+    citations: list[dict[str, Any]],
+    source: Path,
+    snapshot: dict,
+    *,
+    outcome: str,
+) -> list[dict[str, Any]]:
+    """Validate trace structure and frozen-source citation bindings only."""
+    if not isinstance(raw, list) or len(raw) > 100:
+        raise ValueError("Vulnerability trace must be a bounded ordered array")
+    if outcome == "confirmed" and len(raw) < 4:
+        raise ValueError("Confirmed vulnerability requires a closed trace")
+    if outcome == "refuted" and not raw:
+        raise ValueError("Refuted vulnerability requires its decisive protection path")
+    citation_by_id = {citation["id"]: citation for citation in citations}
+    files = snapshot.get("files", {})
+    normalized: list[dict[str, Any]] = []
+    for step in raw:
+        if not isinstance(step, dict) or set(step) != {
+            "file", "line", "symbol", "relation", "observation", "citation_id",
+        }:
+            raise ValueError(
+                "Every trace step requires exactly file, line, symbol, relation, "
+                "observation, and citation_id"
+            )
+        filename = step["file"]
+        line = step["line"]
+        symbol = step["symbol"]
+        relation = step["relation"]
+        observation = step["observation"]
+        citation_id = step["citation_id"]
+        citation = citation_by_id.get(citation_id)
+        if (
+            not isinstance(filename, str)
+            or filename not in files
+            or type(line) is not int
+            or line < 1
+            or not isinstance(symbol, str)
+            or not symbol.strip()
+            or relation not in TRACE_RELATIONS
+            or not isinstance(observation, str)
+            or not observation.strip()
+            or citation is None
+        ):
+            raise ValueError("Invalid vulnerability trace step")
+        content = source_bytes(source, filename, files[filename]).decode(
+            "utf-8", errors="replace",
+        )
+        citation_lines = citation["code"].splitlines()
+        citation_start = citation["line"]
+        if (
+            line > len(content.splitlines())
+            or citation["file"] != filename
+            or not citation_start <= line < citation_start + len(citation_lines)
+        ):
+            raise ValueError("Trace step conflicts with its frozen-source citation")
+        normalized.append({
+            "file": filename,
+            "line": line,
+            "symbol": symbol.strip(),
+            "relation": relation,
+            "observation": observation.strip(),
+            "citation_id": citation_id,
+        })
+    if outcome == "confirmed":
+        relations = [step["relation"] for step in normalized]
+        if (
+            relations[0] != "entry"
+            or relations[-1] != "impact"
+            or "reaches" not in relations[1:-1]
+            or not any(value in {"calls", "flows_to", "crosses", "guards"}
+                       for value in relations[1:-1])
+        ):
+            raise ValueError(
+                "Confirmed trace must order entry, an intermediate hop, reaches, and impact"
+            )
+    return normalized
+
+
+def vulnerability_trace_proof(
+    trace: list[dict[str, Any]], endpoint_id: str, outcome: str, snapshot_id: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "claim_kind": "vulnerability_trace",
+        "attributes": {
+            "trace": trace,
+            "endpoint_id": endpoint_id,
+            "trace_status": "closed" if outcome == "confirmed" else "partial",
+            "candidate_outcome": outcome,
+            "snapshot_id": snapshot_id,
+        },
+    }
 
 
 def evidence_fields(evidence: str | None) -> dict[str, str]:

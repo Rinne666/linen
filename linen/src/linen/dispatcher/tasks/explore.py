@@ -1208,6 +1208,7 @@ def _try_conclude_fallback(
         phase_ms=conclude_ms,
         fact_type=fact["type"],
         evidence=fact["evidence"],
+        proof=fact.get("proof"),
     )
 
 

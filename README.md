@@ -114,8 +114,7 @@ uv run --project linen linen dispatch \
 ```
 
 Create a project in the UI by supplying an origin and a goal. The Dispatcher
-will schedule bootstrap, reasoning, review, and exploration work as the graph
-evolves.
+will schedule reasoning, exploration, and review work as the graph evolves.
 
 ## Source-code audit mode
 
@@ -123,11 +122,12 @@ Linen includes a coverage-driven audit mode for authorized source trees:
 
 ```bash
 cp dispatch.vuln.example.yaml dispatch.yaml
-# edit local.repo_root in dispatch.yaml
+# edit local.repo_root and worker settings in dispatch.yaml
 uv run --project linen linen dispatch --config dispatch.yaml
 ```
 
-Create an audit project through the API:
+Create an audit project through the UI or API. A project may select an existing
+local checkout with `repo_root`:
 
 ```bash
 curl -X POST http://127.0.0.1:9000/projects \
@@ -136,10 +136,15 @@ curl -X POST http://127.0.0.1:9000/projects \
     "title": "audit-example",
     "origin": "/absolute/path/to/source",
     "goal": "Find exploitable SQL injection paths",
-    "bootstrap_enabled": false,
-    "audit_mode": "scope"
+    "audit_mode": "scope",
+    "repo_root": "/absolute/path/to/source"
   }'
 ```
+
+Alternatively, set `clone_url` to an HTTP(S), Git, or SSH URL and the Server
+will create a project-specific checkout. `repo_root` and `clone_url` are
+mutually exclusive. If neither is supplied, the Dispatcher uses
+`local.repo_root` from `dispatch.yaml`.
 
 Audit mode can provide:
 
@@ -147,10 +152,37 @@ Audit mode can provide:
 - coverage plans over included files and configured topics;
 - managed scanner results and reproducible execution records;
 - evidence-bearing vulnerability candidates;
-- independent proof review and technical-confirmation gates;
+- independent review, proof-closure, and technical-confirmation gates;
+- optional isolated review and proof-of-concept execution in prebuilt Docker
+  images, with no host-execution fallback;
 - preserved worker output and artifacts under the project work directory.
 
 Use this only against systems and source code you are authorized to test.
+
+### Audit inspection commands
+
+Print the coverage state derived from the blackboard without scheduling or
+changing any tasks:
+
+```bash
+uv run --project linen linen coverage \
+  --config dispatch.yaml \
+  --project-id proj_000001
+```
+
+Compare exactly three independent audit result files with a JSON or YAML truth
+set. Optional thresholds make the command fail when recall or cross-run
+stability is too low:
+
+```bash
+uv run --project linen linen audit-benchmark \
+  --expected expected.yaml \
+  --run run-1.yaml \
+  --run run-2.yaml \
+  --run run-3.yaml \
+  --min-recall 0.8 \
+  --min-stability 0.7
+```
 
 ## Configuration
 
@@ -170,6 +202,12 @@ local:
 
 `agents_md`, when configured, is copied into new project workspaces as the
 worker brief. Existing files are not overwritten.
+
+When `audit.enabled` is true, configure at least one worker with the `review`
+task type. Scope audits that use semantic recipes or scope adjudication also
+need an `explore` worker and the `vuln_audit` prompt group. See
+[`dispatch.vuln.example.yaml`](dispatch.vuln.example.yaml) for a complete
+starting point.
 
 ## Development
 

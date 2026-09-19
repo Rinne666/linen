@@ -19,7 +19,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 import yaml
 
 from linen.dispatcher.analysis import coverage
-from linen.dispatcher.analysis.artifacts import ancestor_ids, load_artifact, source_bytes
+from linen.dispatcher.analysis.artifacts import (
+    ancestor_ids,
+    canonical_endpoint_id,
+    canonical_source_citations,
+    canonical_vulnerability_trace,
+    load_artifact,
+    source_bytes,
+    vulnerability_trace_proof,
+)
 from linen.dispatcher.analysis.semgrep import digest, write_json
 from linen.dispatcher.config import SemanticAuditConfig
 from linen.server.models import Fact, Intent, ProjectDetail
@@ -314,43 +322,7 @@ def recipe_proposals(
 
 
 def _canonical_citations(raw: Any, source: Path, snapshot: dict) -> list[dict[str, Any]]:
-    if not isinstance(raw, list):
-        raise ValueError("Semantic recipe result requires citations")
-    if len(raw) > 2000:
-        raise ValueError("Semantic recipe citation limit exceeded")
-    result = []
-    ids: set[str] = set()
-    files = snapshot.get("files", {})
-    for citation in raw:
-        if not isinstance(citation, dict) or set(citation) != {"id", "file", "line", "code"}:
-            raise ValueError("Every semantic citation requires exactly id, file, line, and code")
-        citation_id = citation["id"]
-        filename = citation["file"]
-        line = citation["line"]
-        code = citation["code"]
-        if (
-            not isinstance(citation_id, str)
-            or not _ID.fullmatch(citation_id)
-            or citation_id in ids
-            or not isinstance(filename, str)
-            or filename not in files
-            or type(line) is not int
-            or line < 1
-            or not isinstance(code, str)
-            or not code.strip()
-            or len(code) > 8000
-        ):
-            raise ValueError("Invalid semantic citation")
-        content = source_bytes(source, filename, files[filename]).decode(
-            "utf-8", errors="replace",
-        )
-        lines = content.splitlines()
-        excerpt = code.splitlines()
-        if line > len(lines) or lines[line - 1:line - 1 + len(excerpt)] != excerpt:
-            raise ValueError(f"Semantic citation does not match frozen source: {filename}:{line}")
-        ids.add(citation_id)
-        result.append({"id": citation_id, "file": filename, "line": line, "code": code})
-    return result
+    return canonical_source_citations(raw, source, snapshot, label="Semantic")
 
 
 _COMMON_ITEM_KEYS = {"id", "kind", "title", "summary", "citations"}
@@ -359,6 +331,7 @@ _REQUIRED_ITEM_KEYS: dict[str, set[str]] = {
     "authz_matrix": _COMMON_ITEM_KEYS | {
         "transport", "operation", "handler", "expected_scope", "guards",
         "object_identifier", "ownership_check", "tenant_filter", "candidate", "next_step",
+        "endpoint_id",
     },
     "state_model": _COMMON_ITEM_KEYS | {
         "entity", "transition", "precondition", "mutation", "transaction",
@@ -376,12 +349,12 @@ _REQUIRED_ITEM_KEYS: dict[str, set[str]] = {
     "hypothesis_batch": _COMMON_ITEM_KEYS | {
         "category", "reasoning_model", "attacker_capability", "trust_boundary",
         "violated_invariant", "entry_point", "operation", "consequence",
-        "confidence", "next_step",
+        "confidence", "next_step", "endpoint_id",
     },
     "variant_batch": _COMMON_ITEM_KEYS | {
         "category", "reasoning_model", "attacker_capability", "trust_boundary",
         "violated_invariant", "entry_point", "operation", "consequence",
-        "confidence", "next_step", "similarity", "parent_vulnerability",
+        "confidence", "next_step", "similarity", "parent_vulnerability", "endpoint_id",
     },
 }
 
@@ -444,6 +417,10 @@ def _normalize_recipe_result(
         elif recipe.fact_type in {"authz_matrix", "state_model", "cross_service_map", "contract_map"}:
             if not isinstance(item.get("candidate"), bool):
                 raise ValueError("Semantic matrix candidate must be boolean")
+        if recipe.fact_type == "architecture_map" and item.get("kind") == "entrypoint":
+            item["endpoint_id"] = canonical_endpoint_id(item.get("endpoint_id"))
+        elif recipe.fact_type in {"authz_matrix", *CANDIDATE_BATCH_TYPES}:
+            item["endpoint_id"] = canonical_endpoint_id(item.get("endpoint_id"))
         if recipe.fact_type in CANDIDATE_BATCH_TYPES:
             if item.get("kind") not in {"hypothesis", "variant"}:
                 raise ValueError("Semantic candidate batch has an invalid kind")
@@ -456,7 +433,7 @@ def _normalize_recipe_result(
                 key: normalized.get(key) for key in (
                     "category", "attacker_capability", "trust_boundary",
                     "violated_invariant", "entry_point", "operation", "consequence",
-                    "similarity", "parent_vulnerability",
+                    "similarity", "parent_vulnerability", "endpoint_id",
                 )
             }
             normalized["fingerprint"] = digest(
@@ -497,6 +474,7 @@ def _source_context(project: ProjectDetail, intent: Intent, workdir: Path) -> li
             "status": fact.status,
             "description": fact.description,
             "evidence": fact.evidence,
+            "proof": fact.proof.model_dump(mode="json") if fact.proof is not None else None,
         }
         try:
             path, artifact = load_artifact(fact, workdir)
@@ -574,7 +552,7 @@ def outcome_fact(
     workdir: Path,
     config: SemanticAuditConfig,
     prompt_group: str = "vuln_audit",
-) -> dict[str, str]:
+) -> dict[str, object]:
     if not config.enabled:
         raise ValueError("Semantic audit recipes are disabled")
     parsed = parse_recipe_intent(intent, prompt_group)
@@ -679,16 +657,17 @@ def verification_target(
 
 def verification_outcome_fact(
     payload: dict[str, Any], project: ProjectDetail, intent: Intent, workdir: Path,
-) -> dict[str, str]:
+) -> dict[str, object]:
     batch, candidate = verification_target(project, intent, workdir)
     data = payload.get("data", payload)
     expected_keys = {
         "description", "type", "evidence", "citations", "candidate_disposition",
+        "endpoint_id", "trace",
     }
     if not isinstance(data, dict) or set(data) != expected_keys:
         raise ValueError(
             "Semantic verification requires exactly description, type, evidence, "
-            "citations, and candidate_disposition"
+            "citations, endpoint_id, trace, and candidate_disposition"
         )
     disposition = data.get("candidate_disposition")
     if not isinstance(disposition, dict):
@@ -718,6 +697,10 @@ def verification_outcome_fact(
     citations = _canonical_citations(data.get("citations"), source, plan["snapshot"])
     if not citations:
         raise ValueError("Semantic verification requires at least one frozen-source citation")
+    endpoint_id = canonical_endpoint_id(data.get("endpoint_id"))
+    trace = canonical_vulnerability_trace(
+        data.get("trace"), citations, source, plan["snapshot"], outcome=outcome,
+    )
     envelope = {
         "schema_version": 1,
         "source": "semantic_recipe",
@@ -726,6 +709,7 @@ def verification_outcome_fact(
         "outcome": outcome,
         "rationale": rationale.strip(),
         "candidate": candidate,
+        "endpoint_id": endpoint_id,
         "citations": citations,
         "worker_evidence": evidence.strip(),
     }
@@ -733,6 +717,9 @@ def verification_outcome_fact(
         "type": fact_type,
         "description": description.strip(),
         "evidence": json.dumps(envelope, ensure_ascii=False),
+        "proof": vulnerability_trace_proof(
+            trace, endpoint_id, outcome, plan["snapshot"]["id"],
+        ),
     }
 
 

@@ -53,7 +53,16 @@ def test_project_detail_adapter_preserves_intent_edge_and_is_canonical() -> None
             id="proj_001", title="test", status="active", bootstrap_enabled=True,
             created_at="2026-01-01T00:00:00Z",
         ),
-        facts=[Fact(id="origin", description="start"), Fact(id="goal", description="finish"), Fact(id="f001", description="known")],
+        facts=[
+            Fact(id="origin", description="start"),
+            Fact(id="goal", description="finish"),
+            Fact(
+                id="f001", description="known", proof={
+                    "claim_kind": "vulnerability_trace",
+                    "attributes": {"trace": [{"symbol": "Controller.delete"}]},
+                },
+            ),
+        ],
         intents=[intent],
         hints=[Hint(id="h001", content="hint", creator="human", created_at="2026-01-01T00:00:01Z")],
     )
@@ -74,6 +83,8 @@ def test_project_detail_adapter_preserves_intent_edge_and_is_canonical() -> None
     assert first.snapshot_id == second.snapshot_id
     assert {node.id for node in first.nodes} >= {"proj_001", "i001", "f001"}
     assert [(edge.source_id, edge.target_id) for edge in first.edges] == [("f001", "i001")]
+    fact_node = next(node for node in first.nodes if node.id == "f001")
+    assert fact_node.payload["proof"]["attributes"]["trace"][0]["symbol"] == "Controller.delete"
 
 
 def test_projection_is_stable_bounded_and_excludes_unrelated_nodes() -> None:

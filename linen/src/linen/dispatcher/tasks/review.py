@@ -41,6 +41,7 @@ task (see scheduler/loop.py: `i.type == "review" or i.type.startswith("review:")
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -77,6 +78,7 @@ from linen.dispatcher.tasks.common import (
 from linen.dispatcher.workers.registry import get_driver
 from linen.server.models import (
     AUDIT_ATTESTATION_FACT_TYPES,
+    Fact,
     Intent,
     ProjectDetail,
     REVIEW_DIAGNOSTIC_FIELDS,
@@ -92,6 +94,23 @@ REVIEW_MODES: frozenset[str] = frozenset(
 )
 REVIEW_TYPE_PREFIX = "review"
 SUMMARY_FACT_TYPES = frozenset({"module_summary", "semantic_summary", "audit_summary"})
+
+
+def format_review_fact(fact: Fact) -> str:
+    """Inline all candidate-local evidence needed to falsify a saved trace."""
+    block = (
+        f"id: {fact.id}\n"
+        f"description: {fact.description}\n"
+        f"type: {fact.type or '(none)'}\n"
+        f"status: {fact.status}\n"
+    )
+    if fact.evidence:
+        block += f"evidence:\n{fact.evidence}\n"
+    if fact.proof is not None:
+        block += "proof:\n" + json.dumps(
+            fact.proof.model_dump(mode="json"), ensure_ascii=False, indent=2,
+        ) + "\n"
+    return block
 
 
 def review_profile(fact_type: str | None) -> str:
@@ -237,14 +256,7 @@ def run_review_task(
 
         # Inline the candidate fact so the worker doesn't have to search for it;
         # broader graph access remains bounded by the registered projection.
-        fact_block = (
-            f"id: {fact.id}\n"
-            f"description: {fact.description}\n"
-            f"type: {fact.type or '(none)'}\n"
-            f"status: {fact.status}\n"
-        )
-        if fact.evidence:
-            fact_block += f"evidence:\n{fact.evidence}\n"
+        fact_block = format_review_fact(fact)
 
         # Resolve review mode from intent.type (`review` or `review:<mode>`)
         # and pick the corresponding prompt file. The default mode is
@@ -273,9 +285,9 @@ def run_review_task(
         graph_context = "Withheld for independent cold verification. Read the target source directly."
         if profile == "coverage":
             graph_context = "Withheld because coverage review uses its exact cell and frozen snapshot."
-        elif profile == "vulnerability" and mode == "cold-verifier":
-            fact_block = f"id: {fact.id}\ndescription: {fact.description}\ntype: {fact.type or '(none)'}\n"
-        elif not config.audit.review_sandbox.enabled:
+        elif not (
+            profile == "vulnerability" and mode == "cold-verifier"
+        ) and not config.audit.review_sandbox.enabled:
             graph_context = context_reference
         LOG.info(
             "review profile resolved project=%s intent=%s fact_id=%s profile=%s mode=%s prompt=%s",

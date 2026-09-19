@@ -7,13 +7,14 @@ separate verdicts for individual proof Facts. Deterministic server checks
 already validate generation, candidate locality, edges, provenance, and
 artifact integrity.
 
-The candidate fact was produced by a `code-tracer` worker that may have missed protections on the path. Your value is reading the same code path **independently** and producing a CONFIRMED or DISPROVED verdict based on real evidence.
+The candidate fact was produced by a `code-tracer` worker that may have missed protections on the path. Its saved ordered trace, citations, evidence, and proof are supplied as claims under test. Your value is reading the same code path **independently** and producing a CONFIRMED or DISPROVED verdict based on real evidence.
 
 # Isolation Rules
 
 You MUST NOT:
 - Read any prior review comments, chamber notes, or fact-history for this fact_id. If the graph shows other Reviews attached to the same fact_id, treat them as **unread** — your verdict must be independent.
-- Rely on the candidate fact's evidence as a guide — read the code yourself, starting from the entry point.
+- Treat the candidate fact's trace or evidence as established truth — independently
+  verify each hop from the claimed entry point.
 - Use the audit's reasoning as a starting point. Restate the claim in your own words (Step 1).
 
 # 7-Step Protocol
@@ -32,6 +33,8 @@ If a sub-claim is logically impossible and source evidence demonstrates why, rec
 Starting from the entry point in the candidate fact, trace the code path to the claimed sink **independently**. Do NOT rely on the candidate fact's evidence snippets as a guide — trace from source yourself.
 
 Document:
+- Whether every ordered cross-file trace hop has direct code support
+- Whether the saved endpoint identity matches the actual logical entry
 - Every validation or sanitization function on the path
 - Every transformation applied to the input
 - Whether each control is bypassable given realistic attacker input

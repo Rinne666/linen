@@ -9,6 +9,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.protocol.client import LinenClient
@@ -1355,6 +1356,7 @@ def write_conclude_result(
     fact_type: str | None = None,
     evidence: str | None = None,
     fact_status: str = "draft",
+    proof: dict[str, Any] | None = None,
 ) -> str:
     return write_conclude_result_with_fact_id(
         client,
@@ -1368,6 +1370,7 @@ def write_conclude_result(
         fact_type=fact_type,
         evidence=evidence,
         fact_status=fact_status,
+        proof=proof,
     ).status
 
 
@@ -1384,15 +1387,21 @@ def write_conclude_result_with_fact_id(
     fact_type: str | None = None,
     evidence: str | None = None,
     fact_status: str = "draft",
+    proof: dict[str, Any] | None = None,
 ) -> ConcludeWriteResult:
+    conclude_options: dict[str, Any] = {
+        "fact_type": fact_type,
+        "evidence": evidence,
+        "status": fact_status,
+    }
+    if proof is not None:
+        conclude_options["proof"] = proof
     response = client.conclude(
         project_id,
         intent_id,
         worker_name,
         description,
-        fact_type=fact_type,
-        evidence=evidence,
-        status=fact_status,
+        **conclude_options,
     )
     if response.ok:
         fact_id: str | None = None

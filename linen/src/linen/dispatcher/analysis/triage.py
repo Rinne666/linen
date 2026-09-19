@@ -5,7 +5,13 @@ import json
 import uuid
 from pathlib import Path
 
-from linen.dispatcher.analysis.artifacts import load_artifact
+from linen.dispatcher.analysis.artifacts import (
+    canonical_endpoint_id,
+    canonical_source_citations,
+    canonical_vulnerability_trace,
+    load_artifact,
+    vulnerability_trace_proof,
+)
 from linen.dispatcher.analysis.semgrep import digest, write_json
 from linen.dispatcher.config import CandidateTriageConfig
 from linen.server.models import Fact, Intent, ProjectDetail
@@ -189,7 +195,7 @@ def _verification_target(
     project: ProjectDetail,
     intent: Intent,
     workdir: Path,
-) -> tuple[Fact, dict, dict]:
+) -> tuple[Fact, dict, dict, Path, dict]:
     triage_fact = next(
         (fact for fact in project.facts if fact.id in intent.from_ and fact.type == "candidate_triage"),
         None,
@@ -210,15 +216,15 @@ def _verification_target(
     scanner_fact = next((fact for fact in project.facts if fact.id == record["source_fact_id"]), None)
     if scanner_fact is None:
         raise ValueError("Candidate scanner fact is missing")
-    _, _, candidates = scanner_candidates(scanner_fact, workdir)
+    path, manifest, candidates = scanner_candidates(scanner_fact, workdir)
     candidate = next((item for item in candidates if item["fingerprint"] == fingerprint), None)
     if candidate is None:
         raise ValueError("Candidate fingerprint is missing from scanner evidence")
-    return triage_fact, decision, candidate
+    return triage_fact, decision, candidate, path, manifest
 
 
 def verification_context_prompt(project: ProjectDetail, intent: Intent, workdir: Path) -> str:
-    _, decision, candidate = _verification_target(project, intent, workdir)
+    _, decision, candidate, _, _ = _verification_target(project, intent, workdir)
     return "\nManaged candidate verification:\n" + json.dumps({
         "candidate": candidate,
         "triage": decision,
@@ -226,10 +232,16 @@ def verification_context_prompt(project: ProjectDetail, intent: Intent, workdir:
 Independently verify this one candidate end to end. Return accepted:true with the normal
 data.description/type/evidence fields plus data.candidate_disposition containing:
 {fingerprint, outcome, rationale}. outcome must be confirmed, refuted, or blocked.
+Also return data.endpoint_id, data.citations, and data.trace. endpoint_id is the
+stable logical entry identity (for example http:DELETE:/users/{id}). citations
+use exact frozen-source {id, file, line, code} objects. trace is an ordered array
+of {file, line, symbol, relation, observation, citation_id}; scanner trace_seeds
+are unverified hints and every retained step must be independently checked.
 confirmed means the worker believes a vulnerability candidate is ready for the
 server-side Technical Confirmation Gate; it does not create a confirmed finding.
 Use type=vulnerability for compatibility and provide the closed source/reachability/
-guard/sink chain.
+guard/sink/impact chain. refuted preserves the decisive protection path. blocked
+may use a partial or empty trace but its rationale must name the missing hop.
 refuted requires type=candidate_disposition and decisive counter-evidence. blocked is
 reserved for missing build/runtime/dependency evidence and also uses candidate_disposition.
 Do not silently switch to another candidate.
@@ -241,9 +253,18 @@ def verification_outcome_fact(
     project: ProjectDetail,
     intent: Intent,
     workdir: Path,
-) -> dict[str, str]:
-    _, _, candidate = _verification_target(project, intent, workdir)
+) -> dict[str, object]:
+    _, _, candidate, path, manifest = _verification_target(project, intent, workdir)
     data = payload.get("data", payload)
+    expected_keys = {
+        "description", "type", "evidence", "citations", "endpoint_id", "trace",
+        "candidate_disposition",
+    }
+    if not isinstance(data, dict) or set(data) != expected_keys:
+        raise ValueError(
+            "Candidate verification requires exactly description, type, evidence, "
+            "citations, endpoint_id, trace, and candidate_disposition"
+        )
     disposition = data.get("candidate_disposition") if isinstance(data, dict) else None
     if not isinstance(disposition, dict):
         raise ValueError("Candidate verification requires data.candidate_disposition")
@@ -261,17 +282,35 @@ def verification_outcome_fact(
     evidence = data.get("evidence")
     if not isinstance(evidence, str) or not evidence.strip():
         raise ValueError("Candidate verification requires evidence")
+    description = data.get("description")
+    if not isinstance(description, str) or not description.strip():
+        raise ValueError("Candidate verification requires a description")
+    snapshot = manifest.get("snapshot", {})
+    citations = canonical_source_citations(
+        data.get("citations"), path.parent / "source", snapshot, label="Scanner verification",
+    )
+    if not citations:
+        raise ValueError("Candidate verification requires at least one frozen-source citation")
+    endpoint_id = canonical_endpoint_id(data.get("endpoint_id"))
+    trace = canonical_vulnerability_trace(
+        data.get("trace"), citations, path.parent / "source", snapshot, outcome=outcome,
+    )
     envelope = {
         "schema_version": 1,
         "fingerprint": candidate["fingerprint"],
         "outcome": outcome,
         "rationale": rationale.strip(),
+        "endpoint_id": endpoint_id,
+        "citations": citations,
         "worker_evidence": evidence.strip(),
     }
     return {
         "type": fact_type,
-        "description": data["description"].strip(),
+        "description": description.strip(),
         "evidence": json.dumps(envelope, ensure_ascii=False),
+        "proof": vulnerability_trace_proof(
+            trace, endpoint_id, outcome, snapshot["id"],
+        ),
     }
 
 
