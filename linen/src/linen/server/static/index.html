@@ -553,9 +553,9 @@
       </button>
     </div>
     <div class="list-header-create flex items-center gap-1.5">
-      <button @click="showNewProject = true" class="h-7 px-2.5 rounded-lg border border-brand-200 text-xs text-brand-600 hover:bg-brand-50 transition inline-flex items-center gap-1.5">
+      <button @click="openNewAudit()" class="h-7 px-2.5 rounded-lg border border-brand-200 text-xs text-brand-600 hover:bg-brand-50 transition inline-flex items-center gap-1.5">
         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="1.9" viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
-        New Project
+        New audit
       </button>
     </div>
     <div class="list-header-prefs flex items-center gap-1.5 ml-1">
@@ -573,7 +573,7 @@
       <div class="flex flex-col items-center justify-center h-full text-slate-400">
         <img src="/static/favicon.svg" alt="" class="w-20 h-20 mb-5 opacity-30">
         <p class="text-lg font-medium text-slate-500">No projects yet</p>
-        <p class="text-sm mt-1">Create a project to start exploring</p>
+        <p class="text-sm mt-1">Start an audit to investigate a repository</p>
       </div>
     </template>
 
@@ -932,7 +932,7 @@
           </button>
           <div x-show="newActionsOpen" x-cloak @click.outside="newActionsOpen = false" class="absolute right-0 top-9 z-30 w-44 overflow-hidden rounded-xl border border-slate-200 bg-white py-1 shadow-lg">
             <button type="button" @click="newActionsOpen = false; openCreateIntent()" :disabled="!projectIsActive() || !canActOnSelectedFacts()" class="block w-full px-3 py-2 text-left text-xs text-brand-700 hover:bg-brand-50 disabled:cursor-not-allowed disabled:opacity-35">New intent</button>
-            <button type="button" @click="newActionsOpen = false; openHintModal()" :disabled="!projectCanWriteHints()" class="block w-full border-t border-slate-100 px-3 py-2 text-left text-xs text-amber-700 hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-35">Analyst note</button>
+            <button type="button" @click="newActionsOpen = false; openHintModal()" :disabled="!projectCanWriteHints()" class="block w-full border-t border-slate-100 px-3 py-2 text-left text-xs text-amber-700 hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-35">Add analyst note</button>
           </div>
         </div>
         <div class="relative" x-show="projectIsActive() && selectedOpenIntentRecord()">
@@ -1065,7 +1065,7 @@
       </div>
       <div class="flex items-center justify-between gap-3 border-b border-slate-100 bg-slate-50/80 px-3 py-2 shrink-0 select-none">
         <span class="min-w-0 truncate text-[10px] text-slate-400"
-          x-text="sideTab === 'pi' ? 'Worker archives and contract run metadata load on demand' : sideTab === 'gate' ? 'Completion is evidence-gated, not inferred from an idle queue' : sideTab === 'log' ? 'Audit events in execution order' : sideTab === 'hints' ? 'Operator guidance and context' : 'Node and edge evidence is selectable'"></span>
+          x-text="sideTab === 'pi' ? 'Worker archives and contract run metadata load on demand' : sideTab === 'gate' ? 'Completion is evidence-gated, not inferred from an idle queue' : sideTab === 'log' ? 'Audit events in execution order' : sideTab === 'hints' ? 'Analyst guidance and context' : 'Node and edge evidence is selectable'"></span>
         <button type="button" @click="copySidePanelText()"
           class="inline-flex h-7 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-[11px] font-medium text-slate-600 hover:border-brand-200 hover:bg-brand-50 hover:text-brand-700 transition"
           title="Copies highlighted text, or all text in the current sidebar tab">
@@ -1143,7 +1143,7 @@
               <dl x-show="technicalStatusOpen" class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 border-t border-slate-100 px-4 py-3 text-[11px]">
                 <dt class="text-slate-400">Reasoning</dt><dd class="break-words text-right text-slate-600" x-text="reasonEngineLabel()"></dd>
                 <dt class="text-slate-400">Lock</dt><dd class="break-words text-right text-slate-600" x-text="reasonLockLabel()"></dd>
-                <dt class="text-slate-400">Mode</dt><dd class="text-right text-slate-600" x-text="project.project.audit_mode || 'none'"></dd>
+                <dt class="text-slate-400">Mode</dt><dd class="text-right text-slate-600" x-text="auditModeLabel(project.project.audit_mode)"></dd>
                 <dt class="text-slate-400">Graph</dt><dd class="font-mono text-right text-slate-600" x-text="`r${project.project.graph_revision}`"></dd>
               </dl>
             </section>
@@ -1246,10 +1246,8 @@
                             <div class="flex items-start gap-3">
                               <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-slate-900 text-[10px] font-bold text-white tabular-nums" x-text="index + 1"></span>
                               <div class="min-w-0 flex-1">
-                                <div class="flex flex-wrap items-center gap-2">
-                                  <p class="min-w-0 break-words text-sm font-semibold text-slate-800" x-text="step.symbol"></p>
-                                  <span class="rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-500" x-text="formatTraceRelation(step.relation)"></span>
-                                </div>
+                                <p class="break-words text-sm font-semibold text-slate-800" x-text="step.symbol"></p>
+                                <span class="mt-1 inline-flex rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-slate-500" x-text="formatTraceRelation(step.relation)"></span>
                                 <p class="mt-0.5 break-all font-mono text-[10px] text-slate-500" x-text="`${step.file}:${step.line}`"></p>
                                 <p class="mt-2 break-words text-xs leading-relaxed text-slate-600" x-text="step.observation"></p>
                               </div>
@@ -1484,11 +1482,11 @@
         </template>
       </div>
 
-      <!-- Hints -->
+      <!-- Analyst notes -->
       <div x-show="sideTab === 'hints'" class="flex-1 overflow-y-auto p-4 space-y-3 bg-amber-50/25 select-text">
         <template x-if="project.hints.length === 0">
           <div class="rounded-2xl border border-dashed border-amber-200 bg-white/80 px-5 py-10 text-center shadow-sm">
-            <p class="text-sm text-slate-300">No hints yet</p>
+            <p class="text-sm text-slate-400">No analyst notes yet</p>
           </div>
         </template>
         <template x-for="h in project.hints" :key="h.id">
@@ -1503,7 +1501,7 @@
                   <span class="text-amber-600/80 tabular-nums" x-text="formatTime(h.created_at)"></span>
                   <button type="button" @click="openHintTimelineEntry(h.id)"
                     class="rounded-md border border-amber-200 bg-white/80 px-2 py-1 text-[10px] font-medium text-amber-700 hover:bg-white transition"
-                    :aria-label="`Locate hint ${h.id} in timeline`">Locate</button>
+                    :aria-label="`Locate analyst note ${h.id} in timeline`">Locate</button>
                 </div>
               </div>
             </div>
@@ -1745,81 +1743,82 @@
 
 <!-- ═══════════ MODALS ═══════════ -->
 
-<!-- New Project -->
+<!-- New audit -->
 <div x-show="showNewProject" x-cloak class="fixed inset-0 z-50 flex items-center justify-center overlay" @click.self="if (!isCreatingProject) showNewProject = false">
   <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-6 border border-slate-200/60" @click.stop :aria-busy="isCreatingProject">
-    <h3 class="text-base font-semibold text-slate-700 mb-4">New Project</h3>
-    <div class="space-y-3">
-      <input x-model="newProject.title" placeholder="Project title" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300">
-
-      <!-- Source code mode (drives what the Origin field is) -->
-      <div class="flex gap-1 text-[11px]">
-        <button type="button" @click="newProject.source_mode = 'description'"
-          :class="newProject.source_mode === 'description' ? 'bg-brand-500 text-white' : 'bg-white text-slate-600 border border-slate-200 hover:border-slate-300'"
-          class="px-2.5 py-1 rounded-lg font-medium transition">Description only</button>
+    <h3 class="mb-4 text-base font-semibold text-slate-700" x-text="newProject.audit_mode === 'none' ? 'New general project' : 'New audit'"></h3>
+    <div class="space-y-4">
+      <div class="space-y-2">
+        <label class="block text-sm font-medium text-slate-700">Repository</label>
+        <div class="flex flex-wrap gap-1 text-[11px]">
         <button type="button" @click="newProject.source_mode = 'git'"
           :class="newProject.source_mode === 'git' ? 'bg-brand-500 text-white' : 'bg-white text-slate-600 border border-slate-200 hover:border-slate-300'"
           class="px-2.5 py-1 rounded-lg font-medium transition">Git URL</button>
         <button type="button" @click="newProject.source_mode = 'local'"
           :class="newProject.source_mode === 'local' ? 'bg-brand-500 text-white' : 'bg-white text-slate-600 border border-slate-200 hover:border-slate-300'"
-          class="px-2.5 py-1 rounded-lg font-medium transition">Reuse local source</button>
-      </div>
-
-      <!-- Origin field — single field, three flavors driven by source_mode.
-           The same value is sent as both the `origin` fact and either
-           `clone_url` (git) or `repo_root` (local). -->
-      <template x-if="newProject.source_mode === 'description'">
-        <textarea x-model="newProject.origin" placeholder="Origin — free-text starting point (file path, function name, hypothesis, anything)" rows="2" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300"></textarea>
-      </template>
-
-      <template x-if="newProject.source_mode === 'git'">
-        <div class="space-y-1.5">
-          <input x-model="newProject.origin" placeholder="Origin / Git URL — e.g. https://github.com/owner/repo.git"
-            class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300">
-          <p class="text-[10.5px] text-slate-400">Server runs <code class="text-slate-500">git clone</code> synchronously into <code class="text-slate-500">~/.local/share/linen/clones/&lt;project_id&gt;</code>. Up to 10 min. Private repos need SSH keys or credentials on the server.</p>
+          class="px-2.5 py-1 rounded-lg font-medium transition">Local path</button>
+        <button type="button" @click="newProject.source_mode = 'description'"
+          :class="newProject.source_mode === 'description' ? 'bg-brand-500 text-white' : 'bg-white text-slate-600 border border-slate-200 hover:border-slate-300'"
+          class="px-2.5 py-1 rounded-lg font-medium transition">Describe target</button>
         </div>
-      </template>
 
-      <template x-if="newProject.source_mode === 'local'">
-        <div class="space-y-1.5">
-          <div class="flex gap-1.5">
-            <input x-model="newProject.origin" placeholder="Origin / Local folder — /absolute/path/to/repo"
-              class="flex-1 px-3 py-2 border border-slate-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300">
-            <label class="px-2.5 py-2 border border-slate-200 rounded-xl text-sm text-slate-600 hover:border-slate-300 hover:bg-slate-50 transition cursor-pointer flex items-center gap-1.5"
-              :class="newProject.source_browse_name ? 'border-brand-300 bg-brand-50/50 text-brand-700' : ''">
-              <input type="file" webkitdirectory directory multiple class="hidden" @change="const name = $event.target.files[0]?.webkitRelativePath?.split('/')[0] || ''; newProject.source_browse_name = name;">
-              <span x-text="newProject.source_browse_name ? '✓ ' + newProject.source_browse_name : 'Browse'"></span>
-            </label>
-          </div>
-          <p class="text-[10.5px] text-slate-400">
-            <span x-show="!newProject.source_browse_name">Reuse an existing checkout without cloning it. Type or paste its absolute path. <em>Browse</em> confirms a folder exists but cannot read its absolute path from the browser.</span>
-            <span x-show="newProject.source_browse_name" class="text-brand-600">Selected: <span class="font-mono font-medium" x-text="newProject.source_browse_name"></span> — paste the full path above to continue.</span>
-          </p>
-        </div>
-      </template>
+        <template x-if="newProject.source_mode === 'description'">
+          <textarea x-model="newProject.origin" placeholder="Describe the codebase or starting point" rows="2" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300"></textarea>
+        </template>
 
-      <textarea x-model="newProject.goal" placeholder="Goal — what to achieve (the hypothesis to verify)" rows="2" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300"></textarea>
-      <label class="block text-sm text-slate-600">
-        <span class="mb-1 block">Audit profile</span>
-        <select x-model="newProject.audit_mode" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400">
-          <option value="scope">Scope audit — full configured coverage and review gate</option>
-          <option value="hypothesis">Hypothesis audit — evidence/review gate only</option>
-          <option value="none">General project — no audit completion gate</option>
-        </select>
-      </label>
-
-      <div>
-        <div class="flex items-center justify-between mb-2">
-          <span class="text-[11px] text-slate-400 font-medium uppercase tracking-wider">Hints (optional)</span>
-          <button type="button" @click="newProject.hints.push({ content: '' })" class="text-[11px] text-brand-500 hover:text-brand-600 font-medium">+ Add</button>
-        </div>
-        <template x-for="(hint, idx) in newProject.hints" :key="idx">
-          <div class="flex gap-2 mb-2">
-            <input x-model="hint.content" placeholder="Hint content" class="flex-1 px-3 py-1.5 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300">
-            <button type="button" @click="newProject.hints.splice(idx, 1)" x-show="newProject.hints.length > 1" class="px-2 text-slate-300 hover:text-red-400 transition text-sm">&times;</button>
+        <template x-if="newProject.source_mode === 'git'">
+          <div class="space-y-1.5">
+            <input x-model="newProject.origin" placeholder="https://github.com/owner/repository.git"
+              class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300">
+            <p class="text-[10.5px] text-slate-400">Private repositories use credentials already available to the server.</p>
           </div>
         </template>
-        <p class="text-[11px] text-slate-400">Hint creator uses local actor: <span class="font-medium text-slate-600" x-text="actorName()"></span></p>
+
+        <template x-if="newProject.source_mode === 'local'">
+          <div class="space-y-1.5">
+            <div class="flex gap-1.5">
+              <input x-model="newProject.origin" placeholder="/absolute/path/to/repository"
+                class="flex-1 px-3 py-2 border border-slate-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300">
+              <label class="px-2.5 py-2 border border-slate-200 rounded-xl text-sm text-slate-600 hover:border-slate-300 hover:bg-slate-50 transition cursor-pointer flex items-center gap-1.5"
+                :class="newProject.source_browse_name ? 'border-brand-300 bg-brand-50/50 text-brand-700' : ''">
+                <input type="file" webkitdirectory directory multiple class="hidden" @change="const name = $event.target.files[0]?.webkitRelativePath?.split('/')[0] || ''; newProject.source_browse_name = name;">
+                <span x-text="newProject.source_browse_name ? '✓ ' + newProject.source_browse_name : 'Browse'"></span>
+              </label>
+            </div>
+            <p class="text-[10.5px] text-slate-400">
+              <span x-show="!newProject.source_browse_name">Paste an absolute path the server can access.</span>
+              <span x-show="newProject.source_browse_name" class="text-brand-600">Selected <span class="font-medium" x-text="newProject.source_browse_name"></span>; paste its full path above.</span>
+            </p>
+          </div>
+        </template>
+      </div>
+
+      <label class="block space-y-2 text-sm font-medium text-slate-700">
+        <span>Goal</span>
+        <textarea x-model="newProject.goal" placeholder="What should the audit investigate?" rows="3" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm font-normal focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300"></textarea>
+      </label>
+
+      <div class="border-t border-slate-100 pt-3">
+        <button type="button" @click="newProjectAdvancedOpen = !newProjectAdvancedOpen"
+          class="flex w-full items-center justify-between rounded-lg py-1 text-left text-xs font-medium text-slate-500 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-200"
+          :aria-expanded="newProjectAdvancedOpen" aria-controls="new-audit-advanced">
+          <span>Advanced</span>
+          <svg class="h-4 w-4 transition-transform" :class="newProjectAdvancedOpen ? 'rotate-180' : ''" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+        <div id="new-audit-advanced" x-show="newProjectAdvancedOpen" x-cloak class="mt-3 space-y-3">
+          <label class="block text-sm text-slate-600">
+            <span class="mb-1 block">Name <span class="text-slate-400">(optional)</span></span>
+            <input x-model="newProject.title" placeholder="Repository name by default" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300">
+          </label>
+          <label class="block text-sm text-slate-600">
+            <span class="mb-1 block">Audit mode</span>
+            <select x-model="newProject.audit_mode" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400">
+              <option value="scope">Full audit</option>
+              <option value="hypothesis">Hypothesis only</option>
+              <option value="none">General project</option>
+            </select>
+          </label>
+        </div>
       </div>
     </div>
     <div x-show="isCreatingProject" x-cloak class="mt-4 flex items-start gap-2.5 rounded-xl border border-brand-100 bg-brand-50/60 px-3 py-2.5 text-xs text-brand-700">
@@ -1831,13 +1830,13 @@
     </div>
     <div class="flex justify-end gap-2 mt-5">
       <button @click="showNewProject = false" :disabled="isCreatingProject" class="px-4 py-2 text-sm text-slate-500 hover:bg-slate-50 rounded-xl transition disabled:cursor-not-allowed disabled:opacity-40">Cancel</button>
-      <button @click="createProject()" :disabled="isCreatingProject || !newProject.title || !newProject.origin || !newProject.goal"
+      <button @click="createProject()" :disabled="isCreatingProject || !newProject.origin || !newProject.goal"
         class="inline-flex min-w-[96px] items-center justify-center gap-2 px-5 py-2 text-sm bg-brand-500 text-white rounded-xl font-medium hover:bg-brand-600 transition disabled:cursor-not-allowed disabled:opacity-50 shadow-sm shadow-brand-200">
         <svg x-show="isCreatingProject" x-cloak class="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <circle class="opacity-25" cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3"></circle>
           <path class="opacity-80" fill="currentColor" d="M21 12a9 9 0 0 0-9-9v3a6 6 0 0 1 6 6h3Z"></path>
         </svg>
-        <span x-text="isCreatingProject ? (newProject.source_mode === 'git' ? 'Cloning…' : 'Creating…') : 'Create'"></span>
+        <span x-text="isCreatingProject ? (newProject.source_mode === 'git' ? 'Cloning…' : 'Starting…') : (newProject.audit_mode === 'none' ? 'Create project' : 'Start audit')"></span>
       </button>
     </div>
   </div>
@@ -1917,12 +1916,12 @@
   </div>
 </div>
 
-<!-- Hint -->
+<!-- Analyst note -->
 <div x-show="showHintModal" x-cloak class="fixed inset-0 z-50 flex items-center justify-center overlay" @click.self="showHintModal = false">
   <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-6 border border-slate-200/60" @click.stop>
-    <h3 class="text-base font-semibold text-slate-700 mb-4">Add Hint</h3>
+    <h3 class="text-base font-semibold text-slate-700 mb-4">Add analyst note</h3>
     <div class="space-y-3">
-      <textarea x-model="hintForm.content" placeholder="Strategy advice or note..." rows="3" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300"></textarea>
+      <textarea x-model="hintForm.content" placeholder="Add guidance or context for the running audit" rows="3" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300"></textarea>
       <div class="px-3 py-2 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-500">
         Actor: <span class="font-medium text-slate-700" x-text="actorName()"></span>
       </div>
@@ -1930,7 +1929,7 @@
     <div class="flex justify-end gap-2 mt-5">
       <button @click="showHintModal = false" class="px-4 py-2 text-sm text-slate-500 hover:bg-slate-50 rounded-xl transition">Cancel</button>
       <button @click="addHint()" :disabled="!hintForm.content"
-        class="px-5 py-2 text-sm bg-amber-500 text-white rounded-xl font-medium hover:bg-amber-600 transition disabled:opacity-30 shadow-sm shadow-amber-200">Add</button>
+        class="px-5 py-2 text-sm bg-amber-500 text-white rounded-xl font-medium hover:bg-amber-600 transition disabled:opacity-30 shadow-sm shadow-amber-200">Add note</button>
     </div>
 </div>
 </div>
@@ -2179,7 +2178,8 @@ function linenApp() {
     _exportRequestId: 0,
     showDeleteModal: false,
 
-    newProject: { title: '', origin: '', goal: '', audit_mode: 'scope', source_mode: 'description', source_browse_name: '', hints: [{ content: '' }] },
+    newProjectAdvancedOpen: false,
+    newProject: { title: '', origin: '', goal: '', audit_mode: 'scope', completion_policy: 'goal_based', source_mode: 'git', source_browse_name: '' },
     isCreatingProject: false,
     intentForm: { description: '' },
     concludeForm: { description: '', intentId: '' },
@@ -2451,6 +2451,10 @@ function linenApp() {
       return ({ pending: 'Pending', running: 'Running', satisfied: 'Satisfied', blocked: 'Blocked', failed: 'Failed', not_applicable: 'Not applicable' })[status] || status;
     },
 
+    auditModeLabel(mode) {
+      return ({ scope: 'Full audit', hypothesis: 'Hypothesis only', none: 'General project' })[mode] || mode || 'General project';
+    },
+
     stageStatusDotClass(status) {
       return ({ pending: 'bg-slate-300', running: 'bg-sky-500', satisfied: 'bg-emerald-500', blocked: 'bg-rose-500', failed: 'bg-rose-500', not_applicable: 'bg-slate-300' })[status] || 'bg-slate-300';
     },
@@ -2603,7 +2607,12 @@ function linenApp() {
       if (!fact) return false;
       const type = fact.type || '';
       const semantic = fact.semantic_type || '';
-      if (type === 'candidate_disposition' || semantic === 'candidate_disposition') return false;
+      const internalTypes = new Set([
+        'candidate_disposition', 'source', 'sink', 'sanitizer', 'validation',
+        'reachability', 'architecture_map', 'hypothesis_batch', 'variant_batch',
+        'coverage_result',
+      ]);
+      if (internalTypes.has(type) || internalTypes.has(semantic)) return false;
       return ['vulnerability', 'confirmed_finding', 'finding', 'candidate'].includes(type)
         || ['confirmed_finding', 'candidate_finding'].includes(semantic);
     },
@@ -3231,7 +3240,7 @@ function linenApp() {
       if (!this.project) return '';
       if (this.sideTab === 'hints') {
         return this.project.hints.map(hint => [
-          `[${this.formatTimelineDate(hint.created_at)} ${this.formatTime(hint.created_at)}] Hint by ${hint.creator}`,
+          `[${this.formatTimelineDate(hint.created_at)} ${this.formatTime(hint.created_at)}] Analyst note by ${hint.creator}`,
           hint.content,
         ].join('\n')).join('\n\n');
       }
@@ -5432,13 +5441,13 @@ function linenApp() {
     formatTraceRelation(relation) {
       const value = String(relation || '').trim();
       const labels = {
-        calls: 'calls',
-        flows_to: 'flows to',
-        crosses: 'crosses',
-        guards: 'guarded by',
-        reaches: 'reaches',
-        impact: 'impact',
-        entry: 'entry',
+        calls: 'CALLS',
+        flows_to: 'FLOWS TO',
+        crosses: 'CROSSES',
+        guards: 'GUARDED BY',
+        reaches: 'REACHES',
+        impact: 'IMPACT',
+        entry: 'ENTRY',
       };
       return labels[value] || value;
     },
@@ -5929,7 +5938,7 @@ function linenApp() {
     timelineEventBadge(entry) {
       const labels = {
         project_created: 'Project',
-        hint_added: 'Hint',
+        hint_added: 'Analyst note',
         reason_started: 'Reason',
         intent_declared: 'Intent',
         intent_running: 'Execute',
@@ -6156,18 +6165,45 @@ function linenApp() {
       return `${seconds}s`;
     },
 
+    resetNewProject() {
+      this.newProject = {
+        title: '',
+        origin: '',
+        goal: '',
+        audit_mode: 'scope',
+        completion_policy: 'goal_based',
+        source_mode: 'git',
+        source_browse_name: '',
+      };
+      this.newProjectAdvancedOpen = false;
+    },
+
+    openNewAudit() {
+      this.resetNewProject();
+      this.showNewProject = true;
+    },
+
+    newProjectTitle() {
+      const explicit = String(this.newProject.title || '').trim();
+      if (explicit) return explicit;
+      const origin = String(this.newProject.origin || '').trim().replace(/[\\/]+$/, '');
+      if (this.newProject.source_mode === 'description') return 'Security audit';
+      const segment = origin.split(/[\\/]/).pop() || '';
+      return segment.replace(/\.git$/i, '') || 'Security audit';
+    },
+
     async createProject() {
       if (this.isCreatingProject) return;
       this.isCreatingProject = true;
       const sourceMode = this.newProject.source_mode;
+      const auditMode = this.newProject.audit_mode;
       try {
-        const actor = this.actorName();
-        const hintContents = this.newProject.hints.filter(h => h.content?.trim());
         const body = {
-          title: this.newProject.title,
+          title: this.newProjectTitle(),
           origin: this.newProject.origin,
           goal: this.newProject.goal,
-          audit_mode: this.newProject.audit_mode
+          audit_mode: this.newProject.audit_mode,
+          completion_policy: this.newProject.completion_policy,
         };
         // Origin field doubles as the source field in git/local modes. The
         // server treats `clone_url` and `repo_root` as mutually exclusive and
@@ -6178,15 +6214,13 @@ function linenApp() {
         } else if (this.newProject.source_mode === 'local' && this.newProject.origin) {
           body.repo_root = this.newProject.origin.trim();
         }
-        const hints = hintContents.map(h => ({ content: h.content.trim(), creator: actor }));
-        if (hints.length > 0) body.hints = hints;
         const data = await this.api('POST', '/projects', body);
         this.showNewProject = false;
-        this.newProject = { title:'', origin:'', goal:'', audit_mode: 'scope', source_mode: 'description', source_browse_name: '', hints: [{ content:'' }] };
+        this.resetNewProject();
         await this.loadProjects();
         await this.openProject(data.project.id);
         const note = sourceMode === 'git' ? ' (cloned)' : sourceMode === 'local' ? ' (local source)' : '';
-        this.showToast('Project created' + note);
+        this.showToast((auditMode === 'none' ? 'Project created' : 'Audit started') + note);
       } catch(e) {
         // Surface server-side validation cleanly; otherwise fall back to the message.
         let msg = e.message || String(e);
@@ -6295,7 +6329,7 @@ function linenApp() {
         await this.loadProjects();
         await this.loadProject(this.selectedProjectId);
         this.sideTab = 'hints';
-        this.showToast('Hint added');
+        this.showToast('Analyst note added');
       } catch(e) { this.showToast(e.message, 'error'); }
     },
 

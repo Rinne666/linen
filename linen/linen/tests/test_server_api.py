@@ -731,7 +731,8 @@ def test_project_creation_ui_reports_clone_progress_and_blocks_duplicate_submit(
     html = client.get("/").text
 
     assert "if (this.isCreatingProject) return" in html
-    assert ':disabled="isCreatingProject || !newProject.title' in html
+    assert ':disabled="isCreatingProject || !newProject.origin || !newProject.goal"' in html
+    assert "title: this.newProjectTitle()" in html
     assert "Cloning source on the server" in html
     assert "Cloning…" in html
     assert "p.activity_status || 'idle'" in html
@@ -779,7 +780,7 @@ def test_project_workbench_groups_secondary_surfaces_without_duplicate_drawer(
     for label in ("Inspect", "Audit", "Activity"):
         assert f">{label}</button>" in html
     assert ">New intent</button>" in html
-    assert ">Analyst note</button>" in html
+    assert ">Add analyst note</button>" in html
     assert "Execution details" in html
     assert "activityDrawerOpen" not in html
     assert 'class="graph-header-stats' not in html

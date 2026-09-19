@@ -22,6 +22,9 @@ def test_vulnerability_trace_detail_uses_saved_proof_and_citations() -> None:
     assert "step.observation" in source
     assert 'x-text="formatTraceRelation(step.relation)"' in source
     assert "`Relation · ${formatTraceRelation(step.relation)}`" not in source
+    assert "entry: 'ENTRY'" in source
+    assert "reaches: 'REACHES'" in source
+    assert "return labels[value] || value;" in source
     assert "factEvidenceCitations(selectedFactRecord())" in source
     assert "citation.code" in source
 
@@ -62,7 +65,7 @@ def test_primary_finding_list_excludes_architecture_and_trace_internals() -> Non
     end = source.index("primaryFindingFacts()", start)
     predicate = source[start:end]
 
-    assert "type === 'candidate_disposition' || semantic === 'candidate_disposition'" in predicate
+    assert "internalTypes.has(type) || internalTypes.has(semantic)" in predicate
     for finding_type in (
         "vulnerability",
         "confirmed_finding",
@@ -72,14 +75,17 @@ def test_primary_finding_list_excludes_architecture_and_trace_internals() -> Non
         assert f"'{finding_type}'" in predicate
     for internal_type in (
         "architecture_map",
+        "candidate_disposition",
+        "coverage_result",
         "source",
         "sink",
         "sanitizer",
         "validation",
         "reachability",
         "hypothesis_batch",
+        "variant_batch",
     ):
-        assert f"'{internal_type}'" not in predicate
+        assert f"'{internal_type}'" in predicate
 
 
 def test_current_summary_reuses_focus_priority_and_existing_work_data() -> None:
