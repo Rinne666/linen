@@ -20,6 +20,8 @@ def test_vulnerability_trace_detail_uses_saved_proof_and_citations() -> None:
     assert "step.symbol" in source
     assert "`${step.file}:${step.line}`" in source
     assert "step.observation" in source
+    assert 'x-text="formatTraceRelation(step.relation)"' in source
+    assert "`Relation · ${formatTraceRelation(step.relation)}`" not in source
     assert "factEvidenceCitations(selectedFactRecord())" in source
     assert "citation.code" in source
 
@@ -60,11 +62,11 @@ def test_primary_finding_list_excludes_architecture_and_trace_internals() -> Non
     end = source.index("primaryFindingFacts()", start)
     predicate = source[start:end]
 
+    assert "type === 'candidate_disposition' || semantic === 'candidate_disposition'" in predicate
     for finding_type in (
         "vulnerability",
         "confirmed_finding",
         "finding",
-        "candidate_disposition",
         "candidate",
     ):
         assert f"'{finding_type}'" in predicate
