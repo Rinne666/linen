@@ -765,7 +765,7 @@ def test_ui_uses_semantic_node_titles_typed_edges_and_progressive_detail(
     for family in ("Scope", "Work", "Evidence", "Reasoning", "Outcome"):
         assert f"<b>{family}</b>" in html
     assert "Completion Gate" in html
-    assert "Human adjudication" in html
+    assert "Human decision" in html
     assert "toggleTimelineRaw(entry.id)" in html
     assert "switchExportTab('json')" in html
     assert "switchExportTab('sarif')" in html

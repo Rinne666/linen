@@ -813,9 +813,11 @@
         <button type="button" @click="setGraphView('full')" class="workbench-tab" :aria-selected="graphView === 'full'" aria-label="Show full blackboard map">Full map</button>
         <button type="button" @click="setGraphView('list')" class="workbench-tab" :aria-selected="graphView === 'list'" aria-label="Show blackboard list">List</button>
         <span class="mx-1 h-5 w-px bg-slate-200 shrink-0"></span>
-        <button x-show="workspaceMode === 'graph' && graphView !== 'list'" @click="fitGraph()" class="h-7 w-7 rounded-md text-slate-500 hover:text-slate-700 hover:bg-slate-50 transition inline-flex items-center justify-center shrink-0" title="Fit graph" aria-label="Fit graph">
+        <button x-show="workspaceMode === 'graph' && graphView !== 'list' && !(graphView === 'findings' && findingsMode === 'list')" @click="fitGraph()" class="h-7 w-7 rounded-md text-slate-500 hover:text-slate-700 hover:bg-slate-50 transition inline-flex items-center justify-center shrink-0" title="Fit graph" aria-label="Fit graph">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
         </button>
+        <button x-show="graphView === 'findings' && findingsMode === 'graph'" type="button" @click="showFindingsList()"
+          class="workbench-tab shrink-0" aria-label="Return to finding list">Finding list</button>
         <select x-show="graphView === 'full'" x-model="graphKindFilter" @change="changeGraphFilters()" aria-label="Filter graph by evidence kind"
           class="graph-inline-filter h-7 rounded-md border-0 bg-slate-50 px-2 text-[11px] font-medium text-slate-600 focus:ring-2 focus:ring-brand-100">
           <option value="all">All evidence</option>
@@ -838,11 +840,28 @@
           class="workbench-tab shrink-0" :aria-selected="nodeLegendOpen" :aria-expanded="nodeLegendOpen">
           Legend
         </button>
-        <button x-show="graphView !== 'list'" type="button" @click.stop="viewOptionsOpen = !viewOptionsOpen"
+        <button x-show="graphView !== 'list' && !(graphView === 'findings' && findingsMode === 'list')" type="button" @click.stop="viewOptionsOpen = !viewOptionsOpen"
           class="workbench-tab shrink-0" :aria-selected="viewOptionsOpen" :aria-expanded="viewOptionsOpen">View</button>
       </div>
 
-      <div x-show="graphView !== 'full' && graphView !== 'list'" x-cloak
+      <section x-show="graphView === 'current'" x-cloak
+        class="graph-view-status absolute left-3 top-[4.35rem] z-10 w-[min(430px,calc(100%-24px))] px-3 py-2.5"
+        role="status" aria-live="polite">
+        <div>
+          <p class="text-[9px] font-bold uppercase tracking-[0.13em] text-slate-400">Now</p>
+          <p class="mt-0.5 text-xs font-semibold leading-relaxed text-slate-700" x-text="currentSummary().now"></p>
+        </div>
+        <div x-show="currentSummary().next" class="mt-2 border-t border-slate-100 pt-2">
+          <span class="text-[9px] font-bold uppercase tracking-[0.13em] text-slate-400">Next</span>
+          <span class="ml-2 text-[11px] text-slate-600" x-text="currentSummary().next"></span>
+        </div>
+        <div x-show="currentSummary().blocked" class="mt-2 border-t border-slate-100 pt-2">
+          <span class="text-[9px] font-bold uppercase tracking-[0.13em] text-rose-500">Blocked</span>
+          <span class="ml-2 text-[11px] leading-relaxed text-rose-700" x-text="currentSummary().blocked"></span>
+        </div>
+      </section>
+
+      <div x-show="graphView === 'findings' && findingsMode === 'graph'" x-cloak
         class="graph-view-status absolute left-3 top-[4.35rem] z-10 max-w-[min(430px,calc(100%-24px))] px-3 py-2 text-[11px] text-slate-600"
         role="status" aria-live="polite">
         <span class="font-semibold text-slate-700" x-text="graphViewLabel()"></span>
@@ -930,7 +949,48 @@
         </div>
       </div>
 
-      <div x-show="workspaceMode === 'graph'" id="cy" class="relative z-0 flex-1 h-full"></div>
+      <div x-show="graphView === 'findings' && findingsMode === 'list'" x-cloak
+        class="absolute inset-0 overflow-y-auto bg-slate-50 px-5 pb-16 pt-24">
+        <div class="mx-auto max-w-4xl">
+          <div class="mb-5 flex items-start justify-between gap-4">
+            <div>
+              <h2 class="text-lg font-bold tracking-tight text-slate-900">Findings</h2>
+              <p class="mt-1 text-xs leading-relaxed text-slate-500">Candidate and confirmed finding records from the current project.</p>
+            </div>
+            <button type="button" @click="showFindingsGraph()"
+              class="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 transition hover:border-brand-200 hover:text-brand-700">
+              <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="8" r="2.5"/><circle cx="11" cy="18" r="2.5"/><path d="m8.3 6.5 7.2 1M7.2 8l2.7 7.6m6.4-5.5-3.8 5.8"/></svg>
+              View graph
+            </button>
+          </div>
+
+          <div x-show="primaryFindingFacts().length" class="space-y-2">
+            <template x-for="fact in primaryFindingFacts()" :key="fact.id">
+              <button type="button" @click="openFindingFact(fact.id)"
+                class="block w-full rounded-xl border bg-white p-4 text-left transition hover:border-brand-300 hover:bg-brand-50/20 focus-visible:outline-none"
+                :class="selectedFactId() === fact.id ? 'border-brand-400 ring-2 ring-brand-100' : 'border-slate-200'">
+                <div class="flex items-start justify-between gap-4">
+                  <div class="min-w-0 flex-1">
+                    <p x-show="vulnerabilityEndpoint(fact)" class="mb-1 break-words text-[11px] font-semibold text-brand-700" x-text="formatEndpointId(vulnerabilityEndpoint(fact))"></p>
+                    <h3 class="break-words text-sm font-semibold leading-relaxed text-slate-800" x-text="factDisplayTitle(fact)"></h3>
+                    <p class="mt-1 line-clamp-2 text-xs leading-relaxed text-slate-500" x-text="fact.description"></p>
+                  </div>
+                  <span class="shrink-0 rounded-md px-2 py-1 text-[10px] font-semibold"
+                    :class="findingVerificationClass(fact)" x-text="findingVerificationLabel(fact)"></span>
+                </div>
+                <p class="mt-3 text-[10px] font-medium text-slate-400" x-text="findingListMeta(fact)"></p>
+              </button>
+            </template>
+          </div>
+
+          <div x-show="!primaryFindingFacts().length" class="rounded-xl border border-dashed border-slate-300 bg-white px-6 py-12 text-center">
+            <p class="text-sm font-semibold text-slate-600">No findings yet</p>
+            <p class="mt-1 text-xs text-slate-400">Architecture, source, sink, and coverage evidence remain available in the full map.</p>
+          </div>
+        </div>
+      </div>
+
+      <div x-show="workspaceMode === 'graph' && !(graphView === 'findings' && findingsMode === 'list')" id="cy" class="relative z-0 flex-1 h-full"></div>
 
       <div x-show="workspaceMode === 'outline'" x-cloak class="absolute inset-0 overflow-y-auto bg-slate-50/95 px-5 pb-16 pt-28">
         <div class="mx-auto grid max-w-6xl gap-5 lg:grid-cols-2">
@@ -1149,7 +1209,7 @@
           <section class="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
             <div class="px-4 py-3 border-b border-slate-100 bg-slate-50/80">
               <div class="flex items-center gap-2">
-                <span class="px-2 py-0.5 rounded-md text-[10px] font-mono font-bold"
+                <span x-show="!isVulnerabilityTraceFact(selectedFactRecord())" class="px-2 py-0.5 rounded-md text-[10px] font-mono font-bold"
                   :class="{
                     'bg-teal-50 text-teal-700': selectedFactId() === 'origin',
                     'bg-rose-50 text-rose-600': selectedFactId() === 'goal',
@@ -1162,6 +1222,71 @@
             <div class="p-4 space-y-4">
               <h3 class="text-base font-semibold leading-snug text-slate-800" x-text="factDisplayTitle(selectedFactRecord())"></h3>
               <p class="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap break-words" x-text="selectedFactRecord().description"></p>
+
+              <template x-if="isVulnerabilityTraceFact(selectedFactRecord())">
+                <div class="space-y-5">
+                  <dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 rounded-lg bg-slate-50 px-3 py-2.5 text-xs">
+                    <dt class="text-slate-400">Verification</dt>
+                    <dd class="text-right font-semibold text-slate-700" x-text="verificationOutcomeLabel(selectedFactRecord())"></dd>
+                    <template x-if="vulnerabilityEndpoint(selectedFactRecord())">
+                      <div class="contents">
+                        <dt class="text-slate-400">Endpoint</dt>
+                        <dd class="break-words text-right font-medium text-slate-700" x-text="formatEndpointId(vulnerabilityEndpoint(selectedFactRecord()))"></dd>
+                      </div>
+                    </template>
+                  </dl>
+
+                  <section aria-labelledby="attack-path-heading">
+                    <h4 id="attack-path-heading" class="text-xs font-bold text-slate-800">Attack path</h4>
+                    <ol class="mt-3 space-y-0">
+                      <template x-for="(step, index) in vulnerabilityTrace(selectedFactRecord())" :key="`${index}-${step.file}-${step.line}-${step.symbol}`">
+                        <li>
+                          <button type="button" @click="focusTraceCitation(step.citation_id)"
+                            class="w-full rounded-lg border border-slate-200 bg-white p-3 text-left transition hover:border-brand-200 hover:bg-brand-50/30 focus-visible:outline-none">
+                            <div class="flex items-start gap-3">
+                              <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-slate-900 text-[10px] font-bold text-white tabular-nums" x-text="index + 1"></span>
+                              <div class="min-w-0 flex-1">
+                                <p class="break-words text-sm font-semibold text-slate-800" x-text="step.symbol"></p>
+                                <p class="mt-0.5 break-all font-mono text-[10px] text-slate-500" x-text="`${step.file}:${step.line}`"></p>
+                                <p class="mt-2 break-words text-xs leading-relaxed text-slate-600" x-text="step.observation"></p>
+                              </div>
+                            </div>
+                          </button>
+                          <div x-show="index < vulnerabilityTrace(selectedFactRecord()).length - 1" class="flex items-center gap-2 py-2 pl-3 text-[10px] font-semibold text-slate-400">
+                            <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14m0 0 5-5m-5 5-5-5"/></svg>
+                            <span x-text="formatTraceRelation(step.relation)"></span>
+                          </div>
+                          <p x-show="index === vulnerabilityTrace(selectedFactRecord()).length - 1" class="mt-1 pl-9 text-[10px] font-medium text-slate-400" x-text="`Relation · ${formatTraceRelation(step.relation)}`"></p>
+                        </li>
+                      </template>
+                    </ol>
+                  </section>
+
+                  <section aria-labelledby="finding-evidence-heading">
+                    <h4 id="finding-evidence-heading" class="text-xs font-bold text-slate-800">Evidence</h4>
+                    <div x-show="factEvidenceCitations(selectedFactRecord()).length" class="mt-3 space-y-2">
+                      <template x-for="citation in factEvidenceCitations(selectedFactRecord())" :key="citation.id">
+                        <article :id="citationDomId(citation.id)" :data-citation-id="citation.id"
+                          class="overflow-hidden rounded-lg border bg-white transition"
+                          :class="highlightedCitationId === citation.id ? 'border-brand-400 ring-2 ring-brand-100' : 'border-slate-200'">
+                          <div class="border-b border-slate-100 bg-slate-50 px-3 py-2 font-mono text-[10px] font-semibold text-slate-600" x-text="`${citation.file}:${citation.line}`"></div>
+                          <pre class="execution-code overflow-x-auto px-3 py-2.5 text-[11px] leading-relaxed text-slate-700"><code x-text="citation.code"></code></pre>
+                        </article>
+                      </template>
+                    </div>
+                    <pre x-show="!factEvidenceCitations(selectedFactRecord()).length && selectedFactRecord().evidence" class="execution-code mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-[11px] leading-relaxed text-slate-600" x-text="selectedFactRecord().evidence"></pre>
+                    <p x-show="!factEvidenceCitations(selectedFactRecord()).length && !selectedFactRecord().evidence" class="mt-2 text-[11px] text-slate-400">No saved evidence.</p>
+                  </section>
+                </div>
+              </template>
+
+              <template x-if="!isVulnerabilityTraceFact(selectedFactRecord()) && selectedFactRecord().evidence">
+                <section>
+                  <h4 class="text-xs font-bold text-slate-800">Evidence</h4>
+                  <pre class="execution-code mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-[11px] leading-relaxed text-slate-600" x-text="selectedFactRecord().evidence"></pre>
+                </section>
+              </template>
+
               <div class="space-y-3 text-xs">
                 <template x-if="selectedFactId() === 'origin'">
                   <div class="pt-4 border-t border-slate-100">
@@ -1182,22 +1307,11 @@
                     </template>
                   </div>
                 </template>
-                <template x-if="selectedFactId() !== 'origin' && selectedFactId() !== 'goal' && selectedFactProducingIntent()">
-                  <div class="pt-4 border-t border-slate-100 space-y-3">
-                    <p class="text-[10px] font-semibold text-brand-500 uppercase tracking-widest">Produced By</p>
-                    <div class="flex items-start justify-between gap-3"><span class="text-slate-400 shrink-0">Intent</span><span class="font-mono text-slate-600 text-right break-all" x-text="selectedFactProducingIntent().id"></span></div>
-                    <div class="flex items-start justify-between gap-3"><span class="text-slate-400 shrink-0">From</span><span class="font-mono text-slate-600 text-right break-all" x-text="selectedFactProducingIntent().from.join(', ')"></span></div>
-                    <div class="flex items-start justify-between gap-3"><span class="text-slate-400 shrink-0">Creator</span><span class="text-slate-600 text-right break-all" x-text="selectedFactProducingIntent().creator"></span></div>
-                    <div class="flex items-start justify-between gap-3"><span class="text-slate-400 shrink-0">Worker</span><span class="text-slate-600 text-right break-all" x-text="selectedFactProducingIntent().worker || 'None'"></span></div>
-                    <div class="flex items-start justify-between gap-3"><span class="text-slate-400 shrink-0">Concluded</span><span class="text-slate-600 text-right break-words" x-text="formatTime(selectedFactProducingIntent().concluded_at || selectedFactProducingIntent().created_at)"></span></div>
-                  </div>
-                </template>
-
                 <!-- Adversarial Reviews -->
                 <template x-if="selectedFactId() !== 'origin' && selectedFactId() !== 'goal'">
                   <div class="pt-4 border-t border-slate-100 space-y-3">
                     <div class="flex items-center justify-between">
-                      <p class="text-[10px] font-semibold text-amber-600 uppercase tracking-widest">Adversarial Reviews</p>
+                      <p class="text-xs font-bold text-slate-800" x-text="isVulnerabilityTraceFact(selectedFactRecord()) ? 'Reviews' : 'Adversarial reviews'"></p>
                       <button type="button" @click="openRunReviewForSelectedFact()"
                         :disabled="!projectIsActive() || runReviewSubmitting"
                         class="px-2 py-1 text-[10px] font-medium bg-white border border-amber-200 text-amber-700 rounded-md hover:bg-amber-50 transition disabled:opacity-30 disabled:cursor-not-allowed flex items-center gap-1">
@@ -1209,31 +1323,24 @@
                       <p class="text-[11px] text-slate-400">No reviews yet. Click <em>Run review</em> to dispatch an adversarial worker.</p>
                     </template>
                     <template x-for="r in selectedFactReviews()" :key="r.id">
-                      <div class="rounded-lg border border-slate-100 bg-slate-50/40 p-2.5 space-y-1">
-                        <div class="flex items-center justify-between gap-2">
-                          <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold tracking-wider"
+                      <details class="rounded-lg border border-slate-200 bg-white" :open="!isVulnerabilityTraceFact(selectedFactRecord())">
+                        <summary class="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5">
+                          <svg class="h-4 w-4 shrink-0" :class="r.verdict === 'VALID' ? 'text-emerald-600' : r.verdict === 'INVALID' ? 'text-rose-600' : 'text-amber-600'" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>
+                          <span class="min-w-0 flex-1 truncate text-[11px] font-semibold text-slate-700" x-text="reviewerLabel(r)"></span>
+                          <span class="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-bold tracking-wider"
                             :class="{
                               'bg-emerald-100 text-emerald-700': r.verdict === 'VALID',
                               'bg-rose-100 text-rose-700': r.verdict === 'INVALID',
                               'bg-amber-100 text-amber-700': r.verdict === 'NEEDS_REVIEW'
-                            }" x-text="r.verdict"></span>
-                          <span class="text-[10px] text-slate-400" x-text="r.confidence ? r.confidence : 'None'"></span>
+                            }" x-text="`${r.verdict} · ${r.confidence || 'unspecified'}`"></span>
+                        </summary>
+                        <div class="space-y-1 border-t border-slate-100 px-3 py-2.5">
+                          <p class="text-[12px] leading-relaxed text-slate-700" x-text="r.summary"></p>
+                          <p x-show="r.reasoning" class="whitespace-pre-wrap text-[11px] leading-relaxed text-slate-500" x-text="r.reasoning"></p>
+                          <p class="text-[10px] text-slate-400" x-text="`by ${r.created_by || 'unknown'} · ${formatTime(r.created_at)}`"></p>
                         </div>
-                        <p class="text-[12px] text-slate-700 leading-relaxed" x-text="r.summary"></p>
-                        <p class="text-[10px] text-slate-400" x-text="`by ${r.created_by || 'unknown'} · ${formatTime(r.created_at)}`"></p>
-                      </div>
+                      </details>
                     </template>
-                    <div class="flex items-start justify-between gap-3">
-                      <span class="text-slate-400 shrink-0">Status</span>
-                      <span class="font-mono text-slate-600 text-right"
-                        :class="{
-                          'text-rose-600': selectedFactRecord().status === 'false_positive',
-                          'text-emerald-600': selectedFactRecord().status === 'triaged' || selectedFactRecord().status === 'fixed',
-                          'text-amber-600': selectedFactRecord().status === 'draft',
-                          'text-slate-400': selectedFactRecord().status === 'accepted_risk'
-                        }"
-                        x-text="selectedFactRecord().status || 'triaged'"></span>
-                    </div>
                   </div>
                 </template>
 
@@ -1241,7 +1348,7 @@
                   <div class="border-t border-slate-100 pt-4">
                     <div class="flex items-center justify-between gap-3">
                       <div>
-                        <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Human adjudication</p>
+                        <p class="text-xs font-bold text-slate-800">Human decision</p>
                         <p class="mt-1 text-[11px] text-slate-400">Append-only confirmation, rejection, waiver, or scope exclusion.</p>
                       </div>
                       <span class="rounded-md bg-slate-100 px-2 py-1 text-[10px] font-medium text-slate-500" x-text="`${decisionsForTarget('fact', selectedFactId()).length} decisions`"></span>
@@ -1277,6 +1384,28 @@
                       <button type="submit" :disabled="decisionSubmitting || !decisionForm.rationale.trim()" class="inline-flex w-full items-center justify-center rounded-lg border border-slate-900 bg-slate-900 px-3 py-2 text-[11px] font-semibold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-35" x-text="decisionSubmitting ? 'Recording…' : 'Record decision'"></button>
                     </form>
                   </div>
+                </template>
+
+                <template x-if="selectedFactId() !== 'origin' && selectedFactId() !== 'goal'">
+                  <details class="border-t border-slate-100 pt-4 text-xs">
+                    <summary class="cursor-pointer text-[11px] font-semibold text-slate-500">Produced by / diagnostics</summary>
+                    <div class="mt-3 space-y-3 rounded-lg bg-slate-50 p-3">
+                      <div class="flex items-start justify-between gap-3"><span class="shrink-0 text-slate-400">Fact ID</span><span class="break-all text-right font-mono text-slate-600" x-text="selectedFactId()"></span></div>
+                      <template x-if="selectedFactProducingIntent()">
+                        <div class="contents">
+                          <div class="flex items-start justify-between gap-3"><span class="shrink-0 text-slate-400">Intent</span><span class="break-all text-right font-mono text-slate-600" x-text="selectedFactProducingIntent().id"></span></div>
+                          <div class="flex items-start justify-between gap-3"><span class="shrink-0 text-slate-400">From</span><span class="break-all text-right font-mono text-slate-600" x-text="selectedFactProducingIntent().from.join(', ')"></span></div>
+                          <div class="flex items-start justify-between gap-3"><span class="shrink-0 text-slate-400">Creator</span><span class="break-all text-right text-slate-600" x-text="selectedFactProducingIntent().creator"></span></div>
+                          <div class="flex items-start justify-between gap-3"><span class="shrink-0 text-slate-400">Worker</span><span class="break-all text-right text-slate-600" x-text="selectedFactProducingIntent().worker || 'None'"></span></div>
+                          <div class="flex items-start justify-between gap-3"><span class="shrink-0 text-slate-400">Concluded</span><span class="break-words text-right text-slate-600" x-text="formatTime(selectedFactProducingIntent().concluded_at || selectedFactProducingIntent().created_at)"></span></div>
+                        </div>
+                      </template>
+                      <details x-show="selectedFactRecord().evidence" class="border-t border-slate-200 pt-3">
+                        <summary class="cursor-pointer text-[10px] font-semibold uppercase tracking-wider text-slate-400">Raw evidence</summary>
+                        <pre class="execution-code mt-2 text-[10px] leading-relaxed text-slate-500" x-text="selectedFactRecord().evidence"></pre>
+                      </details>
+                    </div>
+                  </details>
                 </template>
               </div>
             </div>
@@ -1457,8 +1586,6 @@
           <select x-model="piExecutionPhase" @change="loadPiExecutions(true)"
             class="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] text-slate-600 focus:border-brand-400 focus:outline-none">
             <option value="">All phases</option>
-            <option value="bootstrap">Bootstrap</option>
-            <option value="bootstrap_conclude">Bootstrap conclude</option>
             <option value="reason_execute">Reason</option>
             <option value="explore_execute">Explore</option>
             <option value="explore_conclude">Explore conclude</option>
@@ -1673,17 +1800,12 @@
       <textarea x-model="newProject.goal" placeholder="Goal — what to achieve (the hypothesis to verify)" rows="2" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300"></textarea>
       <label class="block text-sm text-slate-600">
         <span class="mb-1 block">Audit profile</span>
-        <select x-model="newProject.audit_mode" @change="if (newProject.audit_mode !== 'none') newProject.bootstrap = false" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400">
+        <select x-model="newProject.audit_mode" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400">
           <option value="scope">Scope audit — full configured coverage and review gate</option>
           <option value="hypothesis">Hypothesis audit — evidence/review gate only</option>
           <option value="none">General project — no audit completion gate</option>
         </select>
       </label>
-      <label class="flex items-center gap-2 px-1 text-sm text-slate-600">
-        <input type="checkbox" x-model="newProject.bootstrap" :disabled="newProject.audit_mode !== 'none'" class="h-4 w-4 rounded border-slate-300 text-brand-500 focus:ring-brand-200 disabled:cursor-not-allowed disabled:opacity-50">
-        <span>Run bootstrap attempt</span>
-      </label>
-      <p x-show="newProject.audit_mode !== 'none'" class="-mt-2 px-1 text-[10.5px] text-slate-400">Scope and hypothesis audits start with reason. Enable optional recon in dispatcher configuration before using bootstrap for an audit.</p>
 
       <div>
         <div class="flex items-center justify-between mb-2">
@@ -2022,6 +2144,7 @@ function linenApp() {
     sideTab: 'detail',
     workspaceMode: 'graph',
     graphView: 'current',
+    findingsMode: 'list',
     graphKindFilter: 'all',
     graphStateFilter: 'all',
     nodeLegendOpen: false,
@@ -2055,7 +2178,7 @@ function linenApp() {
     _exportRequestId: 0,
     showDeleteModal: false,
 
-    newProject: { title: '', origin: '', goal: '', bootstrap: false, audit_mode: 'scope', source_mode: 'description', source_browse_name: '', hints: [{ content: '' }] },
+    newProject: { title: '', origin: '', goal: '', audit_mode: 'scope', source_mode: 'description', source_browse_name: '', hints: [{ content: '' }] },
     isCreatingProject: false,
     intentForm: { description: '' },
     concludeForm: { description: '', intentId: '' },
@@ -2069,6 +2192,7 @@ function linenApp() {
     isDeletingProject: false,
     // Review state: reviewsByFactId = { fact_id: [Review, ...] } for the current project
     reviewsByFactId: {},
+    highlightedCitationId: '',
     runReviewSubmitting: false,
     completionGate: null,
     completionGateLoading: false,
@@ -2419,9 +2543,10 @@ function linenApp() {
       if (!['current', 'findings', 'full', 'list'].includes(view)) return;
       this.graphView = view;
       this.workspaceMode = view === 'list' ? 'outline' : 'graph';
+      if (view === 'findings') this.findingsMode = 'list';
       if (view !== 'full') this.nodeLegendOpen = false;
       this.viewOptionsOpen = false;
-      if (this.workspaceMode !== 'graph') return;
+      if (this.workspaceMode !== 'graph' || (view === 'findings' && this.findingsMode === 'list')) return;
       this.$nextTick(() => {
         if (!this.cy) return;
         this.cy.resize();
@@ -2429,6 +2554,24 @@ function linenApp() {
         this.layoutVisibleGraph(false);
         this.pulseActive();
       });
+    },
+
+    showFindingsGraph() {
+      this.findingsMode = 'graph';
+      this.workspaceMode = 'graph';
+      this.$nextTick(() => {
+        if (!this.cy) return;
+        this.cy.resize();
+        this.applyGraphFilters();
+        this.layoutVisibleGraph(false);
+        this.pulseActive();
+      });
+    },
+
+    showFindingsList() {
+      this.findingsMode = 'list';
+      this.viewOptionsOpen = false;
+      this.nodeLegendOpen = false;
     },
 
     isOpenIntent(intent) {
@@ -2452,7 +2595,56 @@ function linenApp() {
     },
 
     findingFactCount() {
-      return this.project?.facts?.filter(fact => this.isFindingFact(fact)).length || 0;
+      return this.primaryFindingFacts().length;
+    },
+
+    isPrimaryFindingFact(fact) {
+      if (!fact) return false;
+      const type = fact.type || '';
+      const semantic = fact.semantic_type || '';
+      return ['vulnerability', 'confirmed_finding', 'finding', 'candidate_disposition', 'candidate'].includes(type)
+        || ['confirmed_finding', 'candidate_finding'].includes(semantic);
+    },
+
+    primaryFindingFacts() {
+      return (this.project?.facts || [])
+        .filter(fact => this.isPrimaryFindingFact(fact))
+        .slice()
+        .reverse();
+    },
+
+    findingVerificationLabel(fact) {
+      if (this.isVulnerabilityTraceFact(fact)) return this.verificationOutcomeLabel(fact);
+      if (fact?.status === 'draft') return 'Under review';
+      if (fact?.status === 'false_positive') return 'Rejected';
+      if (fact?.status === 'fixed') return 'Fixed';
+      if (fact?.status === 'accepted_risk') return 'Accepted risk';
+      if (fact?.semantic_type === 'confirmed_finding' || fact?.status === 'confirmed') return 'Confirmed finding';
+      return 'Candidate';
+    },
+
+    findingVerificationClass(fact) {
+      const label = this.findingVerificationLabel(fact);
+      if (['Confirmed candidate', 'Confirmed finding', 'Fixed'].includes(label)) return 'bg-emerald-50 text-emerald-700';
+      if (['Refuted', 'Rejected'].includes(label)) return 'bg-rose-50 text-rose-700';
+      if (label === 'Blocked') return 'bg-amber-50 text-amber-700';
+      return 'bg-slate-100 text-slate-600';
+    },
+
+    findingListMeta(fact) {
+      const traceCount = this.vulnerabilityTrace(fact).length;
+      const reviewCount = (this.reviewsByFactId?.[fact.id] || []).length;
+      const parts = [];
+      if (traceCount) parts.push(`${traceCount} trace step${traceCount === 1 ? '' : 's'}`);
+      if (reviewCount) parts.push(`${reviewCount} review${reviewCount === 1 ? '' : 's'}`);
+      return parts.join(' · ') || this.semanticTypeLabel(fact.semantic_type || fact.type || 'finding');
+    },
+
+    openFindingFact(factId) {
+      this.selectedFacts = [factId];
+      this.selectedNode = { type: 'fact', id: factId };
+      this.sideTab = 'detail';
+      this.highlightedCitationId = '';
     },
 
     isCurrentFallbackFact(fact) {
@@ -2480,6 +2672,53 @@ function linenApp() {
       return [];
     },
 
+    intentSummaryText(intent) {
+      if (!intent) return 'No active work';
+      const targetId = intent.target || ((intent.from || []).length === 1 ? intent.from[0] : '');
+      const targetFact = targetId ? this.getFactRecord(targetId) : null;
+      const endpoint = this.vulnerabilityEndpoint(targetFact);
+      const subject = endpoint
+        ? this.formatEndpointId(endpoint)
+        : targetFact
+        ? this.factDisplayTitle(targetFact)
+        : this.intentDisplayTitle(intent);
+      const action = String(intent.action || intent.type || '').toLowerCase();
+      if (action.includes('review')) return `Reviewing ${subject}`;
+      if (['verify', 'trace', 'validate', 'reach', 'characterize'].some(value => action.includes(value))) {
+        return `Verifying ${subject}`;
+      }
+      if (action.includes('search') || action.includes('scan')) return `Inspecting ${subject}`;
+      if (action.includes('synthesize')) return `Summarizing ${subject}`;
+      return `Working on ${subject}`;
+    },
+
+    currentSummary() {
+      if (!this.project) return { now: 'Loading current work…', next: '', blocked: '' };
+      if (this.project.project.status === 'completed') {
+        return { now: 'Audit completed', next: '', blocked: '' };
+      }
+      const focused = this.currentFocusIntents();
+      const open = this.project.intents.filter(intent => this.isOpenIntent(intent));
+      const primary = focused[0] || null;
+      const primaryError = primary ? this.intentError(primary.id) : null;
+      let now = 'No active work';
+      if (primary?.worker) now = this.intentSummaryText(primary);
+      else if (primaryError?.classification === 'transient') now = `Retrying · ${this.intentSummaryText(primary)}`;
+      else if (primaryError?.classification === 'blocked') now = `Waiting · ${this.intentSummaryText(primary)}`;
+      else if (primary) now = `Queued · ${this.intentSummaryText(primary)}`;
+
+      const queuedCount = open.filter(intent => !intent.worker && !this.intentError(intent.id)).length;
+      const next = queuedCount
+        ? `${queuedCount} work item${queuedCount === 1 ? '' : 's'} queued`
+        : '';
+      const blockedIntent = open.find(intent => this.intentError(intent.id)?.classification === 'blocked');
+      const blockedError = blockedIntent ? this.intentError(blockedIntent.id) : null;
+      const blocked = blockedIntent
+        ? `${this.intentDisplayTitle(blockedIntent)} · ${blockedError?.message || 'Action required'}`
+        : '';
+      return { now, next, blocked };
+    },
+
     currentGraphFocus() {
       const nodeIds = new Set();
       const primaryNodeIds = new Set();
@@ -2498,11 +2737,6 @@ function linenApp() {
           nodeIds.add(sourceId);
           contextNodeIds.add(sourceId);
           edgeIds.add(`${intent.id}_${sourceId}`);
-        }
-        if (this.isBootstrapIntent(intent)) {
-          nodeIds.add('goal');
-          contextNodeIds.add('goal');
-          edgeIds.add(`${intent.id}_goal`);
         }
       }
 
@@ -2555,10 +2789,6 @@ function linenApp() {
         for (const sourceId of intent.from || []) {
           nodeIds.add(sourceId);
           edgeIds.add(`${intent.id}_${sourceId}`);
-        }
-        if (this.isBootstrapIntent(intent)) {
-          nodeIds.add('goal');
-          edgeIds.add(`${intent.id}_goal`);
         }
       }
       for (const decision of (this.project.decisions || [])) {
@@ -2725,30 +2955,17 @@ function linenApp() {
       this.sideTab = 'detail';
     },
 
-    isBootstrapIntent(intent) {
-      return Boolean(
-        intent
-        && intent.description === 'bootstrap'
-        && intent.creator === 'dispatcher.bootstrap'
-        && Array.isArray(intent.from)
-        && intent.from.length === 1
-        && intent.from[0] === 'origin'
-        && intent.to === null,
-      );
-    },
-
     openIntentNodeType(intent) {
       const error = this.intentError(intent?.id);
       if (error?.classification === 'blocked') return 'intent_blocked';
       if (error) return 'intent_retrying';
-      if (this.isBootstrapIntent(intent)) return intent.worker ? 'bootstrap_running' : 'bootstrap_pending';
       if (this.auditIntentLabel(intent)) return intent.worker ? 'audit_running' : 'audit_pending';
       return intent.worker ? 'in_progress' : 'unclaimed';
     },
 
     openIntentNodeLabel(intent) {
       const error = this.intentError(intent?.id);
-      const title = this.isBootstrapIntent(intent) ? 'Bootstrap' : this.intentDisplayTitle(intent);
+      const title = this.intentDisplayTitle(intent);
       const semantic = this.semanticTypeLabel(intent?.semantic_type || 'audit_task');
       const status = error?.classification === 'blocked'
         ? 'Blocked'
@@ -3676,8 +3893,6 @@ function linenApp() {
 
     formatExecutionPhase(phase) {
       const labels = {
-        bootstrap: 'Bootstrap',
-        bootstrap_conclude: 'Bootstrap conclude',
         reason_execute: 'Reason',
         explore_execute: 'Explore',
         explore_conclude: 'Explore conclude',
@@ -4385,9 +4600,6 @@ function linenApp() {
             const relationType = this.edgeRelationForIntent(intent, src);
             edges.push({ data: { id: `${intent.id}_${src}`, source: src, target: phId, intentId: intent.id, relationType, label: this.relationLabel(relationType), status: nodeType }});
           }
-          if (this.isBootstrapIntent(intent)) {
-            edges.push({ data: { id: `${intent.id}_goal`, source: phId, target: 'goal', intentId: intent.id, relationType: 'defines', label: 'defines', status: nodeType, edgeType: 'bootstrap_scope' }});
-          }
         }
       }
 
@@ -4479,8 +4691,6 @@ function linenApp() {
         { selector: 'node[nodeType="audit_running"]', style: { ...common, shape:'round-rectangle','background-color':'#334155',label:'data(label)',color:'#fff','font-size':'9px','font-weight':'bold',width:'data(width)',height:'data(height)','border-width':2,'border-color':'#94a3b8' }},
         { selector: 'node[nodeType="intent_blocked"]', style: { ...common, shape:'round-rectangle','background-color':'#fff1f2',label:'data(label)',color:'#be123c','font-size':'9px','font-weight':'bold','text-wrap':'wrap','text-max-width':'104px',width:'data(width)',height:'data(height)','border-width':2,'border-color':'#f43f5e' }},
         { selector: 'node[nodeType="intent_retrying"]', style: { ...common, shape:'round-rectangle','background-color':'#fff7ed',label:'data(label)',color:'#c2410c','font-size':'9px','font-weight':'bold','text-wrap':'wrap','text-max-width':'104px',width:'data(width)',height:'data(height)','border-width':1.5,'border-color':'#fb923c','border-style':'dashed' }},
-        { selector: 'node[nodeType="bootstrap_pending"]', style: { ...common, shape:'round-rectangle','background-color':'#fff7ed','background-opacity':0.96,label:'data(label)',color:'#c2410c','font-size':'10px','font-weight':'bold',width:'data(width)',height:'data(height)','border-width':1.5,'border-color':'#fdba74','border-style':'dashed','text-wrap':'wrap','text-max-width':'70px' }},
-        { selector: 'node[nodeType="bootstrap_running"]', style: { ...common, shape:'round-rectangle','background-color':'#fb923c','background-opacity':0.96,label:'data(label)',color:'#fff7ed','font-size':'10px','font-weight':'bold',width:'data(width)',height:'data(height)','border-width':2,'border-color':'#ea580c','text-wrap':'wrap','text-max-width':'70px' }},
 
         { selector: 'node[semanticType="source"]', style: { 'background-color':'#cffafe',color:'#155e75','border-color':'#22d3ee' }},
         { selector: 'node[semanticType="sink"]', style: { 'background-color':'#ffedd5',color:'#9a3412','border-color':'#fb923c' }},
@@ -4531,9 +4741,6 @@ function linenApp() {
         { selector: 'edge[status="audit_running"]', style: { width:2.2,'line-color':'#64748b','line-style':'dashed','target-arrow-color':'#64748b','target-arrow-shape':'triangle','curve-style':'bezier',label:'data(label)','font-size':'7px',color:'#334155','text-rotation':'autorotate','text-margin-y':-9,'text-max-width':'90px','text-wrap':'ellipsis','text-background-color':'#f8fafc','text-background-opacity':0.9,'text-background-padding':'2px' }},
         { selector: 'edge[status="intent_blocked"]', style: { width:2,'line-color':'#f43f5e','line-style':'dashed','target-arrow-color':'#f43f5e','target-arrow-shape':'triangle','curve-style':'bezier',label:'data(label)','font-size':'7px',color:'#be123c','text-rotation':'autorotate','text-margin-y':-9,'text-max-width':'90px','text-wrap':'ellipsis','text-background-color':'#fff1f2','text-background-opacity':0.92,'text-background-padding':'2px' }},
         { selector: 'edge[status="intent_retrying"]', style: { width:1.8,'line-color':'#fb923c','line-style':'dashed','target-arrow-color':'#fb923c','target-arrow-shape':'triangle','curve-style':'bezier',label:'data(label)','font-size':'7px',color:'#c2410c','text-rotation':'autorotate','text-margin-y':-9,'text-max-width':'90px','text-wrap':'ellipsis','text-background-color':'#fff7ed','text-background-opacity':0.92,'text-background-padding':'2px' }},
-        { selector: 'edge[status="bootstrap_pending"]', style: { width:2,'line-color':'#fdba74','line-style':'dashed','line-dash-pattern':[8,4],'line-dash-offset':0,'target-arrow-color':'#fdba74','target-arrow-shape':'triangle','curve-style':'bezier',label:'data(label)','font-size':'7px',color:'#c2410c','text-rotation':'autorotate','text-margin-y':-9,'text-max-width':'88px','text-wrap':'ellipsis','text-background-color':'#fff7ed','text-background-opacity':0.92,'text-background-padding':'2px','text-events':'yes','arrow-scale':0.85 }},
-        { selector: 'edge[status="bootstrap_running"]', style: { width:2.5,'line-color':'#fb923c','line-style':'dashed','line-dash-pattern':[10,4],'line-dash-offset':0,'target-arrow-color':'#fb923c','target-arrow-shape':'triangle','curve-style':'bezier',label:'data(label)','font-size':'7px',color:'#c2410c','text-rotation':'autorotate','text-margin-y':-9,'text-max-width':'88px','text-wrap':'ellipsis','text-background-color':'#fff7ed','text-background-opacity':0.92,'text-background-padding':'2px','text-events':'yes','arrow-scale':0.95 }},
-        { selector: 'edge[edgeType="bootstrap_scope"]', style: { label:'data(label)',width:1.8,'curve-style':'bezier','line-style':'dotted','line-dash-pattern':[2,5],'target-arrow-shape':'triangle-backcurve','arrow-scale':0.75,'target-distance-from-node':2 }},
         { selector: 'edge', style: { label:'data(label)','font-size':'9px','font-weight':'600',color:'#475569','text-rotation':'none','text-margin-y':-9,'text-max-width':'92px','text-wrap':'wrap','text-background-color':'#ffffff','text-background-opacity':0.94,'text-background-padding':'3px','text-events':'yes' }},
         { selector: 'edge:not(.current-edge):not(.focus)', style: { label:'' }},
         { selector: 'edge.current-edge, edge.focus', style: { label:'data(label)' }},
@@ -4747,7 +4954,7 @@ function linenApp() {
     pulseActive() {
       if (!this.cy) return;
       if (this.graphView === 'current') {
-        this.cy.nodes('[nodeType="in_progress"], [nodeType="bootstrap_running"], [nodeType="audit_running"]').forEach(node => {
+        this.cy.nodes('[nodeType="in_progress"], [nodeType="audit_running"]').forEach(node => {
           node.stop();
           node.removeScratch('_pulseActive');
           node.removeStyle('background-opacity');
@@ -4759,12 +4966,11 @@ function linenApp() {
         });
         return;
       }
-      this.cy.nodes('[nodeType="in_progress"], [nodeType="bootstrap_running"], [nodeType="audit_running"]').forEach(node => {
+      this.cy.nodes('[nodeType="in_progress"], [nodeType="audit_running"]').forEach(node => {
         if (node.scratch('_pulseActive')) return;
         node.scratch('_pulseActive', true);
-        const isBootstrap = node.data('nodeType') === 'bootstrap_running';
-        const minOpacity = isBootstrap ? 0.55 : 0.35;
-        const maxOpacity = isBootstrap ? 0.98 : 0.8;
+        const minOpacity = 0.35;
+        const maxOpacity = 0.8;
         const pulseOut = () => {
           if (!node.inside()) {
             node.removeScratch('_pulseActive');
@@ -4781,20 +4987,19 @@ function linenApp() {
         };
         pulseOut();
       });
-      this.cy.edges('[status="in_progress"], [status="bootstrap_running"]').forEach(edge => {
+      this.cy.edges('[status="in_progress"]').forEach(edge => {
         if (edge.scratch('_flowActive')) return;
         edge.scratch('_flowActive', true);
-        const isBootstrap = edge.data('status') === 'bootstrap_running';
-        const dashOffset = isBootstrap ? -16 : -12;
+        const dashOffset = -12;
         const flow = () => {
-          if (!edge.inside() || !['in_progress', 'bootstrap_running'].includes(edge.data('status'))) {
+          if (!edge.inside() || edge.data('status') !== 'in_progress') {
             edge.removeScratch('_flowActive');
             return;
           }
           edge.animate({ style:{'line-dash-offset':dashOffset} }, {
-            duration:isBootstrap ? 620 : 700,
+            duration:700,
             complete:() => {
-              if (!edge.inside() || !['in_progress', 'bootstrap_running'].includes(edge.data('status'))) {
+              if (!edge.inside() || edge.data('status') !== 'in_progress') {
                 edge.removeScratch('_flowActive');
                 return;
               }
@@ -5016,7 +5221,7 @@ function linenApp() {
         return;
       }
 
-      if (['in_progress', 'unclaimed', 'bootstrap_pending', 'bootstrap_running', 'audit_pending', 'audit_running'].includes(nt)) {
+      if (['in_progress', 'unclaimed', 'audit_pending', 'audit_running'].includes(nt)) {
         this.selectIntent(node.data('intentId'));
         if (keepLogFocus) this.scrollTimelineToSelection();
         else this.sideTab = 'detail';
@@ -5125,10 +5330,6 @@ function linenApp() {
         nodeIds.add(sourceId);
         edgeIds.add(`${intent.id}_${sourceId}`);
       }
-      if (this.isBootstrapIntent(intent)) {
-        nodeIds.add('goal');
-        edgeIds.add(`${intent.id}_goal`);
-      }
     },
 
     applyLineageHighlightForIntent(intentId) {
@@ -5194,6 +5395,91 @@ function linenApp() {
       const factId = this.selectedFactId();
       if (!this.project || !factId) return null;
       return this.project.facts.find(f => f.id === factId) || null;
+    },
+
+    isVulnerabilityTraceFact(fact) {
+      return fact?.proof?.claim_kind === 'vulnerability_trace';
+    },
+
+    vulnerabilityTrace(fact) {
+      const trace = fact?.proof?.attributes?.trace;
+      return Array.isArray(trace) ? trace : [];
+    },
+
+    vulnerabilityEndpoint(fact) {
+      const endpoint = fact?.proof?.attributes?.endpoint_id;
+      return typeof endpoint === 'string' && endpoint.trim() ? endpoint.trim() : '';
+    },
+
+    verificationOutcomeLabel(fact) {
+      const outcome = fact?.proof?.attributes?.candidate_outcome;
+      const labels = {
+        confirmed: 'Confirmed candidate',
+        refuted: 'Refuted',
+        blocked: 'Blocked',
+      };
+      return labels[outcome] || 'Not recorded';
+    },
+
+    formatEndpointId(endpointId) {
+      const value = String(endpointId || '').trim();
+      const http = /^http:([^:]+):(.+)$/i.exec(value);
+      return http ? `${http[1].toUpperCase()} ${http[2]}` : value;
+    },
+
+    formatTraceRelation(relation) {
+      const value = String(relation || '').trim();
+      const labels = {
+        calls: 'calls',
+        flows_to: 'flows to',
+        crosses: 'crosses',
+        guards: 'guarded by',
+        reaches: 'reaches',
+        impact: 'impact',
+        entry: 'entry',
+      };
+      return labels[value] || value;
+    },
+
+    factEvidenceEnvelope(fact) {
+      if (typeof fact?.evidence !== 'string') return null;
+      try {
+        const parsed = JSON.parse(fact.evidence);
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+      } catch (_) {
+        return null;
+      }
+    },
+
+    factEvidenceCitations(fact) {
+      const citations = this.factEvidenceEnvelope(fact)?.citations;
+      return Array.isArray(citations) ? citations : [];
+    },
+
+    citationDomId(citationId) {
+      return `finding-citation-${String(citationId || '').replace(/[^A-Za-z0-9_-]/g, '-')}`;
+    },
+
+    focusTraceCitation(citationId) {
+      if (!citationId) return;
+      this.highlightedCitationId = citationId;
+      this.$nextTick(() => {
+        document.getElementById(this.citationDomId(citationId))?.scrollIntoView({
+          behavior: 'smooth', block: 'nearest',
+        });
+      });
+      window.setTimeout(() => {
+        if (this.highlightedCitationId === citationId) this.highlightedCitationId = '';
+      }, 1800);
+    },
+
+    reviewerLabel(review) {
+      const intent = this.project?.intents?.find(item => item.id === review?.intent_id);
+      const type = intent?.type || '';
+      if (type.includes('cold-verifier')) return 'Cold verifier';
+      if (type.includes('contradiction-reasoner')) return 'Contradiction reasoner';
+      if (type.includes('devils-advocate')) return "Devil's advocate";
+      return review?.created_by || 'Reviewer';
     },
 
     selectedFactReviews() {
@@ -5342,7 +5628,6 @@ function linenApp() {
       const error = this.intentError(i.id);
       if (error?.classification === 'blocked') return 'bg-rose-500';
       if (error) return 'bg-orange-400';
-      if (this.isBootstrapIntent(i)) return i.worker ? 'bg-orange-400' : 'bg-orange-200';
       return i.worker ? 'bg-amber-400' : 'bg-slate-300';
     },
     intentStatusClass(i) {
@@ -5350,7 +5635,6 @@ function linenApp() {
       const error = this.intentError(i.id);
       if (error?.classification === 'blocked') return 'text-rose-700';
       if (error) return 'text-orange-700';
-      if (this.isBootstrapIntent(i)) return i.worker ? 'text-orange-600' : 'text-orange-400';
       return i.worker ? 'text-amber-600' : 'text-slate-400';
     },
     intentStatusLabel(i) {
@@ -5358,7 +5642,6 @@ function linenApp() {
       const error = this.intentError(i.id);
       if (error?.classification === 'blocked') return 'Blocked';
       if (error) return 'Retry Deferred';
-      if (this.isBootstrapIntent(i)) return i.worker ? 'Bootstrap Running' : 'Bootstrap Pending';
       return i.worker ? 'In Progress' : 'Unclaimed';
     },
 
@@ -5882,7 +6165,6 @@ function linenApp() {
           title: this.newProject.title,
           origin: this.newProject.origin,
           goal: this.newProject.goal,
-          bootstrap_enabled: this.newProject.bootstrap,
           audit_mode: this.newProject.audit_mode
         };
         // Origin field doubles as the source field in git/local modes. The
@@ -5898,7 +6180,7 @@ function linenApp() {
         if (hints.length > 0) body.hints = hints;
         const data = await this.api('POST', '/projects', body);
         this.showNewProject = false;
-        this.newProject = { title:'', origin:'', goal:'', bootstrap: false, audit_mode: 'scope', source_mode: 'description', source_browse_name: '', hints: [{ content:'' }] };
+        this.newProject = { title:'', origin:'', goal:'', audit_mode: 'scope', source_mode: 'description', source_browse_name: '', hints: [{ content:'' }] };
         await this.loadProjects();
         await this.openProject(data.project.id);
         const note = sourceMode === 'git' ? ' (cloned)' : sourceMode === 'local' ? ' (local source)' : '';
