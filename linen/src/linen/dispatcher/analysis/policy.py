@@ -25,9 +25,17 @@ def completion_blockers(project: ProjectDetail, from_ids: list[str]) -> list[str
     facts = {fact.id: fact for fact in project.facts}
     blockers: list[str] = []
     if not from_ids or not any(
-        facts[fid].type == "vulnerability" for fid in from_ids if fid in facts
+        (
+            facts[fid].type == "vulnerability"
+            or facts[fid].semantic_type in {"confirmed_finding", "negative_assurance"}
+        )
+        for fid in from_ids
+        if fid in facts
     ):
-        blockers.append("Completion must reference a reviewed vulnerability fact.")
+        blockers.append(
+            "Completion must reference a reviewed vulnerability, confirmed finding, "
+            "or negative assurance fact."
+        )
     if any(intent.to is None and intent.concluded_at is None for intent in project.intents):
         blockers.append("Open intents must finish before completion.")
     parents: dict[str, list[str]] = {}
@@ -86,6 +94,12 @@ Origin needs no review. Review scan_batch facts only as scan execution records, 
 as proof of a vulnerability. A scan failure or zero matches does not prove safety.
 NEEDS_REVIEW means uncertainty; seek additional evidence rather than declaring INVALID.
 Read reviews and fact status from the graph. Existing concluded review intents are closed.
+If every remaining candidate finding has been explicitly rejected or excluded and the
+audited question can be answered for a clearly bounded scope, propose a normal Intent
+to produce a reviewed negative_assurance fact. A negative assurance is a scoped,
+evidence-backed conclusion; it must never claim that the repository is universally safe.
+Only complete from a firmly/certainly VALID reviewed vulnerability, confirmed finding,
+or negative_assurance fact.
 """
 
 SCAN_INTENT_DESCRIPTION = "@analysis:semgrep"

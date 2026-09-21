@@ -204,6 +204,22 @@ def test_gate_checks_reviews_ancestors_and_open_intents(api):
     assert any(source in b for b in completion_blockers(client.get_project(pid), [terminal]))
 
 
+def test_hypothesis_completion_accepts_reviewed_negative_assurance(api):
+    _, client = api
+    pid = project(api, audit_mode="hypothesis").project.id
+    source = add_fact(client, pid, fact_type="source")
+    assurance = add_fact(
+        client,
+        pid,
+        parent=source,
+        fact_type="negative_assurance",
+    )
+    client.create_review(pid, source, "VALID", "verified", confidence="certain")
+    client.create_review(pid, assurance, "VALID", "verified", confidence="firm")
+
+    assert completion_blockers(client.get_project(pid), [assurance]) == []
+
+
 def test_server_rejects_audit_completion_until_terminal_fact_is_confirmed(api):
     """A Review is not a substitute for Technical Confirmation."""
     _, client = api
