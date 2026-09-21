@@ -2727,7 +2727,11 @@ function linenApp() {
     technicalConfirmationCandidates() {
       if (!this.project) return [];
       const ids = new Set(this.completionEvidenceCheck()?.evidence_ids || []);
-      return this.project.facts.filter(fact => ids.has(fact.id) && fact.semantic_type === 'candidate_finding');
+      return this.project.facts.filter(fact =>
+        ids.has(fact.id)
+        && fact.semantic_type === 'candidate_finding'
+        && !['reject', 'exclude'].includes(this.currentDecisionForTarget('fact', fact.id)?.decision)
+      );
     },
 
     technicalConfirmationFailureMessage(error) {

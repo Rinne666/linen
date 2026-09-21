@@ -56,6 +56,11 @@ def test_reviewed_candidate_blocker_exposes_technical_confirmation_action() -> N
     source = html()
 
     assert "technicalConfirmationCandidates().length" in source
+    start = source.index("technicalConfirmationCandidates() {")
+    end = source.index("technicalConfirmationFailureMessage(error)", start)
+    candidates = source[start:end]
+    assert "currentDecisionForTarget('fact', fact.id)" in candidates
+    assert "['reject', 'exclude'].includes" in candidates
     assert "Review passed · technical proof not yet confirmed" in source
     assert "Run technical confirmation" in source
     assert "confirmReviewedFinding(fact.id)" in source
