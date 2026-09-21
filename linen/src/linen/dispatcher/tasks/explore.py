@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from pathlib import Path
+from typing import Any
 from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, scope_gate, triage
 from linen.dispatcher.analysis.external_scanners import (
     run_scan as run_external_scan,
@@ -46,9 +47,104 @@ from linen.dispatcher.tasks.common import (
     write_context_projection_reference,
 )
 from linen.dispatcher.workers.registry import get_driver
-from linen.server.models import Intent, ProjectDetail
+from linen.server.models import Intent, ProjectDetail, ProofPayload
+from linen.server.uvpg import GAP_CONTRACTS, parse_proof_obligation
 
 LOG = logging.getLogger(__name__)
+
+
+class ProofContractError(ValueError):
+    """The worker result did not satisfy a server-authored proof obligation."""
+
+
+def _proof_obligation_contract(intent: Intent) -> str:
+    obligation = parse_proof_obligation(intent.description)
+    if obligation is None:
+        return ""
+    candidate_id, gap_code, _generation, target_fact_id = obligation
+    contract = GAP_CONTRACTS.get(gap_code)
+    if contract is None:
+        return ""
+    expected_type = contract[0]
+    target = f" The obligation also references fact `{target_fact_id}`." if target_fact_id else ""
+    return (
+        "\n\n# Proof obligation output contract\n"
+        f"This Intent verifies `{gap_code}` for candidate `{candidate_id}`.{target}\n"
+        f"Return exactly one fact with `type` set to `{expected_type}`. "
+        "Do not substitute `validation`, `reachability`, or another nearby type. "
+        "If the expected claim is not established, still use the required type and state the "
+        "negative result precisely in `description` and `evidence`. The dispatcher binds the "
+        "server-owned proof identity; do not invent candidate or fact identifiers.\n"
+    )
+
+
+def _bind_proof_obligation(intent: Intent, fact: dict[str, Any]) -> dict[str, Any]:
+    obligation = parse_proof_obligation(intent.description)
+    if obligation is None:
+        return fact
+    candidate_id, gap_code, _generation, target_fact_id = obligation
+    contract = GAP_CONTRACTS.get(gap_code)
+    if contract is None:
+        raise ProofContractError(f"unknown proof obligation {gap_code}")
+    expected_type = contract[0]
+    if fact.get("type") != expected_type:
+        raise ProofContractError(
+            f"proof obligation {gap_code} requires fact type {expected_type}; "
+            f"received {fact.get('type') or 'no type'}"
+        )
+
+    supplied = fact.get("proof")
+    if supplied is None:
+        proof = ProofPayload(claim_kind=expected_type)
+    else:
+        try:
+            proof = ProofPayload.model_validate(supplied)
+        except Exception as exc:
+            raise ProofContractError(f"invalid proof payload: {exc}") from exc
+        if proof.claim_kind != expected_type:
+            raise ProofContractError(
+                f"proof claim_kind must be {expected_type}; received {proof.claim_kind}"
+            )
+        if proof.subject_ids and candidate_id not in proof.subject_ids:
+            raise ProofContractError(f"proof subject_ids must reference candidate {candidate_id}")
+        if target_fact_id and proof.object_ids and target_fact_id not in proof.object_ids:
+            raise ProofContractError(f"proof object_ids must reference fact {target_fact_id}")
+
+    bound = proof.model_copy(
+        update={
+            "claim_kind": expected_type,
+            "subject_ids": [candidate_id],
+            "object_ids": [target_fact_id] if target_fact_id else [],
+        }
+    )
+    fact["proof"] = bound.model_dump(mode="json")
+    return fact
+
+
+def _report_proof_contract_block(
+    client: LinenClient,
+    project_id: str,
+    intent: Intent,
+    worker_name: str,
+    error: Exception,
+) -> str:
+    response = client.report_intent_error(
+        project_id,
+        intent.id,
+        worker_name,
+        task_type="explore",
+        code="proof_contract_mismatch",
+        classification="blocked",
+        message=str(error),
+        remediation=(
+            "Retry this work item. The worker must return the exact fact type named by the "
+            "proof obligation; Linen will bind its proof identity automatically."
+        ),
+    ) if hasattr(client, "report_intent_error") else None
+    if response is None or not response.ok:
+        best_effort_release(client, project_id, intent.id, worker_name)
+        return "failed"
+    return "blocked"
 
 
 def _scanner_receipt_start(
@@ -295,7 +391,7 @@ def run_explore_task(
                     fact_type=mechanical["type"], evidence=mechanical["evidence"],
                 )
 
-        if (config.audit.semgrep.enabled and intent.type == "search"
+        if (config.audit.semgrep.enabled and intent.type in {"search", "search:skill"}
                 and intent.description.strip() == SCAN_INTENT_DESCRIPTION):
             scan_repo = Path(container_name) / "repo"
             canonical_snapshot = None
@@ -360,7 +456,7 @@ def run_explore_task(
 
         external_scanner = scanner_for_intent(config.audit, intent.description)
         if (external_scanner is not None and external_scanner.name != "semgrep"
-                and intent.type == "search"):
+                and intent.type in {"search", "search:skill"}):
             scan_repo = Path(container_name) / "repo"
             canonical_snapshot = None
             if scope_audit:
@@ -569,6 +665,7 @@ def run_explore_task(
             prompt += triage.verification_context_prompt(project, intent, Path(container_name))
         if config.audit.enabled and project.project.audit_mode != "none":
             prompt += "\n" + SOURCE_DATA_BOUNDARY
+        prompt += _proof_obligation_contract(intent)
         if poc_isolated:
             prompt += (
                 "\nIsolated PoC execution: the frozen source is mounted read-only at /repo. "
@@ -697,6 +794,7 @@ def run_explore_task(
                 kind, fact = validate_explore_payload(payload)
                 if kind != "rejected":
                     fact = _managed_result(config, project, intent, container_name, payload, fact)
+                    fact = _bind_proof_obligation(intent, fact)
             except Exception as exc:
                 LOG.warning(
                     "explore parse failed project=%s intent=%s worker=%s error=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -734,6 +832,7 @@ def run_explore_task(
                     failure_detail=str(exc),
                     attempt=attempt,
                     trigger=trigger,
+                    proof_contract_failure=isinstance(exc, ProofContractError),
                 )
             if kind == "rejected":
                 LOG.warning(
@@ -758,6 +857,7 @@ def run_explore_task(
                 total_ms=int((time.perf_counter() - task_started) * 1000),
                 fact_type=fact["type"],
                 evidence=fact["evidence"],
+                proof=fact.get("proof"),
             )
         if did_timeout(first):
             LOG.warning(
@@ -862,6 +962,7 @@ def _run_context_continuation(
             "Use only the expanded ContextProjection reference above. Do not request more "
             "context. Return the final explore schema now as one raw JSON object."
         )
+        prompt += _proof_obligation_contract(intent)
         if context_reference not in prompt:
             prompt = append_context_projection_reference(prompt, context_reference)
 
@@ -923,6 +1024,7 @@ def _run_context_continuation(
             best_effort_release(client, project.project.id, intent.id, worker.name)
             return "failed"
         fact = _managed_result(config, project, intent, container_name, payload, fact)
+        fact = _bind_proof_obligation(intent, fact)
         return write_conclude_result(
             client,
             project.project.id,
@@ -934,6 +1036,17 @@ def _run_context_continuation(
             total_ms=int((time.perf_counter() - continuation_started) * 1000),
             fact_type=fact["type"],
             evidence=fact["evidence"],
+            proof=fact.get("proof"),
+        )
+    except ProofContractError as exc:
+        LOG.warning(
+            "explore context proof contract mismatch project=%s intent=%s error=%s",
+            project.project.id,
+            intent.id,
+            exc,
+        )
+        return _report_proof_contract_block(
+            client, project.project.id, intent, worker.name, exc,
         )
     except Exception as exc:
         LOG.warning(
@@ -963,6 +1076,7 @@ def _try_conclude_fallback(
     *,
     attempt: int = 1,
     trigger: str | None = None,
+    proof_contract_failure: bool = False,
 ) -> str:
     if not driver.supports_conclude() or not session:
         LOG.info(
@@ -973,6 +1087,11 @@ def _try_conclude_fallback(
             driver.supports_conclude(),
             bool(session),
         )
+        if proof_contract_failure:
+            return _report_proof_contract_block(
+                client, project_id, intent, worker.name,
+                ProofContractError(failure_detail or "proof obligation output did not match its contract"),
+            )
         best_effort_release(client, project_id, intent.id, worker.name)
         return "failed"
     if lease.failure is not None:
@@ -996,6 +1115,11 @@ def _try_conclude_fallback(
         worker_name=worker.name,
         intent_id=intent.id,
     ):
+        if proof_contract_failure:
+            return _report_proof_contract_block(
+                client, project_id, intent, worker.name,
+                ProofContractError(failure_detail or "proof obligation output did not match its contract"),
+            )
         best_effort_release(client, project_id, intent.id, worker.name)
         return "failed"
 
@@ -1081,6 +1205,7 @@ def _try_conclude_fallback(
         )
     if config.audit.enabled and fresh_project.project.audit_mode != "none":
         prompt += "\n" + SOURCE_DATA_BOUNDARY
+    prompt += _proof_obligation_contract(intent)
     prompt = append_context_projection_reference(prompt, context_reference)
     conclude_phase = (
         "scope_adjudication_conclude"
@@ -1174,6 +1299,16 @@ def _try_conclude_fallback(
         kind, fact = validate_explore_payload(payload)
         if kind != "rejected":
             fact = _managed_result(config, client.get_project(project_id), intent, container_name, payload, fact)
+            fact = _bind_proof_obligation(intent, fact)
+    except ProofContractError as exc:
+        LOG.warning(
+            "conclude proof contract mismatch project=%s intent=%s worker=%s error=%s",
+            project_id,
+            intent.id,
+            worker.name,
+            exc,
+        )
+        return _report_proof_contract_block(client, project_id, intent, worker.name, exc)
     except Exception as exc:
         LOG.warning(
             "conclude parse failed project=%s intent=%s worker=%s error=%s conclude_ms=%s stdout_preview=%s stderr_preview=%s",

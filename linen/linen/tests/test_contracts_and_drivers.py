@@ -132,6 +132,27 @@ def test_explore_payload_rejects_planning_text() -> None:
         validate_explore_payload(parse_json_output("Need inspect files and keep working."))
 
 
+def test_explore_payload_preserves_structured_proof() -> None:
+    kind, fact = validate_explore_payload({
+        "accepted": True,
+        "data": {
+            "description": "attacker controls the identifier",
+            "type": "attacker_control",
+            "evidence": "file:Api.java\nline:42",
+            "proof": {
+                "claim_kind": "attacker_control",
+                "subject_ids": ["f006"],
+                "attributes": {"parameter": "id"},
+            },
+        },
+    })
+
+    assert kind == "fact"
+    assert fact is not None
+    assert fact["proof"]["claim_kind"] == "attacker_control"
+    assert fact["proof"]["attributes"] == {"parameter": "id"}
+
+
 def test_pi_driver_extracts_session_and_last_assistant_text() -> None:
     driver = PiDriver()
     stdout = "\n".join(

@@ -101,6 +101,48 @@ def test_scope_initial_intents_are_derived_from_graph(tmp_path):
     assert all(item["from"] == ["origin"] for item in proposals)
 
 
+def test_terminal_coverage_plan_is_not_reproposed_forever(tmp_path):
+    cfg = config(tmp_path, scan=True, mode="scope")
+    board = ProjectDetail(
+        project=ProjectMeta(
+            id="proj_001", title="audit", status="active", bootstrap_enabled=False,
+            audit_mode="scope", created_at="2026-01-01T00:00:00Z",
+        ),
+        facts=[Fact(id="origin", description="repo"), Fact(id="goal", description="audit")],
+        intents=[Intent(
+            id="i001", from_=["origin"], description=coverage.PLAN_INTENT,
+            type="search", creator=audit_graph.CREATOR,
+            created_at="2026-01-01T00:00:01Z", concluded_at="2026-01-01T00:00:02Z",
+        )],
+        hints=[], reviews=[],
+    )
+
+    assert audit_graph.required_intents(board, tmp_path, cfg.audit) == []
+
+
+def test_proof_obligation_binds_identity_without_relabeling() -> None:
+    intent = Intent(
+        id="i024", from_=["f006"],
+        description="@uvpg:proof:f006:MISSING_ATTACKER_CONTROL:g1:verify:attacker_control Verify attacker control",
+        type="verify", creator=audit_graph.CREATOR,
+        created_at="2026-01-01T00:00:01Z",
+    )
+    fact = explore._bind_proof_obligation(intent, {
+        "description": "request id is attacker controlled",
+        "type": "attacker_control",
+        "evidence": "file:Api.java\nline:42",
+    })
+
+    assert fact["proof"]["claim_kind"] == "attacker_control"
+    assert fact["proof"]["subject_ids"] == ["f006"]
+    with pytest.raises(explore.ProofContractError, match="requires fact type attacker_control"):
+        explore._bind_proof_obligation(intent, {
+            "description": "request id is attacker controlled",
+            "type": "validation",
+            "evidence": "file:Api.java\nline:42",
+        })
+
+
 def test_unresolved_review_gets_one_deterministic_contradiction_followup(tmp_path):
     board = ProjectDetail(
         project=ProjectMeta(

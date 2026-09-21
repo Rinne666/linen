@@ -29,6 +29,7 @@ class StageDefinition:
     capability: str
     required: bool
     skill_id: str | None = None
+    enabled: bool = True
 
 
 def stage_definitions(config: AuditConfig, audit_mode: str) -> list[StageDefinition]:
@@ -50,8 +51,9 @@ def stage_definitions(config: AuditConfig, audit_mode: str) -> list[StageDefinit
             spec.label,
             offset,
             skill.capability,
-            bool(spec.config.enabled),
+            False,
             skill.id,
+            bool(spec.config.enabled),
         ))
     if audit_mode == "scope" and config.spring.enabled:
         result.append(StageDefinition("spring-routes", "Spring route scan", 90, "route.extract", True))
@@ -103,7 +105,7 @@ def _definition_status(
     project: ProjectDetail,
     workdir: Path,
 ) -> dict[str, Any]:
-    if not definition.required:
+    if not definition.enabled:
         existing = next((stage for stage in project.stages if stage.stage_id == definition.stage_id), None)
         return {
             "stage_id": definition.stage_id,

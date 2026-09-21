@@ -144,6 +144,52 @@ def test_negative_assurance_is_a_valid_hypothesis_completion_terminal(client: Te
     assert complete.status_code == 200, complete.text
 
 
+def test_gate_identifies_reviewed_candidates_waiting_for_technical_confirmation(
+    client: TestClient,
+) -> None:
+    response = client.post(
+        "/projects",
+        json={"title": "audit", "origin": "source", "goal": "verify", "audit_mode": "hypothesis"},
+    )
+    project_id = response.json()["project"]["id"]
+    assert client.post(
+        f"/projects/{project_id}/intents",
+        json={"from": ["origin"], "description": "verify candidate", "creator": "reasoner"},
+    ).status_code == 201
+    assert client.post(
+        f"/projects/{project_id}/intents/i001/heartbeat", json={"worker": "worker"},
+    ).status_code == 200
+    concluded = client.post(
+        f"/projects/{project_id}/intents/i001/conclude",
+        json={
+            "worker": "worker",
+            "description": "reviewed candidate",
+            "type": "vulnerability",
+            "status": "triaged",
+            "evidence": "file: app.py:1",
+        },
+    )
+    assert concluded.status_code == 200, concluded.text
+    candidate_id = concluded.json()["fact"]["id"]
+    assert client.post(
+        f"/projects/{project_id}/facts/{candidate_id}/reviews",
+        json={
+            "verdict": "VALID",
+            "confidence": "certain",
+            "summary": "independent review passed",
+            "created_by": "reviewer",
+        },
+    ).status_code == 201
+
+    gate = client.get(f"/projects/{project_id}/completion-gate").json()
+    evidence_check = next(check for check in gate["checks"] if check["id"] == "evidence_chain")
+
+    assert evidence_check["label"] == "Technical confirmation pending"
+    assert evidence_check["detail"] == "1 reviewed candidate finding is waiting for Technical Confirmation."
+    assert evidence_check["evidence_ids"] == [candidate_id]
+    assert gate["blockers"] == [evidence_check["detail"]]
+
+
 def test_stage_put_is_idempotent_and_decision_targets_are_validated(client: TestClient) -> None:
     project_id = _create_project(client)
     body = {"label": "coverage", "phase_order": 1, "status": "pending"}
@@ -215,6 +261,73 @@ def test_skill_receipt_is_bound_to_stage_and_verified_artifact(
     assert client.put(
         f"/projects/{project_id}/skill-runs/{run_id}", json=completed_body,
     ).status_code == 409
+
+
+def test_on_demand_scanner_stage_and_missing_receipt_do_not_block_completion(
+    client: TestClient,
+) -> None:
+    project_id = _create_project(client)
+    stage = client.put(
+        f"/projects/{project_id}/stages/semgrep",
+        json={
+            "label": "Semgrep",
+            "phase_order": 40,
+            "required": False,
+            "status": "pending",
+            "skill_id": "security.semgrep",
+            "capability": "static-analysis.sarif",
+        },
+    )
+    assert stage.status_code == 200
+
+    gate = client.get(f"/projects/{project_id}/completion-gate").json()
+    assert gate["ready"] is True
+    stage_check = next(check for check in gate["checks"] if check["id"] == "pipeline_stages")
+    receipt_check = next(check for check in gate["checks"] if check["id"] == "skill_receipts")
+    assert stage_check["status"] == "not_applicable"
+    assert receipt_check["status"] == "not_applicable"
+    assert "run on demand" in stage_check["detail"]
+    assert "none are required" in receipt_check["detail"]
+    assert not gate["blockers"]
+
+
+def test_on_demand_scanner_error_remains_visible_without_blocking_completion(
+    client: TestClient,
+) -> None:
+    project_id = _create_project(client)
+    created = client.post(
+        f"/projects/{project_id}/intents",
+        json={
+            "from": ["origin"],
+            "description": "@analysis:trivy",
+            "creator": "reasoner",
+            "type": "search:skill",
+            "action": "run_skill",
+            "target": "security.trivy",
+        },
+    )
+    assert created.status_code == 201
+    failed = client.post(
+        f"/projects/{project_id}/intents/i001/fail",
+        json={
+            "worker": "explorer",
+            "task_type": "explore",
+            "code": "scanner_failed",
+            "classification": "transient",
+            "message": "Trivy database is unavailable.",
+            "max_attempts": 1,
+        },
+    )
+    assert failed.status_code == 200
+    assert failed.json()["classification"] == "blocked"
+
+    gate = client.get(f"/projects/{project_id}/completion-gate").json()
+    error_check = next(check for check in gate["checks"] if check["id"] == "operational_errors")
+    assert gate["ready"] is True
+    assert gate["execution_status"] == "idle_attention_required"
+    assert error_check["status"] == "pass"
+    assert "do not block completion" in error_check["detail"]
+    assert not gate["blockers"]
 
 
 def test_completed_report_uses_immutable_snapshot(client: TestClient) -> None:
@@ -481,6 +594,7 @@ def test_graph_revision_and_activity_status_follow_semantic_board_changes(client
     summary = next(p for p in client.get("/projects").json() if p["id"] == project_id)
     assert summary["graph_revision"] == 1
     assert summary["activity_status"] == "idle"
+    assert summary["execution_status"] == "idle"
 
     created = client.post(
         f"/projects/{project_id}/intents",
@@ -490,6 +604,7 @@ def test_graph_revision_and_activity_status_follow_semantic_board_changes(client
     summary = next(p for p in client.get("/projects").json() if p["id"] == project_id)
     assert summary["graph_revision"] == 2
     assert summary["activity_status"] == "queued"
+    assert summary["execution_status"] == "queued"
 
     assert client.post(
         f"/projects/{project_id}/intents/i001/heartbeat",
@@ -498,6 +613,7 @@ def test_graph_revision_and_activity_status_follow_semantic_board_changes(client
     summary = next(p for p in client.get("/projects").json() if p["id"] == project_id)
     assert summary["graph_revision"] == 2
     assert summary["activity_status"] == "working"
+    assert summary["execution_status"] == "working"
 
     assert client.post(
         f"/projects/{project_id}/intents/i001/conclude",
@@ -522,6 +638,7 @@ def test_graph_revision_and_activity_status_follow_semantic_board_changes(client
     assert summary["graph_revision"] == 4
     assert summary["review_count"] == 1
     assert summary["activity_status"] == "idle"
+    assert summary["execution_status"] == "idle"
 
     assert client.post(
         f"/projects/{project_id}/reason/claim",
@@ -530,6 +647,7 @@ def test_graph_revision_and_activity_status_follow_semantic_board_changes(client
     summary = next(p for p in client.get("/projects").json() if p["id"] == project_id)
     assert summary["graph_revision"] == 4
     assert summary["activity_status"] == "reasoning"
+    assert summary["execution_status"] == "reasoning"
 
 
 def test_intent_error_blocks_dispatch_is_visible_and_can_be_retried(client: TestClient) -> None:
@@ -736,7 +854,8 @@ def test_project_creation_ui_reports_clone_progress_and_blocks_duplicate_submit(
     assert "Cloning source on the server" in html
     assert "Cloning…" in html
     assert "p.activity_status || 'idle'" in html
-    assert "projectActivityStatus(project)" in html
+    assert "projectExecutionStatus()" in html
+    assert "executionStatusBadgeClass()" in html
 
 
 def test_ui_exposes_report_export_download_and_copyable_sidebar(client: TestClient) -> None:
@@ -777,7 +896,7 @@ def test_project_workbench_groups_secondary_surfaces_without_duplicate_drawer(
 ) -> None:
     html = client.get("/").text
 
-    for label in ("Inspect", "Audit", "Activity"):
+    for label in ("Details", "Completion", "Activity"):
         assert f">{label}</button>" in html
     assert ">New intent</button>" in html
     assert ">Add analyst note</button>" in html

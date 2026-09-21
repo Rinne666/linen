@@ -448,13 +448,13 @@
   }
   @media (max-width: 820px) {
     .graph-workspace { flex-direction: column; }
-    .graph-canvas { min-height: 44vh; }
+    .graph-canvas { min-height: 50vh; }
     .graph-resizer { display: none; }
     .graph-side-panel {
       width: 100% !important;
       min-width: 100% !important;
       flex-basis: auto !important;
-      height: min(44vh, 420px);
+      height: min(38vh, 360px);
       border-left: 0;
       border-top: 1px solid #e2e8f0;
     }
@@ -713,8 +713,9 @@
         :class="projectStatusBadgeClass(project.project.status)"
         x-text="projectStatusLabel(project.project.status)"></span>
       <span x-show="project.project.status === 'active'"
-        class="px-1.5 py-0.5 rounded-full bg-sky-50 text-sky-600 text-[9px] font-semibold uppercase tracking-[0.12em] shrink-0"
-        x-text="projectActivityStatus(project)"></span>
+        class="px-1.5 py-0.5 rounded-full text-[9px] font-semibold uppercase tracking-[0.12em] shrink-0"
+        :class="executionStatusBadgeClass()"
+        x-text="executionStatusLabel()"></span>
     </div>
     <div class="graph-header-spacer flex-1"></div>
     <div class="graph-header-actions relative flex items-center gap-1.5">
@@ -778,7 +779,7 @@
   <div class="status-rail flex items-stretch shrink-0 overflow-x-auto" aria-label="Project execution status">
     <div class="status-rail-item">
       <span class="h-2 w-2 rounded-full"
-        :class="project.project.status === 'active' ? 'bg-emerald-500' : ['stopped', 'paused'].includes(project.project.status) ? 'bg-amber-500' : 'bg-slate-400'"></span>
+        :class="executionStatusDotClass()"></span>
       <div>
         <div class="status-rail-label">Execution</div>
         <div class="status-rail-value" x-text="executionStatusLabel()"></div>
@@ -786,31 +787,67 @@
     </div>
     <div class="status-rail-item">
       <div>
-        <div class="status-rail-label">Confirmed findings</div>
-        <div class="status-rail-value tabular-nums" x-text="confirmedFindingCount()"></div>
+        <div class="status-rail-label">Current work</div>
+        <div class="status-rail-value" x-text="currentWorkLabel()"></div>
       </div>
     </div>
+    <button type="button" @click="sideTab = 'log'" class="status-rail-item text-left hover:bg-white transition"
+      :title="lastActivityDetail()">
+      <div>
+        <div class="status-rail-label">Last activity</div>
+        <div class="status-rail-value" x-text="lastActivityLabel()"></div>
+      </div>
+    </button>
     <div class="status-rail-item">
       <div>
-        <div class="status-rail-label">Open work</div>
-        <div class="status-rail-value"><span x-text="openIntentCount()"></span> intents, <span x-text="workingIntentCount()"></span> running</div>
+        <div class="status-rail-label">Findings</div>
+        <div class="status-rail-value tabular-nums" x-text="findingSummaryLabel()"></div>
       </div>
     </div>
     <button type="button" @click="sideTab = 'gate'" class="status-rail-item text-left hover:bg-white transition">
       <div>
-        <div class="status-rail-label">Completion gate</div>
-        <div class="status-rail-value" :class="completionGate?.ready ? 'text-emerald-700' : 'text-amber-700'" x-text="completionGateLabel()"></div>
+        <div class="status-rail-label">Audit progress</div>
+        <div class="status-rail-value" :class="completionGate?.ready ? 'text-emerald-700' : 'text-amber-700'" x-text="auditProgressLabel()"></div>
       </div>
     </button>
   </div>
+
+  <template x-if="primaryProjectError()">
+    <section class="flex shrink-0 flex-col gap-3 border-b border-orange-200 bg-orange-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
+      role="alert" aria-live="assertive">
+      <div class="min-w-0">
+        <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span class="inline-flex h-5 items-center rounded-md bg-orange-100 px-2 text-[10px] font-bold uppercase tracking-[0.1em] text-orange-800">Needs attention</span>
+          <h3 class="text-sm font-semibold text-orange-950" x-text="projectErrorTitle(primaryProjectError())"></h3>
+          <span x-show="unresolvedProjectErrors().length > 1" class="text-[11px] text-orange-800"
+            x-text="`+${unresolvedProjectErrors().length - 1} more`"></span>
+        </div>
+        <p class="mt-1 max-w-[75ch] break-words text-xs leading-relaxed text-orange-950"
+          x-text="projectErrorMessage(primaryProjectError())"></p>
+        <p class="mt-1 max-w-[75ch] break-words text-[11px] leading-relaxed text-orange-900"
+          x-text="projectErrorRecovery(primaryProjectError())"></p>
+      </div>
+      <div class="flex shrink-0 items-center gap-2">
+        <button type="button" @click="selectIntent(primaryProjectError().intent_id); sideTab = 'detail'"
+          class="inline-flex min-h-9 items-center justify-center rounded-lg px-3 text-xs font-medium text-orange-900 transition hover:bg-orange-100 hover:text-orange-950">
+          View work
+        </button>
+        <button type="button" @click="retryIntentError(primaryProjectError())"
+          :disabled="!canRetryIntentError(primaryProjectError()) || retryingIntentId === primaryProjectError().intent_id"
+          class="inline-flex min-h-9 items-center justify-center rounded-lg bg-orange-700 px-3 text-xs font-semibold text-white transition hover:bg-orange-800 disabled:cursor-not-allowed disabled:opacity-45"
+          x-text="retryingIntentId === primaryProjectError().intent_id ? 'Retrying…' : 'Retry now'">
+        </button>
+      </div>
+    </section>
+  </template>
 
   <div class="graph-workspace flex-1 flex overflow-hidden" id="graphLayout">
     <!-- Graph -->
     <div class="graph-canvas flex-1 relative min-w-0 min-h-0">
       <div class="workbench-toolbar absolute top-3 left-3 z-10 flex max-w-[calc(100%-24px)] items-center gap-1 p-1 overflow-x-auto">
-        <button type="button" @click="setGraphView('current')" class="workbench-tab" :aria-selected="graphView === 'current'" aria-label="Show current execution focus">Current</button>
         <button type="button" @click="setGraphView('findings')" class="workbench-tab" :aria-selected="graphView === 'findings'" aria-label="Show finding chains">Findings</button>
-        <button type="button" @click="setGraphView('full')" class="workbench-tab" :aria-selected="graphView === 'full'" aria-label="Show full blackboard map">Full map</button>
+        <button type="button" @click="setGraphView('current')" class="workbench-tab" :aria-selected="graphView === 'current'" aria-label="Show current execution focus">Current</button>
+        <button type="button" @click="setGraphView('full')" class="workbench-tab" :aria-selected="graphView === 'full'" aria-label="Show graph">Graph</button>
         <button type="button" @click="setGraphView('list')" class="workbench-tab" :aria-selected="graphView === 'list'" aria-label="Show blackboard list">List</button>
         <span class="mx-1 h-5 w-px bg-slate-200 shrink-0"></span>
         <button x-show="workspaceMode === 'graph' && graphView !== 'list' && !(graphView === 'findings' && findingsMode === 'list')" @click="fitGraph()" class="h-7 w-7 rounded-md text-slate-500 hover:text-slate-700 hover:bg-slate-50 transition inline-flex items-center justify-center shrink-0" title="Fit graph" aria-label="Fit graph">
@@ -845,24 +882,66 @@
       </div>
 
       <section x-show="graphView === 'current'" x-cloak
-        class="graph-view-status absolute left-3 top-[4.35rem] z-10 w-[min(430px,calc(100%-24px))] px-3 py-2.5"
+        class="graph-view-status absolute left-3 top-[10.25rem] z-10 w-[min(430px,calc(100%-24px))] px-3 py-2.5"
         role="status" aria-live="polite">
         <div>
           <p class="text-[9px] font-bold uppercase tracking-[0.13em] text-slate-400">Now</p>
           <p class="mt-0.5 text-xs font-semibold leading-relaxed text-slate-700" x-text="currentSummary().now"></p>
         </div>
         <div x-show="currentSummary().next" class="mt-2 border-t border-slate-100 pt-2">
-          <span class="text-[9px] font-bold uppercase tracking-[0.13em] text-slate-400">Next</span>
+          <span class="text-[9px] font-bold uppercase tracking-[0.13em]"
+            :class="currentSummary().nextMode === 'user_action' ? 'text-amber-600' : currentSummary().nextMode === 'automatic' ? 'text-sky-600' : 'text-slate-400'"
+            x-text="currentSummary().nextMode === 'user_action' ? 'Action required' : currentSummary().nextMode === 'automatic' ? 'Next · automatic' : 'Waiting'"></span>
           <span class="ml-2 text-[11px] text-slate-600" x-text="currentSummary().next"></span>
+          <button x-show="currentSummary().nextMode === 'user_action' && currentSummary().actionTarget" type="button"
+            @click="openFindingFact(currentSummary().actionTarget)"
+            class="ml-2 text-[10px] font-semibold text-amber-700 hover:text-amber-900"
+            x-text="currentSummary().actionLabel"></button>
         </div>
         <div x-show="currentSummary().blocked" class="mt-2 border-t border-slate-100 pt-2">
           <span class="text-[9px] font-bold uppercase tracking-[0.13em] text-rose-500">Blocked</span>
           <span class="ml-2 text-[11px] leading-relaxed text-rose-700" x-text="currentSummary().blocked"></span>
         </div>
+        <div class="mt-2 flex items-center justify-between gap-3 border-t border-slate-100 pt-2">
+          <span class="text-[10px] text-slate-500" x-text="currentContextSummary()"></span>
+          <button type="button" @click="setGraphView('full')"
+            class="shrink-0 text-[10px] font-semibold text-brand-600 hover:text-brand-800">Open full map</button>
+        </div>
+      </section>
+
+      <section x-show="projectPrimaryStatus()" x-cloak
+        class="absolute left-3 right-3 top-[4.35rem] z-10 rounded-xl border px-4 py-3 shadow-sm"
+        :class="projectPrimaryStatus().tone === 'attention' ? 'border-amber-200 bg-amber-50/95' : projectPrimaryStatus().tone === 'blocked' ? 'border-rose-200 bg-rose-50/95' : projectPrimaryStatus().tone === 'success' ? 'border-emerald-200 bg-emerald-50/95' : 'border-slate-200 bg-white/95'"
+        role="status" aria-live="polite">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div class="min-w-0">
+            <p class="text-[9px] font-bold uppercase tracking-[0.13em]"
+              :class="projectPrimaryStatus().tone === 'attention' ? 'text-amber-700' : projectPrimaryStatus().tone === 'blocked' ? 'text-rose-700' : projectPrimaryStatus().tone === 'success' ? 'text-emerald-700' : 'text-slate-400'"
+              x-text="projectPrimaryStatus().eyebrow"></p>
+            <h3 class="mt-0.5 text-sm font-semibold"
+              :class="projectPrimaryStatus().tone === 'attention' ? 'text-amber-950' : projectPrimaryStatus().tone === 'blocked' ? 'text-rose-950' : projectPrimaryStatus().tone === 'success' ? 'text-emerald-950' : 'text-slate-800'"
+              x-text="projectPrimaryStatus().title"></h3>
+            <p class="mt-1 text-xs leading-relaxed"
+              :class="projectPrimaryStatus().tone === 'attention' ? 'text-amber-900' : projectPrimaryStatus().tone === 'blocked' ? 'text-rose-900' : 'text-slate-600'"
+              x-text="projectPrimaryStatus().detail"></p>
+          </div>
+          <template x-if="projectPrimaryStatus().actionTarget">
+            <button type="button" @click="openFindingFact(projectPrimaryStatus().actionTarget)"
+              class="inline-flex min-h-8 shrink-0 items-center justify-center rounded-lg bg-amber-800 px-3 py-2 text-[11px] font-semibold text-white transition hover:bg-amber-900">
+              <span x-text="projectPrimaryStatus().actionLabel"></span>
+            </button>
+          </template>
+          <template x-if="projectPrimaryStatus().completionAction">
+            <button type="button" @click="sideTab = 'gate'"
+              class="inline-flex min-h-8 shrink-0 items-center justify-center rounded-lg border border-slate-300 bg-white px-3 py-2 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50">
+              View completion
+            </button>
+          </template>
+        </div>
       </section>
 
       <div x-show="graphView === 'findings' && findingsMode === 'graph'" x-cloak
-        class="graph-view-status absolute left-3 top-[4.35rem] z-10 max-w-[min(430px,calc(100%-24px))] px-3 py-2 text-[11px] text-slate-600"
+        class="graph-view-status absolute left-3 top-[10.25rem] z-10 max-w-[min(430px,calc(100%-24px))] px-3 py-2 text-[11px] text-slate-600"
         role="status" aria-live="polite">
         <span class="font-semibold text-slate-700" x-text="graphViewLabel()"></span>
         <span class="mx-1 text-slate-300">·</span>
@@ -1052,9 +1131,9 @@
     <div x-ref="sidePanel" class="graph-side-panel side-panel-copyable border-l border-slate-200/60 bg-white flex flex-col overflow-hidden shrink-0 relative z-20" :style="{ width: sidePanelWidth + 'px', minWidth: sidePanelWidth + 'px', flexBasis: sidePanelWidth + 'px' }">
       <div class="flex border-b border-slate-100 shrink-0 select-none">
         <button @click="sideTab = 'detail'" class="flex-1 px-2 py-2.5 text-xs font-medium transition"
-          :class="sideTab === 'detail' ? 'text-brand-600 border-b-2 border-brand-500' : 'text-slate-400 hover:text-slate-600'">Inspect</button>
+          :class="sideTab === 'detail' ? 'text-brand-600 border-b-2 border-brand-500' : 'text-slate-400 hover:text-slate-600'">Details</button>
         <button @click="sideTab = 'gate'" class="flex-1 px-2 py-2.5 text-xs font-medium transition"
-          :class="sideTab === 'gate' ? 'text-brand-600 border-b-2 border-brand-500' : 'text-slate-400 hover:text-slate-600'">Audit</button>
+          :class="sideTab === 'gate' ? 'text-brand-600 border-b-2 border-brand-500' : 'text-slate-400 hover:text-slate-600'">Completion</button>
         <button @click="sideTab = 'log'" class="flex-1 px-2 py-2.5 text-xs font-medium transition"
           :class="['log', 'pi', 'hints'].includes(sideTab) ? 'text-brand-600 border-b-2 border-brand-500' : 'text-slate-400 hover:text-slate-600'">Activity</button>
       </div>
@@ -1089,8 +1168,22 @@
                 </div>
                 <span class="rounded-md px-2 py-1 text-[10px] font-bold uppercase tracking-wide"
                   :class="completionGate.ready ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'"
-                  x-text="completionGate.ready ? 'Pass' : `${completionGate.blockers.length} blockers`"></span>
+                  x-text="completionGate.ready ? 'Pass' : `${completionGate.blockers.length} blocker${completionGate.blockers.length === 1 ? '' : 's'}`"></span>
               </div>
+              <dl class="grid grid-cols-3 divide-x divide-slate-100 border-t border-slate-100 bg-white">
+                <div class="min-w-0 px-3 py-2.5">
+                  <dt class="text-[9px] font-bold uppercase tracking-wider text-slate-400">Work</dt>
+                  <dd class="mt-1 truncate text-[11px] font-semibold text-slate-700" x-text="currentWorkLabel()"></dd>
+                </div>
+                <div class="min-w-0 px-3 py-2.5">
+                  <dt class="text-[9px] font-bold uppercase tracking-wider text-slate-400">Stages</dt>
+                  <dd class="mt-1 text-[11px] font-semibold tabular-nums text-slate-700" x-text="auditStageProgressLabel()"></dd>
+                </div>
+                <div class="min-w-0 px-3 py-2.5">
+                  <dt class="text-[9px] font-bold uppercase tracking-wider text-slate-400">Checks</dt>
+                  <dd class="mt-1 text-[11px] font-semibold tabular-nums text-slate-700" x-text="completionCheckProgressLabel()"></dd>
+                </div>
+              </dl>
               <div class="divide-y divide-slate-100">
                 <template x-for="check in completionGate.checks" :key="check.id">
                   <article class="px-4 py-3">
@@ -1100,7 +1193,34 @@
                       <div class="min-w-0 flex-1">
                         <p class="text-xs font-semibold text-slate-700" x-text="check.label"></p>
                         <p class="mt-1 text-[11px] leading-relaxed text-slate-500" x-text="check.detail"></p>
-                        <p x-show="check.evidence_ids?.length" class="mt-1 break-all font-mono text-[10px] text-slate-400" x-text="check.evidence_ids.join(', ')"></p>
+                        <template x-if="check.id === 'evidence_chain' && technicalConfirmationCandidates().length">
+                          <div class="mt-3 space-y-2">
+                            <template x-for="fact in technicalConfirmationCandidates()" :key="fact.id">
+                              <div class="rounded-lg border border-amber-200 bg-amber-50/70 p-3">
+                                <div class="flex items-start justify-between gap-3">
+                                  <div class="min-w-0 flex-1">
+                                    <p class="break-words text-[11px] font-semibold leading-relaxed text-amber-950" x-text="factDisplayTitle(fact)"></p>
+                                    <p class="mt-1 text-[10px] text-amber-800">Review passed · technical proof not yet confirmed</p>
+                                  </div>
+                                  <span class="shrink-0 font-mono text-[10px] text-amber-700" x-text="fact.id"></span>
+                                </div>
+                                <div class="mt-3 flex flex-wrap gap-2">
+                                  <button type="button" @click="openFindingFact(fact.id)"
+                                    class="inline-flex min-h-8 items-center justify-center rounded-lg border border-amber-300 bg-white px-3 text-[10px] font-semibold text-amber-900 transition hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400">
+                                    Inspect evidence
+                                  </button>
+                                  <button type="button" @click="confirmReviewedFinding(fact.id)"
+                                    :disabled="!projectIsActive() || Boolean(confirmingFindingId)"
+                                    class="inline-flex min-h-8 items-center justify-center rounded-lg bg-amber-800 px-3 text-[10px] font-semibold text-white transition hover:bg-amber-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 disabled:cursor-not-allowed disabled:opacity-45"
+                                    x-text="confirmingFindingId === fact.id ? 'Checking proof…' : 'Run technical confirmation'">
+                                  </button>
+                                </div>
+                              </div>
+                            </template>
+                            <p x-show="technicalConfirmationError" role="alert" class="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] leading-relaxed text-rose-800" x-text="technicalConfirmationError"></p>
+                          </div>
+                        </template>
+                        <p x-show="check.evidence_ids?.length && check.id !== 'evidence_chain'" class="mt-1 break-all font-mono text-[10px] text-slate-400" x-text="check.evidence_ids.join(', ')"></p>
                       </div>
                     </div>
                   </article>
@@ -1111,7 +1231,7 @@
             <section class="rounded-xl border border-slate-200 bg-white p-4">
               <div class="flex items-center justify-between gap-3">
                 <h3 class="text-xs font-bold uppercase tracking-wider text-slate-500">Audit stages</h3>
-                <span class="text-[10px] tabular-nums text-slate-400" x-text="`${satisfiedStageCount()} / ${(project.stages || []).filter(stage => stage.required).length} required`"></span>
+                <span class="text-[10px] tabular-nums text-slate-400" x-text="auditStageSummaryLabel()"></span>
               </div>
               <div class="mt-3 space-y-2">
                 <template x-for="stage in (project.stages || [])" :key="`${stage.source_generation}-${stage.plan_revision}-${stage.stage_id}`">
@@ -1119,8 +1239,11 @@
                     <span class="mt-0.5 h-2 w-2 shrink-0 rounded-full" :class="stageStatusDotClass(stage.status)"></span>
                     <div class="min-w-0 flex-1">
                       <div class="flex items-center justify-between gap-2">
-                        <span class="text-xs font-medium text-slate-700" x-text="stage.label"></span>
-                        <span class="text-[10px] text-slate-400" x-text="stageStatusLabel(stage.status)"></span>
+                        <div class="flex min-w-0 items-center gap-2">
+                          <span class="truncate text-xs font-medium text-slate-700" x-text="stage.label"></span>
+                          <span x-show="!stage.required" class="shrink-0 rounded bg-slate-200 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-slate-500">On demand</span>
+                        </div>
+                        <span class="shrink-0 text-[10px] text-slate-400" x-text="stageStatusLabel(stage.status)"></span>
                       </div>
                       <p x-show="stage.detail" class="mt-1 text-[10px] leading-relaxed text-slate-500" x-text="stage.detail"></p>
                     </div>
@@ -2140,6 +2263,7 @@ function linenApp() {
     selectedProjectId: '',
     polling: true,
     pollTimer: null,
+    projectPollInFlight: false,
     cy: null,
     sideTab: 'detail',
     workspaceMode: 'graph',
@@ -2191,6 +2315,9 @@ function linenApp() {
     settingsForm: { intent_timeout: 5, reason_timeout: 5 },
     deleteConfirm: { id: '', title: '' },
     isDeletingProject: false,
+    retryingIntentId: '',
+    confirmingFindingId: '',
+    technicalConfirmationError: '',
     // Review state: reviewsByFactId = { fact_id: [Review, ...] } for the current project
     reviewsByFactId: {},
     highlightedCitationId: '',
@@ -2242,6 +2369,7 @@ function linenApp() {
       sourceProject: null,
       timer: null,
     },
+    _auditEventsProjectId: null,
     _timelineEventsCacheProject: null,
     _timelineEventsCache: [],
     _centerAnimation: null,
@@ -2286,7 +2414,9 @@ function linenApp() {
         let msg = `HTTP ${r.status}`;
         if (typeof data.detail === 'string') msg = data.detail;
         else if (Array.isArray(data.detail)) msg = data.detail.map(e => e.msg).join('; ');
-        throw new Error(msg);
+        const error = new Error(msg);
+        error.payload = data;
+        throw error;
       }
       return data;
     },
@@ -2402,7 +2532,7 @@ function linenApp() {
     },
 
     executionStatusLabel() {
-      const status = this.completionGate?.execution_status || this.projectActivityStatus(this.project);
+      const status = this.projectExecutionStatus();
       const labels = {
         running: 'Running', ready: 'Ready', blocked: 'Blocked', paused: 'Paused',
         completed: 'Completed', complete: 'Completed', idle_attention_required: 'Needs attention', reasoning: 'Reasoning', working: 'Working',
@@ -2411,12 +2541,221 @@ function linenApp() {
       return labels[status] || String(status || 'Idle').replaceAll('_', ' ');
     },
 
+    projectExecutionStatus() {
+      const activity = this.projectActivityStatus(this.project);
+      const status = this.completionGate?.execution_status || activity;
+      if (status === 'idle' && this.completionGate && !this.completionGate.ready) return 'idle_attention_required';
+      return status;
+    },
+
+    projectPrimaryStatus() {
+      if (!this.project) return null;
+      const candidates = this.technicalConfirmationCandidates();
+      if (candidates.length) {
+        return {
+          eyebrow: 'Action required',
+          title: 'Technical confirmation is ready',
+          detail: `${candidates.length} reviewed candidate${candidates.length === 1 ? '' : 's'} ${candidates.length === 1 ? 'is' : 'are'} ready for confirmation.`,
+          tone: 'attention',
+          actionLabel: 'Review finding',
+          actionTarget: candidates[0].id,
+          completionAction: true,
+        };
+      }
+      const blocked = this.unresolvedProjectErrors().find(error => error.classification === 'blocked');
+      if (blocked) {
+        const intent = this.projectErrorIntent(blocked);
+        return {
+          eyebrow: 'Blocked',
+          title: 'Audit blocked',
+          detail: blocked.message || (intent ? this.intentDisplayTitle(intent) : 'The system could not continue this work.'),
+          tone: 'blocked',
+        };
+      }
+      if (this.project.project.status === 'completed') {
+        return { eyebrow: 'Complete', title: 'Audit completed', detail: 'The completion checks passed and the audit is closed.', tone: 'success' };
+      }
+      if (this.project.project.reason || this.workingIntentCount()) {
+        const intent = this.currentFocusIntents()[0];
+        return {
+          eyebrow: 'In progress',
+          title: 'Audit in progress',
+          detail: intent ? this.intentSummaryText(intent) : 'The system is deciding or executing the next audit step.',
+          tone: 'active',
+        };
+      }
+      if (this.openIntentCount()) {
+        return { eyebrow: 'Automatic', title: 'Work is queued', detail: 'The system will continue automatically.', tone: 'active' };
+      }
+      if (this.project.project.status === 'active') {
+        return {
+          eyebrow: 'Waiting',
+          title: 'Waiting for the next audit step',
+          detail: 'No worker is running. New evidence or a Reason decision will continue the audit automatically.',
+          tone: 'neutral',
+        };
+      }
+      return { eyebrow: 'Paused', title: 'Audit is paused', detail: 'Resume the project when you want the system to continue.', tone: 'neutral' };
+    },
+
+    executionStatusDotClass() {
+      const status = this.projectExecutionStatus();
+      if (['reasoning', 'working', 'running'].includes(status)) return 'bg-emerald-500';
+      if (['blocked', 'idle_attention_required'].includes(status)) return 'bg-rose-500';
+      if (['retrying', 'queued', 'paused', 'stopped'].includes(status)) return 'bg-amber-500';
+      if (['complete', 'completed', 'ready'].includes(status)) return 'bg-teal-500';
+      return 'bg-slate-400';
+    },
+
+    executionStatusBadgeClass() {
+      const status = this.projectExecutionStatus();
+      if (['reasoning', 'working', 'running'].includes(status)) return 'bg-emerald-50 text-emerald-700';
+      if (['blocked', 'idle_attention_required'].includes(status)) return 'bg-rose-50 text-rose-700';
+      if (['retrying', 'queued', 'paused', 'stopped'].includes(status)) return 'bg-amber-50 text-amber-700';
+      if (['complete', 'completed', 'ready'].includes(status)) return 'bg-teal-50 text-teal-700';
+      return 'bg-slate-100 text-slate-600';
+    },
+
+    currentWorkLabel() {
+      const status = this.projectExecutionStatus();
+      const working = this.workingIntentCount();
+      const queued = Math.max(0, this.openIntentCount() - working);
+      if (status === 'reasoning') return this.project?.project?.reason?.worker
+        ? `${this.project.project.reason.worker} reasoning`
+        : 'Reasoning';
+      if (working) return `${working} worker${working === 1 ? '' : 's'} running`;
+      if (queued) return `${queued} queued`;
+      if (status === 'retrying') return 'Waiting to retry';
+      if (status === 'blocked') return 'Blocked';
+      return 'No worker running';
+    },
+
+    auditStageProgressLabel() {
+      const required = (this.project?.stages || []).filter(stage => stage.required);
+      if (!required.length) {
+        const available = (this.project?.stages || []).filter(stage => !stage.required && stage.status !== 'not_applicable');
+        return available.length ? `${available.length} tools on demand` : 'Not tracked';
+      }
+      return `${this.satisfiedStageCount()} / ${required.length}`;
+    },
+
+    auditStageSummaryLabel() {
+      const stages = this.project?.stages || [];
+      const required = stages.filter(stage => stage.required);
+      const onDemand = stages.filter(stage => !stage.required && stage.status !== 'not_applicable');
+      const requiredLabel = required.length ? `${this.satisfiedStageCount()} / ${required.length} required` : 'No required stages';
+      return onDemand.length ? `${requiredLabel} · ${onDemand.length} on demand` : requiredLabel;
+    },
+
+    completionCheckProgressLabel() {
+      const checks = this.completionGate?.checks || [];
+      if (!checks.length) return 'Unavailable';
+      const complete = checks.filter(check => ['pass', 'not_applicable'].includes(check.status)).length;
+      return `${complete} / ${checks.length}`;
+    },
+
+    auditProgressLabel() {
+      if (this.completionGateLoading && !this.completionGate) return 'Checking…';
+      if (!this.completionGate) return 'Unavailable';
+      if (this.completionGate.ready) return 'Ready to complete';
+      const required = (this.project?.stages || []).filter(stage => stage.required);
+      if (required.length) {
+        return `${this.satisfiedStageCount()}/${required.length} stages · ${this.completionGate.blockers.length} blockers`;
+      }
+      return `${this.completionGate.blockers.length} blocker${this.completionGate.blockers.length === 1 ? '' : 's'}`;
+    },
+
+    nextAuditStep() {
+      if (!this.project || this.project.project.status !== 'active') return '';
+      const requiredStages = (this.project.stages || []).filter(stage =>
+        stage.required && !['satisfied', 'not_applicable'].includes(stage.status)
+      );
+      if (requiredStages.length) {
+        return `Complete ${requiredStages.length} required audit stage${requiredStages.length === 1 ? '' : 's'}`;
+      }
+      const failedCheck = (this.completionGate?.checks || []).find(check =>
+        check.blocking && !['pass', 'not_applicable'].includes(check.status)
+      );
+      if (failedCheck?.id === 'finding_reviews') return 'Review the remaining candidate findings';
+      if (failedCheck?.id === 'evidence_chain' && this.technicalConfirmationCandidates().length) return 'Technically confirm the reviewed candidate finding';
+      if (failedCheck?.id === 'evidence_chain') return 'Produce reviewed terminal audit evidence';
+      if (failedCheck) return failedCheck.label;
+      if (this.completionGate?.ready) return 'Select final evidence and complete the audit';
+      return '';
+    },
+
+    latestAuditEvent() {
+      if (!this.auditEvents.length) return null;
+      return this.auditEvents.reduce((latest, event) =>
+        !latest || event.sequence > latest.sequence ? event : latest, null);
+    },
+
+    lastActivityLabel() {
+      const event = this.latestAuditEvent();
+      return event ? this.formatActivityTime(event.created_at) : 'No activity yet';
+    },
+
+    lastActivityDetail() {
+      const event = this.latestAuditEvent();
+      if (!event) return 'No audit activity has been recorded.';
+      return `${this.auditEventSummary(event)} · ${this.formatDate(event.created_at)}`;
+    },
+
     confirmedFindingCount() {
       if (!this.project) return 0;
       return this.project.facts.filter(fact =>
         fact.semantic_type === 'confirmed_finding'
-        || (fact.type === 'vulnerability' && ['triaged', 'fixed'].includes(fact.status || 'triaged'))
+        || (fact.legacy && fact.type === 'vulnerability' && ['triaged', 'fixed'].includes(fact.status || 'triaged'))
       ).length;
+    },
+
+    findingSummaryLabel() {
+      if (!this.project) return '0 candidate · 0 confirmed';
+      const promoted = this.promotedFindingIds();
+      const candidates = this.project.facts.filter(fact =>
+        fact.semantic_type === 'candidate_finding' && !promoted.has(fact.id)
+      ).length;
+      return `${candidates} candidate${candidates === 1 ? '' : 's'} · ${this.confirmedFindingCount()} confirmed`;
+    },
+
+    completionEvidenceCheck() {
+      return (this.completionGate?.checks || []).find(check => check.id === 'evidence_chain') || null;
+    },
+
+    technicalConfirmationCandidates() {
+      if (!this.project) return [];
+      const ids = new Set(this.completionEvidenceCheck()?.evidence_ids || []);
+      return this.project.facts.filter(fact => ids.has(fact.id) && fact.semantic_type === 'candidate_finding');
+    },
+
+    technicalConfirmationFailureMessage(error) {
+      const labels = {
+        CONTRADICTED_EVIDENCE: 'the proof package contains contradictory evidence',
+        MISSING_PROOF_EDGE: 'some proof facts are not connected to the candidate',
+        PROOF_GRAPH_CHANGED: 'the proof graph changed after validation',
+        UNREVIEWED_EVIDENCE: 'part of the proof still needs independent review',
+        INVALID_PROVENANCE: 'some evidence has invalid provenance',
+      };
+      const reasons = (error?.payload?.reason_codes || []).map(code => labels[code] || String(code).toLowerCase().replaceAll('_', ' '));
+      if (!reasons.length) return error?.message || 'Technical confirmation could not be completed. Inspect the evidence and try again.';
+      return `Technical confirmation could not be completed because ${reasons.join('; ')}. Inspect the evidence chain, resolve these issues, then try again.`;
+    },
+
+    async confirmReviewedFinding(factId) {
+      if (!this.projectIsActive() || this.confirmingFindingId || !factId) return;
+      this.confirmingFindingId = factId;
+      this.technicalConfirmationError = '';
+      try {
+        const result = await this.api('POST', `/projects/${this.selectedProjectId}/facts/${factId}/technical-confirmation`);
+        await this.loadProject(this.selectedProjectId);
+        this.updateGraph();
+        this.showToast('Finding technically confirmed');
+        if (result?.confirmed_fact_id) this.selectFact(result.confirmed_fact_id);
+      } catch (error) {
+        this.technicalConfirmationError = this.technicalConfirmationFailureMessage(error);
+      } finally {
+        this.confirmingFindingId = '';
+      }
     },
 
     completionGateLabel() {
@@ -2517,13 +2856,13 @@ function linenApp() {
           if (!this.cy) return;
           this.cy.resize();
           this.applyGraphFilters();
-          this.cy.fit(this.cy.elements(':visible'), 50);
+          this.fitVisibleGraph();
         });
       }
     },
 
     graphViewLabel() {
-      return ({ current: 'Current focus', findings: 'Finding chain', full: 'Full blackboard map', list: 'Blackboard list' })[this.graphView] || 'Graph';
+      return ({ current: 'Current focus', findings: 'Finding chain', full: 'Graph', list: 'Blackboard list' })[this.graphView] || 'Graph';
     },
 
     graphViewSummary() {
@@ -2583,7 +2922,7 @@ function linenApp() {
       return Boolean(intent && !intent.to && !intent.concluded_at);
     },
 
-    findingFactTypes() {
+    findingContextTypes() {
       return new Set([
         'hypothesis', 'candidate', 'candidate_triage', 'candidate_disposition',
         'hypothesis_batch', 'variant_batch', 'finding', 'source', 'sink',
@@ -2592,9 +2931,9 @@ function linenApp() {
       ]);
     },
 
-    isFindingFact(fact) {
+    isFindingContextFact(fact) {
       if (!fact) return false;
-      const types = this.findingFactTypes();
+      const types = this.findingContextTypes();
       return types.has(fact.type) || types.has(fact.semantic_type)
         || ['candidate', 'hypothesis', 'confirmed_finding'].includes(fact.semantic_type);
     },
@@ -2605,16 +2944,15 @@ function linenApp() {
 
     isPrimaryFindingFact(fact) {
       if (!fact) return false;
-      const type = fact.type || '';
       const semantic = fact.semantic_type || '';
-      const internalTypes = new Set([
-        'candidate_disposition', 'source', 'sink', 'sanitizer', 'validation',
-        'reachability', 'architecture_map', 'hypothesis_batch', 'variant_batch',
-        'coverage_result',
-      ]);
-      if (internalTypes.has(type) || internalTypes.has(semantic)) return false;
-      return ['vulnerability', 'confirmed_finding', 'finding', 'candidate'].includes(type)
-        || ['confirmed_finding', 'candidate_finding'].includes(semantic);
+      return ['candidate_finding', 'confirmed_finding'].includes(semantic)
+        && !this.promotedFindingIds().has(fact.id);
+    },
+
+    promotedFindingIds() {
+      return new Set((this.project?.edges || [])
+        .filter(edge => edge.relation_type === 'promotes_to' && edge.source_kind === 'fact')
+        .map(edge => edge.source_id));
     },
 
     primaryFindingFacts() {
@@ -2659,7 +2997,7 @@ function linenApp() {
     },
 
     isCurrentFallbackFact(fact) {
-      if (!fact || !this.isFindingFact(fact)) return false;
+      if (!fact || !this.isFindingContextFact(fact)) return false;
       const kind = fact.type || fact.semantic_type;
       const candidate = ['candidate', 'candidate_triage', 'candidate_disposition', 'hypothesis', 'hypothesis_batch', 'variant_batch'].includes(kind);
       const confirmed = fact.semantic_type === 'confirmed_finding'
@@ -2704,39 +3042,79 @@ function linenApp() {
     },
 
     currentSummary() {
-      if (!this.project) return { now: 'Loading current work…', next: '', blocked: '' };
+      if (!this.project) return { now: 'Loading current work…', next: '', blocked: '', nextMode: null, actionLabel: '', actionTarget: null };
       if (this.project.project.status === 'completed') {
-        return { now: 'Audit completed', next: '', blocked: '' };
+        return { now: 'Audit completed', next: '', blocked: '', nextMode: null, actionLabel: '', actionTarget: null };
       }
       const focused = this.currentFocusIntents();
       const open = this.project.intents.filter(intent => this.isOpenIntent(intent));
       const primary = focused[0] || null;
       const primaryError = primary ? this.intentError(primary.id) : null;
-      let now = 'No active work';
-      if (primary?.worker) now = this.intentSummaryText(primary);
+      const executionStatus = this.projectExecutionStatus();
+      let now = this.project?.project?.status === 'active' ? 'No worker is running' : 'No active work';
+      if (executionStatus === 'reasoning') now = `${this.project.project.reason?.worker || 'Reasoner'} is planning the next audit step`;
+      else if (primary?.worker) now = this.intentSummaryText(primary);
       else if (primaryError?.classification === 'transient') now = `Retrying · ${this.intentSummaryText(primary)}`;
       else if (primaryError?.classification === 'blocked') now = `Waiting · ${this.intentSummaryText(primary)}`;
       else if (primary) now = `Queued · ${this.intentSummaryText(primary)}`;
 
       const queuedCount = open.filter(intent => !intent.worker && !this.intentError(intent.id)).length;
-      const next = queuedCount
+      const confirmationCandidate = this.technicalConfirmationCandidates()[0];
+      const next = confirmationCandidate
+        ? 'Technical confirmation is ready'
+        : queuedCount
         ? `${queuedCount} work item${queuedCount === 1 ? '' : 's'} queued`
-        : '';
+        : this.nextAuditStep();
       const blockedIntent = open.find(intent => this.intentError(intent.id)?.classification === 'blocked');
       const blockedError = blockedIntent ? this.intentError(blockedIntent.id) : null;
       const blocked = blockedIntent
         ? `${this.intentDisplayTitle(blockedIntent)} · ${blockedError?.message || 'Action required'}`
         : '';
-      return { now, next, blocked };
+      return {
+        now,
+        next,
+        blocked,
+        nextMode: confirmationCandidate ? 'user_action' : queuedCount ? 'automatic' : next ? 'waiting' : null,
+        actionLabel: confirmationCandidate ? 'Review finding' : '',
+        actionTarget: confirmationCandidate?.id || null,
+      };
     },
 
     currentGraphFocus() {
+      const compactGraph = window.innerWidth <= 820;
+      const maxNodes = compactGraph ? 6 : 10;
+      const maxEdges = compactGraph ? 8 : 14;
+      const maxDepth = compactGraph ? 2 : 3;
       const nodeIds = new Set();
       const primaryNodeIds = new Set();
       const contextNodeIds = new Set();
       const edgeIds = new Set();
       const intentIds = this.currentFocusIntents().map(intent => intent.id);
       const factsById = new Map((this.project?.facts || []).map(fact => [fact.id, fact]));
+      const producerByFact = new Map(
+        (this.project?.intents || []).filter(intent => intent.to).map(intent => [intent.to, intent]),
+      );
+      const lineageSeeds = [];
+
+      const addLineage = () => {
+        const queue = lineageSeeds.map(factId => ({ factId, depth: 0 }));
+        const visited = new Set();
+        while (queue.length && nodeIds.size < maxNodes && edgeIds.size < maxEdges) {
+          const { factId, depth } = queue.shift();
+          if (visited.has(factId) || depth >= maxDepth) continue;
+          visited.add(factId);
+          const producer = producerByFact.get(factId);
+          if (!producer) continue;
+          for (const sourceId of producer.from || []) {
+            if (!factsById.has(sourceId)) continue;
+            if (!nodeIds.has(sourceId) && nodeIds.size >= maxNodes) break;
+            nodeIds.add(sourceId);
+            if (!primaryNodeIds.has(sourceId)) contextNodeIds.add(sourceId);
+            if (edgeIds.size < maxEdges) edgeIds.add(`${producer.id}_${sourceId}`);
+            queue.push({ factId: sourceId, depth: depth + 1 });
+          }
+        }
+      };
 
       for (const intentId of intentIds) {
         const intent = this.project.intents.find(item => item.id === intentId);
@@ -2746,8 +3124,9 @@ function linenApp() {
         primaryNodeIds.add(placeholderId);
         for (const sourceId of intent.from || []) {
           nodeIds.add(sourceId);
-          contextNodeIds.add(sourceId);
+          primaryNodeIds.add(sourceId);
           edgeIds.add(`${intent.id}_${sourceId}`);
+          lineageSeeds.push(sourceId);
         }
       }
 
@@ -2756,16 +3135,11 @@ function linenApp() {
         for (const fact of fallbackFacts) {
           nodeIds.add(fact.id);
           primaryNodeIds.add(fact.id);
-          const producer = this.project.intents.find(intent => intent.to === fact.id);
-          if (producer) {
-            for (const sourceId of producer.from || []) {
-              nodeIds.add(sourceId);
-              contextNodeIds.add(sourceId);
-              edgeIds.add(`${producer.id}_${sourceId}`);
-            }
-          }
+          lineageSeeds.push(fact.id);
         }
       }
+
+      addLineage();
 
       // Anchors are the last idle-board fallback. Keep them out of an active
       // or evidence-focused projection unless the visible chain references them.
@@ -2787,11 +3161,18 @@ function linenApp() {
       return { nodeIds, primaryNodeIds, contextNodeIds, edgeIds, intentIds, signature };
     },
 
+    currentContextSummary() {
+      const focus = this.currentGraphFocus();
+      const evidenceCount = Array.from(focus.nodeIds).filter(id => !id.startsWith('_ph_')).length;
+      const workCount = focus.intentIds.length;
+      return `${focus.nodeIds.size} linked nodes · ${evidenceCount} evidence item${evidenceCount === 1 ? '' : 's'} · ${workCount} active task${workCount === 1 ? '' : 's'}`;
+    },
+
     findingsGraphFocus() {
       const nodeIds = new Set(['origin', 'goal']);
       const edgeIds = new Set();
       if (!this.project) return { nodeIds, edgeIds };
-      const findingIds = new Set(this.project.facts.filter(fact => this.isFindingFact(fact)).map(fact => fact.id));
+      const findingIds = new Set(this.project.facts.filter(fact => this.isFindingContextFact(fact)).map(fact => fact.id));
       for (const intent of this.project.intents) {
         const related = findingIds.has(intent.to) || (intent.from || []).some(id => findingIds.has(id));
         if (!related) continue;
@@ -2818,7 +3199,7 @@ function linenApp() {
       if (this.graphKindFilter === 'all') return true;
       const type = fact.type || '';
       if (this.graphKindFilter === 'findings') {
-        return this.isFindingFact(fact);
+        return this.isFindingContextFact(fact);
       }
       if (this.graphKindFilter === 'scanners') {
         return ['scan_batch', 'route_scan', 'candidate_triage', 'candidate_disposition'].includes(type);
@@ -2952,7 +3333,7 @@ function linenApp() {
     changeGraphFilters() {
       this.applyGraphFilters();
       if (this.workspaceMode === 'graph' && this.cy) {
-        this.cy.fit(this.cy.elements(':visible'), 50);
+        this.fitVisibleGraph();
       }
     },
 
@@ -2990,8 +3371,8 @@ function linenApp() {
 
     openIntentNodeSize(intent) {
       const label = this.openIntentNodeLabel(intent);
-      const measured = this.measureWrappedText(label, 136, 10);
-      return { width: Math.max(112, Math.ceil(measured.width + 24)), height: Math.max(48, Math.ceil(measured.height + 18)) };
+      const measured = this.measureWrappedText(label, 158, 10);
+      return { width: Math.max(142, Math.ceil(measured.width + 26)), height: Math.max(54, Math.ceil(measured.height + 20)) };
     },
 
     auditIntentLabel(intent) {
@@ -3615,41 +3996,108 @@ function linenApp() {
       } catch(e) { console.error(e); }
     },
 
-    async loadProject(id) {
+    dataMatches(current, next) {
+      if (current === next) return true;
       try {
-        this.project = await this.api('GET', `/projects/${id}`);
+        return JSON.stringify(current) === JSON.stringify(next);
+      } catch (_) {
+        return false;
+      }
+    },
+
+    reconcileProjectSnapshot(nextProject) {
+      if (!this.project) {
+        this.project = nextProject;
+        return true;
+      }
+
+      let changed = false;
+      for (const key of Object.keys(nextProject)) {
+        if (this.dataMatches(this.project[key], nextProject[key])) continue;
+        this.project[key] = nextProject[key];
+        changed = true;
+      }
+      for (const key of Object.keys(this.project)) {
+        if (Object.prototype.hasOwnProperty.call(nextProject, key)) continue;
+        delete this.project[key];
+        changed = true;
+      }
+      return changed;
+    },
+
+    async loadProject(id, { background = false } = {}) {
+      try {
+        const currentProject = this.project;
+        const nextProject = await this.api('GET', `/projects/${id}`);
+        if (background && (this.selectedProjectId !== id || this.view !== 'graph')) return false;
+        const graphChanged = currentProject?.project?.graph_revision !== nextProject?.project?.graph_revision;
+        const eventStreamChanged = currentProject?.project?.event_seq !== nextProject?.project?.event_seq;
+        const embeddedReviewsChanged = !this.dataMatches(currentProject?.reviews, nextProject?.reviews);
+        const changed = this.reconcileProjectSnapshot(nextProject);
+
+        if (background && !changed) return false;
+
+        const refreshes = [this.loadCompletionGate(id, { background })];
+        if (!background || graphChanged || embeddedReviewsChanged) {
+          refreshes.push(this.loadProjectReviews(id, { background }));
+        }
+        if (!background || eventStreamChanged) {
+          refreshes.push(this.loadAuditEvents(id, { background }));
+        }
+        await Promise.allSettled(refreshes);
+        return changed;
+      } catch(e) {
+        if (background) {
+          console.warn('Project background refresh failed', e);
+        } else {
+          this.showToast(e.message, 'error');
+        }
+        return false;
+      }
+    },
+
+    async loadCompletionGate(projectId, { background = false } = {}) {
+      if (!background) this.completionGateLoading = true;
+      try {
+        const nextGate = await this.api('GET', `/projects/${projectId}/completion-gate`);
+        if (!this.dataMatches(this.completionGate, nextGate)) this.completionGate = nextGate;
+      } catch (e) {
+        if (!background) this.completionGate = null;
+      } finally {
+        if (!background) this.completionGateLoading = false;
+      }
+    },
+
+    async loadAuditEvents(projectId, { background = false } = {}) {
+      try {
+        const sameProject = this._auditEventsProjectId === projectId;
+        const currentEvents = sameProject ? this.auditEvents : [];
+        const latestLoaded = currentEvents.reduce(
+          (latest, event) => Math.max(latest, Number(event.sequence) || 0),
+          0,
+        );
+        const projectEventSeq = Number(this.project?.project?.event_seq) || 0;
+        const after = latestLoaded || Math.max(0, projectEventSeq - 500);
+        const newEvents = await this.api('GET', `/projects/${projectId}/events?after=${after}&limit=500`);
+        const eventsBySequence = new Map(currentEvents.map(event => [event.sequence, event]));
+        for (const event of newEvents) eventsBySequence.set(event.sequence, event);
+        const nextEvents = Array.from(eventsBySequence.values()).sort((a, b) => a.sequence - b.sequence);
+        this._auditEventsProjectId = projectId;
+        if (this.dataMatches(this.auditEvents, nextEvents)) return;
+        this.auditEvents = nextEvents;
         this._timelineEventsCacheProject = null;
         this._timelineEventsCache = [];
-        await Promise.allSettled([
-          this.loadProjectReviews(id),
-          this.loadCompletionGate(id),
-          this.loadAuditEvents(id),
-        ]);
-      } catch(e) { this.showToast(e.message, 'error'); }
-    },
-
-    async loadCompletionGate(projectId) {
-      this.completionGateLoading = true;
-      try {
-        this.completionGate = await this.api('GET', `/projects/${projectId}/completion-gate`);
       } catch (e) {
-        this.completionGate = null;
-      } finally {
-        this.completionGateLoading = false;
+        if (!background) {
+          this._auditEventsProjectId = null;
+          this.auditEvents = [];
+          this._timelineEventsCacheProject = null;
+          this._timelineEventsCache = [];
+        }
       }
     },
 
-    async loadAuditEvents(projectId) {
-      try {
-        this.auditEvents = await this.api('GET', `/projects/${projectId}/events?limit=500`);
-      } catch (e) {
-        this.auditEvents = [];
-      }
-      this._timelineEventsCacheProject = null;
-      this._timelineEventsCache = [];
-    },
-
-    async loadProjectReviews(projectId) {
+    async loadProjectReviews(projectId, { background = false } = {}) {
       // Reviews are fetched separately because the project detail endpoint
       // doesn't embed them. Build a per-fact map the fact card can read.
       try {
@@ -3659,9 +4107,9 @@ function linenApp() {
           if (!map[r.fact_id]) map[r.fact_id] = [];
           map[r.fact_id].push(r);
         }
-        this.reviewsByFactId = map;
+        if (!this.dataMatches(this.reviewsByFactId, map)) this.reviewsByFactId = map;
       } catch (e) {
-        this.reviewsByFactId = {};
+        if (!background) this.reviewsByFactId = {};
       }
     },
 
@@ -4497,6 +4945,11 @@ function linenApp() {
       this.expandedTimelineRawIds = {};
       this.decisionForm = { decision: 'confirm', rationale: '', basis_quote: '', revival_condition: '' };
       await this.loadProject(id);
+      if (this.project?.project?.audit_mode && this.project.project.audit_mode !== 'none') {
+        this.graphView = 'findings';
+        this.findingsMode = 'list';
+        this.workspaceMode = 'graph';
+      }
       this.view = 'graph';
       if (location.hash !== `#/projects/${id}`) location.hash = `/projects/${id}`;
       this.$nextTick(() => {
@@ -4535,6 +4988,7 @@ function linenApp() {
       this.selectedTimelineEntryId = null;
       this.sideTab = 'detail';
       this.completionGate = null;
+      this._auditEventsProjectId = null;
       this.auditEvents = [];
       this.expandedTimelineRawIds = {};
       this.resetPiExecutionState();
@@ -4545,13 +4999,22 @@ function linenApp() {
     },
 
     startPolling() {
+      if (this.pollTimer) clearInterval(this.pollTimer);
       this.pollTimer = setInterval(async () => {
-        if (!this.polling) return;
-        if (this.selectedProjectId && this.view === 'graph') {
-          await this.loadProject(this.selectedProjectId);
-          this.updateGraph();
-        } else {
-          await this.loadProjects();
+        if (!this.polling || this.projectPollInFlight) return;
+        this.projectPollInFlight = true;
+        try {
+          if (this.selectedProjectId && this.view === 'graph') {
+            const projectId = this.selectedProjectId;
+            const changed = await this.loadProject(projectId, { background: true });
+            if (changed && this.selectedProjectId === projectId && this.view === 'graph') {
+              this.updateGraph();
+            }
+          } else {
+            await this.loadProjects();
+          }
+        } finally {
+          this.projectPollInFlight = false;
         }
       }, 5000);
     },
@@ -4736,11 +5199,11 @@ function linenApp() {
         { selector: 'node[semanticType="audit_summary"]', style: { 'background-color':'#ede9fe',color:'#4c1d95','border-color':'#8b5cf6' }},
         { selector: 'node[semanticType="vulnerability"]', style: { 'background-color':'#ffe4e6',color:'#9f1239','border-color':'#e11d48' }},
 
-        { selector: 'node[semanticFamily="scope"]', style: { ...common,shape:'round-rectangle','background-color':'#eef2ff',color:'#3730a3','border-color':'#818cf8','border-width':1.8,label:'data(label)','font-size':'10px','font-weight':'600','text-wrap':'wrap','text-max-width':'142px','text-overflow-wrap':'anywhere',width:'data(width)',height:'data(height)' }},
-        { selector: 'node[semanticFamily="work"]', style: { ...common,shape:'round-rectangle','background-color':'#f8fafc',color:'#344054','border-color':'#98a2b3','border-width':1.5,label:'data(label)','font-size':'10px','font-weight':'600','text-wrap':'wrap','text-max-width':'142px','text-overflow-wrap':'anywhere',width:'data(width)',height:'data(height)' }},
-        { selector: 'node[semanticFamily="evidence"]', style: { ...common,shape:'round-rectangle','background-color':'#ecfdf5',color:'#065f46','border-color':'#5eead4','border-width':1.5,label:'data(label)','font-size':'10px','font-weight':'600','text-wrap':'wrap','text-max-width':'142px','text-overflow-wrap':'anywhere',width:'data(width)',height:'data(height)' }},
-        { selector: 'node[semanticFamily="reasoning"]', style: { ...common,shape:'round-rectangle','background-color':'#fffbeb',color:'#92400e','border-color':'#fbbf24','border-width':1.8,label:'data(label)','font-size':'10px','font-weight':'600','text-wrap':'wrap','text-max-width':'142px','text-overflow-wrap':'anywhere',width:'data(width)',height:'data(height)' }},
-        { selector: 'node[semanticFamily="outcome"]', style: { ...common,shape:'round-rectangle','background-color':'#fff1f2',color:'#9f1239','border-color':'#fda4af','border-width':2,label:'data(label)','font-size':'10px','font-weight':'600','text-wrap':'wrap','text-max-width':'142px','text-overflow-wrap':'anywhere',width:'data(width)',height:'data(height)' }},
+        { selector: 'node[semanticFamily="scope"]', style: { ...common,shape:'round-rectangle','background-color':'#eef2ff',color:'#3730a3','border-color':'#818cf8','border-width':1.8,label:'data(label)','font-size':'10px','font-weight':'600','text-wrap':'wrap','text-max-width':'158px','text-overflow-wrap':'anywhere',width:'data(width)',height:'data(height)' }},
+        { selector: 'node[semanticFamily="work"]', style: { ...common,shape:'round-rectangle','background-color':'#f8fafc',color:'#344054','border-color':'#98a2b3','border-width':1.5,label:'data(label)','font-size':'10px','font-weight':'600','text-wrap':'wrap','text-max-width':'158px','text-overflow-wrap':'anywhere',width:'data(width)',height:'data(height)' }},
+        { selector: 'node[semanticFamily="evidence"]', style: { ...common,shape:'round-rectangle','background-color':'#ecfdf5',color:'#065f46','border-color':'#5eead4','border-width':1.5,label:'data(label)','font-size':'10px','font-weight':'600','text-wrap':'wrap','text-max-width':'158px','text-overflow-wrap':'anywhere',width:'data(width)',height:'data(height)' }},
+        { selector: 'node[semanticFamily="reasoning"]', style: { ...common,shape:'round-rectangle','background-color':'#fffbeb',color:'#92400e','border-color':'#fbbf24','border-width':1.8,label:'data(label)','font-size':'10px','font-weight':'600','text-wrap':'wrap','text-max-width':'158px','text-overflow-wrap':'anywhere',width:'data(width)',height:'data(height)' }},
+        { selector: 'node[semanticFamily="outcome"]', style: { ...common,shape:'round-rectangle','background-color':'#fff1f2',color:'#9f1239','border-color':'#fda4af','border-width':2,label:'data(label)','font-size':'10px','font-weight':'600','text-wrap':'wrap','text-max-width':'158px','text-overflow-wrap':'anywhere',width:'data(width)',height:'data(height)' }},
         { selector: 'node[semanticFamily="work"][lifecycle="open"]', style: { 'border-style':'dashed' }},
         { selector: 'node[semanticFamily="work"][lifecycle="running"]', style: { 'background-color':'#fef3c7',color:'#92400e','border-color':'#f59e0b','border-style':'solid' }},
         { selector: 'node[lifecycle="false_positive"]', style: { 'background-color':'#f8fafc',color:'#64748b','border-color':'#94a3b8','border-style':'dotted' }},
@@ -4761,7 +5224,7 @@ function linenApp() {
         { selector: 'node.focus', style: { 'border-width':3,'border-color':'#312e81','border-opacity':0.95,'z-index':1000 }},
         { selector: 'node.current-primary', style: { 'underlay-color':'#a5b4fc','underlay-padding':6,'underlay-opacity':0.3,'z-index':850 }},
         { selector: 'node.current-focus', style: { 'background-color':'#4f46e5','color':'#ffffff','border-width':3,'border-color':'#312e81','border-style':'solid','z-index':900 }},
-        { selector: 'node.current-context', style: { 'background-color':'#f8fafc','color':'#667085','border-color':'#cbd5e1','border-width':1.2,'opacity':0.82,'z-index':700 }},
+        { selector: 'node.current-context', style: { 'border-color':'#cbd5e1','border-width':1.2,'opacity':0.78,'z-index':700 }},
         { selector: 'edge.focus', style: { 'z-index':1000,'overlay-color':'#93c5fd','overlay-opacity':0.22,'overlay-padding':5 }},
         { selector: 'node.selected-fact', style: { 'border-width':0,'underlay-color':'#93c5fd','underlay-padding':8,'underlay-opacity':0.28,'z-index':1001 }},
         { selector: '.faded', style: { opacity:0.5 }},
@@ -4831,16 +5294,29 @@ function linenApp() {
 
     layoutVisibleGraph(animate = false) {
       if (!this.cy) return;
-      const visible = this.cy.elements(':visible');
+      const visible = this.cy.elements().not('.filtered-out');
       if (!visible.nodes().length) return;
       const options = this.layoutOpts(animate);
       options.fit = false;
       visible.layout(options).run();
-      this.cy.fit(visible, 50);
+      this.fitVisibleGraph();
       requestAnimationFrame(() => {
         if (!this.cy) return;
-        this.cy.fit(this.cy.elements(':visible'), 50);
+        this.fitVisibleGraph();
       });
+    },
+
+    fitVisibleGraph() {
+      if (!this.cy) return;
+      const visible = this.cy.elements().not('.filtered-out');
+      if (!visible.nodes().length) return;
+      this.cy.fit(visible, 50);
+      if (this.graphView === 'current') {
+        const offset = window.innerWidth > 820
+          ? { x: Math.min(150, this.cy.width() * 0.14), y: 28 }
+          : { x: 0, y: 58 };
+        this.cy.panBy(offset);
+      }
     },
 
     snapshotNodePositions() {
@@ -5023,7 +5499,7 @@ function linenApp() {
       });
     },
 
-    fitGraph() { if (this.cy) this.cy.fit(this.cy.elements(':visible'), 50); },
+    fitGraph() { this.fitVisibleGraph(); },
 
     centerGraphOnElements(eles) {
       if (!this.cy || !eles || eles.length === 0) return;
@@ -5054,8 +5530,8 @@ function linenApp() {
 
     factNodeSize(label, nodeType) {
       const preset = !['origin', 'goal'].includes(nodeType)
-        ? { fontSize: 10, maxTextWidth: 142, minWidth: 118, minHeight: 48, paddingX: 12, paddingY: 10 }
-        : { fontSize: 10, maxTextWidth: 142, minWidth: 118, minHeight: 48, paddingX: 12, paddingY: 10 };
+        ? { fontSize: 10, maxTextWidth: 158, minWidth: 142, minHeight: 54, paddingX: 13, paddingY: 11 }
+        : { fontSize: 10, maxTextWidth: 158, minWidth: 142, minHeight: 54, paddingX: 13, paddingY: 11 };
 
       const measured = this.measureWrappedText(label, preset.maxTextWidth, preset.fontSize);
       return {
@@ -5125,7 +5601,7 @@ function linenApp() {
               }
             }
             this.cy.resize();
-            this.cy.fit(this.cy.elements(':visible'), 50);
+            this.fitVisibleGraph();
           }
         }, 200);
       });
@@ -5408,17 +5884,23 @@ function linenApp() {
       return this.project.facts.find(f => f.id === factId) || null;
     },
 
+    findingEvidenceFact(fact) {
+      if (!fact || fact.semantic_type !== 'confirmed_finding') return fact;
+      const candidateId = fact.proof?.attributes?.candidate_id;
+      return this.project?.facts?.find(item => item.id === candidateId) || fact;
+    },
+
     isVulnerabilityTraceFact(fact) {
-      return fact?.proof?.claim_kind === 'vulnerability_trace';
+      return this.findingEvidenceFact(fact)?.proof?.claim_kind === 'vulnerability_trace';
     },
 
     vulnerabilityTrace(fact) {
-      const trace = fact?.proof?.attributes?.trace;
+      const trace = this.findingEvidenceFact(fact)?.proof?.attributes?.trace;
       return Array.isArray(trace) ? trace : [];
     },
 
     vulnerabilityEndpoint(fact) {
-      const endpoint = fact?.proof?.attributes?.endpoint_id;
+      const endpoint = this.findingEvidenceFact(fact)?.proof?.attributes?.endpoint_id;
       return typeof endpoint === 'string' && endpoint.trim() ? endpoint.trim() : '';
     },
 
@@ -5453,9 +5935,10 @@ function linenApp() {
     },
 
     factEvidenceEnvelope(fact) {
-      if (typeof fact?.evidence !== 'string') return null;
+      const evidenceFact = this.findingEvidenceFact(fact);
+      if (typeof evidenceFact?.evidence !== 'string') return null;
       try {
-        const parsed = JSON.parse(fact.evidence);
+        const parsed = JSON.parse(evidenceFact.evidence);
         return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
       } catch (_) {
         return null;
@@ -5587,21 +6070,78 @@ function linenApp() {
       return this.intentError(this.selectedIntentId());
     },
 
-    async retrySelectedIntent() {
-      const intent = this.selectedIntentRecord();
-      if (!intent || !this.selectedIntentError() || intent.worker) return;
+    unresolvedProjectErrors() {
+      if (!this.project) return [];
+      return (this.project.errors || [])
+        .filter(error => !error.resolved_at)
+        .slice()
+        .sort((a, b) => String(b.last_failed_at || '').localeCompare(String(a.last_failed_at || '')));
+    },
+
+    primaryProjectError() {
+      return this.unresolvedProjectErrors()[0] || null;
+    },
+
+    projectErrorIntent(error) {
+      if (!this.project || !error) return null;
+      return (this.project.intents || []).find(intent => intent.id === error.intent_id) || null;
+    },
+
+    projectErrorTitle(error) {
+      if (!error) return 'Audit needs attention';
+      const titles = {
+        provider_quota_exhausted: 'Model provider quota exhausted',
+        provider_rate_limited: 'Model provider rate limit reached',
+        source_repository_missing: 'Repository source is unavailable',
+      };
+      return titles[error.code] || (error.classification === 'blocked' ? 'Audit work is blocked' : 'Audit work could not continue');
+    },
+
+    projectErrorMessage(error) {
+      if (!error) return '';
+      const intent = this.projectErrorIntent(error);
+      const work = intent ? this.intentDisplayTitle(intent) : error.intent_id;
+      return `${work}: ${error.message || 'The work item failed.'}`;
+    },
+
+    projectErrorRecovery(error) {
+      if (!error) return '';
+      if (error.code === 'provider_quota_exhausted') {
+        const scheduled = error.retry_at ? ` Automatic retry was deferred until ${this.formatDate(error.retry_at)}.` : '';
+        return `Restore the model provider quota, then retry this work item.${scheduled}`;
+      }
+      return error.remediation || 'Correct the problem, then retry this work item.';
+    },
+
+    canRetryIntentError(error) {
+      const intent = this.projectErrorIntent(error);
+      return Boolean(error && this.projectIsActive() && intent && !intent.worker && !intent.to && !intent.concluded_at);
+    },
+
+    async retryIntentError(error) {
+      if (!this.canRetryIntentError(error) || this.retryingIntentId) return;
       try {
+        this.retryingIntentId = error.intent_id;
         await this.api(
           'POST',
-          `/projects/${this.selectedProjectId}/intents/${intent.id}/retry`,
+          `/projects/${this.selectedProjectId}/intents/${error.intent_id}/retry`,
           { actor: this.actorName() },
         );
         await this.loadProject(this.selectedProjectId);
         this.updateGraph();
-        this.showToast(`Retry queued for ${intent.id}`);
+        this.showToast('Retry queued');
       } catch (e) {
         this.showToast(e.message, 'error');
+      } finally {
+        this.retryingIntentId = '';
       }
+    },
+
+    async retrySelectedIntent() {
+      const intent = this.selectedIntentRecord();
+      const error = this.selectedIntentError();
+      if (!intent || !error || intent.worker) return;
+      await this.retryIntentError(error);
     },
 
     selectedOpenIntentRecord() {
@@ -5907,6 +6447,11 @@ function linenApp() {
         audit_stage_updated: `Stage ${event.entity_id || ''} is ${payload.status || 'updated'}`,
         skill_run_created: `Skill ${payload.skill_id || event.entity_id || ''} started`,
         skill_run_updated: `Skill ${payload.skill_id || event.entity_id || ''} ${payload.status || 'updated'}`,
+        run_registered: `Worker run ${event.entity_id || ''} started`,
+        run_status_changed: `Worker run ${event.entity_id || ''} ${payload.status || 'updated'}`,
+        audit_task_created: `Audit task ${event.entity_id || ''} created`,
+        audit_task_concluded: `Audit task ${event.entity_id || ''} completed`,
+        review_created: `Review ${event.entity_id || ''} recorded`,
         human_decision_created: `Human ${payload.decision || 'decision'} recorded for ${payload.target_id || 'audit evidence'}`,
         project_reopened: 'Project reopened with a new audit plan',
         project_status_changed: `Project ${payload.status || 'status changed'}`,
@@ -6155,6 +6700,18 @@ function linenApp() {
     formatTime(ts) { if (!ts) return ''; return new Date(ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}); },
     formatDate(ts) { if (!ts) return ''; const d = new Date(ts); return d.toLocaleDateString([],{year:'numeric',month:'short',day:'numeric'}) + ' ' + d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); },
     formatTimelineDate(ts) { if (!ts) return ''; return new Date(ts).toLocaleDateString([],{year:'numeric',month:'short',day:'numeric'}); },
+    formatActivityTime(ts) {
+      if (!ts) return 'No activity yet';
+      const date = new Date(ts);
+      if (Number.isNaN(date.getTime())) return 'Unknown';
+      const today = new Date();
+      const sameDay = date.getFullYear() === today.getFullYear()
+        && date.getMonth() === today.getMonth()
+        && date.getDate() === today.getDate();
+      const time = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      if (sameDay) return `Today ${time}`;
+      return `${date.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`;
+    },
     formatDurationMs(ms) {
       const totalSeconds = Math.max(0, Math.round(ms / 1000));
       const hours = Math.floor(totalSeconds / 3600);

@@ -22,6 +22,7 @@ from linen.dispatcher.workers.base import DriverResult
 from linen.server import db
 from linen.server.routers import executions
 from linen.server.models import ProjectDetail
+from linen.server.audit_state import fact_semantic_type
 
 
 @pytest.fixture
@@ -58,6 +59,10 @@ def project(api, repo=None, *, audit_mode="none"):
     response = http.post("/projects", json=body)
     assert response.status_code == 201, response.text
     return client.get_project(response.json()["project"]["id"])
+
+
+def test_candidate_disposition_is_project_observation_not_finding() -> None:
+    assert fact_semantic_type("fact-1", "candidate_disposition", "triaged") == "observation"
 
 
 def add_fact(client, pid, *, parent="origin", fact_type="vulnerability"):

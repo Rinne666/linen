@@ -25,6 +25,7 @@ def _loop() -> DispatcherLoop:
     loop.worker_rejected_until = {}
     loop.worker_provider_until = {}
     loop.worker_provider_reason = {}
+    loop._manual_provider_retries_seen = set()
     loop._log_state = {}
     loop.project_cursor = 0
     return loop
@@ -231,6 +232,59 @@ def test_provider_circuit_persists_across_dispatcher_restart(tmp_path, monkeypat
     restored._restore_provider_circuits()
     assert restored.worker_provider_until == {"test-worker": 3700.0}
     assert restored.worker_provider_reason == {"test-worker": "quota_exhausted"}
+
+
+def test_manual_retry_clears_one_persisted_provider_cooldown() -> None:
+    loop = _loop()
+    loop.config = make_config()
+    loop.worker_provider_until = {"test-worker": 3700.0}
+    loop.worker_provider_reason = {"test-worker": "quota_exhausted"}
+    loop._persist_provider_circuits = lambda: None
+    project = make_project()
+    project.errors.append(IntentError(
+        id="e001",
+        intent_id="i001",
+        task_type="explore",
+        worker="test-worker",
+        code="provider_quota_exhausted",
+        classification="transient",
+        message="quota exhausted",
+        first_failed_at="1970-01-01T00:01:40Z",
+        last_failed_at="1970-01-01T00:01:40Z",
+        resolved_at="1970-01-01T00:03:20Z",
+        resolution="manual retry requested by Human",
+    ))
+
+    loop._honor_manual_provider_retries(project)
+    loop._honor_manual_provider_retries(project)
+
+    assert loop.worker_provider_until == {}
+    assert loop.worker_provider_reason == {}
+    assert loop._manual_provider_retries_seen == {"e001"}
+
+
+def test_reason_waits_for_runnable_or_claimed_work_but_can_resolve_blocked_work() -> None:
+    loop = _loop()
+    intent = make_intent()
+    intent.worker = None
+    project = make_project(intents=[intent])
+
+    assert not loop._reason_may_run(project)
+    intent.worker = "test-worker"
+    assert not loop._reason_may_run(project)
+    intent.worker = None
+    project.errors.append(IntentError(
+        id="e001",
+        intent_id=intent.id,
+        task_type="explore",
+        worker="test-worker",
+        code="proof_contract_mismatch",
+        classification="blocked",
+        message="wrong proof type",
+        first_failed_at="2026-01-01T00:00:00Z",
+        last_failed_at="2026-01-01T00:00:00Z",
+    ))
+    assert loop._reason_may_run(project)
 
 
 def test_coverage_plan_is_model_free_explore_work() -> None:

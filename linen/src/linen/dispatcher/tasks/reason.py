@@ -612,6 +612,33 @@ def run_reason_task(
                     resolution["action"],
                 )
                 if not response.ok:
+                    if response.status_code == 409 and resolution["action"] == "retry":
+                        current = client.get_project(project.project.id)
+                        current_intent = next(
+                            (item for item in current.intents if item.id == resolution["intent_id"]),
+                            None,
+                        )
+                        unresolved_error = next(
+                            (
+                                error for error in current.errors
+                                if error.intent_id == resolution["intent_id"]
+                                and error.resolved_at is None
+                            ),
+                            None,
+                        )
+                        if (
+                            current_intent is not None
+                            and current_intent.to is None
+                            and current_intent.concluded_at is None
+                            and current_intent.worker is None
+                            and unresolved_error is None
+                        ):
+                            LOG.info(
+                                "reason retry already satisfied project=%s intent=%s",
+                                project.project.id,
+                                resolution["intent_id"],
+                            )
+                            continue
                     LOG.warning(
                         "reason intent resolution failed project=%s intent=%s action=%s "
                         "status=%s body=%s",
@@ -667,11 +694,15 @@ def run_reason_task(
         if kind == "intents":
             created = 0
             for intent_data in data:
+                intent_type = intent_data.get("type")
                 if scope_audit:
                     fresh = client.get_project(project.project.id)
                     try:
                         coverage.validate_intent(fresh, Path(container_name), config.audit.coverage, intent_data)
-                        if audit_graph.managed_description(intent_data["description"]):
+                        if (
+                            audit_graph.managed_description(intent_data["description"])
+                            and intent_type != "search:skill"
+                        ):
                             raise ValueError(
                                 "Reserved audit intents are materialized from graph state by the dispatcher"
                             )
@@ -686,7 +717,6 @@ def run_reason_task(
                 # validate/reach/characterize intents. Pass it through so the
                 # scheduler can route review intents to the review dispatcher
                 # (loop.py: `if intent.type == "review"`).
-                intent_type = intent_data.get("type")
                 if intent_type == "search:skill":
                     skill_id = intent_data.get("target")
                     selected_skill = next(

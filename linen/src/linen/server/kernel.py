@@ -330,6 +330,11 @@ def create_intent(conn: sqlite3.Connection, project_id: str, body: CreateIntentR
     # never part of identity: ``from`` describes inputs, not the task.
     action = body.action or body.type or semantic_type or "investigate"
     target = body.target or body.description
+    if body.target is None and body.description.startswith("@coverage:"):
+        # A coverage retry is a new attempt only after its reviewed predecessor
+        # becomes an input. Keep general intent identity independent of evidence,
+        # while giving this reserved workflow an append-only attempt history.
+        target = f"{body.description}:attempt:{'|'.join(sorted(body.from_))}"
     intent_key = hashlib.sha256(
         json.dumps(
             {"action": canonical(action), "target": canonical(target)},

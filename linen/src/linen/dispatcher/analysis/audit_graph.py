@@ -404,11 +404,6 @@ def audit_summary_inputs(
             if fact is None or fact.type != "module_summary" or not _reviewed(project, fact.id):
                 return None
             scanner_ids.append(fact.id)
-        if any(
-            len(_scanner_sources(project, workdir, spec.name, completed_only=True)) != 1
-            for spec in scanner_specs(config)
-        ):
-            return None
         if config.spring.enabled and not any(fact.type == "route_scan" for fact in expected_scanners):
             return None
         for source in expected_scanners:
@@ -483,9 +478,10 @@ def audit_summary_fact(
         "input_fact_ids": inputs,
         "confirmed_vulnerability_ids": sorted(vulnerabilities),
         "statement": (
-            "The scope gate and configured coverage, scanner, and semantic recipe branches "
-            "completed on frozen evidence; policy eligibility remains separate from technical "
-            "exploitability and this is not proof of repository safety."
+            "The scope gate and required coverage and semantic recipe branches completed on "
+            "frozen evidence. Any scanner branches selected by a worker are included in the "
+            "reviewed inputs; an unselected scanner is not evidence of safety. Policy eligibility "
+            "remains separate from technical exploitability."
         ),
     }
     directory = workdir / ".linen-analysis" / ("audit-summary-" + uuid.uuid4().hex)
@@ -496,8 +492,9 @@ def audit_summary_fact(
         "type": "audit_summary",
         "description": (
             f"Scope audit synthesis completed with {len(vulnerabilities)} confirmed vulnerabilities. "
-            "All configured coverage, scanner, and semantic recipe branches reached reviewed summaries; "
-            "declared exclusions remain part of the evidence and this does not prove the repository safe."
+            "All required coverage and semantic recipe branches reached reviewed summaries; selected "
+            "scanner branches are included when present. Declared exclusions and tools not run remain "
+            "part of the limitations, and this does not prove the repository safe."
         ),
         "evidence": (
             f"artifact: {path}\nmanifest_sha256: {digest(path.read_bytes())}\n"
@@ -575,7 +572,7 @@ def required_intents(
         return []
 
     proposals: list[dict] = []
-    if not any(fact.type == "coverage_plan" for fact in project.facts) and not _open(project, coverage.PLAN_INTENT):
+    if not any(fact.type == "coverage_plan" for fact in project.facts) and not _proposal_exists(project, coverage.PLAN_INTENT):
         proposals.append({"from": [plan_anchor], "type": "search", "description": coverage.PLAN_INTENT})
     if proposals:
         return proposals[:limit]
@@ -641,7 +638,13 @@ def required_intents(
                             continue
                         from_ids.append(result.id)
                     if not _open(project, row["description"]):
-                        proposals.append({"from": from_ids, "type": "verify", "description": row["description"]})
+                        attempt_anchor = row["result_id"] or "initial"
+                        proposals.append({
+                            "from": from_ids,
+                            "type": "verify",
+                            "description": row["description"],
+                            "target": f"{row['description']}:attempt:{attempt_anchor}",
+                        })
         except (ValueError, OSError, KeyError, TypeError):
             pass
 
@@ -694,23 +697,6 @@ def scope_blockers(
         blockers.append("Scope completion must reference a reviewed audit_summary fact.")
     elif not _reviewed(project, summary.id):
         blockers.append(f"{summary.id} requires a firm/certain VALID review.")
-    for spec in scanner_specs(config):
-        scans = _scanner_sources(project, workdir, spec.name, completed_only=True)
-        if len(scans) != 1:
-            attempts = len(_scanner_sources(project, workdir, spec.name))
-            blockers.append(
-                f"Scope audit requires one completed {spec.label} scan_batch "
-                f"(attempts {attempts}/{spec.config.max_attempts})."
-            )
-        for fact in scans:
-            try:
-                _, manifest = load_artifact(fact, workdir)
-                if manifest.get("status") != "completed":
-                    blockers.append(
-                        f"{spec.label} {fact.id} is {manifest.get('status')}; completed is required."
-                    )
-            except (ValueError, OSError, KeyError, TypeError) as exc:
-                blockers.append(f"Invalid {spec.label} evidence {fact.id}: {exc}")
     if config.spring.enabled:
         routes = _completed_sources(project, workdir, "route_scan")
         if len(routes) != 1:

@@ -176,7 +176,7 @@ def _optional_text(value: Any) -> str | None:
     return text or None
 
 
-def validate_explore_payload(payload: dict[str, Any]) -> tuple[str, dict[str, str | None] | None]:
+def validate_explore_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
     accepted, data = _unwrap_wrapped_payload(payload)
     if accepted is False:
         return "rejected", None
@@ -195,11 +195,16 @@ def validate_explore_payload(payload: dict[str, Any]) -> tuple[str, dict[str, st
     fact_evidence = _optional_text(data.get("evidence"))
     if data.get("evidence") is not None and fact_evidence is None:
         raise ValueError("evidence must be a non-empty string when provided")
-    return "fact", {
+    fact: dict[str, Any] = {
         "description": description.strip(),
         "type": fact_type,
         "evidence": fact_evidence,
     }
+    if data.get("proof") is not None:
+        if not isinstance(data["proof"], dict):
+            raise ValueError("proof must be an object when provided")
+        fact["proof"] = data["proof"]
+    return "fact", fact
 
 
 def validate_review_payload(

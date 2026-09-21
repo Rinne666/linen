@@ -316,7 +316,7 @@ def test_scope_fans_out_and_gates_each_scanner_by_identity(api, configured_scann
     }
     blockers = audit_graph.scope_blockers(current, workdir, configured_scanners.audit, [])
     for label in ("Semgrep", "SpotBugs + FindSecBugs", "OSV-Scanner", "Gitleaks", "Trivy"):
-        assert any(label in blocker for blocker in blockers)
+        assert all(label not in blocker for blocker in blockers)
 
 
 def test_startup_rejects_enabled_missing_scanner(configured_scanners, monkeypatch):

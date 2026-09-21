@@ -52,7 +52,7 @@ FACT_SEMANTIC_TYPES: dict[str, str] = {
     "hypothesis_batch": "hypothesis",
     "variant_batch": "hypothesis",
     "candidate_triage": "hypothesis",
-    "candidate_disposition": "candidate_finding",
+    "candidate_disposition": "observation",
     "vulnerability": "candidate_finding",
     "negative_assurance": "negative_assurance",
     "module_summary": "summary",
@@ -456,58 +456,75 @@ def completion_gate_from_db(
             blockers.append(detail)
 
     open_rows = conn.execute(
-        "SELECT id FROM intents WHERE project_id = ? AND concluded_at IS NULL",
+        "SELECT id, worker, phase FROM intents WHERE project_id = ? AND concluded_at IS NULL",
         (project_id,),
     ).fetchall()
+    blocking_open_rows = [row for row in open_rows if row["phase"] != "baseline_scan"]
+    on_demand_open_rows = [row for row in open_rows if row["phase"] == "baseline_scan"]
     exhaustive = (project["completion_policy"] if "completion_policy" in project.keys() else "goal_based") == "exhaustive"
     add(
         "open_work",
         "All audit tasks reached a terminal state",
-        not open_rows if exhaustive else True,
+        not blocking_open_rows if exhaustive else True,
         "No open audit tasks remain." if not open_rows else (
-            f"{len(open_rows)} audit task(s) remain open." if exhaustive
+            f"No required audit tasks remain; {len(on_demand_open_rows)} on-demand tool run(s) remain open."
+            if exhaustive and not blocking_open_rows
+            else f"{len(blocking_open_rows)} required audit task(s) remain open." if exhaustive
             else "Open work is allowed after the goal is satisfied."
         ),
-        evidence_ids=[row["id"] for row in open_rows],
+        evidence_ids=[row["id"] for row in blocking_open_rows],
         blocking=exhaustive,
-        status="pass" if not open_rows or not exhaustive else "fail",
+        status="pass" if not blocking_open_rows or not exhaustive else "fail",
     )
 
     error_rows = conn.execute(
-        "SELECT e.id, e.code FROM intent_errors e JOIN intents i "
+        "SELECT e.id, e.code, i.phase FROM intent_errors e JOIN intents i "
         "ON i.project_id = e.project_id AND i.id = e.intent_id "
         "WHERE e.project_id = ? AND e.resolved_at IS NULL AND i.source_generation = ?",
         (project_id, generation),
     ).fetchall()
+    blocking_error_rows = [row for row in error_rows if row["phase"] != "baseline_scan"]
+    on_demand_error_rows = [row for row in error_rows if row["phase"] == "baseline_scan"]
     add(
         "operational_errors",
-        "No unresolved execution errors",
-        not error_rows,
-        "No unresolved execution errors." if not error_rows
-        else f"{len(error_rows)} unresolved execution error(s) block completion.",
-        evidence_ids=[row["id"] for row in error_rows],
+        "No unresolved blocking execution errors",
+        not blocking_error_rows,
+        (
+            f"{len(on_demand_error_rows)} on-demand tool error(s) remain visible but do not block completion."
+            if on_demand_error_rows and not blocking_error_rows
+            else "No unresolved execution errors." if not error_rows
+            else f"{len(blocking_error_rows)} unresolved execution error(s) block completion."
+        ),
+        evidence_ids=[row["id"] for row in blocking_error_rows],
     )
 
     decisions = effective_human_decisions(conn, project_id)
     stages = list_audit_stages(conn, project_id)
     if stages:
+        required_stages: list[AuditStage] = []
         incomplete_stages: list[AuditStage] = []
         for stage in stages:
-            if not stage.required or stage.status in {"satisfied", "not_applicable"}:
+            if not stage.required:
                 continue
             decision = decisions.get(("stage", stage.stage_id))
             if decision is not None and decision.decision == "waive":
+                continue
+            required_stages.append(stage)
+            if stage.status in {"satisfied", "not_applicable"}:
                 continue
             incomplete_stages.append(stage)
         add(
             "pipeline_stages",
             "Required audit stages completed",
             not incomplete_stages,
-            "All required audit stages are satisfied." if not incomplete_stages
+            "No audit stages are required for completion; available scanners run on demand."
+            if not required_stages
+            else "All required audit stages are satisfied." if not incomplete_stages
             else "Incomplete stages: " + ", ".join(
                 f"{stage.label} ({stage.status})" for stage in incomplete_stages
             ) + ".",
             evidence_ids=[stage.stage_id for stage in incomplete_stages],
+            status="not_applicable" if not required_stages else None,
         )
         receipt_rows = conn.execute(
             "SELECT * FROM skill_runs WHERE project_id = ? AND source_generation = ? "
@@ -515,6 +532,7 @@ def completion_gate_from_db(
             (project_id, generation, plan_revision),
         ).fetchall()
         receipts_by_id = {row["id"]: row for row in receipt_rows}
+        required_skill_stages: list[AuditStage] = []
         invalid_receipt_stages: list[AuditStage] = []
         valid_receipt_ids: list[str] = []
         for stage in stages:
@@ -523,6 +541,7 @@ def completion_gate_from_db(
             decision = decisions.get(("stage", stage.stage_id))
             if decision is not None and decision.decision == "waive":
                 continue
+            required_skill_stages.append(stage)
             receipt = receipts_by_id.get(stage.run_id or "")
             valid = bool(
                 receipt is not None
@@ -546,12 +565,15 @@ def completion_gate_from_db(
             "skill_receipts",
             "Managed Skill runs have verified receipts",
             not invalid_receipt_stages,
-            "All required managed Skill runs have terminal receipts and verified artifact hashes."
+            "On-demand scanner receipts are verified when a tool runs; none are required for completion."
+            if not required_skill_stages
+            else "All required managed Skill runs have terminal receipts and verified artifact hashes."
             if not invalid_receipt_stages
             else "Missing or invalid Skill receipts: " + ", ".join(
                 stage.label for stage in invalid_receipt_stages
             ) + ".",
             evidence_ids=valid_receipt_ids,
+            status="not_applicable" if not required_skill_stages else None,
         )
     else:
         add(
@@ -583,6 +605,12 @@ def completion_gate_from_db(
     unresolved_candidates = [
         row for row in candidate_rows
         if row["status"] == "draft" or not _decisively_reviewed(conn, project_id, row["id"])
+    ]
+    reviewed_candidates = [
+        row for row in candidate_rows
+        if row["semantic_type"] == "candidate_finding"
+        and row["status"] == "triaged"
+        and _strongly_reviewed(conn, project_id, row["id"])
     ]
     add(
         "finding_reviews",
@@ -640,11 +668,19 @@ def completion_gate_from_db(
             evidence_ids=selected_ids,
         )
     elif audit_mode != "none":
+        reviewed_candidate_ids = [row["id"] for row in reviewed_candidates]
+        reviewed_count = len(reviewed_candidate_ids)
         add(
             "evidence_chain",
-            "Completion evidence is reviewed and connected",
+            "Technical confirmation pending" if reviewed_count else "Terminal audit evidence is missing",
             False,
-            "Select the reviewed terminal audit evidence for completion.",
+            (
+                f"{reviewed_count} reviewed candidate finding"
+                f"{'s are' if reviewed_count != 1 else ' is'} waiting for Technical Confirmation."
+                if reviewed_count
+                else "No reviewed terminal audit evidence is available yet."
+            ),
+            evidence_ids=reviewed_candidate_ids,
         )
     else:
         add(
@@ -681,10 +717,14 @@ def completion_gate_from_db(
         status="pass" if snapshot is not None else "pending",
     )
 
+    claimed_rows = [row for row in open_rows if row["worker"] is not None]
     execution_status = "complete" if project["status"] == "completed" else (
         "paused" if project["status"] in {"paused", "stopped"} else
-        "blocked" if error_rows else
-        "running" if open_rows or project["reason_worker"] else
+        "blocked" if blocking_error_rows else
+        "reasoning" if project["reason_worker"] else
+        "working" if claimed_rows else
+        "idle_attention_required" if on_demand_error_rows else
+        "queued" if open_rows else
         "idle_attention_required" if blockers else
         "idle"
     )

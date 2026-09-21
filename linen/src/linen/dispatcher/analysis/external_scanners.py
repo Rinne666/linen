@@ -79,12 +79,14 @@ def scanner_for_intent(config: AuditConfig, description: str) -> ScannerSpec | N
 def scanner_reason_instructions(config: AuditConfig) -> str:
     labels = ", ".join(spec.label for spec in scanner_specs(config))
     return f"""
-Managed baseline scanners configured: {labels}. The dispatcher materializes their
-reserved @analysis intents; do not duplicate those intents. Every scan_batch is an
-execution record containing unverified candidates, not a vulnerability or proof of
-safety. Read the manifest and candidates artifact, then create bounded trace/validate
-intents for promising fingerprints without repeating covered candidates. A failed or
-partial batch establishes neither coverage nor safety.
+On-demand scanners available: {labels}. Select a scanner only through an exact Trusted
+Skill choice supplied by the dispatcher; do not invent or duplicate reserved @analysis
+intents. Scanners strengthen an investigation but are not completion requirements.
+Every scan_batch is an execution record containing unverified candidates, not a
+vulnerability or proof of safety. Read the manifest and candidates artifact, then
+create bounded trace/validate intents for promising fingerprints without repeating
+covered candidates. A scanner that was not run, failed, or returned a partial batch
+establishes neither coverage nor safety.
 """
 
 

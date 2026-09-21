@@ -13,13 +13,13 @@ def test_graph_defaults_to_current_and_exposes_four_projection_views() -> None:
     assert "setGraphView('full')" in html
     assert "setGraphView('list')" in html
     assert 'aria-label="Show current execution focus"' in html
-    assert 'aria-label="Show full blackboard map"' in html
+    assert 'aria-label="Show graph"' in html
 
 
 def test_current_projection_has_priority_order_and_non_empty_anchor_fallback() -> None:
     html = HTML_PATH.read_text(encoding="utf-8")
 
-    current_start = html.index("currentFocusIntents()")
+    current_start = html.index("currentFocusIntents() {")
     current_end = html.index("currentGraphFocus()", current_start)
     current_logic = html[current_start:current_end]
     assert "const running = open.filter(intent => Boolean(intent.worker));" in current_logic
@@ -29,6 +29,18 @@ def test_current_projection_has_priority_order_and_non_empty_anchor_fallback() -
     assert "for (const anchor of ['origin', 'goal'])" in html
     assert ".filter(fact => this.isCurrentFallbackFact(fact)).slice(-4)" in html
     assert "if (!nodeIds.size)" in html
+
+
+def test_current_projection_expands_a_bounded_causal_neighborhood() -> None:
+    html = HTML_PATH.read_text(encoding="utf-8")
+
+    assert "const maxNodes = compactGraph ? 6 : 10;" in html
+    assert "const maxEdges = compactGraph ? 8 : 14;" in html
+    assert "const maxDepth = compactGraph ? 2 : 3;" in html
+    assert "const producerByFact = new Map(" in html
+    assert "queue.push({ factId: sourceId, depth: depth + 1 });" in html
+    assert "currentContextSummary()" in html
+    assert "Open full map" in html
 
 
 def test_full_map_keeps_existing_filters_and_projection_is_client_side() -> None:

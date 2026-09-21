@@ -63,6 +63,7 @@ class DispatcherLoop:
         self.worker_rejected_until: dict[tuple[str, str, str], float] = {}
         self.worker_provider_until: dict[str, float] = {}
         self.worker_provider_reason: dict[str, str] = {}
+        self._manual_provider_retries_seen: set[str] = set()
         self._restore_provider_circuits()
         self._log_state: dict[str, tuple[int, str, tuple[object, ...]]] = {}
         self._cleanup_pending: set[str] = set()
@@ -415,6 +416,7 @@ class DispatcherLoop:
                 project.project.status,
             )
             return False
+        self._honor_manual_provider_retries(project)
         # Managed audit mechanics are derived exclusively from the exported
         # graph and immutable project artifacts. Scope mode derives the full
         # coverage DAG; hypothesis mode derives only configured baseline scan
@@ -432,7 +434,7 @@ class DispatcherLoop:
 
         if project.project.reason is None:
             reason_trigger = self._reason_trigger(project)
-            if reason_trigger is not None:
+            if reason_trigger is not None and self._reason_may_run(project):
                 export_yaml = self.client.export_project(summary.id)
                 return self._dispatch_reason(project, export_yaml, reason_trigger)
         running_intent_ids = self._project_running_explore_intents(summary.id)
@@ -686,6 +688,7 @@ class DispatcherLoop:
                 if not proposal["description"].strip().startswith(coverage.CELL_PREFIX)
             ][:1]
         created = 0
+        known_intent_ids = {intent.id for intent in project.intents}
         for proposal in proposals:
             response = self.client.create_intent(
                 project.project.id,
@@ -704,6 +707,10 @@ class DispatcherLoop:
                     project.project.id, response.status_code, response.text, proposal["description"],
                 )
                 continue
+            response_intent_id = response.data.get("id") if isinstance(response.data, dict) else None
+            if not isinstance(response_intent_id, str) or response_intent_id in known_intent_ids:
+                continue
+            known_intent_ids.add(response_intent_id)
             created += 1
         if created:
             LOG.info(
@@ -1237,6 +1244,51 @@ class DispatcherLoop:
             return None
         return Path(root).expanduser() / ".linen-provider-circuits.json"
 
+    def _honor_manual_provider_retries(self, project: ProjectDetail) -> None:
+        """Let an explicit Retry now bypass one persisted provider cooldown."""
+        seen = getattr(self, "_manual_provider_retries_seen", None)
+        if seen is None:
+            seen = self._manual_provider_retries_seen = set()
+        changed = False
+        for error in project.errors:
+            if (
+                error.id in seen
+                or error.resolved_at is None
+                or not (error.resolution or "").startswith("manual retry requested by ")
+            ):
+                continue
+            seen.add(error.id)
+            try:
+                resolved_at = datetime.fromisoformat(
+                    error.resolved_at.replace("Z", "+00:00")
+                ).timestamp()
+            except ValueError:
+                continue
+            worker_names = [error.worker] if error.worker else list(self.worker_provider_until)
+            for worker_name in worker_names:
+                if not worker_name:
+                    continue
+                until = self.worker_provider_until.get(worker_name, 0)
+                reason = self.worker_provider_reason.get(worker_name)
+                retry_window = (
+                    QUOTA_EXHAUSTED_RETRY_AFTER_SECONDS
+                    if reason == "quota_exhausted"
+                    else RATE_LIMIT_RETRY_AFTER_SECONDS
+                )
+                if until <= 0 or resolved_at < until - retry_window:
+                    continue
+                self.worker_provider_until.pop(worker_name, None)
+                self.worker_provider_reason.pop(worker_name, None)
+                changed = True
+                LOG.info(
+                    "manual retry cleared provider circuit project=%s intent=%s worker=%s",
+                    project.project.id,
+                    error.intent_id,
+                    worker_name,
+                )
+        if changed:
+            self._persist_provider_circuits()
+
     def _restore_provider_circuits(self) -> None:
         path = self._provider_circuit_path()
         if path is None or not path.is_file():
@@ -1324,6 +1376,25 @@ class DispatcherLoop:
 
     def _project_open_intent_count(self, project: ProjectDetail) -> int:
         return sum(1 for intent in project.intents if intent.to is None and intent.concluded_at is None)
+
+    def _reason_may_run(self, project: ProjectDetail) -> bool:
+        """Do not let strategy race work that is already runnable or claimed."""
+        open_intents = [
+            intent for intent in project.intents
+            if intent.to is None and intent.concluded_at is None
+        ]
+        if not open_intents:
+            return True
+        for intent in open_intents:
+            blocked = any(
+                error.intent_id == intent.id
+                and error.resolved_at is None
+                and error.classification == "blocked"
+                for error in project.errors
+            )
+            if intent.worker is not None or not blocked:
+                return False
+        return True
 
     def _reason_trigger(self, project: ProjectDetail) -> str | None:
         if project.project.event_seq > project.project.reason_last_seen_event_seq:

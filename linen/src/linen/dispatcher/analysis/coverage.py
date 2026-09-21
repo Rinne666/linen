@@ -416,12 +416,14 @@ def reason_instructions(project: ProjectDetail, workdir: Path, config: CoverageC
 Scope audit policy (overrides hypothesis completion): Finding one vulnerability does
 NOT finish this project. Reserved @analysis, @coverage, @candidate-triage, and
 @candidate-verify intents are derived from the blackboard and materialized by the
-dispatcher; do not emit or duplicate them. Review their results as graph facts.
+dispatcher; do not emit or duplicate them. The only exception is an exact
+`search:skill` choice supplied separately by the dispatcher: select one when its
+trusted scanner would materially improve the investigation. Review results as graph facts.
 checked/not_applicable only count after VALID review. For needs_followup, trace every
 lead with an ordinary source-grounded intent; the dispatcher will schedule a repeat
 that references the prior result. Retry exhaustion and unexplained skips mean
 INCOMPLETE, not safe. Do not complete until a reviewed audit_summary exists, every
-configured branch has fanned into it, and no intent or unresolved finding remains.
+required branch has fanned into it, and no intent or unresolved finding remains.
 Completion may report zero findings and must reference that audit_summary. State
 precisely that this covers configured checks on frozen snapshots with declared
 exclusions, not that the entire repository is safe.

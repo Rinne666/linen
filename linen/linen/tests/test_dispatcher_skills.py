@@ -37,11 +37,23 @@ def test_receipt_rejects_unregistered_skill(tmp_path: Path) -> None:
         }, allowed_root=tmp_path)
 
 
-def test_stage_skeleton_is_stable_and_marks_disabled_scanners_optional() -> None:
+def test_stage_skeleton_is_stable_and_marks_scanners_on_demand(tmp_path: Path) -> None:
     config = AuditConfig(enabled=True, semgrep=SemgrepConfig(enabled=False))
     first = stage_definitions(config, "hypothesis")
     second = stage_definitions(config, "hypothesis")
     assert first == second
     semgrep = next(stage for stage in first if stage.stage_id == "semgrep")
     assert semgrep.required is False
+    assert semgrep.enabled is False
     assert semgrep.skill_id == "security.semgrep"
+
+    enabled = AuditConfig(
+        enabled=True,
+        semgrep=SemgrepConfig(enabled=True, rules=tmp_path / "rules.yaml"),
+    )
+    enabled_semgrep = next(
+        stage for stage in stage_definitions(enabled, "hypothesis")
+        if stage.stage_id == "semgrep"
+    )
+    assert enabled_semgrep.required is False
+    assert enabled_semgrep.enabled is True
