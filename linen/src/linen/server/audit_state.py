@@ -602,14 +602,21 @@ def completion_gate_from_db(
         if row["type"] == "vulnerability"
         or row["semantic_type"] in {"candidate_finding", "confirmed_finding", "rejected_finding"}
     ]
+    human_excluded_candidate_ids = {
+        target_id
+        for (target_kind, target_id), decision in decisions.items()
+        if target_kind == "fact" and decision.decision in {"reject", "exclude"}
+    }
     unresolved_candidates = [
         row for row in candidate_rows
-        if row["status"] == "draft" or not _decisively_reviewed(conn, project_id, row["id"])
+        if row["id"] not in human_excluded_candidate_ids
+        and (row["status"] == "draft" or not _decisively_reviewed(conn, project_id, row["id"]))
     ]
     reviewed_candidates = [
         row for row in candidate_rows
         if row["semantic_type"] == "candidate_finding"
         and row["status"] == "triaged"
+        and row["id"] not in human_excluded_candidate_ids
         and _strongly_reviewed(conn, project_id, row["id"])
     ]
     add(

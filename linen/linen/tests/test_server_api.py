@@ -189,6 +189,26 @@ def test_gate_identifies_reviewed_candidates_waiting_for_technical_confirmation(
     assert evidence_check["evidence_ids"] == [candidate_id]
     assert gate["blockers"] == [evidence_check["detail"]]
 
+    rejected = client.post(
+        f"/projects/{project_id}/decisions",
+        json={
+            "target_kind": "fact",
+            "target_id": candidate_id,
+            "decision": "reject",
+            "rationale": "The authorization check is enforced by the shared guard.",
+            "actor": "human",
+        },
+    )
+    assert rejected.status_code == 201, rejected.text
+
+    gate = client.get(f"/projects/{project_id}/completion-gate").json()
+    evidence_check = next(check for check in gate["checks"] if check["id"] == "evidence_chain")
+    reviews_check = next(check for check in gate["checks"] if check["id"] == "finding_reviews")
+    assert evidence_check["label"] == "Terminal audit evidence is missing"
+    assert evidence_check["evidence_ids"] == []
+    assert reviews_check["status"] == "pass"
+    assert "Technical Confirmation" not in " ".join(gate["blockers"])
+
 
 def test_stage_put_is_idempotent_and_decision_targets_are_validated(client: TestClient) -> None:
     project_id = _create_project(client)
@@ -919,12 +939,13 @@ def test_summary_export_separates_confirmed_excluded_and_pending_findings(
         )
 
     assert client.post(
-        f"/projects/{project_id}/facts/f002/reviews",
+        f"/projects/{project_id}/decisions",
         json={
-            "verdict": "INVALID",
-            "confidence": "certain",
-            "summary": "Permission check makes the path unreachable.",
-            "created_by": "reviewer",
+            "target_kind": "fact",
+            "target_id": "f002",
+            "decision": "reject",
+            "rationale": "Permission check makes the path unreachable.",
+            "actor": "human",
         },
     ).status_code == 201
     assert client.post(
