@@ -116,6 +116,25 @@ def test_primary_status_and_current_summary_explain_next_owner() -> None:
     assert "candidate${candidates === 1 ? '' : 's'} ·" in source
 
 
+def test_confirmed_finding_keeps_its_own_badge_and_reuses_candidate_reviews() -> None:
+    source = html()
+    start = source.index("findingVerificationLabel(fact)")
+    end = source.index("findingVerificationClass(fact)", start)
+    label = source[start:end]
+    assert "if (fact?.semantic_type === 'confirmed_finding') return 'Confirmed finding';" in label
+    assert "if (this.isVulnerabilityTraceFact(fact))" in label
+    assert "findingEvidenceReviews(fact)" in source
+    assert "const evidenceFact = this.findingEvidenceFact(fact);" in source
+    assert "return this.reviewsByFactId?.[evidenceFact.id] || [];" in source
+    assert "selectedFactReviews()" in source
+
+
+def test_waiting_status_does_not_promise_automatic_wakeup() -> None:
+    source = html()
+    assert "Waiting for new evidence or a Reason trigger." in source
+    assert "New evidence or a Reason decision will continue the audit automatically." not in source
+
+
 def test_confirmed_finding_reuses_candidate_evidence_and_findings_are_the_default_audit_view() -> None:
     source = html()
     assert "findingEvidenceFact(fact)" in source

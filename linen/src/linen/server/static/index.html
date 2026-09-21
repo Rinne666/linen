@@ -1441,10 +1441,10 @@
                         <span x-text="runReviewSubmitting ? 'Submitting…' : 'Run review'"></span>
                       </button>
                     </div>
-                    <template x-if="selectedFactReviews().length === 0">
+                    <template x-if="findingEvidenceReviews(selectedFactRecord()).length === 0">
                       <p class="text-[11px] text-slate-400">No reviews yet. Click <em>Run review</em> to dispatch an adversarial worker.</p>
                     </template>
-                    <template x-for="r in selectedFactReviews()" :key="r.id">
+                    <template x-for="r in findingEvidenceReviews(selectedFactRecord())" :key="r.id">
                       <details class="rounded-lg border border-slate-200 bg-white" :open="!isVulnerabilityTraceFact(selectedFactRecord())">
                         <summary class="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5">
                           <svg class="h-4 w-4 shrink-0" :class="r.verdict === 'VALID' ? 'text-emerald-600' : r.verdict === 'INVALID' ? 'text-rose-600' : 'text-amber-600'" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>
@@ -2591,7 +2591,7 @@ function linenApp() {
         return {
           eyebrow: 'Waiting',
           title: 'Waiting for the next audit step',
-          detail: 'No worker is running. New evidence or a Reason decision will continue the audit automatically.',
+          detail: 'Waiting for new evidence or a Reason trigger.',
           tone: 'neutral',
         };
       }
@@ -2963,6 +2963,7 @@ function linenApp() {
     },
 
     findingVerificationLabel(fact) {
+      if (fact?.semantic_type === 'confirmed_finding') return 'Confirmed finding';
       if (this.isVulnerabilityTraceFact(fact)) return this.verificationOutcomeLabel(fact);
       if (fact?.status === 'draft') return 'Under review';
       if (fact?.status === 'false_positive') return 'Rejected';
@@ -2982,7 +2983,7 @@ function linenApp() {
 
     findingListMeta(fact) {
       const traceCount = this.vulnerabilityTrace(fact).length;
-      const reviewCount = (this.reviewsByFactId?.[fact.id] || []).length;
+      const reviewCount = this.findingEvidenceReviews(fact).length;
       const parts = [];
       if (traceCount) parts.push(`${traceCount} trace step${traceCount === 1 ? '' : 's'}`);
       if (reviewCount) parts.push(`${reviewCount} review${reviewCount === 1 ? '' : 's'}`);
@@ -5981,6 +5982,12 @@ function linenApp() {
       if (!factId) return [];
       const map = this.reviewsByFactId || {};
       return map[factId] || [];
+    },
+
+    findingEvidenceReviews(fact) {
+      const evidenceFact = this.findingEvidenceFact(fact);
+      if (!evidenceFact) return [];
+      return this.reviewsByFactId?.[evidenceFact.id] || [];
     },
 
     selectedFactProducingIntent() {
