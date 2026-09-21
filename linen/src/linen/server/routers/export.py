@@ -397,6 +397,242 @@ def _markdown_code_block(value: str) -> str:
     return "\n".join(f"    {line}" if line else "    " for line in lines)
 
 
+def _compact_text(value: object | None, limit: int = 1200) -> str:
+    """Keep the summary readable without inventing a semantic rewrite."""
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _fact_title(fact) -> str:
+    return _compact_text(
+        fact["display_title"] or fact["description"] or fact["id"],
+        limit=180,
+    )
+
+
+def _export_summary(conn, project_id: str) -> str:
+    """Render a short, decision-focused audit report.
+
+    Confirmed findings are created only by Technical Confirmation. Rejected
+    candidates require a decisive Review or human decision. Everything else
+    remains visibly pending instead of being silently promoted or discarded.
+    """
+    proj, facts, _hints, _intents, _sources_by_intent = _load_project_data(
+        conn, project_id
+    )
+    reviews = list_reviews_for_project(conn, project_id)
+    decisions = [
+        decision
+        for decision in list_human_decisions(conn, project_id)
+        if decision.source_generation == proj["source_generation"]
+    ]
+    superseded_decisions = {
+        decision.supersedes_id for decision in decisions if decision.supersedes_id
+    }
+    effective_decisions = {
+        (decision.target_kind, decision.target_id): decision
+        for decision in decisions
+        if decision.id not in superseded_decisions
+    }
+    reviews_by_fact: dict[str, list] = {}
+    for review in reviews:
+        reviews_by_fact.setdefault(review.fact_id, []).append(review)
+
+    facts_by_id = {fact["id"]: fact for fact in facts}
+    goal = facts_by_id.get("goal")
+    domain_facts = [fact for fact in facts if fact["id"] not in {"origin", "goal"}]
+    confirmed = [
+        fact for fact in domain_facts if fact["semantic_type"] == "confirmed_finding"
+    ]
+    confirmed_ids = {fact["id"] for fact in confirmed}
+
+    edges = list_graph_edges(conn, project_id)
+    promoted_candidate_ids = {
+        edge.source_id
+        for edge in edges
+        if edge.relation_type == "promotes_to" and edge.target_id in confirmed_ids
+    }
+    for fact in confirmed:
+        proof = _export_proof(fact["proof"]) or {}
+        candidate_id = proof.get("attributes", {}).get("candidate_id")
+        if isinstance(candidate_id, str):
+            promoted_candidate_ids.add(candidate_id)
+
+    candidates = [
+        fact
+        for fact in domain_facts
+        if fact["id"] not in promoted_candidate_ids
+        and fact["semantic_type"] != "confirmed_finding"
+        and (
+            fact["type"] == "vulnerability"
+            or fact["semantic_type"] in {"candidate_finding", "rejected_finding"}
+        )
+    ]
+
+    excluded: list[tuple[object, str, str]] = []
+    pending = []
+    for fact in candidates:
+        fact_reviews = reviews_by_fact.get(fact["id"], [])
+        latest_review = fact_reviews[-1] if fact_reviews else None
+        decision = effective_decisions.get(("fact", fact["id"]))
+        exclusion_label = ""
+        exclusion_reason = ""
+        if decision is not None and decision.decision in {"reject", "exclude"}:
+            exclusion_label = "Rejected" if decision.decision == "reject" else "Excluded from scope"
+            exclusion_reason = decision.rationale
+        elif latest_review is not None and latest_review.verdict == "INVALID":
+            confidence = latest_review.confidence or "unspecified confidence"
+            exclusion_label = f"Independent Review: INVALID / {confidence}"
+            exclusion_reason = latest_review.summary
+        elif fact["semantic_type"] == "rejected_finding" or fact["status"] == "false_positive":
+            exclusion_label = "Rejected finding"
+            exclusion_reason = "The candidate is recorded as a false positive; no decisive Review summary is available."
+
+        if exclusion_reason:
+            excluded.append((fact, exclusion_label, exclusion_reason))
+        else:
+            pending.append(fact)
+
+    status_label = {
+        "completed": "Completed",
+        "active": "In progress",
+        "stopped": "Paused",
+        "paused": "Paused",
+    }.get(proj["status"], proj["status"])
+    generated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    lines = [
+        f"# {_markdown_text(proj['title'])} — Security Audit Summary",
+        "",
+        f"> Point-in-time summary generated {generated_at}. Graph revision `{proj['graph_revision']}`.",
+        "",
+        "## Result",
+        "",
+        f"**{len(confirmed)} confirmed vulnerabilit{'y' if len(confirmed) == 1 else 'ies'} · "
+        f"{len(excluded)} excluded candidate{'s' if len(excluded) != 1 else ''} · "
+        f"{len(pending)} pending candidate{'s' if len(pending) != 1 else ''}.**",
+        "",
+        f"**Audit status:** {_markdown_text(status_label)}  ",
+        f"**Goal:** {_markdown_text(_compact_text(goal['description'] if goal else '', 500))}",
+        "",
+        "## Confirmed vulnerabilities",
+        "",
+    ]
+
+    if not confirmed:
+        lines.extend(
+            [
+                "No technically confirmed vulnerabilities are recorded.",
+                "",
+            ]
+        )
+    else:
+        for index, fact in enumerate(confirmed, 1):
+            confirmed_proof = _export_proof(fact["proof"]) or {}
+            confirmed_attributes = confirmed_proof.get("attributes", {})
+            candidate_id = confirmed_attributes.get("candidate_id")
+            candidate = facts_by_id.get(candidate_id) if isinstance(candidate_id, str) else None
+            candidate_proof = _export_proof(candidate["proof"]) if candidate is not None else None
+            candidate_attributes = (candidate_proof or {}).get("attributes", {})
+            trace = candidate_attributes.get("trace", [])
+            endpoint = candidate_attributes.get("endpoint_id")
+            verification_level = confirmed_attributes.get("verification_level")
+            lines.extend(
+                [
+                    f"### {index}. {_markdown_text(_fact_title(fact))}",
+                    "",
+                    f"**Finding:** `{_markdown_text(fact['id'])}`"
+                    + (f" · source candidate `{_markdown_text(candidate_id)}`" if candidate_id else ""),
+                    "",
+                ]
+            )
+            if endpoint:
+                lines.extend([f"**Endpoint:** `{_markdown_text(endpoint)}`", ""])
+            if verification_level:
+                lines.extend(
+                    [
+                        f"**Confirmation:** {_markdown_text(str(verification_level).replace('_', ' '))}",
+                        "",
+                    ]
+                )
+            lines.extend([_markdown_text(_compact_text(fact["description"])), ""])
+            if isinstance(trace, list) and trace:
+                symbols = [
+                    _compact_text(step.get("symbol"), 80)
+                    for step in trace
+                    if isinstance(step, dict) and step.get("symbol")
+                ]
+                citations = []
+                for step in trace:
+                    if not isinstance(step, dict) or not step.get("file") or not step.get("line"):
+                        continue
+                    location = f"{step['file']}:{step['line']}"
+                    if location not in citations:
+                        citations.append(location)
+                if symbols:
+                    lines.extend(
+                        [
+                            "**Attack path:** " + " → ".join(_markdown_text(symbol) for symbol in symbols),
+                            "",
+                        ]
+                    )
+                if citations:
+                    lines.extend(["**Evidence locations:**", ""])
+                    lines.extend(f"- `{_markdown_text(location)}`" for location in citations)
+                    lines.append("")
+
+    lines.extend(["## Excluded candidates", ""])
+    if not excluded:
+        lines.extend(["No candidates have a decisive exclusion record.", ""])
+    else:
+        for index, (fact, label, reason) in enumerate(excluded, 1):
+            lines.extend(
+                [
+                    f"### {index}. {_markdown_text(_fact_title(fact))}",
+                    "",
+                    f"**Candidate:** `{_markdown_text(fact['id'])}`  ",
+                    f"**Decision:** {_markdown_text(label)}",
+                    "",
+                    "**Reason:** " + _markdown_text(_compact_text(reason, 900)),
+                    "",
+                ]
+            )
+
+    if pending:
+        lines.extend(
+            [
+                "## Pending candidates",
+                "",
+                "These candidates are not counted as confirmed or excluded.",
+                "",
+            ]
+        )
+        for fact in pending:
+            fact_reviews = reviews_by_fact.get(fact["id"], [])
+            latest_review = fact_reviews[-1] if fact_reviews else None
+            if latest_review is not None and latest_review.verdict == "VALID":
+                state = "Independent Review passed; Technical Confirmation is still required."
+            elif latest_review is not None:
+                state = f"Latest Review: {latest_review.verdict}."
+            else:
+                state = "Independent Review is still required."
+            lines.append(
+                f"- `{_markdown_text(fact['id'])}` — {_markdown_text(_fact_title(fact))}: {_markdown_text(state)}"
+            )
+        lines.append("")
+
+    lines.extend(
+        [
+            "## Scope and limitations",
+            "",
+            "This brief report contains terminal finding decisions only. A candidate is listed as confirmed only after Technical Confirmation, and an exclusion requires a decisive Review or human decision. It does not prove that unexamined code or vulnerability classes are safe.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _export_report(conn, project_id: str) -> str:
     proj, facts, hints, intents, sources_by_intent = _load_project_data(conn, project_id)
     reviews = list_reviews_for_project(conn, project_id)
@@ -679,11 +915,14 @@ def _export_report(conn, project_id: str) -> str:
 
 @router.get("/projects/{project_id}/export")
 def export_project(project_id: str, format: str = "yaml"):
-    if format not in ("yaml", "timeline", "report", "json", "sarif"):
-        raise HTTPException(400, "Supported formats: yaml, timeline, report, json, sarif")
+    if format not in ("yaml", "timeline", "summary", "report", "json", "sarif"):
+        raise HTTPException(400, "Supported formats: yaml, timeline, summary, report, json, sarif")
 
     with get_conn() as conn:
-        if format == "report":
+        if format == "summary":
+            text = _export_summary(conn, project_id)
+            media_type = "text/markdown"
+        elif format == "report":
             project = get_project_or_404(conn, project_id)
             snapshot = None
             if project["status"] == "completed":

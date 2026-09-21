@@ -861,7 +861,10 @@ def test_project_creation_ui_reports_clone_progress_and_blocks_duplicate_submit(
 def test_ui_exposes_report_export_download_and_copyable_sidebar(client: TestClient) -> None:
     html = client.get("/").text
 
-    assert "Final result & project export" in html
+    assert "Reports & project export" in html
+    assert "switchExportTab('summary')" in html
+    assert "Confirmed vulnerabilities, excluded candidates and decision reasons" in html
+    assert "p.audit_mode === 'none'" in html
     assert "switchExportTab('report')" in html
     assert "downloadExportPreview()" in html
     assert "copySidePanelText()" in html
@@ -869,6 +872,83 @@ def test_ui_exposes_report_export_download_and_copyable_sidebar(client: TestClie
     assert "Retry intent" in html
     assert "selectedIntentError()" in html
     assert "intent_blocked" in html
+
+
+def test_summary_export_separates_confirmed_excluded_and_pending_findings(
+    client: TestClient,
+) -> None:
+    response = client.post(
+        "/projects",
+        json={
+            "title": "summary audit",
+            "origin": "repository",
+            "goal": "find authorization bugs",
+            "audit_mode": "hypothesis",
+        },
+    )
+    project_id = response.json()["project"]["id"]
+
+    for index, description in enumerate(
+        ("confirmed issue", "refuted issue", "reviewed candidate"), start=1,
+    ):
+        intent_id = f"i{index:03d}"
+        assert client.post(
+            f"/projects/{project_id}/intents",
+            json={"from": ["origin"], "description": description, "creator": "reasoner"},
+        ).status_code == 201
+        assert client.post(
+            f"/projects/{project_id}/intents/{intent_id}/heartbeat",
+            json={"worker": "worker"},
+        ).status_code == 200
+        assert client.post(
+            f"/projects/{project_id}/intents/{intent_id}/conclude",
+            json={
+                "worker": "worker",
+                "description": description,
+                "type": "vulnerability",
+                "status": "triaged",
+                "evidence": f"file: app.py:{index}",
+            },
+        ).status_code == 200
+
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE facts SET semantic_type = 'confirmed_finding' "
+            "WHERE project_id = ? AND id = 'f001'",
+            (project_id,),
+        )
+
+    assert client.post(
+        f"/projects/{project_id}/facts/f002/reviews",
+        json={
+            "verdict": "INVALID",
+            "confidence": "certain",
+            "summary": "Permission check makes the path unreachable.",
+            "created_by": "reviewer",
+        },
+    ).status_code == 201
+    assert client.post(
+        f"/projects/{project_id}/facts/f003/reviews",
+        json={
+            "verdict": "VALID",
+            "confidence": "firm",
+            "summary": "Candidate evidence is credible.",
+            "created_by": "reviewer",
+        },
+    ).status_code == 201
+
+    exported = client.get(f"/projects/{project_id}/export?format=summary")
+
+    assert exported.status_code == 200
+    assert exported.headers["content-type"].startswith("text/markdown")
+    assert "# summary audit — Security Audit Summary" in exported.text
+    assert "**1 confirmed vulnerability · 1 excluded candidate · 1 pending candidate.**" in exported.text
+    assert "## Confirmed vulnerabilities" in exported.text
+    assert "confirmed issue" in exported.text
+    assert "## Excluded candidates" in exported.text
+    assert "Permission check makes the path unreachable." in exported.text
+    assert "## Pending candidates" in exported.text
+    assert "Technical Confirmation is still required" in exported.text
 
 
 def test_ui_uses_semantic_node_titles_typed_edges_and_progressive_detail(
