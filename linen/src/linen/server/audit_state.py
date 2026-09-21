@@ -383,13 +383,14 @@ def _strongly_reviewed(conn: sqlite3.Connection, project_id: str, fact_id: str) 
         if proof.get("attributes", {}).get("gate_version") == "uvpg-proof-v1":
             return True
     rows = conn.execute(
-        "SELECT verdict, confidence FROM reviews WHERE project_id = ? AND fact_id = ?",
+        "SELECT verdict, confidence FROM reviews WHERE project_id = ? AND fact_id = ? "
+        "ORDER BY created_at, id",
         (project_id, fact_id),
     ).fetchall()
-    return bool(rows) and all(
-        row["verdict"] == "VALID" and row["confidence"] in {"firm", "certain"}
-        for row in rows
-    )
+    if not rows:
+        return False
+    latest = rows[-1]
+    return latest["verdict"] == "VALID" and latest["confidence"] in {"firm", "certain"}
 
 
 def _decisively_reviewed(conn: sqlite3.Connection, project_id: str, fact_id: str) -> bool:
@@ -408,17 +409,16 @@ def _decisively_reviewed(conn: sqlite3.Connection, project_id: str, fact_id: str
         if proof.get("attributes", {}).get("gate_version") == "uvpg-proof-v1":
             return True
     rows = conn.execute(
-        "SELECT verdict, confidence FROM reviews WHERE project_id = ? AND fact_id = ?",
+        "SELECT verdict, confidence FROM reviews WHERE project_id = ? AND fact_id = ? "
+        "ORDER BY created_at, id",
         (project_id, fact_id),
     ).fetchall()
     if not rows:
         return False
-    if any(row["verdict"] == "INVALID" for row in rows):
+    latest = rows[-1]
+    if latest["verdict"] == "INVALID":
         return True
-    return all(
-        row["verdict"] == "VALID" and row["confidence"] in {"firm", "certain"}
-        for row in rows
-    )
+    return latest["verdict"] == "VALID" and latest["confidence"] in {"firm", "certain"}
 
 
 def completion_gate_from_db(

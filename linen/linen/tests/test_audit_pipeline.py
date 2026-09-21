@@ -215,6 +215,7 @@ def test_hypothesis_completion_accepts_reviewed_negative_assurance(api):
         fact_type="negative_assurance",
     )
     client.create_review(pid, source, "VALID", "verified", confidence="certain")
+    client.create_review(pid, assurance, "INVALID", "initial concern", confidence="firm")
     client.create_review(pid, assurance, "VALID", "verified", confidence="firm")
 
     assert completion_blockers(client.get_project(pid), [assurance]) == []

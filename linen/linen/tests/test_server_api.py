@@ -135,6 +135,10 @@ def test_negative_assurance_is_a_valid_hypothesis_completion_terminal(client: Te
     assert concluded.json()["fact"]["semantic_type"] == "negative_assurance"
     assert client.post(
         f"/projects/{project_id}/facts/f001/reviews",
+        json={"verdict": "INVALID", "confidence": "firm", "summary": "initial concern", "created_by": "reviewer"},
+    ).status_code == 201
+    assert client.post(
+        f"/projects/{project_id}/facts/f001/reviews",
         json={"verdict": "VALID", "confidence": "firm", "summary": "checked", "created_by": "reviewer"},
     ).status_code == 201
     complete = client.post(

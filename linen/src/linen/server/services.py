@@ -418,7 +418,8 @@ def audit_completion_blockers_from_db(
     ):
         parents.setdefault(row["target_id"], []).append(row["source_id"])
     review_rows = conn.execute(
-        "SELECT fact_id, verdict, confidence FROM reviews WHERE project_id = ?", (project_id,)
+        "SELECT fact_id, verdict, confidence FROM reviews WHERE project_id = ? "
+        "ORDER BY created_at, id", (project_id,)
     ).fetchall()
     reviews: dict[str, list[sqlite3.Row]] = {}
     for review in review_rows:
@@ -464,21 +465,23 @@ def audit_completion_blockers_from_db(
         if fact is None or fact_id == "goal":
             blockers.append(f"Invalid evidence reference: {fact_id}.")
             return
-        if fact["status"] != "triaged":
+        if fact["status"] not in {"triaged", "false_positive", "fixed", "accepted_risk"}:
             blockers.append(f"{fact_id} has unresolved status {fact['status']}.")
         if not fact["evidence"] or not fact["evidence"].strip():
             blockers.append(f"{fact_id} lacks evidence.")
         fact_reviews = reviews.get(fact_id, [])
+        latest_review = fact_reviews[-1] if fact_reviews else None
         technical_confirmation = False
         if fact["semantic_type"] == "confirmed_finding":
             try:
                 technical_confirmation = json.loads(fact["proof"] or "{}").get("attributes", {}).get("gate_version") == "uvpg-proof-v1"
             except (TypeError, ValueError):
                 technical_confirmation = False
-        if not technical_confirmation and (not fact_reviews or any(
-            review["verdict"] != "VALID" or review["confidence"] not in {"firm", "certain"}
-            for review in fact_reviews
-        )):
+        if not technical_confirmation and (
+            latest_review is None
+            or latest_review["verdict"] != "VALID"
+            or latest_review["confidence"] not in {"firm", "certain"}
+        ):
             blockers.append(f"{fact_id} needs VALID review(s) with firm/certain confidence.")
         if not parents.get(fact_id):
             blockers.append(f"{fact_id} has no incoming evidence chain.")

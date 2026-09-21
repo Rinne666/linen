@@ -58,7 +58,7 @@ def completion_blockers(project: ProjectDetail, from_ids: list[str]) -> list[str
             return
         if fid == "origin":
             return
-        if fact.status != "triaged":
+        if fact.status not in {"triaged", "false_positive", "fixed", "accepted_risk"}:
             blockers.append(f"{fid} has unresolved status {fact.status}.")
         if not fact.evidence or not fact.evidence.strip():
             blockers.append(f"{fid} lacks evidence.")
@@ -66,11 +66,11 @@ def completion_blockers(project: ProjectDetail, from_ids: list[str]) -> list[str
             (review for review in project.reviews if review.fact_id == fid),
             key=lambda review: (review.created_at, review.id),
         )
+        latest_review = reviews[-1] if reviews else None
         if (
-            not reviews
-            or any(review.verdict == "INVALID" for review in reviews)
-            or reviews[-1].verdict != "VALID"
-            or reviews[-1].confidence not in {"firm", "certain"}
+            latest_review is None
+            or latest_review.verdict != "VALID"
+            or latest_review.confidence not in {"firm", "certain"}
         ):
             blockers.append(f"{fid} needs VALID review(s) with firm/certain confidence.")
         if not parents.get(fid):
