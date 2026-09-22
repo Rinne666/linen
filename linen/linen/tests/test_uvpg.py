@@ -390,6 +390,18 @@ def test_unified_candidate_review_is_one_gate_and_stales_on_proof_change(tmp_pat
     assert "PROOF_GRAPH_CHANGED" in stale.reason_codes
 
 
+def test_unified_review_digest_is_captured_after_review_status_projection(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    with db.get_conn() as conn:
+        conn.execute("UPDATE facts SET status = 'draft' WHERE id = 'candidate'")
+    create_review("p", "candidate", CreateReviewRequest(
+        verdict="VALID", confidence="firm", summary="whole proof reviewed", created_by="reviewer",
+        cold_verification={"review_kind": "vulnerability_proof", "candidate_id": "candidate"},
+    ))
+    with db.get_conn() as conn:
+        assert evaluate_shadow_gate(conn, "p", "candidate").status == "PASS"
+
+
 def _dynamic_board(tmp_path, monkeypatch, *, include_negative=True, same_capability=False, unsafe=False):
     candidate_id = _strict_board(tmp_path, monkeypatch)
     repo = tmp_path / "repo"

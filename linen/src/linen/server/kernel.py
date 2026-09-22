@@ -217,6 +217,7 @@ def create_review(
 
     diagnostics = body.model_dump(include=set(REVIEW_DIAGNOSTIC_FIELDS), exclude_none=True)
     verification = diagnostics.get("cold_verification")
+    unified_proof_review = False
     if (
         fact_row["type"] == "vulnerability"
         and isinstance(verification, dict)
@@ -227,8 +228,8 @@ def create_review(
         verification = dict(verification)
         verification["review_kind"] = UNIFIED_REVIEW_KIND
         verification["candidate_id"] = fact_id
-        verification["proof_evidence_sha256"] = proof_graph_fingerprint(conn, project_id, fact_id)
         diagnostics["cold_verification"] = verification
+        unified_proof_review = True
 
     rid = next_review_id(conn, project_id)
     now = utcnow()
@@ -263,6 +264,17 @@ def create_review(
             "WHEN display_title IS NULL OR display_title IN ('Candidate finding', 'Confirmed finding') "
             "THEN ? ELSE display_title END WHERE id = ? AND project_id = ?",
             (semantic_type, "Candidate finding" if semantic_type == "candidate_finding" else "Rejected finding", fact_id, project_id),
+        )
+
+    # Review aggregation above may change the candidate's lifecycle or semantic
+    # projection.  Capture the proof digest only after those deterministic
+    # writes, otherwise every first review invalidates itself as stale.
+    if unified_proof_review:
+        verification["proof_evidence_sha256"] = proof_graph_fingerprint(conn, project_id, fact_id)
+        diagnostics["cold_verification"] = verification
+        conn.execute(
+            "UPDATE reviews SET diagnostics = ? WHERE id = ? AND project_id = ?",
+            (json.dumps(diagnostics), rid, project_id),
         )
 
     if body.intent_id:
