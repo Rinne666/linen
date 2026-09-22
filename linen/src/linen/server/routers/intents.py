@@ -232,7 +232,15 @@ def report_failure(
                 resolved_at=now,
             )
 
-        attempt_count = existing["attempt_count"] + 1 if same_episode else 1
+        historical_attempts = conn.execute(
+            "SELECT COALESCE(SUM(attempt_count), 0) AS attempts "
+            "FROM intent_errors WHERE project_id = ? AND intent_id = ? "
+            "AND code = ? AND resolved_at IS NOT NULL",
+            (project_id, intent_id, body.code),
+        ).fetchone()["attempts"]
+        attempt_count = (
+            (existing["attempt_count"] if same_episode else historical_attempts) + 1
+        )
         classification = body.classification
         remediation = body.remediation
         if same_episode and existing["classification"] == "blocked":

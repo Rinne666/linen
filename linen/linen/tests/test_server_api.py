@@ -762,6 +762,41 @@ def test_transient_intent_error_uses_backoff_and_promotes_after_retry_budget(cli
     assert second.json()["attempt_count"] == 2
 
 
+def test_transient_retry_budget_survives_resolved_error_episodes(client: TestClient) -> None:
+    project_id = _create_project(client)
+    client.post(
+        f"/projects/{project_id}/intents",
+        json={"from": ["origin"], "description": "inspect", "creator": "reasoner"},
+    )
+    body = {
+        "worker": "explorer",
+        "task_type": "explore",
+        "code": "task_failed",
+        "classification": "transient",
+        "message": "Worker output was invalid.",
+        "base_retry_seconds": 1,
+        "max_retry_seconds": 1,
+        "max_attempts": 2,
+    }
+
+    first = client.post(f"/projects/{project_id}/intents/i001/fail", json=body)
+    assert first.status_code == 200
+    assert first.json()["attempt_count"] == 1
+    assert client.post(
+        f"/projects/{project_id}/intents/i001/retry",
+        json={"actor": "Reason"},
+    ).status_code == 200
+    assert client.post(
+        f"/projects/{project_id}/intents/i001/heartbeat",
+        json={"worker": "explorer"},
+    ).status_code == 200
+
+    second = client.post(f"/projects/{project_id}/intents/i001/fail", json=body)
+    assert second.status_code == 200
+    assert second.json()["classification"] == "blocked"
+    assert second.json()["attempt_count"] == 2
+
+
 def test_project_creation_persists_audit_profile_and_exports_it(client: TestClient) -> None:
     response = client.post(
         "/projects",
