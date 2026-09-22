@@ -24,7 +24,7 @@ from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.process import ProcessResult
 from linen.dispatcher.scheduler.loop import DispatcherLoop
 from linen.dispatcher.tasks import explore
-from linen.server.models import Fact, Intent, ProjectDetail, ProjectMeta, Review
+from linen.server.models import Fact, Intent, ProjectDetail, ProjectMeta, ProofPayload, Review
 
 
 def _approve(client, project_id: str, fact_id: str) -> None:
@@ -186,6 +186,26 @@ def test_unresolved_review_gets_one_deterministic_contradiction_followup(tmp_pat
         created_at="2026-01-01T00:00:04Z",
     ))
     board.facts[-1].status = "triaged"
+    assert audit_graph._review_proposals(board) == []
+
+
+def test_uvpg_proof_atom_does_not_get_generic_review_proposal() -> None:
+    board = ProjectDetail(
+        project=ProjectMeta(
+            id="proj_001", title="audit", status="active", bootstrap_enabled=False,
+            audit_mode="hypothesis", created_at="2026-01-01T00:00:00Z",
+        ),
+        facts=[
+            Fact(id="origin", description="repo"),
+            Fact(id="goal", description="audit"),
+            Fact(
+                id="f001", description="reachable path", type="reachability", status="draft",
+                proof=ProofPayload(claim_kind="reachability"),
+            ),
+        ],
+        intents=[], hints=[], reviews=[],
+    )
+
     assert audit_graph._review_proposals(board) == []
 
 

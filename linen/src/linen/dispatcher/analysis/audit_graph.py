@@ -19,6 +19,7 @@ from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT
 from linen.dispatcher.config import AuditConfig
 from linen.dispatcher.skills import skill_for_scanner
 from linen.server.models import Fact, ProjectDetail
+from linen.server.uvpg import REQUIRED_ROLES
 
 
 CREATOR = "dispatcher.audit"
@@ -257,6 +258,11 @@ def _review_proposals(project: ProjectDetail) -> list[dict]:
                 })
             continue
         if fact.status in {"false_positive", "fixed", "accepted_risk"} or fact.id in open_reviews:
+            continue
+        # UVPG proof atoms are inputs to the candidate-local proof-package
+        # review.  Do not create a second, generic per-Fact review path for
+        # them; derive_proof_gaps() retains the legacy targeted fallback.
+        if fact.proof is not None and fact.proof.claim_kind in REQUIRED_ROLES:
             continue
         if not reviews and fact.status == "draft":
             mode = "cold-verifier" if fact.type == "vulnerability" else "devils-advocate"
