@@ -24,8 +24,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 
 from linen.dispatcher.analysis import audit_recipes
-from linen.dispatcher.analysis.artifacts import load_artifact, source_bytes
-from linen.dispatcher.analysis.semgrep import digest, write_json
+from linen.dispatcher.analysis.artifacts import digest, load_artifact, source_bytes, write_json
 from linen.dispatcher.config import ScopeAdjudicationConfig
 from linen.server.models import Fact, Intent, ProjectDetail
 

@@ -93,41 +93,6 @@ audit:
     candidates_per_batch: 20
     max_batches: 500
     max_verify_attempts: 3
-  semgrep:
-    enabled: true
-    rules: "linen/rules/audit-baseline.yaml"
-    timeout: 300
-    max_target_bytes: 2000000  # align with coverage.max_target_bytes
-    cache: true
-  # Java bytecode pass. Build the target in an isolated/trusted build lane
-  # first; Linen never executes repository Maven/Gradle scripts implicitly.
-  spotbugs:
-    enabled: false
-    executable: "spotbugs"
-    plugin: "/absolute/path/to/findsecbugs-plugin.jar"
-    targets: ["**/target/classes", "**/build/classes/java/main"]
-    timeout: 600
-  # Dependency advisory baseline. OSV-Scanner v2 emits SARIF directly.
-  osv:
-    enabled: false
-    executable: "osv-scanner"
-    recursive: true
-    timeout: 300
-  # Frozen working-tree secret scan. Historical-commit scanning is deliberately
-  # separate because scope mode must remain tied to its canonical snapshot.
-  gitleaks:
-    enabled: false
-    executable: "gitleaks"
-    redact_percent: 100
-    timeout: 300
-  # Filesystem dependency, secret and deployment/IaC configuration scan.
-  trivy:
-    enabled: false
-    executable: "trivy"
-    # Override the default mirror when mirror.gcr.io is unavailable.
-    db_repository: ["ghcr.io/aquasecurity/trivy-db:2", "public.ecr.aws/aquasecurity/trivy-db:2"]
-    scanners: [vuln, misconfig, secret]
-    timeout: 600
 
 runtime:
   worker_healthcheck: disabled
@@ -142,9 +107,6 @@ tasks:
   # Reason timeouts are typically shorter than explore (reason just reads the
   # graph and proposes intents). Explore can be long — workers may read many
   # files before forming a finding.
-  bootstrap:
-    timeout: 300
-    conclude_timeout: 60
   reason:
     timeout: 120
     max_intents: 3

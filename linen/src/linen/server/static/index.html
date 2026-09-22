@@ -859,7 +859,7 @@
           class="graph-inline-filter h-7 rounded-md border-0 bg-slate-50 px-2 text-[11px] font-medium text-slate-600 focus:ring-2 focus:ring-brand-100">
           <option value="all">All evidence</option>
           <option value="findings">Hypothesis chain</option>
-          <option value="scanners">Scanner evidence</option>
+          <option value="routes">Route inventory</option>
           <option value="scope">Scope and trust</option>
           <option value="coverage">Coverage and summaries</option>
           <option value="semantic">Semantic recipes</option>
@@ -956,7 +956,7 @@
             class="h-8 w-full rounded-lg border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-600 focus:ring-2 focus:ring-brand-100">
             <option value="all">All evidence</option>
             <option value="findings">Hypothesis chain</option>
-            <option value="scanners">Scanner evidence</option>
+            <option value="routes">Route inventory</option>
             <option value="scope">Scope and trust</option>
             <option value="coverage">Coverage and summaries</option>
             <option value="semantic">Semantic recipes</option>
@@ -3208,8 +3208,8 @@ function linenApp() {
       if (this.graphKindFilter === 'findings') {
         return this.isFindingContextFact(fact);
       }
-      if (this.graphKindFilter === 'scanners') {
-        return ['scan_batch', 'route_scan', 'candidate_triage', 'candidate_disposition'].includes(type);
+      if (this.graphKindFilter === 'routes') {
+        return ['route_scan', 'candidate_triage', 'candidate_disposition'].includes(type);
       }
       if (this.graphKindFilter === 'scope') {
         return ['policy_evidence', 'scope_adjudication'].includes(type);
@@ -3244,7 +3244,7 @@ function linenApp() {
       if (this.graphStateFilter === 'open' && !open) return false;
       if (!['all', 'open'].includes(this.graphStateFilter)) return false;
       if (this.graphKindFilter === 'all') return true;
-      if (this.graphKindFilter === 'scanners') return Boolean(this.auditIntentLabel(intent));
+      if (this.graphKindFilter === 'routes') return Boolean(this.auditIntentLabel(intent));
       if (this.graphKindFilter === 'scope') {
         const description = intent.description || '';
         return description === '@analysis:scope-evidence'
@@ -3387,11 +3387,6 @@ function linenApp() {
       if (description === '@analysis:scope-evidence') return 'Policy evidence';
       if (description === '@analysis:scope-adjudication') return 'Scope gate';
       if (description === '@analysis:coverage-plan') return 'Plan';
-      if (description === '@analysis:semgrep') return 'Scan';
-      if (description === '@analysis:spotbugs-findsecbugs') return 'SpotBugs';
-      if (description === '@analysis:osv-scanner') return 'OSV';
-      if (description === '@analysis:gitleaks') return 'Secrets';
-      if (description === '@analysis:trivy') return 'Trivy';
       if (description === '@analysis:spring-route-auth') return 'Routes';
       if (description === '@analysis:audit-summary') return 'Audit summary';
       if (description === '@analysis:semantic-summary') return 'Semantic summary';
@@ -3464,7 +3459,7 @@ function linenApp() {
       if (['confirmed_finding', 'rejected_finding', 'negative_assurance', 'summary'].includes(semantic)) return 'outcome';
       if (record?.id === 'origin' || record?.id === 'goal') return 'scope';
       if (['policy_evidence', 'scope_adjudication'].includes(record?.type)) return 'scope';
-      if (['coverage_plan', 'coverage_result', 'scan_batch', 'route_scan', 'source', 'sink', 'dataflow', 'sanitizer', 'validation', 'reachability'].includes(record?.type)) return 'evidence';
+      if (['coverage_plan', 'coverage_result', 'route_scan', 'source', 'sink', 'dataflow', 'sanitizer', 'validation', 'reachability'].includes(record?.type)) return 'evidence';
       if (['candidate_triage', 'hypothesis_batch', 'variant_batch'].includes(record?.type)) return 'reasoning';
       if (['candidate_disposition', 'module_summary', 'semantic_summary', 'audit_summary', 'vulnerability'].includes(record?.type)) return 'outcome';
       return 'evidence';
@@ -3493,7 +3488,7 @@ function linenApp() {
       if (fact.id === 'goal') return 'goal';
       if (fact.type === 'policy_evidence' || fact.type === 'scope_adjudication') return 'scope_fact';
       if (fact.type === 'coverage_plan' || fact.type === 'coverage_result') return 'coverage_fact';
-      if (fact.type === 'scan_batch' || fact.type === 'route_scan') return 'scan_fact';
+      if (fact.type === 'route_scan') return 'route_fact';
       if (fact.type === 'candidate_triage') return 'triage_fact';
       if (fact.type === 'candidate_disposition') return 'disposition_fact';
       if (['architecture_map', 'authz_matrix', 'state_model', 'cross_service_map', 'contract_map'].includes(fact.type)) return 'semantic_map_fact';
@@ -5189,7 +5184,6 @@ function linenApp() {
         { selector: 'node[semanticType="reach"]', style: { 'background-color':'#e0e7ff',color:'#3730a3','border-color':'#6366f1' }},
         { selector: 'node[semanticType="characterize"]', style: { 'background-color':'#ffe4e6',color:'#9f1239','border-color':'#f43f5e' }},
         { selector: 'node[semanticType="review"]', style: { 'background-color':'#fef3c7',color:'#92400e','border-color':'#f59e0b' }},
-        { selector: 'node[semanticType="scan_batch"]', style: { 'background-color':'#ccfbf1',color:'#115e59','border-color':'#14b8a6' }},
         { selector: 'node[semanticType="route_scan"]', style: { 'background-color':'#cffafe',color:'#155e75','border-color':'#06b6d4' }},
         { selector: 'node[semanticType="policy_evidence"]', style: { 'background-color':'#ecfeff',color:'#155e75','border-color':'#22d3ee' }},
         { selector: 'node[semanticType="scope_adjudication"]', style: { 'background-color':'#eef2ff',color:'#3730a3','border-color':'#6366f1' }},
@@ -6461,8 +6455,6 @@ function linenApp() {
       const payload = event?.payload || {};
       const labels = {
         audit_stage_updated: `Stage ${event.entity_id || ''} is ${payload.status || 'updated'}`,
-        skill_run_created: `Skill ${payload.skill_id || event.entity_id || ''} started`,
-        skill_run_updated: `Skill ${payload.skill_id || event.entity_id || ''} ${payload.status || 'updated'}`,
         run_registered: `Worker run ${event.entity_id || ''} started`,
         run_status_changed: `Worker run ${event.entity_id || ''} ${payload.status || 'updated'}`,
         audit_task_created: `Audit task ${event.entity_id || ''} created`,

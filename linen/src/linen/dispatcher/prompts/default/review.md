@@ -13,7 +13,7 @@ Do not create facts or intents.
   the claim.
 - Return `NEEDS_REVIEW` when decisive evidence is unavailable or contradictory.
 - Cite useful file and line references in the summary or reasoning. Do not infer
-  repository safety from a scanner result or from missing matches.
+  repository safety from incomplete evidence or from missing matches.
 
 # Output
 

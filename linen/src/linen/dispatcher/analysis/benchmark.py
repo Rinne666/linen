@@ -54,7 +54,7 @@ def evaluate(expected: set[str], runs: list[set[str]]) -> dict:
     """Return recall, precision, and cross-run Jaccard stability.
 
     Exactly three runs are required so a one-off lucky hit cannot be presented
-    as stable scanner behavior.
+    as stable analysis behavior.
     """
     if len(runs) != 3:
         raise ValueError("Audit benchmark requires exactly three independent runs")

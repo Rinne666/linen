@@ -3,20 +3,18 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from linen.dispatcher.analysis.policy import completion_blockers, SCAN_INTENT_DESCRIPTION
-from linen.dispatcher.analysis.semgrep import digest, normalize_sarif, run_scan
-from linen.dispatcher.config import DispatchConfig, SemgrepConfig
+from linen.dispatcher.analysis.policy import completion_blockers
+from linen.dispatcher.config import DispatchConfig
 from linen.dispatcher.protocol.client import LinenClient
 from linen.dispatcher.runtime.backend import LocalBackend
 from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.process import ProcessResult
-from linen.dispatcher.tasks import explore, reason, review
+from linen.dispatcher.tasks import reason, review
 from linen.dispatcher.tasks.common import run_worker_process
 from linen.dispatcher.workers.base import DriverResult
 from linen.server import db
@@ -36,7 +34,7 @@ def api(tmp_path, monkeypatch):
         yield http, client
 
 
-def config(tmp_path, *, audit=True, scan=False, mode="hypothesis"):
+def config(tmp_path, *, audit=True, mode="hypothesis"):
     return DispatchConfig.model_validate({
         "server": "http://testserver",
         "runtime": {"interval": 60, "max_workers": 2, "max_running_projects": 1,
@@ -45,8 +43,7 @@ def config(tmp_path, *, audit=True, scan=False, mode="hypothesis"):
         "local": {"workspace_root": str(tmp_path / "work")},
         "workers": [{"name": "tester", "type": "mock", "task_types": ["reason", "explore", "review"],
                      "max_running": 1, "priority": 0}],
-        "audit": {"enabled": audit, "mode": mode,
-                  "semgrep": {"enabled": scan, "rules": str(tmp_path / "rules.yaml")}},
+        "audit": {"enabled": audit, "mode": mode},
     })
 
 
@@ -73,83 +70,6 @@ def add_fact(client, pid, *, parent="origin", fact_type="vulnerability"):
     response = client.conclude(pid, iid, "tester", "candidate", fact_type=fact_type, evidence="file: app.py:1")
     assert response.ok, response.text
     return response.data["fact"]["id"]
-
-
-def sarif():
-    return {"version": "2.1.0", "runs": [{
-        "tool": {"driver": {"name": "Semgrep", "rules": [{"id": "eval", "properties": {"cwe": ["CWE-95"]}}]}},
-        "results": [{"ruleId": "eval", "message": {"text": "check input"}, "locations": [{
-            "physicalLocation": {"artifactLocation": {"uri": "app.py"}, "region": {"startLine": 1}}
-        }], "codeFlows": [{"threadFlows": [{"locations": [
-            {"location": {"physicalLocation": {"artifactLocation": {"uri": "Controller.java"},
-                                                "region": {"startLine": 42}},
-                          "logicalLocations": [{"fullyQualifiedName": "UserController.update"}],
-                          "message": {"text": "request id enters handler"}}},
-            {"location": {"physicalLocation": {"artifactLocation": {"uri": "UserService.java"},
-                                                "region": {"startLine": 88}},
-                          "logicalLocations": [{"fullyQualifiedName": "UserService.updateUser"}]}},
-            {"location": {"physicalLocation": {"artifactLocation": {"uri": "UserRepository.java"},
-                                                "region": {"startLine": 31}},
-                          "logicalLocations": [{"fullyQualifiedName": "UserRepository.save"}]}}
-        ]}]}]}],
-    }]}
-
-
-@pytest.fixture
-def scanner(tmp_path, monkeypatch):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / "app.py").write_text("eval(input())\n")
-    rules = tmp_path / "rules.yaml"
-    rules.write_text("rules: []\n")
-    monkeypatch.setattr("linen.dispatcher.analysis.semgrep.shutil.which", lambda _: "/fake/semgrep")
-    monkeypatch.setattr("linen.dispatcher.analysis.semgrep.subprocess.run", lambda *a, **k:
-                        SimpleNamespace(returncode=0, stdout="1.test", stderr=""))
-    calls = []
-
-    def execute(source, argv, *, errors=None, timed_out=False, returncode=0):
-        calls.append(argv)
-        assert source != repo
-        assert (source / "app.py").read_text() == (repo / "app.py").read_text()
-        Path(argv[argv.index("--json-output") + 1]).write_text(json.dumps({
-            "paths": {"scanned": ["app.py"], "skipped": []}, "errors": errors or [],
-        }))
-        return ProcessResult(returncode, json.dumps(sarif()), "scanner log", timed_out=timed_out)
-
-    return repo, SemgrepConfig(enabled=True, rules=rules), execute, calls
-
-
-def manifest(fact):
-    path = Path(fact["evidence"].splitlines()[0].removeprefix("artifact: "))
-    return path, json.loads(path.read_text())
-
-
-def test_scope_scan_uses_exact_canonical_files_not_scanner_exclusions(scanner, tmp_path):
-    repo, scanner_config, execute, _ = scanner
-    content = (repo / "app.py").read_bytes()
-    canonical_files = {"app.py": digest(content)}
-    canonical = {
-        "id": digest(json.dumps({"files": canonical_files, "skipped": []}, sort_keys=True).encode()),
-        "files": canonical_files,
-        "skipped": [],
-    }
-    restrictive = scanner_config.model_copy(update={
-        "max_target_bytes": 1,
-        "exclude": ["app.py"],
-        "cache": False,
-    })
-
-    fact = run_scan(
-        repo,
-        tmp_path / "analysis",
-        restrictive,
-        execute,
-        canonical_snapshot=canonical,
-    )
-    _, record = manifest(fact)
-
-    assert record["status"] == "completed"
-    assert record["snapshot"] == canonical
 
 
 def test_review_diagnostics_round_trip_and_export(api):
@@ -447,160 +367,6 @@ def test_reason_gate_blocks_only_opted_in_dispatcher(api, tmp_path, monkeypatch,
         assert not any("Audit completion blocked" in hint.content for hint in current.hints)
 
 
-def test_scan_cache_invalidates_source_rules_and_corrupt_artifacts(scanner, tmp_path):
-    repo, cfg, execute, calls = scanner
-    first = run_scan(repo, tmp_path / "artifacts", cfg, execute)
-    path, data = manifest(first)
-    assert data["status"] == "completed"
-    assert data["candidate_count"] == 1
-    assert first["type"] == "scan_batch"
-    second = run_scan(repo, tmp_path / "artifacts", cfg, execute)
-    assert "Cache hit: True" in second["description"]
-    assert len(calls) == 1
-    (path.parent / "candidates.json").write_text("[]")
-    run_scan(repo, tmp_path / "artifacts", cfg, execute)
-    assert len(calls) == 2
-    cfg.rules.write_text("rules: [changed]\n")
-    run_scan(repo, tmp_path / "artifacts", cfg, execute)
-    assert len(calls) == 3
-    (repo / "app.py").write_text("eval('changed')\n")
-    changed = run_scan(repo, tmp_path / "artifacts", cfg, execute)
-    assert len(calls) == 4
-    assert manifest(changed)[1]["snapshot"]["id"] != data["snapshot"]["id"]
-    assert (path.parent / "source/app.py").read_text() == "eval(input())\n"
-
-
-@pytest.mark.parametrize("failure", ["parse", "timeout", "exit", "invalid_json"])
-def test_incomplete_scans_are_visible_and_not_cached(scanner, tmp_path, failure):
-    repo, cfg, execute, calls = scanner
-
-    def failing(source, argv):
-        result = execute(source, argv, errors=[{"type": "ParseError"}] if failure == "parse" else [],
-                         timed_out=failure == "timeout", returncode=2 if failure == "exit" else 0)
-        if failure == "invalid_json":
-            result.stdout = "not SARIF"
-        return result
-
-    for _ in range(2):
-        fact = run_scan(repo, tmp_path / "artifacts", cfg, failing)
-        _, data = manifest(fact)
-        assert data["status"] in {"partial", "failed"}
-        assert data["errors"]
-    assert len(calls) == 2
-
-
-def test_sarif_keeps_flows_and_deduplicates_identical_alerts():
-    doc = sarif()
-    doc["runs"][0]["results"] *= 2
-    candidates = normalize_sarif(doc)
-    assert len(candidates) == 1
-    assert candidates[0]["occurrences"] == 2
-    assert candidates[0]["code_flows"]
-    assert candidates[0]["status"] == "unverified"
-    assert "proof" not in candidates[0]
-    seed = candidates[0]["trace_seeds"][0]
-    assert seed["status"] == "unverified"
-    assert [step["file"] for step in seed["trace"]] == [
-        "Controller.java", "UserService.java", "UserRepository.java",
-    ]
-    assert [step["relation"] for step in seed["trace"]] == [
-        "flows_to", "flows_to", "flows_to",
-    ]
-    assert all("citation_id" not in step for step in seed["trace"])
-    without_flow = sarif()
-    without_flow["runs"][0]["results"][0].pop("codeFlows")
-    assert "trace_seeds" not in normalize_sarif(without_flow)[0]
-    with pytest.raises(ValueError):
-        normalize_sarif({"version": "2.1.0", "runs": []})
-
-
-def test_snapshot_records_exclusions_and_missing_scanner(scanner, tmp_path, monkeypatch):
-    repo, cfg, execute, _ = scanner
-    (repo / "linked.py").symlink_to(repo / "app.py")
-    (repo / ".venv").mkdir()
-    (repo / ".venv/ignored.py").write_text("secret")
-    monkeypatch.setattr("linen.dispatcher.analysis.semgrep.shutil.which", lambda _: None)
-    _, data = manifest(run_scan(repo, tmp_path / "artifacts", cfg, execute))
-    assert data["status"] == "failed"
-    assert {s["reason"] for s in data["snapshot"]["skipped"]} == {"symlink", "excluded"}
-
-
-def test_scan_explore_review_and_reason_complete_through_board(api, scanner, tmp_path, monkeypatch):
-    http, client = api
-    repo, _, execute, _ = scanner
-    cfg = config(tmp_path, scan=True)
-    current = project(api, repo)
-    pid = current.project.id
-    backend = LocalBackend(cfg.local, client)
-    worker = cfg.workers[0]
-    stage = http.put(
-        f"/projects/{pid}/stages/semgrep",
-        json={
-            "label": "Semgrep", "phase_order": 30, "status": "pending",
-            "skill_id": "security.semgrep", "capability": "static-analysis.sarif",
-        },
-    )
-    assert stage.status_code == 200
-    response = client.create_intent(pid, ["origin"], SCAN_INTENT_DESCRIPTION, "reasoner", intent_type="search")
-    iid = response.data["id"]
-    assert client.heartbeat(pid, iid, worker.name).ok
-    current = client.get_project(pid)
-    intent = next(i for i in current.intents if i.id == iid)
-    monkeypatch.setattr(explore, "run_worker_process", lambda backend, source, worker, argv, **kw:
-                        execute(Path(source), argv))
-    assert explore.run_explore_task(cfg, client, backend, current, client.export_project(pid),
-                                    intent, worker, TaskCancellation()) == "success"
-    current = client.get_project(pid)
-    batch = next(f for f in current.facts if f.type == "scan_batch")
-    assert batch.status == "draft"
-    candidate = add_fact(client, pid, parent=batch.id)
-    driver = FakeDriver()
-    monkeypatch.setattr(review, "get_driver", lambda _: driver)
-    # Real review task saves its model output using the existing Review API.
-    monkeypatch.setattr(review, "run_worker_process", lambda *a, **kw: ProcessResult(0, json.dumps({
-        "accepted": True, "data": {"verdict": "VALID", "summary": "verified", "confidence": "firm",
-                                    "attestation_check": {
-                                        "artifact_integrity": "valid: manifest digest matches",
-                                        "source_consistency": "consistent: app.py:1",
-                                        "scope_complete": "yes: declared batch completed",
-                                        "contradictions": [],
-                                    },
-                                    "cold_verification": {
-                                        "sub_claims": {"source": "input", "path": "app.py:1", "effect": "sink"},
-                                        "sub_claim_failure": "none",
-                                        "static_status": "confirmed",
-                                        "poc_status": "not required",
-                                        "prosecution": "source reaches sink",
-                                        "defense": "no effective guard",
-                                        "severity_challenged": "impact remains material",
-                                        "isolation_observed": "read-only source",
-                                    }},
-    }), ""))
-    for fid in (batch.id, candidate):
-        response = client.create_intent(pid, [fid], "SECRET PRIOR REASONING", "reasoner",
-                                        action="review", target=fid,
-                                        intent_type="review:cold-verifier")
-        review_id = response.data["id"]
-        client.heartbeat(pid, review_id, worker.name)
-        current = client.get_project(pid)
-        review_intent = next(i for i in current.intents if i.id == review_id)
-        assert review.run_review_task(cfg, client, backend, current, client.export_project(pid),
-                                      review_intent, worker, TaskCancellation()) == "success"
-    assert all("SECRET PRIOR REASONING" not in prompt for prompt in driver.prompts)
-    assert "audit-process attestation" in driver.prompts[0]
-    current = client.get_project(pid)
-    assert completion_blockers(current, [candidate]) == []
-    assert len(current.reviews) == 2
-    assert all(r.cold_verification for r in current.reviews)
-    monkeypatch.setattr(reason, "get_driver", lambda _: driver)
-    monkeypatch.setattr(reason, "run_worker_process", lambda *a, **kw: ProcessResult(0, json.dumps({
-        "accepted": True, "data": {"complete": {"from": [candidate], "description": "hypothesis verified"}},
-    }), ""))
-    assert reason.run_reason_task(cfg, client, backend, current, client.export_project(pid),
-                                  worker, TaskCancellation()) == "success"
-    assert client.get_project(pid).project.status == "completed"
-
-
 def test_audit_configuration_requires_review_and_local_rules(tmp_path):
     raw = config(tmp_path).model_dump()
     raw["workers"][0]["task_types"] = ["reason", "explore"]
@@ -610,30 +376,3 @@ def test_audit_configuration_requires_review_and_local_rules(tmp_path):
     raw["audit"]["recon"] = {"enabled": True}
     with pytest.raises(ValueError, match="recon requires scope mode"):
         DispatchConfig.model_validate(raw)
-    with pytest.raises(ValueError, match="local rule file"):
-        SemgrepConfig(enabled=True)
-
-
-def test_cancelled_scan_does_not_conclude_intent(api, scanner, tmp_path, monkeypatch):
-    _, client = api
-    repo, _, execute, _ = scanner
-    cfg = config(tmp_path, scan=True)
-    current = project(api, repo)
-    pid = current.project.id
-    worker = cfg.workers[0]
-    iid = client.create_intent(pid, ["origin"], SCAN_INTENT_DESCRIPTION, "reasoner", intent_type="search").data["id"]
-    client.heartbeat(pid, iid, worker.name)
-    current = client.get_project(pid)
-    cancellation = TaskCancellation()
-
-    def cancelled_run(backend, source, worker, argv, **kw):
-        result = execute(Path(source), argv)
-        cancellation.cancel("project stopped")
-        return result
-
-    monkeypatch.setattr(explore, "run_worker_process", cancelled_run)
-    assert explore.run_explore_task(cfg, client, LocalBackend(cfg.local, client), current,
-                                    client.export_project(pid), current.intents[0], worker, cancellation) == "cancelled"
-    current = client.get_project(pid)
-    assert not any(f.type == "scan_batch" for f in current.facts)
-    assert current.intents[0].concluded_at is None

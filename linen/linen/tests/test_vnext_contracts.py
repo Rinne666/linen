@@ -310,8 +310,8 @@ def test_workspace_paths_reject_nul_and_control_characters() -> None:
 
 def test_component_and_context_contracts_are_closed_and_traceable() -> None:
     component = ComponentManifest(
-        id="security.semgrep",
-        kind="scanner",
+        id="analysis.route-inventory",
+        kind="tool",
         version="1",
         provides=["static-analysis.sarif", "security.sast"],
         required_permissions=["repo.read", "process.execute"],
@@ -354,7 +354,7 @@ def test_component_and_context_contracts_are_closed_and_traceable() -> None:
         created_at="2026-01-01T00:00:00Z",
     )
     assert projection.request == request
-    assert projection.context["components"][0]["id"] == "security.semgrep"
+    assert projection.context["components"][0]["id"] == "analysis.route-inventory"
     projection_reordered = ContextProjection(
         **{
             **projection.model_dump(),

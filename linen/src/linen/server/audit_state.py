@@ -19,14 +19,12 @@ from linen.server.models import (
     CompletionGate,
     GraphEdge,
     HumanDecision,
-    SkillRun,
 )
 from linen.server.services import (
     audit_completion_blockers_from_db,
     get_project_or_404,
     next_graph_edge_id,
     next_human_decision_id,
-    next_skill_run_id,
     utcnow,
 )
 
@@ -36,7 +34,6 @@ FACT_SEMANTIC_TYPES: dict[str, str] = {
     "scope_adjudication": "scope",
     "coverage_plan": "coverage",
     "coverage_result": "coverage",
-    "scan_batch": "observation",
     "route_scan": "observation",
     "source": "observation",
     "sink": "observation",
@@ -65,7 +62,6 @@ FACT_TITLES: dict[str, str] = {
     "scope_adjudication": "Scope decision",
     "coverage_plan": "Coverage plan",
     "coverage_result": "Coverage result",
-    "scan_batch": "Scanner evidence",
     "route_scan": "Route evidence",
     "architecture_map": "Architecture map",
     "authz_matrix": "Authorization map",
@@ -87,11 +83,6 @@ INTENT_METADATA: tuple[tuple[str, str, str, str], ...] = (
     ("@analysis:scope-evidence", "Collect scope evidence", "scope", "defines"),
     ("@analysis:scope-adjudication", "Decide audit scope", "scope", "defines"),
     ("@analysis:coverage-plan", "Plan coverage", "coverage", "defines"),
-    ("@analysis:semgrep", "Run Semgrep", "baseline_scan", "produces"),
-    ("@analysis:spotbugs-findsecbugs", "Run SpotBugs", "baseline_scan", "produces"),
-    ("@analysis:osv-scanner", "Run OSV-Scanner", "baseline_scan", "produces"),
-    ("@analysis:gitleaks", "Run Gitleaks", "baseline_scan", "produces"),
-    ("@analysis:trivy", "Run Trivy", "baseline_scan", "produces"),
     ("@analysis:audit-summary", "Build audit summary", "report", "produces"),
     ("@analysis:semantic-summary", "Summarize reasoning", "hypothesis", "produces"),
 )
@@ -290,8 +281,6 @@ def _stage_from_row(row: sqlite3.Row) -> AuditStage:
         required=bool(row["required"]),
         status=row["status"],
         capability=row["capability"],
-        skill_id=row["skill_id"],
-        run_id=row["run_id"],
         detail=row["detail"],
         source_generation=row["source_generation"],
         plan_revision=row["plan_revision"],
@@ -315,14 +304,6 @@ def list_human_decisions(conn: sqlite3.Connection, project_id: str) -> list[Huma
         (project_id,),
     ).fetchall()
     return [HumanDecision(**dict(row)) for row in rows]
-
-
-def list_skill_runs(conn: sqlite3.Connection, project_id: str) -> list[SkillRun]:
-    rows = conn.execute(
-        "SELECT * FROM skill_runs WHERE project_id = ? ORDER BY started_at, id",
-        (project_id,),
-    ).fetchall()
-    return [SkillRun(**dict(row)) for row in rows]
 
 
 def list_audit_events(
@@ -517,7 +498,7 @@ def completion_gate_from_db(
             "pipeline_stages",
             "Required audit stages completed",
             not incomplete_stages,
-            "No audit stages are required for completion; available scanners run on demand."
+            "No audit stages are required for completion."
             if not required_stages
             else "All required audit stages are satisfied." if not incomplete_stages
             else "Incomplete stages: " + ", ".join(
@@ -526,68 +507,12 @@ def completion_gate_from_db(
             evidence_ids=[stage.stage_id for stage in incomplete_stages],
             status="not_applicable" if not required_stages else None,
         )
-        receipt_rows = conn.execute(
-            "SELECT * FROM skill_runs WHERE project_id = ? AND source_generation = ? "
-            "AND plan_revision = ?",
-            (project_id, generation, plan_revision),
-        ).fetchall()
-        receipts_by_id = {row["id"]: row for row in receipt_rows}
-        required_skill_stages: list[AuditStage] = []
-        invalid_receipt_stages: list[AuditStage] = []
-        valid_receipt_ids: list[str] = []
-        for stage in stages:
-            if not stage.required or not stage.skill_id:
-                continue
-            decision = decisions.get(("stage", stage.stage_id))
-            if decision is not None and decision.decision == "waive":
-                continue
-            required_skill_stages.append(stage)
-            receipt = receipts_by_id.get(stage.run_id or "")
-            valid = bool(
-                receipt is not None
-                and receipt["stage_id"] == stage.stage_id
-                and receipt["skill_id"] == stage.skill_id
-                and receipt["status"] in {"completed", "not_applicable"}
-                and (
-                    receipt["status"] == "not_applicable"
-                    or (
-                        bool(receipt["artifact_ref"])
-                        and isinstance(receipt["artifact_sha256"], str)
-                        and len(receipt["artifact_sha256"]) == 64
-                    )
-                )
-            )
-            if valid:
-                valid_receipt_ids.append(receipt["id"])
-            else:
-                invalid_receipt_stages.append(stage)
-        add(
-            "skill_receipts",
-            "Managed Skill runs have verified receipts",
-            not invalid_receipt_stages,
-            "On-demand scanner receipts are verified when a tool runs; none are required for completion."
-            if not required_skill_stages
-            else "All required managed Skill runs have terminal receipts and verified artifact hashes."
-            if not invalid_receipt_stages
-            else "Missing or invalid Skill receipts: " + ", ".join(
-                stage.label for stage in invalid_receipt_stages
-            ) + ".",
-            evidence_ids=valid_receipt_ids,
-            status="not_applicable" if not required_skill_stages else None,
-        )
     else:
         add(
             "pipeline_stages",
             "Required audit stages completed",
             True,
             "Legacy board: no stage ledger was registered; evidence checks remain authoritative.",
-            status="not_applicable",
-        )
-        add(
-            "skill_receipts",
-            "Managed Skill runs have verified receipts",
-            True,
-            "Legacy board: no managed Skill stages were registered.",
             status="not_applicable",
         )
 

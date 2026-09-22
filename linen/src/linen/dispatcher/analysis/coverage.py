@@ -5,9 +5,8 @@ import json
 import uuid
 from pathlib import Path
 
-from linen.dispatcher.analysis.artifacts import ancestor_ids, load_artifact, source_bytes
-from linen.dispatcher.analysis.semgrep import digest, snapshot_source, write_json
-from linen.dispatcher.config import CoverageConfig, SemgrepConfig
+from linen.dispatcher.analysis.artifacts import ancestor_ids, digest, load_artifact, snapshot_source, source_bytes, write_json
+from linen.dispatcher.config import CoverageConfig
 from linen.server.models import Fact, Intent, ProjectDetail
 
 PLAN_INTENT = "@analysis:coverage-plan"
@@ -22,9 +21,7 @@ def create_plan(repo: Path, workdir: Path, config: CoverageConfig) -> dict[str, 
     directory.mkdir(parents=True)
     if not repo.is_dir():
         raise ValueError("Coverage requires an existing repository")
-    snapshot = snapshot_source(repo.resolve(), directory / "source", SemgrepConfig(
-        max_target_bytes=config.max_target_bytes, exclude=config.exclude,
-    ), workdir.resolve())
+    snapshot = snapshot_source(repo.resolve(), directory / "source", config, workdir.resolve())
     # Top-level modules then bounded file chunks. Every included file belongs
     # to exactly one chunk for each configured topic, including non-code files.
     modules: dict[str, list[str]] = {}
@@ -416,9 +413,7 @@ def reason_instructions(project: ProjectDetail, workdir: Path, config: CoverageC
 Scope audit policy (overrides hypothesis completion): Finding one vulnerability does
 NOT finish this project. Reserved @analysis, @coverage, @candidate-triage, and
 @candidate-verify intents are derived from the blackboard and materialized by the
-dispatcher; do not emit or duplicate them. The only exception is an exact
-`search:skill` choice supplied separately by the dispatcher: select one when its
-trusted scanner would materially improve the investigation. Review results as graph facts.
+dispatcher; do not emit or duplicate them. Review results as graph facts.
 checked/not_applicable only count after VALID review. For needs_followup, trace every
 lead with an ordinary source-grounded intent; the dispatcher will schedule a repeat
 that references the prior result. Retry exhaustion and unexplained skips mean

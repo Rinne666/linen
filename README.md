@@ -186,7 +186,7 @@ Audit mode can provide:
 
 - frozen scope and policy evidence;
 - coverage plans over included files and configured topics;
-- managed scanner results and reproducible execution records;
+- deterministic source inventory and reproducible execution records;
 - evidence-bearing vulnerability candidates;
 - independent review, proof-closure, and technical-confirmation gates;
 - optional isolated review and proof-of-concept execution in prebuilt Docker

@@ -1,4 +1,4 @@
-"""Graph-derived scanner triage and per-candidate verification contracts."""
+"""Graph-derived candidate triage and per-candidate verification contracts."""
 from __future__ import annotations
 
 import json
@@ -12,15 +12,14 @@ from linen.dispatcher.analysis.artifacts import (
     load_artifact,
     vulnerability_trace_proof,
 )
-from linen.dispatcher.analysis.semgrep import digest, write_json
+from linen.dispatcher.analysis.artifacts import digest, write_json
 from linen.dispatcher.config import CandidateTriageConfig
 from linen.server.models import Fact, Intent, ProjectDetail
 
 
 TRIAGE_PREFIX = "@candidate-triage:"
 VERIFY_PREFIX = "@candidate-verify:"
-SCAN_SUMMARY_PREFIX = "@analysis:candidate-summary:"
-CANDIDATE_FACT_TYPES = {"scan_batch", "route_scan"}
+CANDIDATE_FACT_TYPES = {"route_scan"}
 TRIAGE_OUTCOMES = {"keep", "drop", "duplicate"}
 VERIFY_OUTCOMES = {"confirmed", "refuted", "blocked"}
 
@@ -29,19 +28,19 @@ def _artifact_file(path: Path, manifest: dict, name: str) -> bytes:
     expected = manifest.get("artifact_hashes", {}).get(name)
     target = path.parent / name
     if not expected or not target.is_file():
-        raise ValueError(f"Scanner artifact is missing {name}")
+        raise ValueError(f"Candidate artifact is missing {name}")
     data = target.read_bytes()
     if digest(data) != expected:
-        raise ValueError(f"Scanner artifact changed: {name}")
+        raise ValueError(f"Candidate artifact changed: {name}")
     return data
 
 
-def scanner_candidates(fact: Fact, workdir: Path) -> tuple[Path, dict, list[dict]]:
+def candidate_sources(fact: Fact, workdir: Path) -> tuple[Path, dict, list[dict]]:
     if fact.type not in CANDIDATE_FACT_TYPES:
-        raise ValueError("Candidate source must be a scan_batch or route_scan fact")
+        raise ValueError("Candidate source must be a route_scan fact")
     path, manifest = load_artifact(fact, workdir)
     if manifest.get("status") != "completed":
-        raise ValueError(f"Scanner {fact.id} is not complete: {manifest.get('status')}")
+        raise ValueError(f"Candidate source {fact.id} is not complete: {manifest.get('status')}")
     candidates = json.loads(_artifact_file(path, manifest, "candidates.json"))
     if not isinstance(candidates, list):
         raise ValueError("candidates.json must contain an array")
@@ -49,7 +48,7 @@ def scanner_candidates(fact: Fact, workdir: Path) -> tuple[Path, dict, list[dict
     if any(not isinstance(value, str) or not value for value in fingerprints):
         raise ValueError("Every candidate requires a fingerprint")
     if len(set(fingerprints)) != len(fingerprints):
-        raise ValueError("Candidate fingerprints must be unique within a scanner batch")
+        raise ValueError("Candidate fingerprints must be unique within a candidate batch")
     return path, manifest, sorted(candidates, key=lambda item: item["fingerprint"])
 
 
@@ -58,7 +57,7 @@ def batch_description(fact_id: str, start: int, stop: int) -> str:
 
 
 def batches(fact: Fact, workdir: Path, config: CandidateTriageConfig) -> list[dict]:
-    _, _, candidates = scanner_candidates(fact, workdir)
+    _, _, candidates = candidate_sources(fact, workdir)
     result = []
     for start in range(0, len(candidates), config.candidates_per_batch):
         stop = min(start + config.candidates_per_batch, len(candidates))
@@ -91,7 +90,7 @@ def _batch_for_intent(
             )
             if match is not None and (intent.type or "").startswith("triage"):
                 return fact, match
-    raise ValueError("Triage intent must reference its scanner fact and an exact candidate batch")
+    raise ValueError("Triage intent must reference its candidate source and exact batch")
 
 
 def triage_context_prompt(
@@ -104,7 +103,6 @@ def triage_context_prompt(
     path, manifest = load_artifact(source, workdir)
     return "\nManaged candidate triage (the graph remains the task ledger):\n" + json.dumps({
         "source_fact_id": source.id,
-        "scanner": manifest.get("scanner"),
         "snapshot": manifest.get("snapshot", {}).get("id"),
         "source_root": str(path.parent / "source"),
         "candidates": batch["candidates"],
@@ -114,7 +112,7 @@ data.type="candidate_triage", data.evidence, and data.triage containing exactly 
 object per fingerprint: {fingerprint, outcome, category, rationale, duplicate_of?}.
 outcome is keep, drop, or duplicate. keep means a plausible trust-boundary crossing
 that needs a dedicated verification branch. drop requires a concrete source-grounded
-reason such as test-only, unreachable, safe API, or scanner mismatch. duplicate requires
+reason such as test-only, unreachable, safe API, or source mismatch. duplicate requires
 duplicate_of naming another fingerprint in this batch or a clearly cited earlier graph
 candidate. This task classifies candidates; it does not claim a vulnerability.
 """
@@ -213,13 +211,13 @@ def _verification_target(
     )
     if decision is None:
         raise ValueError("Candidate verification must target a kept candidate")
-    scanner_fact = next((fact for fact in project.facts if fact.id == record["source_fact_id"]), None)
-    if scanner_fact is None:
-        raise ValueError("Candidate scanner fact is missing")
-    path, manifest, candidates = scanner_candidates(scanner_fact, workdir)
+    source_fact = next((fact for fact in project.facts if fact.id == record["source_fact_id"]), None)
+    if source_fact is None:
+        raise ValueError("Candidate source fact is missing")
+    path, manifest, candidates = candidate_sources(source_fact, workdir)
     candidate = next((item for item in candidates if item["fingerprint"] == fingerprint), None)
     if candidate is None:
-        raise ValueError("Candidate fingerprint is missing from scanner evidence")
+        raise ValueError("Candidate fingerprint is missing from candidate evidence")
     return triage_fact, decision, candidate, path, manifest
 
 
@@ -237,7 +235,7 @@ stable logical entry identity (for example http:DELETE:/users/{id}) when the
 candidate has a logical HTTP, RPC, queue, or similar entry; otherwise return
 null. citations use exact frozen-source {id, file, line, code} objects. trace is
 an ordered array of {file, line, symbol, relation, observation, citation_id};
-scanner trace_seeds are unverified hints and every retained step must be
+    Trace seeds are unverified hints and every retained step must be
 independently checked.
 confirmed means the worker believes a vulnerability candidate is ready for the
 server-side Technical Confirmation Gate; it does not create a confirmed finding.
@@ -290,7 +288,7 @@ def verification_outcome_fact(
         raise ValueError("Candidate verification requires a description")
     snapshot = manifest.get("snapshot", {})
     citations = canonical_source_citations(
-        data.get("citations"), path.parent / "source", snapshot, label="Scanner verification",
+        data.get("citations"), path.parent / "source", snapshot, label="Candidate verification",
     )
     if not citations:
         raise ValueError("Candidate verification requires at least one frozen-source citation")
@@ -320,10 +318,6 @@ def verification_outcome_fact(
     }
 
 
-def scanner_summary_description(source_fact_id: str) -> str:
-    return f"{SCAN_SUMMARY_PREFIX}{source_fact_id}"
-
-
 def verification_attempts(project: ProjectDetail, source_fact_id: str, fingerprint: str) -> list[Intent]:
     prefix = f"{VERIFY_PREFIX}{source_fact_id}:{fingerprint}:"
     return sorted(
@@ -351,84 +345,3 @@ def terminal_verification(
             except (ValueError, TypeError):
                 pass
     return None
-
-
-def scanner_summary_inputs(
-    project: ProjectDetail,
-    source: Fact,
-    workdir: Path,
-    config: CandidateTriageConfig,
-) -> dict | None:
-    from linen.dispatcher.analysis.coverage import reviewed
-
-    expected_batches = batches(source, workdir, config)
-    triage_facts: list[Fact] = []
-    facts = {fact.id: fact for fact in project.facts}
-    for batch in expected_batches:
-        matching = [intent for intent in project.intents if intent.description == batch["description"]]
-        if len(matching) != 1:
-            return None
-        fact = facts.get(matching[0].to or "")
-        if fact is None or fact.type != "candidate_triage" or not reviewed(project, fact.id):
-            return None
-        triage_facts.append(fact)
-    decisions = []
-    terminal_facts: list[Fact] = []
-    for fact in triage_facts:
-        decisions.extend(triage_record(fact, workdir)["decisions"])
-    for decision in decisions:
-        if decision["outcome"] != "keep":
-            continue
-        terminal = terminal_verification(project, source.id, decision["fingerprint"])
-        if terminal is None or not reviewed(project, terminal.id):
-            return None
-        terminal_facts.append(terminal)
-    return {
-        "source": source,
-        "triage_facts": triage_facts,
-        "terminal_facts": terminal_facts,
-        "decisions": decisions,
-        "description": scanner_summary_description(source.id),
-    }
-
-
-def scanner_summary_fact(
-    project: ProjectDetail,
-    intent: Intent,
-    workdir: Path,
-    config: CandidateTriageConfig,
-) -> dict[str, str]:
-    source_id = intent.description.removeprefix(SCAN_SUMMARY_PREFIX)
-    source = next((fact for fact in project.facts if fact.id == source_id and fact.type in CANDIDATE_FACT_TYPES), None)
-    if source is None or intent.description != scanner_summary_description(source_id):
-        raise ValueError("Invalid scanner summary intent")
-    inputs = scanner_summary_inputs(project, source, workdir, config)
-    if inputs is None or (intent.type or "") != "synthesize":
-        raise ValueError("Scanner summary requires complete reviewed triage and verification")
-    expected = {source.id, *(fact.id for fact in inputs["triage_facts"]),
-                *(fact.id for fact in inputs["terminal_facts"])}
-    if set(intent.from_) != expected:
-        raise ValueError("Scanner summary must fan in every triage and terminal verification fact")
-    counts = {outcome: sum(row["outcome"] == outcome for row in inputs["decisions"])
-              for outcome in sorted(TRIAGE_OUTCOMES)}
-    record = {
-        "schema_version": 1,
-        "kind": "candidate_scanner_summary",
-        "source_fact_id": source.id,
-        "counts": counts,
-        "triage_fact_ids": [fact.id for fact in inputs["triage_facts"]],
-        "terminal_fact_ids": [fact.id for fact in inputs["terminal_facts"]],
-        "fingerprints": sorted(row["fingerprint"] for row in inputs["decisions"]),
-    }
-    directory = workdir / ".linen-analysis" / ("summary-" + uuid.uuid4().hex)
-    directory.mkdir(parents=True)
-    path = directory / "candidate-summary.json"
-    write_json(path, record)
-    return {
-        "type": "module_summary",
-        "description": f"Scanner candidate set {source.id} fully dispositioned: {counts}.",
-        "evidence": (
-            f"artifact: {path}\nmanifest_sha256: {digest(path.read_bytes())}\n"
-            f"source_fact_id: {source.id}\nstatus: completed"
-        ),
-    }

@@ -28,7 +28,7 @@ from linen.dispatcher.analysis.artifacts import (
     source_bytes,
     vulnerability_trace_proof,
 )
-from linen.dispatcher.analysis.semgrep import digest, write_json
+from linen.dispatcher.analysis.artifacts import digest, write_json
 from linen.dispatcher.config import SemanticAuditConfig
 from linen.server.models import Fact, Intent, ProjectDetail
 
@@ -479,7 +479,7 @@ def _source_context(project: ProjectDetail, intent: Intent, workdir: Path) -> li
         try:
             path, artifact = load_artifact(fact, workdir)
             entry["artifact"] = str(path)
-            entry["artifact_kind"] = artifact.get("kind") or artifact.get("scanner", {}).get("name")
+            entry["artifact_kind"] = artifact.get("kind") or artifact.get("producer", {}).get("name")
         except (ValueError, OSError, KeyError, TypeError):
             pass
         records.append(entry)

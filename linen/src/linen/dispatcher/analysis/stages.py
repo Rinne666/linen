@@ -13,10 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from linen.dispatcher.analysis.artifacts import load_artifact
-from linen.dispatcher.analysis.external_scanners import scanner_specs
 from linen.dispatcher.analysis import audit_recipes, coverage, scope_gate
 from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT
-from linen.dispatcher.skills import skill_for_scanner
 from linen.dispatcher.config import AuditConfig
 from linen.server.models import AuditStage, Fact, Intent, ProjectDetail
 
@@ -28,7 +26,6 @@ class StageDefinition:
     phase_order: int
     capability: str
     required: bool
-    skill_id: str | None = None
     enabled: bool = True
 
 
@@ -44,19 +41,8 @@ def stage_definitions(config: AuditConfig, audit_mode: str) -> list[StageDefinit
         ])
     if audit_mode == "scope":
         result.append(StageDefinition("coverage-plan", "Coverage plan", 30, "coverage.plan", True))
-    for offset, spec in enumerate(scanner_specs(config, enabled_only=False), start=40):
-        skill = skill_for_scanner(spec.name)
-        result.append(StageDefinition(
-            spec.name,
-            spec.label,
-            offset,
-            skill.capability,
-            False,
-            skill.id,
-            bool(spec.config.enabled),
-        ))
     if audit_mode == "scope" and config.spring.enabled:
-        result.append(StageDefinition("spring-routes", "Spring route scan", 90, "route.extract", True))
+        result.append(StageDefinition("spring-routes", "Spring route inventory", 90, "route.extract", True))
     if audit_mode == "scope" and config.semantic.enabled:
         result.append(StageDefinition("semantic-analysis", "Semantic analysis", 100, "semantic.analysis", True))
     if audit_mode == "scope":
@@ -106,7 +92,6 @@ def _definition_status(
     workdir: Path,
 ) -> dict[str, Any]:
     if not definition.enabled:
-        existing = next((stage for stage in project.stages if stage.stage_id == definition.stage_id), None)
         return {
             "stage_id": definition.stage_id,
             "label": definition.label,
@@ -114,8 +99,6 @@ def _definition_status(
             "required": False,
             "status": "not_applicable",
             "capability": definition.capability,
-            "skill_id": definition.skill_id,
-            "run_id": existing.run_id if existing is not None else None,
             "detail": "Disabled in the persisted dispatcher configuration",
         }
     description = {
@@ -128,14 +111,10 @@ def _definition_status(
     if definition.stage_id == "spring-routes":
         description = SPRING_SCAN_INTENT
     if description is None:
-        description = next(
-            (spec.intent for spec in scanner_specs(config, enabled_only=False)
-             if spec.name == definition.stage_id),
-            f"@analysis:{definition.stage_id}",
-        )
+        description = f"@analysis:{definition.stage_id}"
     intent = _intent(project, description)
     fact = _fact(project, intent)
-    status, run_id, detail = _result_status(intent, fact, workdir)
+    status, _unused_run_id, detail = _result_status(intent, fact, workdir)
     if intent is not None:
         errors = [
             error for error in project.errors
@@ -145,11 +124,6 @@ def _definition_status(
             error = errors[-1]
             status = "blocked" if error.classification == "blocked" else "failed"
             detail = error.message
-    existing = next((stage for stage in project.stages if stage.stage_id == definition.stage_id), None)
-    if run_id is None and existing is not None:
-        # The run id is owned by the skill receipt endpoint. Preserve it when
-        # deriving from a graph snapshot that does not expose skill_runs.
-        run_id = existing.run_id
     return {
         "stage_id": definition.stage_id,
         "label": definition.label,
@@ -157,8 +131,6 @@ def _definition_status(
         "required": definition.required,
         "status": status,
         "capability": definition.capability,
-        "skill_id": definition.skill_id,
-        "run_id": run_id,
         "detail": detail,
     }
 
@@ -180,7 +152,7 @@ def changed_rows(project: ProjectDetail, rows: list[dict[str, Any]]) -> list[dic
     for row in rows:
         old: AuditStage | None = current.get(row["stage_id"])
         if old is None or any(getattr(old, key) != row.get(key) for key in (
-            "label", "phase_order", "required", "status", "capability", "skill_id", "run_id", "detail",
+            "label", "phase_order", "required", "status", "capability", "detail",
         )):
             changed.append(row)
     return changed

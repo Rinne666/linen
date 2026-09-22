@@ -7,8 +7,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
-from linen.dispatcher.analysis.artifacts import source_bytes
-from linen.dispatcher.analysis.semgrep import write_json
+from linen.dispatcher.analysis.artifacts import source_bytes, write_json
 from linen.dispatcher.config import ReviewSandboxConfig
 from linen.dispatcher.runtime.process import LocalProcess, ProcessResult
 

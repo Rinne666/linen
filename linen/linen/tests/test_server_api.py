@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import subprocess
 from pathlib import Path
 
@@ -231,129 +230,6 @@ def test_stage_put_is_idempotent_and_decision_targets_are_validated(client: Test
     ).status_code == 404
 
 
-def test_skill_receipt_is_bound_to_stage_and_verified_artifact(
-    client: TestClient, tmp_path: Path,
-) -> None:
-    project_id = _create_project(client)
-    stage = client.put(
-        f"/projects/{project_id}/stages/semgrep",
-        json={
-            "label": "Semgrep",
-            "phase_order": 30,
-            "status": "pending",
-            "skill_id": "security.semgrep",
-            "capability": "static-analysis.sarif",
-        },
-    )
-    assert stage.status_code == 200
-    running_body = {
-        "stage_id": "semgrep",
-        "intent_id": None,
-        "skill_id": "security.semgrep",
-        "skill_version": "1",
-        "capability": "static-analysis.sarif",
-        "status": "running",
-    }
-    started = client.post(f"/projects/{project_id}/skill-runs", json=running_body)
-    assert started.status_code == 201, started.text
-    run_id = started.json()["id"]
-
-    artifact_dir = tmp_path / ".linen-analysis" / "semgrep-run"
-    artifact_dir.mkdir(parents=True)
-    artifact = artifact_dir / "manifest.json"
-    artifact.write_text('{"status":"completed"}', encoding="utf-8")
-    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-    completed_body = {
-        **running_body,
-        "status": "completed",
-        "artifact_ref": str(artifact),
-        "artifact_sha256": digest,
-    }
-    bad = client.put(
-        f"/projects/{project_id}/skill-runs/{run_id}",
-        json={**completed_body, "artifact_sha256": "0" * 64},
-    )
-    assert bad.status_code == 422
-    finished = client.put(
-        f"/projects/{project_id}/skill-runs/{run_id}", json=completed_body,
-    )
-    assert finished.status_code == 200, finished.text
-    gate = client.get(f"/projects/{project_id}/completion-gate").json()
-    receipt_check = next(check for check in gate["checks"] if check["id"] == "skill_receipts")
-    assert receipt_check["status"] == "pass"
-    assert receipt_check["evidence_ids"] == [run_id]
-    assert client.put(
-        f"/projects/{project_id}/skill-runs/{run_id}", json=completed_body,
-    ).status_code == 409
-
-
-def test_on_demand_scanner_stage_and_missing_receipt_do_not_block_completion(
-    client: TestClient,
-) -> None:
-    project_id = _create_project(client)
-    stage = client.put(
-        f"/projects/{project_id}/stages/semgrep",
-        json={
-            "label": "Semgrep",
-            "phase_order": 40,
-            "required": False,
-            "status": "pending",
-            "skill_id": "security.semgrep",
-            "capability": "static-analysis.sarif",
-        },
-    )
-    assert stage.status_code == 200
-
-    gate = client.get(f"/projects/{project_id}/completion-gate").json()
-    assert gate["ready"] is True
-    stage_check = next(check for check in gate["checks"] if check["id"] == "pipeline_stages")
-    receipt_check = next(check for check in gate["checks"] if check["id"] == "skill_receipts")
-    assert stage_check["status"] == "not_applicable"
-    assert receipt_check["status"] == "not_applicable"
-    assert "run on demand" in stage_check["detail"]
-    assert "none are required" in receipt_check["detail"]
-    assert not gate["blockers"]
-
-
-def test_on_demand_scanner_error_remains_visible_without_blocking_completion(
-    client: TestClient,
-) -> None:
-    project_id = _create_project(client)
-    created = client.post(
-        f"/projects/{project_id}/intents",
-        json={
-            "from": ["origin"],
-            "description": "@analysis:trivy",
-            "creator": "reasoner",
-            "type": "search:skill",
-            "action": "run_skill",
-            "target": "security.trivy",
-        },
-    )
-    assert created.status_code == 201
-    failed = client.post(
-        f"/projects/{project_id}/intents/i001/fail",
-        json={
-            "worker": "explorer",
-            "task_type": "explore",
-            "code": "scanner_failed",
-            "classification": "transient",
-            "message": "Trivy database is unavailable.",
-            "max_attempts": 1,
-        },
-    )
-    assert failed.status_code == 200
-    assert failed.json()["classification"] == "blocked"
-
-    gate = client.get(f"/projects/{project_id}/completion-gate").json()
-    error_check = next(check for check in gate["checks"] if check["id"] == "operational_errors")
-    assert gate["ready"] is True
-    assert gate["execution_status"] == "idle_attention_required"
-    assert error_check["status"] == "pass"
-    assert "do not block completion" in error_check["detail"]
-    assert not gate["blockers"]
-
-
 def test_completed_report_uses_immutable_snapshot(client: TestClient) -> None:
     project_id = _create_project(client)
     # Generic projects preserve the legacy completion contract.
@@ -514,7 +390,6 @@ def test_json_and_sarif_exports_include_semantics_gate_and_findings(client: Test
     assert payload["facts"][-1]["display_title"] == "Command argument injection"
     assert "graph_edges" in payload
     assert "audit_stages" in payload
-    assert "skill_runs" in payload
     assert "human_decisions" in payload
 
     sarif = client.get(f"/projects/{project_id}/export?format=sarif")

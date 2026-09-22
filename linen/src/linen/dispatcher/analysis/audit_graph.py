@@ -9,15 +9,11 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
-from typing import Any
 
 from linen.dispatcher.analysis import audit_recipes, coverage, scope_gate, triage
-from linen.dispatcher.analysis.artifacts import ancestor_ids, evidence_fields, load_artifact
-from linen.dispatcher.analysis.external_scanners import scanner_specs
-from linen.dispatcher.analysis.semgrep import digest, write_json
+from linen.dispatcher.analysis.artifacts import ancestor_ids, digest, load_artifact, write_json
 from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT
 from linen.dispatcher.config import AuditConfig
-from linen.dispatcher.skills import skill_for_scanner
 from linen.server.models import Fact, ProjectDetail
 from linen.server.uvpg import REQUIRED_ROLES
 
@@ -91,117 +87,6 @@ def _completed_sources(project: ProjectDetail, workdir: Path, fact_type: str) ->
     return result
 
 
-def _scanner_sources(
-    project: ProjectDetail,
-    workdir: Path,
-    scanner_name: str,
-    *,
-    completed_only: bool = False,
-) -> list[Fact]:
-    result = []
-    for fact in project.facts:
-        if fact.type != "scan_batch":
-            continue
-        try:
-            _, manifest = load_artifact(fact, workdir)
-            if manifest.get("scanner", {}).get("name") != scanner_name:
-                continue
-            if completed_only and manifest.get("status") != "completed":
-                continue
-            result.append(fact)
-        except (ValueError, OSError, KeyError, TypeError):
-            recorded = evidence_fields(fact.evidence).get("scanner")
-            legacy_semgrep = scanner_name == "semgrep" and fact.description.startswith("Semgrep scan ")
-            if not completed_only and (recorded == scanner_name or legacy_semgrep):
-                result.append(fact)
-    return result
-
-
-def _scanner_attempt_consumes_budget(fact: Fact, workdir: Path) -> bool:
-    """Ignore records produced by the pre-execution SARIF adapter bug.
-
-    Older Linen versions tried to open raw.sarif before persisting the process
-    result. A real scanner failure was therefore recorded as a missing-file
-    adapter error with a command but no execution object. Retrying those facts
-    under the fixed adapter is safe and keeps existing projects recoverable.
-    Configuration/preflight failures have no command and still consume budget.
-    """
-    try:
-        _, manifest = load_artifact(fact, workdir)
-    except (ValueError, OSError, KeyError, TypeError):
-        return True
-    return not (
-        manifest.get("status") == "failed"
-        and isinstance(manifest.get("command"), list)
-        and "execution" not in manifest
-    )
-
-
-def _scanner_proposals(
-    project: ProjectDetail,
-    workdir: Path,
-    config: AuditConfig,
-    anchor_fact_id: str,
-) -> list[dict]:
-    proposals = []
-    for spec in scanner_specs(config):
-        attempts = _scanner_sources(project, workdir, spec.name)
-        budgeted_attempts = [
-            fact for fact in attempts if _scanner_attempt_consumes_budget(fact, workdir)
-        ]
-        completed = _scanner_sources(project, workdir, spec.name, completed_only=True)
-        max_attempts = spec.config.max_attempts
-        if (not completed
-                and len(budgeted_attempts) < max_attempts
-                and (not attempts or _reviewed(project, attempts[-1].id))
-                and not _open(project, spec.intent)):
-            proposals.append({
-                "from": [anchor_fact_id, *(fact.id for fact in attempts[-1:])],
-                "type": "search",
-                "description": spec.intent,
-            })
-    return proposals
-
-
-def selectable_skill_choices(
-    project: ProjectDetail,
-    workdir: Path,
-    config: AuditConfig,
-) -> list[dict[str, Any]]:
-    """Return pending, trusted scanner capabilities the model may select next.
-
-    Applicability, retry budget, source anchors, and executable descriptions
-    remain deterministic.  The LLM chooses only the next registry id/order.
-    """
-    if project.project.audit_mode == "hypothesis":
-        anchor = "origin"
-    elif project.project.audit_mode == "scope":
-        plan = next((fact for fact in project.facts if fact.type == "coverage_plan"), None)
-        if plan is None or not _reviewed(project, plan.id):
-            return []
-        anchor = plan.id
-    else:
-        return []
-    proposals = _scanner_proposals(project, workdir, config, anchor)
-    specs_by_intent = {spec.intent: spec for spec in scanner_specs(config)}
-    choices: list[dict[str, Any]] = []
-    for proposal in proposals:
-        spec = specs_by_intent.get(proposal["description"])
-        if spec is None:
-            continue
-        skill = skill_for_scanner(spec.name)
-        choices.append({
-            "skill_id": skill.id,
-            "version": skill.version,
-            "capability": skill.capability,
-            "stage_id": skill.stage_id,
-            "label": spec.label,
-            "description": spec.intent,
-            "from": list(proposal["from"]),
-        })
-    return choices
-
-
 def _review_proposals(project: ProjectDetail) -> list[dict]:
     proposals = []
     open_reviews = {
@@ -228,7 +113,7 @@ def _review_proposals(project: ProjectDetail) -> list[dict]:
         reviews = coverage.effective_reviews(project, fact.id)
         # Legacy coverage plans were accidentally sent through the vulnerability
         # review prompt.  Their rows remain visible, but one new attestation is
-        # needed before the plan may fan out scanner, recipe, or coverage work.
+        # needed before the plan may fan out recipe or coverage work.
         if (
             fact.type == "coverage_plan"
             and all_reviews
@@ -355,31 +240,6 @@ def _coverage_summary_proposals(
     return proposals
 
 
-def _scanner_summary_proposals(
-    project: ProjectDetail,
-    workdir: Path,
-    config: AuditConfig,
-) -> list[dict]:
-    proposals = []
-    for source in project.facts:
-        if source.type not in triage.CANDIDATE_FACT_TYPES or not _reviewed(project, source.id):
-            continue
-        inputs = triage.scanner_summary_inputs(project, source, workdir, config.triage)
-        description = triage.scanner_summary_description(source.id)
-        if inputs is None or _proposal_exists(project, description):
-            continue
-        proposals.append({
-            "from": [
-                source.id,
-                *(fact.id for fact in inputs["triage_facts"]),
-                *(fact.id for fact in inputs["terminal_facts"]),
-            ],
-            "type": "synthesize",
-            "description": description,
-        })
-    return proposals
-
-
 def audit_summary_inputs(
     project: ProjectDetail,
     workdir: Path,
@@ -396,23 +256,10 @@ def audit_summary_inputs(
             module_ids.append(fact.id)
         if len(module_ids) != len(expected_modules) or not _reviewed(project, plan_fact.id):
             return None
-        scanner_ids = []
-        expected_scanners = [
-            *(
-                fact
-                for spec in scanner_specs(config)
-                for fact in _scanner_sources(project, workdir, spec.name, completed_only=True)
-            ),
-            *_completed_sources(project, workdir, "route_scan"),
-        ]
-        for source in expected_scanners:
-            fact = _result(project, triage.scanner_summary_description(source.id))
-            if fact is None or fact.type != "module_summary" or not _reviewed(project, fact.id):
-                return None
-            scanner_ids.append(fact.id)
-        if config.spring.enabled and not any(fact.type == "route_scan" for fact in expected_scanners):
+        route_sources = _completed_sources(project, workdir, "route_scan")
+        if config.spring.enabled and not route_sources:
             return None
-        for source in expected_scanners:
+        for source in route_sources:
             _, manifest = load_artifact(source, workdir)
             if manifest.get("snapshot", {}).get("id") != plan["snapshot"]["id"]:
                 return None
@@ -439,7 +286,7 @@ def audit_summary_inputs(
             ):
                 return None
             semantic_ids.append(semantic.id)
-        summary_ids = sorted(set(gate_ids + module_ids + scanner_ids + semantic_ids))
+        summary_ids = sorted(set(gate_ids + module_ids + semantic_ids))
         if any(
             intent.to is None
             and intent.concluded_at is None
@@ -472,7 +319,7 @@ def audit_summary_fact(
     inputs = audit_summary_inputs(project, workdir, config)
     if (intent.description.strip() != AUDIT_SUMMARY_INTENT or (intent.type or "") != "synthesize"
             or inputs is None or set(intent.from_) != set(inputs)):
-        raise ValueError("Audit summary requires every reviewed coverage/scanner module summary")
+        raise ValueError("Audit summary requires every reviewed coverage module summary")
     vulnerabilities = [
         fact.id for fact in project.facts
         if fact.type == "vulnerability" and fact.status == "triaged" and _reviewed(project, fact.id)
@@ -485,8 +332,7 @@ def audit_summary_fact(
         "confirmed_vulnerability_ids": sorted(vulnerabilities),
         "statement": (
             "The scope gate and required coverage and semantic recipe branches completed on "
-            "frozen evidence. Any scanner branches selected by a worker are included in the "
-            "reviewed inputs; an unselected scanner is not evidence of safety. Policy eligibility "
+            "frozen evidence. Policy eligibility "
             "remains separate from technical exploitability."
         ),
     }
@@ -498,9 +344,8 @@ def audit_summary_fact(
         "type": "audit_summary",
         "description": (
             f"Scope audit synthesis completed with {len(vulnerabilities)} confirmed vulnerabilities. "
-            "All required coverage and semantic recipe branches reached reviewed summaries; selected "
-            "scanner branches are included when present. Declared exclusions and tools not run remain "
-            "part of the limitations, and this does not prove the repository safe."
+            "All required coverage and semantic recipe branches reached reviewed summaries. "
+            "This does not prove the repository universally safe."
         ),
         "evidence": (
             f"artifact: {path}\nmanifest_sha256: {digest(path.read_bytes())}\n"
@@ -523,7 +368,7 @@ def required_intents(
     # Keep the entire gate ahead of unrelated legacy work. This is important
     # when enabling the gate on an active board whose ready window is already
     # full: collection, both attestations, and adjudication must still become
-    # visible instead of waiting behind coverage or scanner branches.
+    # visible instead of waiting behind coverage branches.
     if (
         project.project.audit_mode == "scope"
         and config.scope_adjudication.enabled
@@ -613,8 +458,7 @@ def required_intents(
     if proposals:
         return proposals[:limit]
 
-    # Scanner candidates are time-sensitive, high-signal branches. Triage
-    # them before fanning out the much larger deterministic coverage grid.
+    # Candidate evidence is triaged before the larger deterministic coverage grid.
     if config.triage.enabled:
         for source in project.facts:
             if source.type not in triage.CANDIDATE_FACT_TYPES or not _reviewed(project, source.id):
@@ -657,8 +501,6 @@ def required_intents(
     if proposals:
         return proposals[:limit]
     proposals.extend(_coverage_summary_proposals(project, workdir, config))
-    if config.triage.enabled:
-        proposals.extend(_scanner_summary_proposals(project, workdir, config))
     if config.semantic.enabled:
         semantic_summary = audit_recipes.summary_proposal(
             project, workdir, config.semantic,
@@ -741,5 +583,5 @@ def scope_blockers(
         except (ValueError, OSError, KeyError, TypeError) as exc:
             blockers.append(f"Invalid semantic recipe evidence: {exc}")
     if audit_summary_inputs(project, workdir, config) is None:
-        blockers.append("Coverage/scanner branches have not reached reviewed module summaries.")
+        blockers.append("Coverage branches have not reached reviewed module summaries.")
     return list(dict.fromkeys(blockers))

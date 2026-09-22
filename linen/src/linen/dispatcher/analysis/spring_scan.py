@@ -11,13 +11,13 @@ import re
 import uuid
 from pathlib import Path
 
-from linen.dispatcher.analysis.semgrep import (
+from linen.dispatcher.analysis.artifacts import (
     digest,
     snapshot_canonical_source,
     snapshot_source,
     write_json,
 )
-from linen.dispatcher.config import SemgrepConfig, SpringScanConfig
+from linen.dispatcher.config import CoverageConfig, SpringScanConfig
 
 
 SPRING_SCAN_INTENT = "@analysis:spring-route-auth"
@@ -208,7 +208,7 @@ def run_spring_scan(
     manifest: dict = {
         "schema_version": 1,
         "status": "failed",
-        "scanner": {"name": "spring-route-auth", "version": 1},
+        "producer": {"name": "spring-route-auth", "version": 1},
         "errors": [],
         "candidate_count": 0,
     }
@@ -221,7 +221,7 @@ def run_spring_scan(
             else snapshot_source(
                 repo,
                 run_dir / "source",
-                SemgrepConfig(max_target_bytes=2_000_000),
+                CoverageConfig(max_target_bytes=2_000_000),
                 output_root,
             )
         )
@@ -282,7 +282,7 @@ def run_spring_scan(
                     "test_only": route["test_only"],
                     "coverage_gap": "Spring Security filters and runtime proxy policy are not statically resolved",
                 },
-                "scanner_fingerprints": {},
+                "route_fingerprints": {},
                 "occurrences": 1,
                 "status": "unverified",
             })

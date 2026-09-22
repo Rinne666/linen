@@ -7,8 +7,6 @@ from pydantic import ValidationError
 
 from linen.dispatcher.config import (
     DispatchConfig,
-    SpotBugsConfig,
-    TrivyConfig,
     WorkerConfig,
     validate_prompt_resources,
 )
@@ -141,13 +139,8 @@ def test_codex_driver_execute_argv_passes_model_endpoint_and_prompt() -> None:
     assert argv[-2:] == ["--", "prompt"]
 
 
-def test_managed_scanner_configuration_is_explicit_and_safe() -> None:
-    with pytest.raises(ValidationError, match="FindSecBugs plugin jar"):
-        SpotBugsConfig(enabled=True)
-    with pytest.raises(ValidationError, match="unique scanner names"):
-        TrivyConfig(scanners=["vuln", "vuln"])
-
+def test_dispatch_config_rejects_removed_scanner_configuration() -> None:
     payload = make_config().model_dump()
-    payload["audit"]["trivy"]["enabled"] = True
-    with pytest.raises(ValidationError, match="managed scanners require audit.enabled"):
+    payload["audit"]["trivy"] = {"enabled": True}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         DispatchConfig.model_validate(payload)

@@ -12,7 +12,7 @@ and security effect. Do not create facts or intents.
   required sub-claim.
 - Return `NEEDS_REVIEW` for missing runtime/configuration evidence or unresolved
   ambiguity.
-- Cite useful file and line references. Missing scanner matches are not evidence
+- Cite useful file and line references. Missing matches are not evidence
   of safety, and an execution/scope record is not a vulnerability.
 
 # Output

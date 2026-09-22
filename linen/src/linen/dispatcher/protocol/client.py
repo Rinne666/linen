@@ -16,7 +16,6 @@ from linen.server.models import (
     ProjectDetail,
     ProjectSummary,
     Settings,
-    SkillRun,
 )
 from linen.contracts import (
     ArtifactMetadata,
@@ -200,8 +199,6 @@ class LinenClient:
         status: str,
         required: bool = True,
         capability: str | None = None,
-        skill_id: str | None = None,
-        run_id: str | None = None,
         detail: str | None = None,
         source_generation: int | None = None,
         plan_revision: int | None = None,
@@ -216,8 +213,6 @@ class LinenClient:
         }
         for key, value in {
             "capability": capability,
-            "skill_id": skill_id,
-            "run_id": run_id,
             "detail": detail,
             "source_generation": source_generation,
             "plan_revision": plan_revision,
@@ -237,97 +232,6 @@ class LinenClient:
         )
         response.raise_for_status()
         return TypeAdapter(list[AuditStage]).validate_python(response.json())
-
-    def create_skill_run(
-        self,
-        project_id: str,
-        *,
-        stage_id: str,
-        skill_id: str,
-        skill_version: str,
-        capability: str,
-        status: str,
-        intent_id: str | None = None,
-        command: str | None = None,
-        artifact_ref: str | None = None,
-        artifact_sha256: str | None = None,
-        detail: str | None = None,
-        source_generation: int | None = None,
-        plan_revision: int | None = None,
-        actor: str = "dispatcher",
-    ) -> ApiResult:
-        body = {
-            "stage_id": stage_id,
-            "skill_id": skill_id,
-            "skill_version": skill_version,
-            "capability": capability,
-            "status": status,
-            "actor": actor,
-        }
-        for key, value in {
-            "intent_id": intent_id,
-            "command": command,
-            "artifact_ref": artifact_ref,
-            "artifact_sha256": artifact_sha256,
-            "detail": detail,
-            "source_generation": source_generation,
-            "plan_revision": plan_revision,
-        }.items():
-            if value is not None:
-                body[key] = value
-        return self._request_json(
-            "POST", f"/projects/{project_id}/skill-runs", json=body,
-        )
-
-    def update_skill_run(
-        self,
-        project_id: str,
-        run_id: str,
-        *,
-        stage_id: str,
-        skill_id: str,
-        skill_version: str,
-        capability: str,
-        status: str,
-        intent_id: str | None = None,
-        command: str | None = None,
-        artifact_ref: str | None = None,
-        artifact_sha256: str | None = None,
-        detail: str | None = None,
-        source_generation: int | None = None,
-        plan_revision: int | None = None,
-        actor: str = "dispatcher",
-    ) -> ApiResult:
-        """Finalize or amend a dispatcher-issued skill execution receipt."""
-        body: dict[str, Any] = {
-            "stage_id": stage_id,
-            "skill_id": skill_id,
-            "skill_version": skill_version,
-            "capability": capability,
-            "status": status,
-            "actor": actor,
-        }
-        for key, value in {
-            "intent_id": intent_id,
-            "command": command,
-            "artifact_ref": artifact_ref,
-            "artifact_sha256": artifact_sha256,
-            "detail": detail,
-            "source_generation": source_generation,
-            "plan_revision": plan_revision,
-        }.items():
-            if value is not None:
-                body[key] = value
-        return self._request_json(
-            "PUT", f"/projects/{project_id}/skill-runs/{run_id}", json=body,
-        )
-
-    def list_skill_runs(self, project_id: str) -> list[SkillRun]:
-        response = self._session().get(
-            self._url(f"/projects/{project_id}/skill-runs"), timeout=self._timeout,
-        )
-        response.raise_for_status()
-        return TypeAdapter(list[SkillRun]).validate_python(response.json())
 
     def export_project(self, project_id: str) -> str:
         response = self._session().get(

@@ -9,7 +9,7 @@
 - `ArtifactMetadata`：工作区证据索引；路径必须是 workspace-relative，保存 kind、SHA-256、媒体类型、producer run 和相关节点。内容读取必须做路径逃逸与哈希校验。
 - `RunEnvelope`：一次 Worker 尝试的生命周期和身份，包含 `run_id`、task/stage、`attempt`、幂等键、版本、状态、Manifest/Context 引用及 Artifact 引用。
 - `WorkerManifest`：Dispatcher 发给 Worker 的不可变运行清单，固定 recipe、组件引用、能力、工具和权限，并产生 canonical digest。
-- `ComponentManifest`：Skill、Plugin、MCP、Scanner、Tool、Prompt 或 Policy pack 的版本化能力/权限/风险描述。
+- `ComponentManifest`：Skill、Plugin、MCP、Tool、Prompt 或 Policy pack 的版本化能力/权限/风险描述。
 - `ContextProjection`：按 Intent、阶段和权限生成的最小上下文投影，引用快照、图版本、节点/边/Artifact 集合，并带可验证 `projection_digest`。
 
 `ContextRequest` 是 `ContextProjection` 的配套请求模型，不是第八类运行时状态：Worker 只能通过显式的 `context_required` envelope 请求有限的节点、关系或 Artifact。

@@ -44,14 +44,6 @@ def test_audit_progress_uses_real_stage_and_gate_counts() -> None:
     assert "No worker is running" in source
 
 
-def test_on_demand_scanners_are_not_presented_as_required_progress() -> None:
-    source = html()
-
-    assert "tools on demand" in source
-    assert "No required stages" in source
-    assert ">On demand</span>" in source
-
-
 def test_reviewed_candidate_blocker_exposes_technical_confirmation_action() -> None:
     source = html()
 

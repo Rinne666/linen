@@ -90,8 +90,8 @@ Audit policy (takes precedence over earlier completion instructions):
 This dispatcher verifies a vulnerability hypothesis, not exhaustive repository safety.
 Never complete until the vulnerability AND its supporting ancestor facts have evidence,
 triaged status, and VALID reviews with firm/certain confidence, with no open intents.
-Origin needs no review. Review scan_batch facts only as scan execution records, never
-as proof of a vulnerability. A scan failure or zero matches does not prove safety.
+Origin needs no review. Execution records are not proof of a vulnerability.
+An incomplete investigation does not prove safety.
 NEEDS_REVIEW means uncertainty; seek additional evidence rather than declaring INVALID.
 Read reviews and fact status from the graph. Existing concluded review intents are closed.
 If every remaining candidate finding has been explicitly rejected or excluded and the
@@ -101,5 +101,3 @@ evidence-backed conclusion; it must never claim that the repository is universal
 Only complete from a firmly/certainly VALID reviewed vulnerability, confirmed finding,
 or negative_assurance fact.
 """
-
-SCAN_INTENT_DESCRIPTION = "@analysis:semgrep"

@@ -6,16 +6,10 @@ import time
 from pathlib import Path
 from typing import Any
 from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, scope_gate, triage
-from linen.dispatcher.analysis.external_scanners import (
-    run_scan as run_external_scan,
-    scanner_for_intent,
-)
 from linen.dispatcher.analysis.artifacts import review_inputs, select_snapshot
 
-from linen.dispatcher.analysis.policy import SCAN_INTENT_DESCRIPTION, SOURCE_DATA_BOUNDARY
-from linen.dispatcher.analysis.semgrep import run_scan
+from linen.dispatcher.analysis.policy import SOURCE_DATA_BOUNDARY
 from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT, run_spring_scan
-from linen.dispatcher.skills import build_receipt, skill_for_scanner, validate_receipt
 
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.contracts.common import canonical_digest
@@ -145,113 +139,6 @@ def _report_proof_contract_block(
         best_effort_release(client, project_id, intent.id, worker_name)
         return "failed"
     return "blocked"
-
-
-def _scanner_receipt_start(
-    client: LinenClient,
-    project_id: str,
-    intent: Intent,
-    scanner_name: str,
-    *,
-    source_generation: int,
-    plan_revision: int,
-) -> tuple[object, object] | None:
-    """Issue a running receipt for a registered scanner, if supported."""
-    if not hasattr(client, "create_skill_run"):
-        return None
-    try:
-        skill = skill_for_scanner(scanner_name)
-        response = client.create_skill_run(
-            project_id,
-            stage_id=skill.stage_id,
-            skill_id=skill.id,
-            skill_version=skill.version,
-            capability=skill.capability,
-            status="running",
-            intent_id=intent.id,
-            source_generation=source_generation,
-            plan_revision=plan_revision,
-        )
-        if response.ok and isinstance(response.data, dict) and isinstance(response.data.get("id"), str):
-            return skill, response.data["id"]
-        LOG.warning(
-            "scanner receipt start failed project=%s intent=%s scanner=%s status=%s body=%s",
-            project_id, intent.id, scanner_name, response.status_code, response.text,
-        )
-    except Exception:
-        LOG.exception("scanner receipt start crashed project=%s intent=%s scanner=%s", project_id, intent.id, scanner_name)
-    return None
-
-
-def _scanner_receipt_finish(
-    client: LinenClient,
-    project_id: str,
-    intent: Intent,
-    started: tuple[object, object] | None,
-    fact: dict[str, str],
-    analysis_root: Path,
-    *,
-    source_generation: int,
-    plan_revision: int,
-) -> str | None:
-    """Verify the immutable manifest before finalizing a skill-run receipt."""
-    run_id = None
-    try:
-        artifact_line = next(
-            (line for line in fact.get("evidence", "").splitlines() if line.startswith("artifact:")),
-            "",
-        )
-        artifact = artifact_line.partition(":")[2].strip()
-        manifest_path = Path(artifact) if artifact else None
-        if manifest_path is None:
-            raise ValueError("scanner fact did not include a manifest artifact")
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        status = "not_applicable" if manifest.get("applicability", {}).get("status") == "not_applicable" else manifest.get("status")
-        if started is None or not hasattr(client, "update_skill_run"):
-            return status
-        skill, run_id = started
-        command = manifest.get("command")
-        detail = "; ".join(
-            str(error.get("message", error)) for error in manifest.get("errors", [])
-            if isinstance(error, dict)
-        ) or None
-        receipt = build_receipt(
-            skill,
-            status=status,
-            artifact_ref=manifest_path,
-            command=command if isinstance(command, list) else None,
-            detail=detail,
-            allowed_root=analysis_root,
-        )
-        receipt = validate_receipt(receipt, allowed_root=analysis_root)
-        if started is not None and hasattr(client, "update_skill_run"):
-            response = client.update_skill_run(
-                project_id,
-                str(run_id),
-                stage_id=receipt.stage_id,
-                skill_id=receipt.skill_id,
-                skill_version=receipt.skill_version,
-                capability=receipt.capability,
-                status=receipt.status,
-                intent_id=intent.id,
-                command=receipt.command,
-                artifact_ref=receipt.artifact_ref,
-                artifact_sha256=receipt.artifact_sha256,
-                detail=receipt.detail,
-                source_generation=source_generation,
-                plan_revision=plan_revision,
-            )
-            if not response.ok:
-                LOG.warning(
-                    "scanner receipt finish failed project=%s intent=%s run=%s status=%s body=%s",
-                    project_id, intent.id, run_id, response.status_code, response.text,
-                )
-        return status
-    except Exception:
-        # A malformed or moved artifact must never be reported as a completed
-        # receipt. The scan Fact remains available for diagnosis/retry.
-        LOG.exception("scanner receipt validation failed project=%s intent=%s run=%s", project_id, intent.id, run_id)
-        return None
 
 
 def run_explore_task(
@@ -390,144 +277,6 @@ def run_explore_task(
                     phase_ms=int((time.perf_counter() - task_started) * 1000),
                     fact_type=mechanical["type"], evidence=mechanical["evidence"],
                 )
-
-        if (config.audit.semgrep.enabled and intent.type in {"search", "search:skill"}
-                and intent.description.strip() == SCAN_INTENT_DESCRIPTION):
-            scan_repo = Path(container_name) / "repo"
-            canonical_snapshot = None
-            if scope_audit:
-                _, plan_path, plan = coverage.get_plan(
-                    client.get_project(project.project.id), Path(container_name),
-                )
-                scan_repo = plan_path.parent / "source"
-                canonical_snapshot = plan["snapshot"]
-            receipt = _scanner_receipt_start(
-                client,
-                project.project.id,
-                intent,
-                "semgrep",
-                source_generation=project.project.source_generation,
-                plan_revision=project.project.plan_revision,
-            )
-            fact = run_scan(
-                scan_repo, Path(container_name) / ".linen-analysis",
-                config.audit.semgrep,
-                lambda source, argv: run_worker_process(
-                    backend, str(source), worker, argv, phase="semgrep_scan",
-                    timeout_seconds=config.audit.semgrep.timeout,
-                    lease=lease, cancellation=cancellation,
-                ),
-                canonical_snapshot=canonical_snapshot,
-            )
-            scanner_status = _scanner_receipt_finish(
-                client,
-                project.project.id,
-                intent,
-                receipt,
-                fact,
-                Path(container_name) / ".linen-analysis",
-                source_generation=project.project.source_generation,
-                plan_revision=project.project.plan_revision,
-            )
-            if scanner_status not in {"completed", "not_applicable"}:
-                response = client.report_intent_error(
-                    project.project.id,
-                    intent.id,
-                    worker.name,
-                    task_type="explore",
-                    code="scanner_failed",
-                    classification="transient",
-                    message=f"Semgrep scan status: {scanner_status or 'unknown'}",
-                    remediation="Retry the same scanner Intent while attempts remain.",
-                    max_attempts=config.audit.semgrep.max_attempts,
-                ) if hasattr(client, "report_intent_error") else None
-                if response is None or not response.ok:
-                    best_effort_release(client, project.project.id, intent.id, worker.name)
-                return "failed"
-            if cancellation.is_cancelled or lease.failure is not None:
-                best_effort_release(client, project.project.id, intent.id, worker.name)
-                return "cancelled" if cancellation.is_cancelled else "failed"
-            return write_conclude_result(
-                client, project.project.id, intent.id, worker.name,
-                fact["description"], source="semgrep_scan",
-                phase_ms=int((time.perf_counter() - task_started) * 1000),
-                fact_type=fact["type"], evidence=fact["evidence"],
-            )
-
-        external_scanner = scanner_for_intent(config.audit, intent.description)
-        if (external_scanner is not None and external_scanner.name != "semgrep"
-                and intent.type in {"search", "search:skill"}):
-            scan_repo = Path(container_name) / "repo"
-            canonical_snapshot = None
-            if scope_audit:
-                _, plan_path, plan = coverage.get_plan(
-                    client.get_project(project.project.id), Path(container_name),
-                )
-                scan_repo = plan_path.parent / "source"
-                canonical_snapshot = plan["snapshot"]
-            receipt = _scanner_receipt_start(
-                client,
-                project.project.id,
-                intent,
-                external_scanner.name,
-                source_generation=project.project.source_generation,
-                plan_revision=project.project.plan_revision,
-            )
-            fact = run_external_scan(
-                scan_repo,
-                Path(container_name) / ".linen-analysis",
-                external_scanner,
-                lambda source, argv: run_worker_process(
-                    backend,
-                    str(source),
-                    worker,
-                    argv,
-                    phase=external_scanner.phase,
-                    timeout_seconds=external_scanner.config.timeout,
-                    lease=lease,
-                    cancellation=cancellation,
-                ),
-                canonical_snapshot=canonical_snapshot,
-            )
-            scanner_status = _scanner_receipt_finish(
-                client,
-                project.project.id,
-                intent,
-                receipt,
-                fact,
-                Path(container_name) / ".linen-analysis",
-                source_generation=project.project.source_generation,
-                plan_revision=project.project.plan_revision,
-            )
-            if scanner_status not in {"completed", "not_applicable"}:
-                response = client.report_intent_error(
-                    project.project.id,
-                    intent.id,
-                    worker.name,
-                    task_type="explore",
-                    code="scanner_failed",
-                    classification="transient",
-                    message=f"{external_scanner.label} scan status: {scanner_status or 'unknown'}",
-                    remediation="Retry the same scanner Intent while attempts remain.",
-                    max_attempts=external_scanner.config.max_attempts,
-                ) if hasattr(client, "report_intent_error") else None
-                if response is None or not response.ok:
-                    best_effort_release(client, project.project.id, intent.id, worker.name)
-                return "failed"
-            if cancellation.is_cancelled or lease.failure is not None:
-                best_effort_release(client, project.project.id, intent.id, worker.name)
-                return "cancelled" if cancellation.is_cancelled else "failed"
-            return write_conclude_result(
-                client,
-                project.project.id,
-                intent.id,
-                worker.name,
-                fact["description"],
-                source=external_scanner.phase,
-                phase_ms=int((time.perf_counter() - task_started) * 1000),
-                fact_type=fact["type"],
-                evidence=fact["evidence"],
-            )
 
         if task_healthcheck_enabled(config):
             LOG.info(
@@ -1379,7 +1128,7 @@ def _managed_result(config, project, intent, container_name, payload, fact):
         if intent.description.startswith(triage.VERIFY_PREFIX):
             return triage.verification_outcome_fact(payload, project, intent, Path(container_name))
         if fact["type"] in {
-            "coverage_plan", "coverage_result", "scan_batch", "route_scan", "candidate_triage",
+            "coverage_plan", "coverage_result", "route_scan", "candidate_triage",
             "module_summary", "audit_summary", *audit_recipes.SEMANTIC_ARTIFACT_FACT_TYPES,
             "policy_evidence", "scope_adjudication",
         }:
@@ -1391,8 +1140,6 @@ def _managed_summary_fact(config, project, intent, workdir):
     description = intent.description.strip()
     if description.startswith(coverage.MODULE_SUMMARY_PREFIX):
         return coverage.module_summary_fact(project, intent, workdir, config.audit.coverage)
-    if description.startswith(triage.SCAN_SUMMARY_PREFIX):
-        return triage.scanner_summary_fact(project, intent, workdir, config.audit.triage)
     if description == audit_recipes.SUMMARY_INTENT:
         return audit_recipes.summary_fact(
             project,

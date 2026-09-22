@@ -10,7 +10,7 @@ Read the complete blackboard snapshot, the summary Fact, and every referenced
 artifact. Reconstruct the expected direct inputs from concluded Intent edges and
 compare them with the summary. Verify that:
 
-- every expected coverage, scanner, and configured semantic-recipe branch is
+- every expected coverage and configured semantic-recipe branch is
   represented exactly once;
 - each referenced result has a decisive review and a terminal state;
 - failed, blocked, unresolved, or skipped work is disclosed rather than hidden;

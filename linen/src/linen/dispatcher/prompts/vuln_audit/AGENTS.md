@@ -22,12 +22,10 @@ read host credentials, or make network calls. Only an explicit `poc:isolated`
 Intent may authorize bounded execution in its declared sandbox.
 
 Use read-only inspection tools such as `rg`, `find`, `cat`, `head`, `tail`,
-`tree`, and read-only `git show/log/diff`. Semgrep, SpotBugs/FindSecBugs,
-OSV-Scanner, Gitleaks, Trivy, and route extraction are managed by the dispatcher
-on frozen inputs. Do not launch duplicate broad scans, download rule packs, build
-a CodeQL database, or install tools from an ordinary Explore task. When a managed
-scanner Fact is in the graph, read its manifest and candidate artifact, then
-verify the assigned candidate against source.
+`tree`, and read-only `git show/log/diff`. Route inventory is the only
+dispatcher-provided deterministic source analysis. Do not launch broad scans,
+download rule packs, build a CodeQL database, or install tools from an ordinary
+Explore task. Verify every assigned candidate against the frozen source.
 
 ## Output format
 
@@ -59,7 +57,7 @@ Recommended layout for `evidence` (one label per line, grep-friendly):
 file: <relative path from repo root>
 line: <line number>
 code: <short code excerpt, ≤ 5 lines>
-tool: <name and config, e.g. "semgrep p/sql-injection">
+tool: <read-only inspection command, if any>
 taint: <source → variable → sink>
 fix: <concrete fix, only when type is vulnerability or sanitizer-blocked>
 ```
@@ -112,7 +110,7 @@ If a fact is too long for the description (e.g., a multi-page taint trace), writ
 
 ## Quality bar
 
-- **Read code, don't pattern-match.** Managed scanner output and `rg` are starting
+- **Read code, don't pattern-match.** Route inventory and `rg` are starting
   points, not conclusions. Every finding needs a human-style read of the relevant
   path and surrounding code.
 - **Bypass-aware.** If a sanitizer exists, ask: is it applied to all paths? Is it correct? Is it bypassable (e.g., URL-decoded before sanitization)?

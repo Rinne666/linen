@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
 import sqlite3
 
 from fastapi import APIRouter, HTTPException, Query
@@ -14,7 +12,6 @@ from linen.server.audit_state import (
     list_audit_events,
     list_audit_stages,
     list_human_decisions,
-    list_skill_runs,
     _stage_from_row,
 )
 from linen.server.db import get_conn
@@ -24,16 +21,13 @@ from linen.server.models import (
     CompletionGate,
     CreateHumanDecisionRequest,
     HumanDecision,
-    SkillRun,
     UpsertAuditStageRequest,
-    UpsertSkillRunRequest,
 )
 from linen.server.services import (
     bump_graph_revision,
     check_project_active,
     get_project_or_404,
     next_human_decision_id,
-    next_skill_run_id,
     utcnow,
 )
 
@@ -145,8 +139,6 @@ def upsert_audit_stage(
             "required": int(body.required),
             "status": body.status,
             "capability": body.capability,
-            "skill_id": body.skill_id,
-            "run_id": body.run_id,
             "detail": body.detail,
         }
         # PUT is a reconciliation operation.  Replaying the same ledger
@@ -155,12 +147,11 @@ def upsert_audit_stage(
             return _stage_from_row(existing)
         conn.execute(
             "INSERT INTO audit_stages (project_id, source_generation, plan_revision, stage_id, "
-            "label, phase_order, required, status, capability, skill_id, run_id, detail, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "label, phase_order, required, status, capability, detail, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(project_id, source_generation, plan_revision, stage_id) DO UPDATE SET "
             "label=excluded.label, phase_order=excluded.phase_order, required=excluded.required, "
-            "status=excluded.status, capability=excluded.capability, skill_id=excluded.skill_id, "
-            "run_id=excluded.run_id, detail=excluded.detail, updated_at=excluded.updated_at",
+            "status=excluded.status, capability=excluded.capability, detail=excluded.detail, updated_at=excluded.updated_at",
             (
                 project_id,
                 generation,
@@ -171,8 +162,6 @@ def upsert_audit_stage(
                 int(body.required),
                 body.status,
                 body.capability,
-                body.skill_id,
-                body.run_id,
                 body.detail,
                 now,
             ),
@@ -189,8 +178,6 @@ def upsert_audit_stage(
                 "status": body.status,
                 "required": body.required,
                 "capability": body.capability,
-                "skill_id": body.skill_id,
-                "run_id": body.run_id,
                 "detail": body.detail,
             },
             created_at=now,
@@ -203,165 +190,6 @@ def upsert_audit_stage(
         ).fetchone()
         assert row is not None
         return _stage_from_row(row)
-
-
-@router.get(
-    "/projects/{project_id}/skill-runs",
-    response_model=list[SkillRun],
-)
-def get_skill_runs(project_id: str):
-    with get_conn() as conn:
-        get_project_or_404(conn, project_id)
-        return list_skill_runs(conn, project_id)
-
-
-def _write_skill_run(
-    conn: sqlite3.Connection,
-    project_id: str,
-    run_id: str,
-    body: UpsertSkillRunRequest,
-    *,
-    create: bool,
-) -> SkillRun:
-    project = check_project_active(conn, project_id)
-    generation = project["source_generation"]
-    revision = project["plan_revision"]
-    if body.source_generation is not None and body.source_generation != generation:
-        raise HTTPException(409, "Skill run source_generation is stale")
-    if body.plan_revision is not None and body.plan_revision != revision:
-        raise HTTPException(409, "Skill run plan_revision is stale")
-    now = utcnow()
-    existing = conn.execute(
-        "SELECT * FROM skill_runs WHERE project_id = ? AND id = ?",
-        (project_id, run_id),
-    ).fetchone()
-    if create and existing is not None:
-        raise HTTPException(409, "Skill run already exists")
-    if not create and existing is None:
-        raise HTTPException(404, "Skill run not found")
-    stage = conn.execute(
-        "SELECT * FROM audit_stages WHERE project_id = ? AND source_generation = ? "
-        "AND plan_revision = ? AND stage_id = ?",
-        (project_id, generation, revision, body.stage_id),
-    ).fetchone()
-    if stage is None:
-        raise HTTPException(409, "Skill run requires a current registered audit stage")
-    if stage["skill_id"] not in {None, body.skill_id}:
-        raise HTTPException(409, "Skill run does not match the stage skill_id")
-    if stage["capability"] not in {None, body.capability}:
-        raise HTTPException(409, "Skill run does not match the stage capability")
-    if existing is not None:
-        identity = ("stage_id", "intent_id", "skill_id", "skill_version", "capability")
-        if any(existing[key] != getattr(body, key) for key in identity):
-            raise HTTPException(409, "Skill run identity is immutable")
-        if existing["status"] in {"completed", "failed", "not_applicable"}:
-            raise HTTPException(409, "Terminal Skill run receipts are immutable")
-    if body.status in {"completed", "not_applicable"}:
-        if not body.artifact_ref or not body.artifact_sha256:
-            raise HTTPException(422, "Terminal successful Skill run requires an artifact and SHA-256")
-        artifact = Path(body.artifact_ref).expanduser().resolve()
-        if ".linen-analysis" not in artifact.parts or not artifact.is_file():
-            raise HTTPException(422, "Skill artifact must be an existing file under .linen-analysis")
-        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-        if digest != body.artifact_sha256.lower():
-            raise HTTPException(422, "Skill artifact SHA-256 does not match the file")
-    started_at = existing["started_at"] if existing is not None else now
-    finished_at = now if body.status in {"completed", "failed", "not_applicable"} else None
-    conn.execute(
-        "INSERT INTO skill_runs (id, project_id, stage_id, intent_id, skill_id, skill_version, "
-        "capability, status, command, artifact_ref, artifact_sha256, detail, source_generation, "
-        "plan_revision, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(id, project_id) DO UPDATE SET stage_id=excluded.stage_id, "
-        "intent_id=excluded.intent_id, skill_id=excluded.skill_id, skill_version=excluded.skill_version, "
-        "capability=excluded.capability, status=excluded.status, command=excluded.command, "
-        "artifact_ref=excluded.artifact_ref, artifact_sha256=excluded.artifact_sha256, "
-        "detail=excluded.detail, finished_at=excluded.finished_at",
-        (
-            run_id,
-            project_id,
-            body.stage_id,
-            body.intent_id,
-            body.skill_id,
-            body.skill_version,
-            body.capability,
-            body.status,
-            body.command,
-            body.artifact_ref,
-            body.artifact_sha256,
-            body.detail,
-            generation,
-            revision,
-            started_at,
-            finished_at,
-        ),
-    )
-    stage_status = {
-        "running": "running",
-        "completed": "satisfied",
-        "failed": "failed",
-        "not_applicable": "not_applicable",
-    }[body.status]
-    conn.execute(
-        "UPDATE audit_stages SET status = ?, run_id = ?, skill_id = ?, detail = ?, updated_at = ? "
-        "WHERE project_id = ? AND source_generation = ? AND plan_revision = ? AND stage_id = ?",
-        (
-            stage_status,
-            run_id,
-            body.skill_id,
-            body.detail,
-            now,
-            project_id,
-            generation,
-            revision,
-            body.stage_id,
-        ),
-    )
-    append_event(
-        conn,
-        project_id,
-        "skill_run_updated",
-        body.actor,
-        entity_kind="skill_run",
-        entity_id=run_id,
-        payload={
-            "stage_id": body.stage_id,
-            "skill_id": body.skill_id,
-            "skill_version": body.skill_version,
-            "capability": body.capability,
-            "status": body.status,
-            "artifact_ref": body.artifact_ref,
-            "artifact_sha256": body.artifact_sha256,
-            "detail": body.detail,
-        },
-        created_at=now,
-    )
-    bump_graph_revision(conn, project_id)
-    row = conn.execute(
-        "SELECT * FROM skill_runs WHERE project_id = ? AND id = ?",
-        (project_id, run_id),
-    ).fetchone()
-    assert row is not None
-    return SkillRun(**dict(row))
-
-
-@router.post(
-    "/projects/{project_id}/skill-runs",
-    response_model=SkillRun,
-    status_code=201,
-)
-def create_skill_run(project_id: str, body: UpsertSkillRunRequest):
-    with get_conn() as conn:
-        run_id = next_skill_run_id(conn, project_id)
-        return _write_skill_run(conn, project_id, run_id, body, create=True)
-
-
-@router.put(
-    "/projects/{project_id}/skill-runs/{run_id}",
-    response_model=SkillRun,
-)
-def update_skill_run(project_id: str, run_id: str, body: UpsertSkillRunRequest):
-    with get_conn() as conn:
-        return _write_skill_run(conn, project_id, run_id, body, create=False)
 
 
 @router.get(

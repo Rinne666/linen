@@ -61,7 +61,7 @@ Normal output — one typed fact with evidence:
 {"accepted": true, "data": {
   "description": "...",
   "type": "dataflow",
-  "evidence": "file:src/api/users.py:42\ncode:db.execute(f'SELECT * FROM users WHERE id={uid}')\ntool:semgrep p/sql-injection\ntaint:request.args['id'] -> uid -> f-string -> db.execute"
+  "evidence": "file:src/api/users.py:42\ncode:db.execute(f'SELECT * FROM users WHERE id={uid}')\ntool:rg -n 'execute' repo/src/api\ntaint:request.args['id'] -> uid -> f-string -> db.execute"
 }}
 ```
 
@@ -71,8 +71,8 @@ Normal output — one typed fact with evidence:
 
 - Do exactly the step described by the Current Intent. Do not do other work.
 - Read the source code first. Use read-only `cat`, `rg`, `find`, and `git
-  show/log/diff` as appropriate. Managed scanners run in dedicated dispatcher
-  tasks; do not launch duplicate broad scans or build the target here.
+  show/log/diff` as appropriate. Do not launch broad scans or install tools in
+  an ordinary Explore task.
 - The `type` field in your output is REQUIRED when the step produced a typed fact. Pick the most specific canonical type. If your finding is a generic observation (no chain advancement), you may omit `type` — but the reason task will treat that as low-signal.
 - The `evidence` field is REQUIRED when you can cite it. It is the structured backing: `file:`, `line:`, `code:`, `tool:`, raw tool output, taint trace, anything that lets a reviewer re-derive your conclusion. Plain text, not JSON.
 - For NO-finding outcomes, still return a fact with `type` set and a `description` that clearly says "no X in Y because Z". The reason task uses these as counter-evidence to close dead chains.
@@ -93,7 +93,7 @@ Normal output — one typed fact with evidence:
 file: <relative path from repo root>
 line: <line number>
 code: <short code excerpt, ≤ 5 lines>
-tool: <name and config, e.g. "semgrep p/sql-injection">
+tool: <read-only inspection command, if any>
 taint: <source → variable → sink>
 fix: <concrete fix recommendation, only when type is vulnerability or sanitizer-blocked>
 ```

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import fnmatch
+import hashlib
+import os
 import re
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from linen.dispatcher.analysis.semgrep import digest
 from linen.server.models import Fact, ProjectDetail
 
 
@@ -15,6 +17,114 @@ TRACE_RELATIONS = frozenset({
 })
 _ENDPOINT_ID = re.compile(r"^[a-z][a-z0-9+.-]*:\S{1,191}$")
 _CITATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def write_json(path: Path, data: object) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def snapshot_source(repo: Path, destination: Path, config: object, output_root: Path) -> dict:
+    """Copy regular files into a bounded immutable source snapshot."""
+    files: dict[str, str] = {}
+    skipped: list[dict] = []
+    destination.mkdir(parents=True)
+    exclude = getattr(config, "exclude", [])
+    max_target_bytes = getattr(config, "max_target_bytes", 2_000_000)
+    for directory, dirs, names in os.walk(repo, followlinks=False):
+        directory = Path(directory)
+        for name in sorted(dirs + names):
+            path = directory / name
+            relative = path.relative_to(repo).as_posix()
+            reason = None
+            if path.is_symlink():
+                reason = "symlink"
+            elif path == output_root or output_root in path.parents:
+                reason = "analysis_artifacts"
+            elif name == ".git" or any(
+                fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch(name, pattern)
+                for pattern in exclude
+            ):
+                reason = "excluded"
+            elif path.is_file() and path.stat().st_size > max_target_bytes:
+                reason = "max_target_bytes"
+            if reason:
+                skipped.append({"path": relative, "reason": reason})
+                if name in dirs:
+                    dirs.remove(name)
+                continue
+            if name in dirs:
+                continue
+            if not path.is_file():
+                skipped.append({"path": relative, "reason": "not_regular_file"})
+                continue
+            content = path.read_bytes()
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            files[relative] = digest(content)
+    identity = json.dumps(
+        {"files": files, "skipped": sorted(skipped, key=lambda x: x["path"])},
+        sort_keys=True,
+    )
+    return {"id": digest(identity.encode()), "files": files, "skipped": skipped}
+
+
+def snapshot_canonical_source(repo: Path, destination: Path, canonical_snapshot: dict) -> dict:
+    """Copy exactly the regular files named by a prior immutable snapshot."""
+    expected = canonical_snapshot.get("files")
+    snapshot_id = canonical_snapshot.get("id")
+    skipped = canonical_snapshot.get("skipped", [])
+    if (not isinstance(expected, dict) or not expected or not isinstance(snapshot_id, str)
+            or not isinstance(skipped, list)):
+        raise ValueError("Invalid canonical source snapshot")
+    for name, expected_hash in expected.items():
+        if not isinstance(name, str) or not name or not isinstance(expected_hash, str):
+            raise ValueError("Invalid canonical snapshot file entry")
+        relative = PurePosixPath(name)
+        if relative.is_absolute() or ".." in relative.parts or "\\" in name:
+            raise ValueError("Invalid canonical snapshot file entry")
+    if any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("path"), str)
+        or not isinstance(item.get("reason"), str)
+        for item in skipped
+    ):
+        raise ValueError("Invalid canonical snapshot skip entry")
+    identity = json.dumps(
+        {"files": expected, "skipped": sorted(skipped, key=lambda item: item["path"])},
+        sort_keys=True,
+    )
+    if digest(identity.encode()) != snapshot_id:
+        raise ValueError("Canonical source snapshot id does not match its manifest")
+    actual: set[str] = set()
+    for directory, dirs, names in os.walk(repo, followlinks=False):
+        directory = Path(directory)
+        for name in sorted(dirs + names):
+            path = directory / name
+            relative = path.relative_to(repo).as_posix()
+            if path.is_symlink():
+                raise ValueError(f"Canonical source contains a symlink: {relative}")
+            if name in dirs:
+                continue
+            if not path.is_file():
+                raise ValueError(f"Canonical source contains a non-regular file: {relative}")
+            actual.add(relative)
+    if actual != set(expected):
+        raise ValueError("Source input differs from the canonical coverage snapshot")
+    destination.mkdir(parents=True)
+    for name, expected_hash in sorted(expected.items()):
+        source = repo / name
+        data = source.read_bytes()
+        if digest(data) != expected_hash:
+            raise ValueError(f"Canonical snapshot file changed: {name}")
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    return {"id": snapshot_id, "files": dict(expected), "skipped": list(skipped)}
 
 
 def canonical_endpoint_id(value: Any) -> str:
@@ -208,7 +318,7 @@ def select_snapshot(project: ProjectDetail, fact_id: str, workdir: Path) -> tupl
         allowed_types = (
             {"policy_evidence"}
             if policy_review
-            else {"scan_batch", "route_scan", "coverage_plan"}
+            else {"route_scan", "coverage_plan"}
         )
         if fact.id in ancestors and fact.type in allowed_types:
             path, artifact = load_artifact(fact, workdir)
@@ -216,7 +326,7 @@ def select_snapshot(project: ProjectDetail, fact_id: str, workdir: Path) -> tupl
             if snapshot.get("id") and isinstance(snapshot.get("files"), dict):
                 candidates.append((path.parent / "source", snapshot))
     if not candidates:
-        raise ValueError("Isolated execution requires an ancestor scanner or coverage snapshot")
+        raise ValueError("Isolated execution requires an ancestor evidence or coverage snapshot")
     if len({snapshot["id"] for _, snapshot in candidates}) != 1:
         raise ValueError("Review chain references different snapshots; split the finding before review")
     return candidates[0]
@@ -226,7 +336,7 @@ def review_inputs(project: ProjectDetail, fact: Fact, workdir: Path) -> dict[str
     """Selected execution records, never other reviews or graph history."""
     inputs: dict[str, bytes] = {}
     artifact_fact_types = {
-        "scan_batch", "route_scan", "coverage_plan", "module_summary", "audit_summary",
+        "route_scan", "coverage_plan", "module_summary", "audit_summary",
         "architecture_map", "authz_matrix", "state_model", "cross_service_map",
         "contract_map", "hypothesis_batch", "variant_batch", "semantic_summary",
         "policy_evidence", "scope_adjudication",
@@ -234,7 +344,7 @@ def review_inputs(project: ProjectDetail, fact: Fact, workdir: Path) -> dict[str
     if fact.type in artifact_fact_types:
         path, artifact = load_artifact(fact, workdir)
         record = {key: artifact[key] for key in (
-            "id", "kind", "snapshot", "cells", "config", "status", "scanner", "coverage",
+            "id", "kind", "snapshot", "cells", "config", "status", "producer", "coverage",
             "candidate_count", "route_count", "guard_patterns", "counts", "results",
             "input_fact_ids", "confirmed_vulnerability_ids", "errors", "recipe",
             "subject_fact_id", "citations", "items", "recipe_fact_ids", "worker_evidence",
@@ -243,12 +353,8 @@ def review_inputs(project: ProjectDetail, fact: Fact, workdir: Path) -> dict[str
             "technical_exploitability_unchanged", "evidence_gaps",
         ) if key in artifact}
         inputs["record.json"] = json.dumps(record, ensure_ascii=False).encode()
-        if fact.type in {"scan_batch", "route_scan"}:
-            names = (
-                ("raw.sarif", "report.json", "candidates.json")
-                if fact.type == "scan_batch"
-                else ("routes.json", "guards.json", "candidates.json")
-            )
+        if fact.type == "route_scan":
+            names = ("routes.json", "guards.json", "candidates.json")
             for name in names:
                 expected = artifact.get("artifact_hashes", {}).get(name)
                 if expected:

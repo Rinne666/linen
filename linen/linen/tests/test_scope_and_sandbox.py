@@ -10,7 +10,7 @@ import pytest
 from test_audit_pipeline import api, config, project, FakeDriver
 from linen.dispatcher.analysis import audit_graph, coverage
 from linen.dispatcher.analysis.artifacts import load_artifact, select_snapshot
-from linen.dispatcher.analysis.semgrep import digest
+from linen.dispatcher.analysis.artifacts import digest
 from linen.dispatcher.config import CoverageConfig, ReviewSandboxConfig
 from linen.dispatcher.runtime.backend import LocalBackend
 from linen.dispatcher.runtime.cancellation import TaskCancellation

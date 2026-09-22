@@ -32,7 +32,6 @@ FACT_TYPE_VALIDATION = "validation"
 FACT_TYPE_REACHABILITY = "reachability"
 FACT_TYPE_VULNERABILITY = "vulnerability"
 FACT_TYPE_RECON = "recon"
-FACT_TYPE_SCAN_BATCH = "scan_batch"
 FACT_TYPE_ROUTE_SCAN = "route_scan"
 FACT_TYPE_COVERAGE_PLAN = "coverage_plan"
 FACT_TYPE_COVERAGE_RESULT = "coverage_result"
@@ -110,7 +109,6 @@ GRAPH_RELATION_TYPES: frozenset[str] = frozenset(
 AUDIT_ATTESTATION_FACT_TYPES: frozenset[str] = frozenset(
     {
         FACT_TYPE_COVERAGE_PLAN,
-        FACT_TYPE_SCAN_BATCH,
         FACT_TYPE_ROUTE_SCAN,
         FACT_TYPE_CANDIDATE_TRIAGE,
         FACT_TYPE_CANDIDATE_DISPOSITION,
@@ -152,7 +150,6 @@ ALL_FACT_TYPES: frozenset[str] = frozenset(
         FACT_TYPE_REACHABILITY,
         FACT_TYPE_VULNERABILITY,
         FACT_TYPE_RECON,
-        FACT_TYPE_SCAN_BATCH,
         FACT_TYPE_ROUTE_SCAN,
         FACT_TYPE_COVERAGE_PLAN,
         FACT_TYPE_COVERAGE_RESULT,
@@ -196,7 +193,7 @@ INTENT_TYPE_SEARCH = "search"          # find candidates (sinks, sources, saniti
 INTENT_TYPE_VALIDATE = "validate"      # validate a sanitizer / guard
 INTENT_TYPE_REACH = "reach"            # determine if a call site is reachable
 INTENT_TYPE_CHARACTERIZE = "characterize"  # fully characterize a confirmed vuln
-INTENT_TYPE_TRIAGE = "triage"          # classify a bounded scanner-candidate batch
+INTENT_TYPE_TRIAGE = "triage"          # classify a bounded candidate batch
 INTENT_TYPE_SYNTHESIZE = "synthesize"  # fan-in reviewed graph branches
 
 ALL_INTENT_TYPES: frozenset[str] = frozenset(
@@ -539,8 +536,6 @@ class AuditStage(BaseModel):
         "pending", "running", "satisfied", "blocked", "failed", "not_applicable",
     ] = "pending"
     capability: str | None = None
-    skill_id: str | None = None
-    run_id: str | None = None
     detail: str | None = None
     source_generation: int = 1
     plan_revision: int = 1
@@ -555,42 +550,6 @@ class UpsertAuditStageRequest(BaseModel):
         "pending", "running", "satisfied", "blocked", "failed", "not_applicable",
     ] = "pending"
     capability: str | None = None
-    skill_id: str | None = None
-    run_id: str | None = None
-    detail: str | None = None
-    source_generation: int | None = Field(default=None, ge=1)
-    plan_revision: int | None = Field(default=None, ge=1)
-    actor: str = "dispatcher"
-
-
-class SkillRun(BaseModel):
-    id: str
-    stage_id: str
-    intent_id: str | None = None
-    skill_id: str
-    skill_version: str
-    capability: str
-    status: Literal["running", "completed", "failed", "not_applicable"]
-    command: str | None = None
-    artifact_ref: str | None = None
-    artifact_sha256: str | None = None
-    detail: str | None = None
-    source_generation: int = 1
-    plan_revision: int = 1
-    started_at: str
-    finished_at: str | None = None
-
-
-class UpsertSkillRunRequest(BaseModel):
-    stage_id: str
-    intent_id: str | None = None
-    skill_id: str
-    skill_version: str
-    capability: str
-    status: Literal["running", "completed", "failed", "not_applicable"]
-    command: str | None = None
-    artifact_ref: str | None = None
-    artifact_sha256: str | None = None
     detail: str | None = None
     source_generation: int | None = Field(default=None, ge=1)
     plan_revision: int | None = Field(default=None, ge=1)

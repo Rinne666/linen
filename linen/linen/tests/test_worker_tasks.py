@@ -8,7 +8,6 @@ from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.process import ProcessResult
 from linen.dispatcher.workers.health import HealthResult
 from linen.dispatcher.tasks import explore, reason
-from linen.dispatcher.analysis.external_scanners import TRIVY_INTENT
 
 from conftest import (
     FakeClient,
@@ -111,47 +110,6 @@ def test_reason_treats_retry_of_already_ready_intent_as_idempotent(monkeypatch) 
     assert client.released_reasons == [("proj_001", "test-worker")]
 
 
-def test_failed_scanner_keeps_intent_open_for_retry(monkeypatch, tmp_path) -> None:
-    config = make_config()
-    config.audit.enabled = True
-    config.audit.trivy.enabled = True
-    intent = make_intent()
-    intent.description = TRIVY_INTENT
-    intent.type = "search:skill"
-    project = make_project(intents=[intent])
-    client = FakeClient(project)
-    containers = FakeContainerManager()
-    driver = FakeDriver()
-    lease = FakeLease()
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({
-        "status": "failed",
-        "errors": [{"message": "scanner unavailable"}],
-        "scanner": {"name": "trivy"},
-    }))
-
-    monkeypatch.setattr(explore, "get_driver", lambda *_a, **_k: driver)
-    monkeypatch.setattr(explore.HeartbeatLease, "for_intent", _lease_factory(lease))
-    monkeypatch.setattr(
-        explore,
-        "run_external_scan",
-        lambda *_args, **_kwargs: {
-            "description": "Trivy scan failed",
-            "type": "scan_batch",
-            "evidence": f"artifact: {manifest}",
-        },
-    )
-
-    outcome = explore.run_explore_task(
-        config, client, containers, project, "graph", intent,
-        config.workers[0], TaskCancellation(),
-    )
-
-    assert outcome == "failed"
-    assert client.concluded == []
-    assert client.errors == [("proj_001", "i001", "scanner_failed", "transient")]
-
-
 def test_reason_uses_project_audit_mode_instead_of_global_scope_mode(monkeypatch) -> None:
     config = make_config()
     config.audit.enabled = True
@@ -187,72 +145,6 @@ def test_reason_uses_project_audit_mode_instead_of_global_scope_mode(monkeypatch
     prompt = driver.execute_prompts[0]
     assert "verifies a vulnerability hypothesis" in prompt
     assert "Scope-audit policy" not in prompt
-
-
-def test_scope_reason_can_select_an_exact_on_demand_scanner(monkeypatch) -> None:
-    config = make_config()
-    config.audit.enabled = True
-    config.audit.trivy.enabled = True
-    project = make_project()
-    project.project.audit_mode = "scope"
-    client = FakeClient(project)
-    containers = FakeContainerManager()
-    driver = FakeDriver()
-    lease = FakeLease()
-    choice = {
-        "skill_id": "security.trivy",
-        "version": "1",
-        "capability": "filesystem-security.sarif",
-        "stage_id": "trivy",
-        "label": "Trivy",
-        "description": TRIVY_INTENT,
-        "from": ["origin"],
-    }
-
-    monkeypatch.setattr(reason, "get_driver", lambda *_a, **_k: driver)
-    monkeypatch.setattr(reason.HeartbeatLease, "for_reason", _lease_factory(lease))
-    monkeypatch.setattr(
-        reason.audit_graph,
-        "selectable_skill_choices",
-        lambda *_args, **_kwargs: [choice],
-    )
-    monkeypatch.setattr(
-        reason,
-        "run_worker_process",
-        lambda *_args, **_kwargs: ProcessResult(
-            0,
-            json.dumps({
-                "accepted": True,
-                "data": {
-                    "intents": [{
-                        "from": ["origin"],
-                        "action": "run_skill",
-                        "target": "security.trivy",
-                        "type": "search:skill",
-                        "description": TRIVY_INTENT,
-                    }],
-                },
-            }),
-            "",
-        ),
-    )
-
-    outcome = reason.run_reason_task(
-        config,
-        client,
-        containers,
-        project,
-        "graph",
-        config.workers[0],
-        TaskCancellation(),
-    )
-
-    assert outcome == "success"
-    assert client.created_intents == [
-        ("proj_001", ["origin"], TRIVY_INTENT, "test-worker"),
-    ]
-    assert client.created_intent_semantics == [("run_skill", "security.trivy")]
-    assert client.created_hints == []
 
 
 def test_explore_early_plain_text_exit_uses_conclude_fallback(monkeypatch) -> None:

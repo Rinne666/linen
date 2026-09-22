@@ -104,10 +104,6 @@ def next_human_decision_id(conn: sqlite3.Connection, project_id: str) -> str:
     return _next_scoped_id(conn, "human_decision", "d", project_id)
 
 
-def next_skill_run_id(conn: sqlite3.Connection, project_id: str) -> str:
-    return _next_scoped_id(conn, "skill_run", "s", project_id)
-
-
 def next_report_snapshot_id(conn: sqlite3.Connection, project_id: str) -> str:
     return _next_scoped_id(conn, "report_snapshot", "rp", project_id)
 

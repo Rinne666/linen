@@ -17,7 +17,6 @@ from pathlib import Path
 import requests
 
 from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, scope_gate, stages, triage
-from linen.dispatcher.analysis.external_scanners import scanner_for_intent, scanner_specs
 from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.models import RunningTask
@@ -132,7 +131,6 @@ class DispatcherLoop:
         # aren't useful here (the worker uses the host CLI's own credentials,
         # not the env keys in dispatch.yaml).
         self._run_local_binary_check()
-        self._run_managed_scanner_check()
         self._startup_healthchecks_checked = True
         if not force and self.config.runtime.worker_healthcheck == "disabled":
             return
@@ -180,26 +178,6 @@ class DispatcherLoop:
             "configured and usable directly (e.g. `claude -p ...` works) — linen injects no API keys.",
             ", ".join(sorted(available)),
         )
-
-    def _run_managed_scanner_check(self) -> None:
-        missing: list[str] = []
-        for spec in scanner_specs(self.config.audit):
-            executable = str(spec.config.executable)
-            path = shutil.which(executable)
-            if path is None:
-                missing.append(f"{spec.label} executable `{executable}`")
-                continue
-            if spec.name == "spotbugs-findsecbugs":
-                plugin = spec.config.plugin.expanduser().resolve() if spec.config.plugin else None
-                if plugin is None or not plugin.is_file():
-                    missing.append(f"FindSecBugs plugin `{plugin or 'unset'}`")
-                    continue
-            LOG.info("[+] managed scanner %-24s %s", spec.label, path)
-        if missing:
-            raise RuntimeError(
-                "enabled managed scanners are unavailable: " + ", ".join(missing)
-                + ". Install them or disable their audit config blocks."
-            )
 
     @staticmethod
     def _probe_local_cli(binary: str) -> tuple[str | None, bool]:
@@ -517,7 +495,7 @@ class DispatcherLoop:
             # its heartbeat timestamp, so failures rotate to the back of the
             # persisted blackboard queue instead of starving older work. For
             # never-attempted intents this is ordinary FIFO ordering. Non-cell
-            # graph work (scanner, review, triage, synthesis) stays ahead of
+            # graph work (review, triage, synthesis) stays ahead of
             # bulk coverage, including on boards created before ready-window
             # bounding was introduced.
             next_intent = min(
@@ -632,7 +610,7 @@ class DispatcherLoop:
         workdir = Path(self.container_manager.ensure_running(project.project.id))
         # Keep only a small ready window on the blackboard. The complete audit
         # DAG remains derivable from facts, intents, and reviews, but thousands
-        # of future coverage cells no longer hide scanner/triage work or make
+        # of future coverage cells no longer hide triage work or make
         # the UI look as if every cell is already running.
         limit = min(8, max(1, self.config.runtime.max_project_workers * 2))
         open_managed = sum(
@@ -738,8 +716,6 @@ class DispatcherLoop:
                 required=row["required"],
                 status=row["status"],
                 capability=row.get("capability"),
-                skill_id=row.get("skill_id"),
-                run_id=row.get("run_id"),
                 detail=row.get("detail"),
                 source_generation=project.project.source_generation,
                 plan_revision=project.project.plan_revision,
@@ -1141,10 +1117,8 @@ class DispatcherLoop:
         )
 
     def _explore_requires_provider(self, project: ProjectDetail, intent: Intent) -> bool:
-        """Keep deterministic audit scanners runnable during an LLM outage."""
+        """Keep deterministic audit work runnable during an LLM outage."""
         description = intent.description.strip()
-        if scanner_for_intent(self.config.audit, description) is not None:
-            return False
         scope_audit = self.config.audit.enabled and project.project.audit_mode == "scope"
         if not scope_audit:
             return True
@@ -1163,7 +1137,6 @@ class DispatcherLoop:
             return False
         return not (
             description.startswith(coverage.MODULE_SUMMARY_PREFIX)
-            or description.startswith(triage.SCAN_SUMMARY_PREFIX)
             or description == audit_recipes.SUMMARY_INTENT
             or description == audit_graph.AUDIT_SUMMARY_INTENT
         )

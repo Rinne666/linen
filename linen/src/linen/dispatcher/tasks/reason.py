@@ -6,7 +6,6 @@ import time
 import uuid
 from pathlib import Path
 from linen.dispatcher.analysis import audit_graph, coverage
-from linen.dispatcher.analysis.external_scanners import scanner_reason_instructions, scanner_specs
 
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.analysis.policy import (
@@ -408,11 +407,6 @@ def run_reason_task(
             for intent in project.intents
             if intent.to is None and intent.concluded_at is None and intent.id in projected_ids
         ]
-        skill_choices = (
-            audit_graph.selectable_skill_choices(project, Path(container_name), config.audit)
-            if config.audit.enabled and project.project.audit_mode != "none"
-            else []
-        )
         allowed_fact_ids = [
             fact.id for fact in project.facts
             if fact.id != "goal" and fact.id in projected_ids
@@ -442,13 +436,6 @@ def run_reason_task(
                 "max_intents": str(config.tasks.reason.max_intents),
             },
         )
-        if skill_choices:
-            prompt += (
-                "\nTrusted Skill choices (select by emitting a normal Intent with "
-                "action=run_skill, target=skill_id, type=search:skill, and the "
-                "choice's exact description):\n"
-                + json.dumps(skill_choices, ensure_ascii=False, sort_keys=True)
-            )
         if audit_enabled:
             prompt += "\n" + SOURCE_DATA_BOUNDARY
 
@@ -462,8 +449,6 @@ def run_reason_task(
                     )
             else:
                 prompt += "\n" + AUDIT_REASON_INSTRUCTIONS
-            if scanner_specs(config.audit):
-                prompt += "\n" + scanner_reason_instructions(config.audit)
         worker_manifest, run_envelope = _reason_contracts(
             project,
             worker,
@@ -699,10 +684,7 @@ def run_reason_task(
                     fresh = client.get_project(project.project.id)
                     try:
                         coverage.validate_intent(fresh, Path(container_name), config.audit.coverage, intent_data)
-                        if (
-                            audit_graph.managed_description(intent_data["description"])
-                            and intent_type != "search:skill"
-                        ):
+                        if audit_graph.managed_description(intent_data["description"]):
                             raise ValueError(
                                 "Reserved audit intents are materialized from graph state by the dispatcher"
                             )
@@ -717,27 +699,6 @@ def run_reason_task(
                 # validate/reach/characterize intents. Pass it through so the
                 # scheduler can route review intents to the review dispatcher
                 # (loop.py: `if intent.type == "review"`).
-                if intent_type == "search:skill":
-                    skill_id = intent_data.get("target")
-                    selected_skill = next(
-                        (choice for choice in skill_choices if choice["skill_id"] == skill_id),
-                        None,
-                    )
-                    if (
-                        intent_data.get("action") != "run_skill"
-                        or selected_skill is None
-                        or intent_data.get("description") != selected_skill["description"]
-                    ):
-                        LOG.warning(
-                            "reason skill intent rejected project=%s worker=%s target=%s",
-                            project.project.id, worker.name, skill_id,
-                        )
-                        continue
-                    intent_data = {
-                        **intent_data,
-                        "description": selected_skill["description"],
-                        "from": selected_skill["from"],
-                    }
                 response = client.create_intent(
                     project.project.id,
                     intent_data["from"],

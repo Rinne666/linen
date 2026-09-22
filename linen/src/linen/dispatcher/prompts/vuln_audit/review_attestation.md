@@ -9,13 +9,13 @@ confirmed vulnerability claim.
 Read the Fact evidence and the referenced immutable artifacts. Verify their
 hashes when present, inspect the cited frozen source, and decide whether the
 record faithfully represents what was executed or classified. A successful
-scanner exit or a zero-candidate result is not evidence that the repository is
+inventory or a zero-candidate result is not evidence that the repository is
 safe.
 
 Check all of the following:
 
 1. The evidence artifact exists and its declared digest matches.
-2. Scanner identity, snapshot, status, exclusions, errors, and applicability
+2. Producer identity, snapshot, status, exclusions, errors, and applicability
    agree with the artifact.
 3. Candidate/triage fingerprints are complete, unique, and tied to the stated
    source batch.

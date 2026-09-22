@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .common import ContractModel
 
-ComponentKind = Literal["skill", "plugin", "mcp", "scanner", "tool", "prompt", "policy_pack"]
+ComponentKind = Literal["skill", "plugin", "mcp", "tool", "prompt", "policy_pack"]
 
 
 class ComponentRisk(BaseModel):

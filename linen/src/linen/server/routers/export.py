@@ -12,7 +12,6 @@ from linen.server.audit_state import (
     list_audit_stages,
     list_graph_edges,
     list_human_decisions,
-    list_skill_runs,
 )
 from linen.server.db import get_conn
 from linen.server.services import (
@@ -192,9 +191,6 @@ def _export_yaml(conn, project_id: str) -> str:
     ]
     data["audit_stages"] = [
         stage.model_dump(exclude_none=True) for stage in list_audit_stages(conn, project_id)
-    ]
-    data["skill_runs"] = [
-        run.model_dump(exclude_none=True) for run in list_skill_runs(conn, project_id)
     ]
     data["human_decisions"] = [
         decision.model_dump(exclude_none=True)

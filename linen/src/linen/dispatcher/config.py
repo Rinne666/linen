@@ -182,110 +182,6 @@ class WorkerConfig(BaseModel):
         return self
 
 
-class SemgrepConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    enabled: bool = False
-    executable: str = "semgrep"
-    rules: Path | None = None
-    timeout: int = Field(default=300, gt=0)
-    max_attempts: int = Field(default=3, gt=0, le=10)
-    max_target_bytes: int = Field(default=1_000_000, gt=0)
-    exclude: list[str] = Field(default_factory=lambda: [".git", ".venv", "node_modules"])
-    cache: bool = True
-
-    @model_validator(mode="after")
-    def require_rules(self) -> "SemgrepConfig":
-        if self.enabled and self.rules is None:
-            raise ValueError("semgrep.rules must name a local rule file when enabled")
-        return self
-
-
-class ManagedScannerConfig(BaseModel):
-    """Shared limits for deterministic, filesystem-backed audit scanners."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False
-    executable: str
-    timeout: int = Field(default=300, gt=0)
-    max_attempts: int = Field(default=3, gt=0, le=10)
-    max_target_bytes: int = Field(default=2_000_000, gt=0)
-    exclude: list[str] = Field(
-        default_factory=lambda: [".git", ".venv", "node_modules", "__pycache__"]
-    )
-    cache: bool = True
-
-
-class SpotBugsConfig(ManagedScannerConfig):
-    """SpotBugs with FindSecBugs; consumes pre-built bytecode only.
-
-    Building an untrusted target can execute Maven/Gradle plugins, so Linen
-    deliberately never builds it implicitly. ``targets`` are glob patterns
-    inside the immutable source snapshot.
-    """
-
-    executable: str = "spotbugs"
-    plugin: Path | None = None
-    targets: list[str] = Field(default_factory=lambda: [
-        "**/target/classes",
-        "**/build/classes/java/main",
-        "**/build/classes/kotlin/main",
-    ])
-    effort: Literal["min", "less", "default", "more", "max"] = "max"
-    confidence: Literal["low", "medium", "high"] = "medium"
-
-    @model_validator(mode="after")
-    def require_findsecbugs(self) -> "SpotBugsConfig":
-        if self.enabled and self.plugin is None:
-            raise ValueError("spotbugs.plugin must name the FindSecBugs plugin jar when enabled")
-        if not self.targets or any(
-            Path(pattern).is_absolute() or ".." in Path(pattern).parts
-            for pattern in self.targets
-        ):
-            raise ValueError("spotbugs.targets must contain relative snapshot glob patterns")
-        return self
-
-
-class OsvScannerConfig(ManagedScannerConfig):
-    executable: str = "osv-scanner"
-    recursive: bool = True
-    # Advisory databases change independently of source and scanner version.
-    cache: bool = False
-
-
-class GitleaksConfig(ManagedScannerConfig):
-    executable: str = "gitleaks"
-    config: Path | None = None
-    redact_percent: int = Field(default=100, ge=1, le=100)
-
-
-class TrivyConfig(ManagedScannerConfig):
-    executable: str = "trivy"
-    # Trivy manages its own vulnerability DB cache; do not cache final results.
-    cache: bool = False
-    # Keep database locations configurable because the default mirror may be
-    # unavailable in restricted networks. Trivy accepts repeated flags and
-    # tries repositories in the supplied order.
-    db_repository: list[str] = Field(default_factory=list)
-    scanners: list[Literal["vuln", "misconfig", "secret"]] = Field(
-        default_factory=lambda: ["vuln", "misconfig", "secret"]
-    )
-
-    @field_validator("scanners")
-    @classmethod
-    def unique_scanners(cls, value: list[str]) -> list[str]:
-        if not value or len(value) != len(set(value)):
-            raise ValueError("trivy.scanners must contain unique scanner names")
-        return value
-
-    @field_validator("db_repository")
-    @classmethod
-    def valid_db_repositories(cls, value: list[str]) -> list[str]:
-        if any(not repository.strip() for repository in value):
-            raise ValueError("trivy.db_repository entries must not be empty")
-        return value
-
-
 class CoverageConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     topics: list[str] = Field(default_factory=lambda: ["input-validation", "authorization", "dangerous-operations"])
@@ -417,10 +313,10 @@ class ScopeAdjudicationConfig(BaseModel):
 
 
 class CandidateTriageConfig(BaseModel):
-    """Graph-backed batching for scanner candidates.
+    """Graph-backed batching for bounded candidate evidence.
 
     The batches are represented by ordinary Intents and Facts.  This config
-    only controls how the immutable scanner artifact is partitioned; it does
+    only controls how an immutable candidate artifact is partitioned; it does
     not introduce a dispatcher-private queue.
     """
 
@@ -482,11 +378,6 @@ class AuditConfig(BaseModel):
     # defaults to scope coverage rather than stopping after one hypothesis.
     enabled: bool = False
     mode: Literal["hypothesis", "scope"] = "scope"
-    semgrep: SemgrepConfig = Field(default_factory=SemgrepConfig)
-    spotbugs: SpotBugsConfig = Field(default_factory=SpotBugsConfig)
-    osv: OsvScannerConfig = Field(default_factory=OsvScannerConfig)
-    gitleaks: GitleaksConfig = Field(default_factory=GitleaksConfig)
-    trivy: TrivyConfig = Field(default_factory=TrivyConfig)
     coverage: CoverageConfig = Field(default_factory=CoverageConfig)
     review_sandbox: ReviewSandboxConfig = Field(default_factory=ReviewSandboxConfig)
     poc_sandbox: PocSandboxConfig = Field(default_factory=PocSandboxConfig)
@@ -552,18 +443,6 @@ class DispatchConfig(BaseModel):
                 raise ValueError("audit recon requires scope mode")
             if not any("review" in worker.task_types for worker in self.workers):
                 raise ValueError("audit mode requires at least one review worker")
-        managed_scanners = {
-            "semgrep": self.audit.semgrep,
-            "spotbugs": self.audit.spotbugs,
-            "osv": self.audit.osv,
-            "gitleaks": self.audit.gitleaks,
-            "trivy": self.audit.trivy,
-        }
-        enabled_scanners = [name for name, scanner in managed_scanners.items() if scanner.enabled]
-        if enabled_scanners and not self.audit.enabled:
-            raise ValueError(
-                "managed scanners require audit.enabled: " + ", ".join(enabled_scanners)
-            )
         if self.audit.spring.enabled and not self.audit.enabled:
             raise ValueError("spring scan requires audit.enabled")
         if self.audit.spring.enabled and self.audit.mode != "scope":
@@ -591,10 +470,6 @@ class DispatchConfig(BaseModel):
             "explore" in worker.task_types for worker in self.workers
         ):
             raise ValueError("semantic recipes require at least one explore worker")
-        if (self.audit.enabled and self.audit.mode == "scope"
-                and (enabled_scanners or self.audit.spring.enabled)
-                and not self.audit.triage.enabled):
-            raise ValueError("scope scanners require audit.triage.enabled")
         # `mode` is inert while audit is disabled (and defaults to scope for
         # the next audit run).  An enabled sandbox, however, must never be
         # silently ignored.

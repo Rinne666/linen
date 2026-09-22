@@ -11,7 +11,7 @@ from test_audit_pipeline import FakeDriver, api, config, project
 from linen.cli import main
 from linen.dispatcher.analysis import audit_graph, coverage, scope_gate, triage
 from linen.dispatcher.analysis.benchmark import evaluate
-from linen.dispatcher.analysis.semgrep import digest, write_json
+from linen.dispatcher.analysis.artifacts import digest, write_json
 from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT, extract_routes, run_spring_scan
 from linen.dispatcher.config import (
     CandidateTriageConfig,
@@ -82,7 +82,7 @@ def _scanner_fact(client, project_id: str, workdir: Path) -> tuple[str, list[dic
 
 
 def test_scope_initial_intents_are_derived_from_graph(tmp_path):
-    cfg = config(tmp_path, scan=True, mode="scope")
+    cfg = config(tmp_path, mode="scope")
     cfg.audit.spring = SpringScanConfig(enabled=True)
     from linen.server.models import ProjectDetail, ProjectMeta
 
@@ -102,7 +102,7 @@ def test_scope_initial_intents_are_derived_from_graph(tmp_path):
 
 
 def test_terminal_coverage_plan_is_not_reproposed_forever(tmp_path):
-    cfg = config(tmp_path, scan=True, mode="scope")
+    cfg = config(tmp_path, mode="scope")
     board = ProjectDetail(
         project=ProjectMeta(
             id="proj_001", title="audit", status="active", bootstrap_enabled=False,
@@ -261,7 +261,7 @@ def test_legacy_plan_review_is_preserved_but_requires_fresh_attestation(tmp_path
 
 def test_scheduler_materializes_graph_intents_idempotently(api, tmp_path):
     _, client = api
-    cfg = config(tmp_path, scan=True, mode="scope")
+    cfg = config(tmp_path, mode="scope")
     cfg.audit.spring = SpringScanConfig(enabled=True)
     board = project(api, audit_mode="scope")
     loop = DispatcherLoop.__new__(DispatcherLoop)
@@ -345,9 +345,9 @@ def test_scope_evidence_missing_repository_becomes_visible_blocker(api, tmp_path
     assert fresh.errors[0].code == "source_repository_missing"
 
 
-def test_reviewed_plan_fans_out_scanners_from_one_canonical_snapshot(api, tmp_path):
+def test_reviewed_plan_fans_out_route_inventory_from_one_canonical_snapshot(api, tmp_path):
     _, client = api
-    cfg = config(tmp_path, scan=True, mode="scope")
+    cfg = config(tmp_path, mode="scope")
     cfg.audit.spring = SpringScanConfig(enabled=True)
     current = project(api, audit_mode="scope")
     pid = current.project.id
@@ -371,11 +371,6 @@ def test_reviewed_plan_fans_out_scanners_from_one_canonical_snapshot(api, tmp_pa
         ("search", SPRING_SCAN_INTENT),
     }
     assert all(item["from"] == [plan_id] for item in proposals)
-    choices = audit_graph.selectable_skill_choices(current, workdir, cfg.audit)
-    assert [(choice["skill_id"], choice["from"]) for choice in choices] == [
-        ("security.semgrep", [plan_id]),
-    ]
-
     _, plan_path, plan_record = coverage.get_plan(current, workdir)
     route_fact = run_spring_scan(
         plan_path.parent / "source",

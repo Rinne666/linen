@@ -31,7 +31,7 @@ readable through a compatibility path while they migrate.
 
 Finding lifecycle is now explicitly split:
 
-`hypothesis / scanner / worker` may create a `candidate_finding`; the shared
+`hypothesis / route-inventory / worker` may create a `candidate_finding`; the shared
 deterministic proof core evaluates its proof graph; the only confirmation
 authority is the server-side Technical Confirmation operation, which creates a
 new `confirmed_finding` Fact and a `candidate --promotes_to--> confirmed`
