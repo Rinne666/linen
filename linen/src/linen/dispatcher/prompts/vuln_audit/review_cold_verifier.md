@@ -7,7 +7,7 @@ separate verdicts for individual proof Facts. Deterministic server checks
 already validate generation, candidate locality, edges, provenance, and
 artifact integrity.
 
-The candidate fact was produced by a `code-tracer` worker that may have missed protections on the path. Its saved ordered trace, citations, evidence, and proof are supplied as claims under test. Your value is reading the same code path **independently** and producing a CONFIRMED or DISPROVED verdict based on real evidence.
+The candidate fact was produced by an earlier audit pass that may have missed protections on the path. Its saved ordered trace, citations, evidence, and proof are supplied as claims under test. Your value is reading the same code path **independently** and producing a CONFIRMED or DISPROVED verdict based on real evidence.
 
 # Isolation Rules
 

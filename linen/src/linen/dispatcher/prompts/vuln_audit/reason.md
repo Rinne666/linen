@@ -54,6 +54,11 @@ You receive a YAML snapshot of the graph. Each fact has `id`, `description`, opt
 
 You must judge, in this order:
 
+Prefer following a concrete security causal chain to closure. Prioritize low-trust
+input crossing a trust boundary, persistent state, privilege transition, or dangerous
+sink. When a plausible root cause appears, check sibling paths reusing its invariant
+before returning to broad coverage.
+
 ## 1. Is a vulnerability hypothesis PROVEN?
 
 Scan all facts for any `type=vulnerability`. A terminal vulnerability is **not** proven while it is `draft`, has no review, has a `NEEDS_REVIEW`/`INVALID` review, or any supporting ancestor is unresolved. In those cases, emit a `review:cold-verifier` intent for the terminal fact first; do not complete.

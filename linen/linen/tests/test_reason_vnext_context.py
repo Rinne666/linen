@@ -10,6 +10,7 @@ from linen.contracts import (
     ContextRequest,
     RunEnvelope,
 )
+from linen.dispatcher.contracts import validate_reason_payload
 from linen.dispatcher.protocol.client import ApiResult
 from linen.dispatcher.runtime.process import ProcessResult
 from linen.dispatcher.tasks import reason
@@ -18,7 +19,7 @@ from linen.dispatcher.tasks.common import (
     prepare_context_projection,
 )
 from linen.dispatcher.tasks.reason import _reason_contracts
-from linen.server.models import GraphEdge
+from linen.server.models import AuditEvent, Fact, GraphEdge, Intent, ProofPayload
 
 from conftest import (
     FakeClient,
@@ -619,3 +620,54 @@ def test_reason_prompt_filters_open_intents_to_projected_frontier(monkeypatch) -
     assert "i000" in prompt
     assert "i039" not in prompt
     assert '"i039"' not in prompt
+
+
+def test_triggering_root_cause_fact_precedes_open_intents_without_more_seeds() -> None:
+    project = make_project(intents=[make_intent("i001")])
+    project.facts.extend([
+        Fact(id="f010", description="HTTP session accepts a caller-controlled role", type="source"),
+        Fact(
+            id="f011",
+            description="Root cause: role is persisted without an authorization invariant",
+            type="vulnerability",
+            semantic_type="candidate_finding",
+            proof=ProofPayload(
+                claim_kind="vulnerability_trace",
+                attributes={"trace": [{"kind": "state_write", "symbol": "Session.role"}]},
+            ),
+        ),
+    ])
+    producer = Intent(
+        id="i010", from_=["f010"], description="Trace role storage", creator="explore",
+        worker="test-worker", created_at="2026-01-01T00:00:03Z", to="f011",
+        concluded_at="2026-01-01T00:00:04Z",
+    )
+    project.intents.append(producer)
+    event = AuditEvent(
+        sequence=12, event_type="audit_task_concluded", actor="local-pi",
+        entity_kind="intent", entity_id="i010", payload={"fact_id": "f011"},
+        created_at="2026-01-01T00:00:04Z",
+    )
+
+    seeds = reason._reason_frontier_seed_ids(project, trigger_events=[event])
+
+    assert seeds[:3] == ["f011", "i010", "f010"]
+    assert seeds.index("f011") < seeds.index("i001")
+    assert len(seeds) <= reason.REASON_SEED_BUDGET
+    projection = reason._prepare_reason_contracts(
+        _ContractClient(project), FakeContainerManager(), project, "/tmp/reason-context",
+        phase="reason_execute", trigger_events=[event],
+    )
+    assert projection is not None
+    assert projection.node_ids.index("f011") < projection.node_ids.index("i001")
+    root_cause_node = next(node for node in projection.context["nodes"] if node["id"] == "f011")
+    assert "Root cause" in root_cause_node["payload"]["description"]
+    intent_kind, sibling_intents = validate_reason_payload({
+        "accepted": True,
+        "data": {"intents": [{
+            "from": ["f011"], "action": "search", "target": "sibling endpoint",
+            "type": "search", "description": "Check sibling endpoints for the same role invariant",
+        }]},
+    }, open_intents_empty=False, max_intents=make_config().tasks.reason.max_intents)
+    assert intent_kind == "intents"
+    assert sibling_intents[0]["type"] == "search"

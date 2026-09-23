@@ -234,7 +234,10 @@ Also return data.endpoint_id, data.citations, and data.trace. endpoint_id is the
 stable logical entry identity (for example http:DELETE:/users/{id}) when the
 candidate has a logical HTTP, RPC, queue, or similar entry; otherwise return
 null. citations use exact frozen-source {id, file, line, code} objects. trace is
-an ordered array of {file, line, symbol, relation, observation, citation_id};
+an ordered array of {file, line, symbol, kind, observation, citation_id}, with
+optional endpoint_id per step. Use source, propagation, boundary, state_write,
+state_read, and sink to describe the causal path. Optional provenance may contain
+source_type and source_ref; a machine path is a path claim, not a vulnerability verdict.
     Trace seeds are unverified hints and every retained step must be
 independently checked.
 confirmed means the worker believes a vulnerability candidate is ready for the
@@ -261,10 +264,12 @@ def verification_outcome_fact(
         "description", "type", "evidence", "citations", "endpoint_id", "trace",
         "candidate_disposition",
     }
-    if not isinstance(data, dict) or set(data) != expected_keys:
+    optional_keys = {"provenance", "root_cause", "variants_checked"}
+    if not isinstance(data, dict) or not expected_keys <= set(data) or set(data) - expected_keys - optional_keys:
         raise ValueError(
             "Candidate verification requires exactly description, type, evidence, "
-            "citations, endpoint_id, trace, and candidate_disposition"
+            "citations, endpoint_id, trace, and candidate_disposition; provenance, "
+            "root_cause, and variants_checked are optional"
         )
     disposition = data.get("candidate_disposition") if isinstance(data, dict) else None
     if not isinstance(disposition, dict):
@@ -314,6 +319,9 @@ def verification_outcome_fact(
         "evidence": json.dumps(envelope, ensure_ascii=False),
         "proof": vulnerability_trace_proof(
             trace, endpoint_id, outcome, snapshot["id"],
+            provenance=data.get("provenance"),
+            root_cause=data.get("root_cause"),
+            variants_checked=data.get("variants_checked"),
         ),
     }
 

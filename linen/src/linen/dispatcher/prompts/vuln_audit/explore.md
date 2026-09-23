@@ -31,6 +31,11 @@ the issue into a fake taint chain.
 
 # Task
 
+Follow a concrete causal chain across files and logical endpoints when the assigned
+facts identify one. Record persistent writes and later reads as linked evidence and
+preserve endpoint identities. A state handoff is a hypothesis to verify, not proof that
+attacker control survived storage.
+
 You receive:
 - The full graph (all known facts and intents)
 - The **Current Intent** (an `id` and a `description`) — this is the one step you must perform

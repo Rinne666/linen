@@ -12,9 +12,18 @@ from typing import Any
 from linen.server.models import Fact, ProjectDetail
 
 
-TRACE_RELATIONS = frozenset({
+TRACE_KINDS = frozenset({
+    "source", "propagation", "boundary", "state_write", "state_read", "sink",
+    # Read and normalize traces persisted before the causal-kind contract.
     "entry", "calls", "flows_to", "crosses", "guards", "reaches", "impact",
 })
+_LEGACY_TRACE_KINDS = {
+    "entry": "source",
+    "calls": "propagation",
+    "flows_to": "propagation",
+    "crosses": "boundary",
+    "reaches": "sink",
+}
 _ENDPOINT_ID = re.compile(r"^[a-z][a-z0-9+.-]*:\S{1,191}$")
 _CITATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -216,20 +225,24 @@ def canonical_vulnerability_trace(
     files = snapshot.get("files", {})
     normalized: list[dict[str, Any]] = []
     for step in raw:
-        if not isinstance(step, dict) or set(step) != {
-            "file", "line", "symbol", "relation", "observation", "citation_id",
-        }:
+        legacy_keys = {"file", "line", "symbol", "relation", "observation", "citation_id"}
+        causal_keys = {"file", "line", "symbol", "kind", "observation", "citation_id"}
+        if (
+            not isinstance(step, dict)
+            or set(step) not in (legacy_keys, causal_keys, causal_keys | {"endpoint_id"})
+        ):
             raise ValueError(
-                "Every trace step requires exactly file, line, symbol, relation, "
-                "observation, and citation_id"
+                "Every trace step requires file, line, symbol, kind, observation, "
+                "and citation_id (or the legacy relation field)"
             )
         filename = step["file"]
         line = step["line"]
         symbol = step["symbol"]
-        relation = step["relation"]
+        kind = step.get("kind", step.get("relation"))
         observation = step["observation"]
         citation_id = step["citation_id"]
-        citation = citation_by_id.get(citation_id)
+        endpoint_id = step.get("endpoint_id")
+        citation = citation_by_id.get(citation_id) if isinstance(citation_id, str) else None
         if (
             not isinstance(filename, str)
             or filename not in files
@@ -237,12 +250,16 @@ def canonical_vulnerability_trace(
             or line < 1
             or not isinstance(symbol, str)
             or not symbol.strip()
-            or relation not in TRACE_RELATIONS
+            or not isinstance(kind, str)
+            or kind not in TRACE_KINDS
             or not isinstance(observation, str)
             or not observation.strip()
             or citation is None
+            or (endpoint_id is not None and not isinstance(endpoint_id, str))
         ):
             raise ValueError("Invalid vulnerability trace step")
+        if endpoint_id is not None:
+            endpoint_id = canonical_endpoint_id(endpoint_id)
         content = source_bytes(source, filename, files[filename]).decode(
             "utf-8", errors="replace",
         )
@@ -254,20 +271,49 @@ def canonical_vulnerability_trace(
             or not citation_start <= line < citation_start + len(citation_lines)
         ):
             raise ValueError("Trace step conflicts with its frozen-source citation")
-        normalized.append({
+        normalized_step = {
             "file": filename,
             "line": line,
             "symbol": symbol.strip(),
-            "relation": relation,
+            "kind": _LEGACY_TRACE_KINDS.get(kind, kind),
             "observation": observation.strip(),
             "citation_id": citation_id,
-        })
+        }
+        if endpoint_id is not None:
+            normalized_step["endpoint_id"] = endpoint_id
+        normalized.append(normalized_step)
     return normalized
 
 
 def vulnerability_trace_proof(
     trace: list[dict[str, Any]], endpoint_id: str | None, outcome: str, snapshot_id: str,
+    *, provenance: Any = None, root_cause: str | None = None,
+    variants_checked: list[str] | None = None,
 ) -> dict[str, Any]:
+    if provenance is None:
+        provenance = {"source_type": "llm"}
+    if (
+        not isinstance(provenance, dict)
+        or set(provenance) - {"source_type", "source_ref"}
+        or not isinstance(provenance.get("source_type"), str)
+        or not provenance["source_type"].strip()
+        or len(provenance["source_type"]) > 64
+        or (provenance.get("source_ref") is not None and (
+            not isinstance(provenance["source_ref"], str) or len(provenance["source_ref"]) > 500
+        ))
+    ):
+        raise ValueError("Trace provenance requires a bounded source_type and optional source_ref")
+    if root_cause is not None and (not isinstance(root_cause, str) or len(root_cause) > 4000):
+        raise ValueError("Trace root_cause must be bounded text")
+    if variants_checked is not None and (
+        not isinstance(variants_checked, list)
+        or len(variants_checked) > 100
+        or any(not isinstance(value, str) or not value.strip() or len(value) > 500 for value in variants_checked)
+    ):
+        raise ValueError("Trace variants_checked must be a bounded list of non-empty labels")
+    normalized_provenance = {"source_type": provenance["source_type"].strip()}
+    if provenance.get("source_ref"):
+        normalized_provenance["source_ref"] = provenance["source_ref"].strip()
     return {
         "schema_version": 1,
         "claim_kind": "vulnerability_trace",
@@ -277,6 +323,10 @@ def vulnerability_trace_proof(
             "trace_status": "closed" if outcome == "confirmed" else "partial",
             "candidate_outcome": outcome,
             "snapshot_id": snapshot_id,
+            "provenance": normalized_provenance,
+            **({"root_cause": root_cause.strip()} if isinstance(root_cause, str) and root_cause.strip() else {}),
+            **({"variants_checked": [value.strip() for value in variants_checked if value.strip()]}
+               if isinstance(variants_checked, list) else {}),
         },
     }
 

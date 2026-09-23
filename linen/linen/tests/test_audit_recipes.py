@@ -6,9 +6,12 @@ from pathlib import Path
 import pytest
 
 from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage
-from linen.dispatcher.analysis.artifacts import canonical_vulnerability_trace
+from linen.dispatcher.analysis.artifacts import (
+    canonical_vulnerability_trace,
+    vulnerability_trace_proof,
+)
 from linen.dispatcher.config import AuditConfig, CoverageConfig, SemanticAuditConfig
-from linen.server.models import Fact, Intent, ProjectDetail, ProjectMeta, Review
+from linen.server.models import Fact, Intent, ProjectDetail, ProjectMeta, ProofPayload, Review
 
 
 NOW = "2026-09-09T00:00:00Z"
@@ -252,6 +255,9 @@ def test_semantic_recipe_result_is_cited_then_verified_and_summarized(tmp_path):
                 "type": "vulnerability",
                 "evidence": "traced the request through controller, service, and repository",
                 "endpoint_id": "http:DELETE:/users/{id}",
+                "provenance": {"source_type": "synthetic_static", "source_ref": "fixture/path-1"},
+                "root_cause": "The object selector is not bound to the caller's ownership invariant.",
+                "variants_checked": ["DELETE /groups/{id}", "DELETE /tokens/{id}"],
                 "citations": [
                     {"id": "t1", "file": "Controller.java", "line": 1,
                      "code": "class Controller { void delete(String id) { service.delete(id); } }"},
@@ -262,11 +268,11 @@ def test_semantic_recipe_result_is_cited_then_verified_and_summarized(tmp_path):
                 ],
                 "trace": [
                     {"file": "Controller.java", "line": 1, "symbol": "Controller.delete",
-                     "relation": "entry", "observation": "id is request controlled", "citation_id": "t1"},
+                     "kind": "source", "observation": "id is request controlled", "citation_id": "t1"},
                     {"file": "Service.java", "line": 1, "symbol": "Service.delete",
-                     "relation": "calls", "observation": "id crosses into service", "citation_id": "t2"},
+                     "kind": "propagation", "observation": "id crosses into service", "citation_id": "t2"},
                     {"file": "Repository.java", "line": 1, "symbol": "Repository.delete",
-                     "relation": "reaches", "observation": "id selects the delete target", "citation_id": "t3"},
+                     "kind": "sink", "observation": "id selects the delete target", "citation_id": "t3"},
                 ],
                 "candidate_disposition": {
                     "fingerprint": candidate["fingerprint"],
@@ -285,6 +291,12 @@ def test_semantic_recipe_result_is_cited_then_verified_and_summarized(tmp_path):
     assert [step["symbol"] for step in disposition_fact.proof.attributes["trace"]] == [
         "Controller.delete", "Service.delete", "Repository.delete",
     ]
+    assert disposition_fact.proof.attributes["provenance"]["source_type"] == "synthetic_static"
+    assert disposition_fact.proof.attributes["root_cause"].startswith("The object selector")
+    assert disposition_fact.proof.attributes["variants_checked"] == [
+        "DELETE /groups/{id}", "DELETE /tokens/{id}",
+    ]
+    assert "semgrep" not in json.dumps(disposition_fact.proof.model_dump(mode="json")).lower()
     verify_intent.to = disposition_fact.id
     verify_intent.concluded_at = NOW
     board.facts.append(disposition_fact)
@@ -323,11 +335,77 @@ def test_confirmed_trace_has_no_deterministic_topology_requirement(tmp_path):
 
     assert canonical_vulnerability_trace(
         trace, citations, source, plan["snapshot"], outcome="confirmed",
-    ) == trace
+    ) == [{
+        "file": "Controller.java", "line": 1, "symbol": "Controller.delete",
+        "kind": "propagation", "observation": "direct flow", "citation_id": "c1",
+    }]
     with pytest.raises(ValueError, match="requires a trace"):
         canonical_vulnerability_trace(
             [], citations, source, plan["snapshot"], outcome="confirmed",
         )
+
+
+def test_provider_neutral_persistent_trace_round_trips_through_fact_proof(tmp_path):
+    board, workdir, _ = _board_with_plan(tmp_path)
+    _, source, plan = audit_recipes._plan_context(board, workdir)
+    citations = [
+        {"id": "c1", "file": "Api.java", "line": 1,
+         "code": 'class Api { void remove(String owner) { authorize(owner); delete(owner); } }'},
+        {"id": "c2", "file": "Controller.java", "line": 1,
+         "code": "class Controller { void delete(String id) { service.delete(id); } }"},
+        {"id": "c3", "file": "Service.java", "line": 1,
+         "code": "class Service { void delete(String id) { repository.delete(id); } }"},
+    ]
+    raw_trace = [
+        {"file": "Api.java", "line": 1, "symbol": "POST /session", "kind": "source",
+         "observation": "caller supplies role", "endpoint_id": "http:POST:/session", "citation_id": "c1"},
+        {"file": "Api.java", "line": 1, "symbol": "Session.role", "kind": "state_write",
+         "observation": "role is persisted", "endpoint_id": "http:POST:/session", "citation_id": "c1"},
+        {"file": "Controller.java", "line": 1, "symbol": "GET /admin/export", "kind": "boundary",
+         "observation": "privileged HTTP endpoint reads the session", "endpoint_id": "http:GET:/admin/export", "citation_id": "c2"},
+        {"file": "Service.java", "line": 1, "symbol": "Session.role", "kind": "state_read",
+         "observation": "persisted role is consumed without revalidation", "endpoint_id": "http:GET:/admin/export", "citation_id": "c3"},
+        {"file": "Service.java", "line": 1, "symbol": "executePrivilegedExport", "kind": "sink",
+         "observation": "privileged export operation executes", "endpoint_id": "http:GET:/admin/export", "citation_id": "c3"},
+    ]
+    trace = canonical_vulnerability_trace(
+        raw_trace, citations, source, plan["snapshot"], outcome="confirmed",
+    )
+    proof = vulnerability_trace_proof(
+        trace, "http:POST:/session", "confirmed", plan["snapshot"]["id"],
+        provenance={"source_type": "synthetic_static", "source_ref": "fixture/path-1"},
+        root_cause="Persisted role state is trusted at a privileged sibling endpoint.",
+        variants_checked=["GET /admin/export", "GET /admin/status"],
+    )
+    fact = Fact.model_validate({
+        "id": "f-machine-trace", "description": "Synthetic provider-neutral path",
+        "type": "vulnerability", "proof": proof,
+    })
+    round_tripped = ProofPayload.model_validate(fact.proof.model_dump(mode="json"))
+
+    assert [step["kind"] for step in round_tripped.attributes["trace"]] == [
+        "source", "state_write", "boundary", "state_read", "sink",
+    ]
+    assert round_tripped.attributes["trace"][2]["endpoint_id"] == "http:GET:/admin/export"
+    assert round_tripped.attributes["provenance"] == {
+        "source_type": "synthetic_static", "source_ref": "fixture/path-1",
+    }
+    assert "semgrep" not in json.dumps(round_tripped.model_dump(mode="json")).lower()
+
+
+def test_causal_lead_does_not_satisfy_required_coverage_obligations(tmp_path):
+    board, workdir, plan_id = _board_with_plan(tmp_path)
+    board.facts.append(Fact(
+        id="f-causal-lead", description="Cross-endpoint state handoff to privileged sink",
+        type="dataflow", status="triaged",
+    ))
+    config = CoverageConfig(topics=["authorization"], files_per_cell=20)
+
+    state = coverage.coverage_state(board, workdir, config)
+    blockers = coverage.scope_blockers(board, workdir, config, [plan_id])
+
+    assert state["summary"]["covered"] == 0
+    assert any(item.startswith("Coverage ") for item in blockers)
 
 
 @pytest.mark.parametrize(

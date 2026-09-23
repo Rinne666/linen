@@ -1369,7 +1369,30 @@
                         <dd class="break-words text-right font-medium text-slate-700" x-text="formatEndpointId(vulnerabilityEndpoint(selectedFactRecord()))"></dd>
                       </div>
                     </template>
+                    <template x-if="findingTraceRootCause(selectedFactRecord())">
+                      <div class="contents">
+                        <dt class="text-slate-400">Root cause</dt>
+                        <dd class="text-right font-medium text-slate-700" x-text="findingTraceRootCause(selectedFactRecord())"></dd>
+                      </div>
+                    </template>
+                    <template x-if="findingTraceVariants(selectedFactRecord()).length">
+                      <div class="contents">
+                        <dt class="text-slate-400">Variants checked</dt>
+                        <dd class="text-right font-medium text-slate-700" x-text="findingTraceVariants(selectedFactRecord()).join(', ')"></dd>
+                      </div>
+                    </template>
+                    <dt class="text-slate-400">Verified locations</dt>
+                    <dd class="text-right font-medium text-slate-700" x-text="`${factEvidenceCitations(selectedFactRecord()).length} source citations`"></dd>
                   </dl>
+
+                  <section x-show="findingTraceBoundaries(selectedFactRecord()).length" class="rounded-lg border border-brand-100 bg-brand-50/50 px-3 py-2.5">
+                    <h4 class="text-[10px] font-bold uppercase tracking-wider text-brand-700">Boundaries</h4>
+                    <ul class="mt-1 space-y-1 text-xs leading-relaxed text-slate-700">
+                      <template x-for="(boundary, index) in findingTraceBoundaries(selectedFactRecord())" :key="`${index}-${boundary}`">
+                        <li x-text="boundary"></li>
+                      </template>
+                    </ul>
+                  </section>
 
                   <section aria-labelledby="attack-path-heading">
                     <h4 id="attack-path-heading" class="text-xs font-bold text-slate-800">Attack path</h4>
@@ -1382,8 +1405,9 @@
                               <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-slate-900 text-[10px] font-bold text-white tabular-nums" x-text="index + 1"></span>
                               <div class="min-w-0 flex-1">
                                 <p class="break-words text-sm font-semibold text-slate-800" x-text="step.symbol"></p>
-                                <span class="mt-1 inline-flex rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-slate-500" x-text="formatTraceRelation(step.relation)"></span>
+                                <span class="mt-1 inline-flex rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-slate-500" x-text="formatTraceKind(step.kind || step.relation)"></span>
                                 <p class="mt-0.5 break-all font-mono text-[10px] text-slate-500" x-text="`${step.file}:${step.line}`"></p>
+                                <p x-show="step.endpoint_id" class="mt-1 break-words text-[10px] font-medium text-brand-700" x-text="formatEndpointId(step.endpoint_id)"></p>
                                 <p class="mt-2 break-words text-xs leading-relaxed text-slate-600" x-text="step.observation"></p>
                               </div>
                             </div>
@@ -5939,7 +5963,10 @@ function linenApp() {
     },
 
     isVulnerabilityTraceFact(fact) {
-      return this.findingEvidenceFact(fact)?.proof?.claim_kind === 'vulnerability_trace';
+      const proof = this.findingEvidenceFact(fact)?.proof;
+      return proof?.claim_kind === 'vulnerability_trace'
+        && Array.isArray(proof.attributes?.trace)
+        && proof.attributes.trace.length > 0;
     },
 
     vulnerabilityTrace(fact) {
@@ -5950,6 +5977,23 @@ function linenApp() {
     vulnerabilityEndpoint(fact) {
       const endpoint = this.findingEvidenceFact(fact)?.proof?.attributes?.endpoint_id;
       return typeof endpoint === 'string' && endpoint.trim() ? endpoint.trim() : '';
+    },
+
+    findingTraceRootCause(fact) {
+      const value = this.findingEvidenceFact(fact)?.proof?.attributes?.root_cause;
+      return typeof value === 'string' ? value.trim() : '';
+    },
+
+    findingTraceVariants(fact) {
+      const value = this.findingEvidenceFact(fact)?.proof?.attributes?.variants_checked;
+      return Array.isArray(value) ? value.filter(item => typeof item === 'string' && item.trim()) : [];
+    },
+
+    findingTraceBoundaries(fact) {
+      return this.vulnerabilityTrace(fact)
+        .filter(step => ['boundary', 'crosses'].includes(step.kind || step.relation))
+        .map(step => [step.endpoint_id ? this.formatEndpointId(step.endpoint_id) : '', step.observation]
+          .filter(value => typeof value === 'string' && value.trim()).join(' · '));
     },
 
     verificationOutcomeLabel(fact) {
@@ -5968,12 +6012,18 @@ function linenApp() {
       return http ? `${http[1].toUpperCase()} ${http[2]}` : value;
     },
 
-    formatTraceRelation(relation) {
-      const value = String(relation || '').trim();
+    formatTraceKind(kind) {
+      const value = String(kind || '').trim();
       const labels = {
+        source: 'ENTRY',
+        propagation: 'PROPAGATION',
+        boundary: 'TRUST BOUNDARY',
+        state_write: 'STATE WRITE',
+        state_read: 'STATE READ',
+        sink: 'SINK',
         calls: 'CALLS',
         flows_to: 'FLOWS TO',
-        crosses: 'CROSSES',
+        crosses: 'TRUST BOUNDARY',
         guards: 'GUARDED BY',
         reaches: 'REACHES',
         impact: 'IMPACT',

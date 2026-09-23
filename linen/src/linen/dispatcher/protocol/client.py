@@ -10,6 +10,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from linen.server.models import (
+    AuditEvent,
     AuditStage,
     CompletionGate,
     Intent,
@@ -51,6 +52,7 @@ class LinenClient:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._summary_adapter = TypeAdapter(list[ProjectSummary])
+        self._audit_event_adapter = TypeAdapter(list[AuditEvent])
         self._local = threading.local()
         self._sessions: dict[int, requests.Session] = {}
         self._sessions_lock = threading.Lock()
@@ -71,6 +73,15 @@ class LinenClient:
         response = self._session().get(self._url(f"/projects/{project_id}"), timeout=self._timeout)
         response.raise_for_status()
         return ProjectDetail.model_validate(response.json())
+
+    def get_audit_events(self, project_id: str, *, after: int = 0, limit: int = 2000) -> list[AuditEvent]:
+        response = self._session().get(
+            self._url(f"/projects/{project_id}/events"),
+            params={"after": after, "limit": limit},
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        return self._audit_event_adapter.validate_python(response.json())
 
     def get_settings(self) -> Settings:
         response = self._session().get(self._url("/settings"), timeout=self._timeout)

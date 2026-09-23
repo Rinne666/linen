@@ -8,6 +8,11 @@ that the mechanical graph cannot infer, or to complete from the final reviewed
 
 # Reasoning model
 
+Prefer following a concrete security causal chain to closure. Prioritize low-trust
+input crossing a trust boundary, persistent state, privilege transition, or dangerous
+sink. When a plausible root cause appears, check sibling paths reusing its invariant
+before returning to broad coverage.
+
 Use the model that fits the suspected weakness:
 
 - Data-flow flaw: `source -> transformations -> sink -> impact`.

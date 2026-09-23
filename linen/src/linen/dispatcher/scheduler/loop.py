@@ -29,7 +29,7 @@ from linen.dispatcher.workers.registry import get_driver
 from linen.dispatcher.tasks.explore import run_explore_task
 from linen.dispatcher.tasks.reason import run_reason_task
 from linen.dispatcher.tasks.review import run_review_task
-from linen.server.models import Intent, ProjectDetail, ProjectSummary
+from linen.server.models import AuditEvent, Intent, ProjectDetail, ProjectSummary
 
 LOG = logging.getLogger(__name__)
 UNHEALTHY_RETRY_AFTER_SECONDS = 5
@@ -412,9 +412,13 @@ class DispatcherLoop:
 
         if project.project.reason is None:
             reason_trigger = self._reason_trigger(project)
-            if reason_trigger is not None and self._reason_may_run(project):
+            trigger_events = (
+                self._reason_trigger_events(project, reason_trigger)
+                if reason_trigger is not None else []
+            )
+            if reason_trigger is not None and self._reason_may_run(project, trigger_events):
                 export_yaml = self.client.export_project(summary.id)
-                return self._dispatch_reason(project, export_yaml, reason_trigger)
+                return self._dispatch_reason(project, export_yaml, reason_trigger, trigger_events)
         running_intent_ids = self._project_running_explore_intents(summary.id)
         unclaimed_intents = [
             intent
@@ -806,6 +810,7 @@ class DispatcherLoop:
         project: ProjectDetail,
         export_yaml: str,
         trigger: str,
+        trigger_events: list[AuditEvent] | None = None,
     ) -> bool:
         if self._project_has_running_reason(project.project.id):
             self._log_changed(
@@ -862,6 +867,7 @@ class DispatcherLoop:
                 cancellation := TaskCancellation(),
                 lease_id=lease_id,
                 trigger=trigger,
+                trigger_events=trigger_events or [],
                 attempt=attempt,
             )
         except Exception:
@@ -1350,13 +1356,42 @@ class DispatcherLoop:
     def _project_open_intent_count(self, project: ProjectDetail) -> int:
         return sum(1 for intent in project.intents if intent.to is None and intent.concluded_at is None)
 
-    def _reason_may_run(self, project: ProjectDetail) -> bool:
-        """Do not let strategy race work that is already runnable or claimed."""
+    def _reason_trigger_events(self, project: ProjectDetail, trigger: str) -> list[AuditEvent]:
+        match = re.fullmatch(r"events:(\d+)->(\d+)", trigger)
+        getter = getattr(getattr(self, "client", None), "get_audit_events", None)
+        if match is None or getter is None:
+            return []
+        after, through = (int(value) for value in match.groups())
+        events: list[AuditEvent] = []
+        try:
+            while after < through:
+                page = getter(project.project.id, after=after, limit=2000)
+                if not page:
+                    break
+                events.extend(event for event in page if event.sequence <= through)
+                last = max(event.sequence for event in page)
+                if last <= after:
+                    break
+                after = last
+        except Exception:
+            LOG.exception("reason trigger event lookup failed project=%s trigger=%s", project.project.id, trigger)
+        return events
+
+    def _reason_may_run(
+        self, project: ProjectDetail, trigger_events: list[AuditEvent] | None = None,
+    ) -> bool:
+        """Allow fresh evidence to wake strategy while unrelated work remains open."""
         open_intents = [
             intent for intent in project.intents
             if intent.to is None and intent.concluded_at is None
         ]
         if not open_intents:
+            return True
+        wake_events = {
+            "audit_task_concluded", "audit_task_failed", "review_created",
+            "audit_task_abandoned", "technical_confirmation", "dynamic_verification_pass",
+        }
+        if any(event.event_type in wake_events for event in (trigger_events or [])):
             return True
         for intent in open_intents:
             blocked = any(

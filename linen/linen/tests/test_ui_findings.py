@@ -11,19 +11,24 @@ def html() -> str:
 def test_vulnerability_trace_detail_uses_saved_proof_and_citations() -> None:
     source = html()
 
-    assert "this.findingEvidenceFact(fact)?.proof?.claim_kind === 'vulnerability_trace'" in source
+    assert "proof?.claim_kind === 'vulnerability_trace'" in source
+    assert "proof.attributes.trace.length > 0" in source
     assert "this.findingEvidenceFact(fact)?.proof?.attributes?.trace" in source
     assert "this.findingEvidenceFact(fact)?.proof?.attributes?.endpoint_id" in source
     assert "fact?.proof?.attributes?.candidate_outcome" in source
     assert "Confirmed candidate" in source
     assert "formatEndpointId(vulnerabilityEndpoint(selectedFactRecord()))" in source
     assert "step.symbol" in source
+    assert "formatTraceKind(step.kind || step.relation)" in source
+    assert "step.endpoint_id" in source
     assert "`${step.file}:${step.line}`" in source
     assert "step.observation" in source
-    assert 'x-text="formatTraceRelation(step.relation)"' in source
-    assert "`Relation · ${formatTraceRelation(step.relation)}`" not in source
-    assert "entry: 'ENTRY'" in source
-    assert "reaches: 'REACHES'" in source
+    assert "findingTraceRootCause(selectedFactRecord())" in source
+    assert "findingTraceBoundaries(selectedFactRecord())" in source
+    assert "findingTraceVariants(selectedFactRecord())" in source
+    assert "state_write: 'STATE WRITE'" in source
+    assert "state_read: 'STATE READ'" in source
+    assert "boundary: 'TRUST BOUNDARY'" in source
     assert "return labels[value] || value;" in source
     assert "factEvidenceCitations(selectedFactRecord())" in source
     assert "citation.code" in source
@@ -42,6 +47,12 @@ def test_legacy_fact_keeps_plain_evidence_display() -> None:
 
     assert '!isVulnerabilityTraceFact(selectedFactRecord()) && selectedFactRecord().evidence' in source
     assert 'x-text="selectedFactRecord().evidence"' in source
+
+
+def test_empty_structured_trace_uses_existing_evidence_fallback() -> None:
+    source = html()
+    assert "proof.attributes.trace.length > 0" in source
+    assert '!isVulnerabilityTraceFact(selectedFactRecord()) && selectedFactRecord().evidence' in source
 
 
 def test_frontend_has_no_bootstrap_specific_ui_or_graph_semantics() -> None:
@@ -100,8 +111,8 @@ def test_primary_status_and_current_summary_explain_next_owner() -> None:
     end = source.index("executionStatusDotClass()", start)
     status = source[start:end]
     assert "Action required" in status
-    assert "Audit blocked" in status
     assert "Audit in progress" in status
+    assert "Waiting for new evidence or a Reason trigger." in status
     assert "The system will continue automatically" in status
     assert "technicalConfirmationCandidates()" in status
 

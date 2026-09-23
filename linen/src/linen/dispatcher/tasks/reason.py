@@ -42,7 +42,7 @@ from linen.dispatcher.tasks.common import (
     write_context_projection_reference,
 )
 from linen.dispatcher.workers.registry import get_driver
-from linen.server.models import ProjectDetail
+from linen.server.models import AuditEvent, ProjectDetail
 
 LOG = logging.getLogger(__name__)
 
@@ -52,18 +52,29 @@ HIGH_VALUE_FACT_TYPES = (
     "scope", "summary", "candidate_finding", "confirmed_finding",
     "negative_assurance", "coverage", "coverage_plan", "coverage_result",
     "candidate_triage", "candidate_disposition", "audit_summary",
+    "source", "sink", "dataflow", "sanitizer", "validation", "reachability",
 )
 
 
-def _reason_frontier_seed_ids(project: ProjectDetail, *, budget: int = REASON_SEED_BUDGET) -> list[str]:
-    """Return deterministic, high-value roots for a no-Intent Reason pass."""
+def _reason_frontier_seed_ids(
+    project: ProjectDetail,
+    *,
+    budget: int = REASON_SEED_BUDGET,
+    trigger_events: list[AuditEvent] | None = None,
+) -> list[str]:
+    """Return bounded roots with the triggering evidence ahead of stable fill."""
     available = {
         project.project.id,
         *(fact.id for fact in project.facts),
         *(intent.id for intent in project.intents),
+        *(error.id for error in project.errors),
+        *(review.id for review in project.reviews),
         *(hint.id for hint in project.hints),
     }
     hint_ids = {hint.id for hint in project.hints}
+    facts_by_id = {fact.id: fact for fact in project.facts}
+    intents_by_id = {intent.id: intent for intent in project.intents}
+    errors_by_id = {error.id: error for error in project.errors}
     seeds: list[str] = []
 
     def add(identifier: str) -> None:
@@ -71,11 +82,79 @@ def _reason_frontier_seed_ids(project: ProjectDetail, *, budget: int = REASON_SE
         if identifier and identifier in available and identifier not in seeds and len(seeds) < budget:
             seeds.append(identifier)
 
-    # Project is also injected by ContextProjector; retaining it here makes
-    # the caller's priority order explicit and observable in tests/logging.
-    add(project.project.id)
-    for special in ("origin", "goal"):
-        add(special)
+    # A conclusion event identifies its produced Fact in the payload. Carry
+    # that Fact, its producer, and the producer's direct evidence into the
+    # next Reason projection before any open-intent or stable-ID fill.
+    triggered: list[str] = []
+    relevant_event_types = {
+        "audit_task_concluded", "audit_task_failed", "audit_task_abandoned",
+        "audit_task_retry_requested", "review_created", "technical_confirmation",
+        "dynamic_verification_pass",
+    }
+    for event in reversed(trigger_events or []):
+        if event.event_type not in relevant_event_types:
+            continue
+        for identifier in (
+            event.payload.get("fact_id"),
+            event.payload.get("candidate_id"),
+            event.payload.get("error_id"),
+            event.entity_id,
+            event.payload.get("intent_id"),
+        ):
+            if isinstance(identifier, str) and identifier not in triggered:
+                triggered.append(identifier)
+        event_sources = event.payload.get("from", [])
+        if not isinstance(event_sources, list):
+            continue
+        for identifier in event_sources:
+            if isinstance(identifier, str) and identifier not in triggered:
+                triggered.append(identifier)
+
+    for identifier in triggered:
+        add(identifier)
+        fact = facts_by_id.get(identifier)
+        if fact is not None:
+            producer = next((item for item in project.intents if item.to == fact.id), None)
+            if producer is not None:
+                add(producer.id)
+                for source_id in producer.from_:
+                    add(source_id)
+        intent = intents_by_id.get(identifier)
+        if intent is not None:
+            for source_id in intent.from_:
+                add(source_id)
+        error = errors_by_id.get(identifier)
+        if error is not None:
+            add(error.intent_id)
+            parent = intents_by_id.get(error.intent_id)
+            if parent is not None:
+                for source_id in parent.from_:
+                    add(source_id)
+
+    if not triggered:
+        # Older event records may not identify their produced Fact. Prefer the
+        # newest current-generation rows returned by the project snapshot over
+        # stable-ID fill, without widening the seed budget.
+        for fact in reversed(project.facts):
+            if fact.source_generation != project.project.source_generation:
+                continue
+            add(fact.id)
+            producer = next((item for item in project.intents if item.to == fact.id), None)
+            if producer is not None:
+                add(producer.id)
+                for source_id in producer.from_:
+                    add(source_id)
+            if len(seeds) >= min(budget, REASON_HINT_SEED_LIMIT):
+                break
+
+    # Existing trace-bearing candidate facts are useful context for a newly
+    # produced sibling lead, even when their IDs are old and lexically small.
+    for fact in project.facts:
+        proof = fact.proof
+        has_trace = bool(proof and isinstance(proof.attributes.get("trace"), list))
+        is_finding = fact.semantic_type in {"candidate_finding", "confirmed_finding"}
+        if (has_trace or is_finding) and fact.source_generation == project.project.source_generation:
+            add(fact.id)
 
     open_intents = sorted(
         (intent for intent in project.intents if intent.to is None and intent.concluded_at is None),
@@ -85,6 +164,11 @@ def _reason_frontier_seed_ids(project: ProjectDetail, *, budget: int = REASON_SE
         add(intent.id)
         for source_id in sorted(set(intent.from_)):
             add(source_id)
+
+    # ContextProjector already injects the project node. Preserve the audit
+    # anchors only after concrete leads and currently open work.
+    for special in ("origin", "goal"):
+        add(special)
 
     for fact_type in HIGH_VALUE_FACT_TYPES:
         for fact in sorted(project.facts, key=lambda item: item.id):
@@ -122,13 +206,14 @@ def _prepare_reason_contracts(
     container_name: str,
     *,
     phase: str,
+    trigger_events: list[AuditEvent] | None = None,
 ) -> ContextProjection | None:
     projection = prepare_context_projection(
         client,
         backend,
         project,
         container_name,
-        seed_ids=_reason_frontier_seed_ids(project),
+        seed_ids=_reason_frontier_seed_ids(project, trigger_events=trigger_events),
         phase=phase,
         current_graph_revision=project.project.graph_revision,
     )
@@ -329,6 +414,7 @@ def run_reason_task(
     lease_id: str | None = None,
     trigger: str | None = None,
     attempt: int = 1,
+    trigger_events: list[AuditEvent] | None = None,
 ) -> str:
     lease_id = lease_id or uuid.uuid4().hex
     ack_event_seq: int | None = None
@@ -382,6 +468,7 @@ def run_reason_task(
             project,
             container_name,
             phase="reason_execute",
+            trigger_events=trigger_events,
         )
         if prepared_contracts is None:
             return "failed"

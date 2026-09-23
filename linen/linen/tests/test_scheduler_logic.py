@@ -10,7 +10,7 @@ from linen.dispatcher.runtime.process import ProcessResult
 from linen.dispatcher.scheduler.loop import DispatcherLoop
 from linen.dispatcher.scheduler.worker_select import choose_worker
 from linen.dispatcher.tasks.common import classify_provider_failure
-from linen.server.models import CompletionGate, Fact, IntentError, ProjectSummary, Review
+from linen.server.models import AuditEvent, CompletionGate, Fact, IntentError, ProjectSummary, Review
 
 from conftest import make_config, make_intent, make_project
 
@@ -285,6 +285,44 @@ def test_reason_waits_for_runnable_or_claimed_work_but_can_resolve_blocked_work(
         last_failed_at="2026-01-01T00:00:00Z",
     ))
     assert loop._reason_may_run(project)
+
+
+def test_new_fact_event_wakes_reason_while_other_intents_remain_open_once() -> None:
+    loop = _loop()
+    project = make_project(intents=[make_intent("i001")])
+    project.project.event_seq = 9
+    project.project.reason_last_seen_event_seq = 8
+    fact_event = AuditEvent(
+        sequence=9,
+        event_type="audit_task_concluded",
+        actor="local-pi",
+        entity_kind="intent",
+        entity_id="i002",
+        payload={"fact_id": "f003"},
+        created_at="2026-01-01T00:00:00Z",
+    )
+
+    assert loop._reason_trigger(project) == "events:8->9"
+    assert loop._reason_may_run(project, [fact_event])
+
+    project.project.reason_last_seen_event_seq = 9
+    assert loop._reason_trigger(project) is None
+    assert not loop._reason_may_run(project, [])
+
+
+def test_reason_does_not_wake_for_its_own_new_open_intent_event() -> None:
+    loop = _loop()
+    project = make_project(intents=[make_intent("i001")])
+    event = AuditEvent(
+        sequence=4,
+        event_type="audit_task_created",
+        actor="local-pi",
+        entity_kind="intent",
+        entity_id="i002",
+        payload={"from": ["f001"]},
+        created_at="2026-01-01T00:00:00Z",
+    )
+    assert not loop._reason_may_run(project, [event])
 
 
 def test_coverage_plan_is_model_free_explore_work() -> None:

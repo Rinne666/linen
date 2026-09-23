@@ -664,10 +664,12 @@ def verification_outcome_fact(
         "description", "type", "evidence", "citations", "candidate_disposition",
         "endpoint_id", "trace",
     }
-    if not isinstance(data, dict) or set(data) != expected_keys:
+    optional_keys = {"provenance", "root_cause", "variants_checked"}
+    if not isinstance(data, dict) or not expected_keys <= set(data) or set(data) - expected_keys - optional_keys:
         raise ValueError(
             "Semantic verification requires exactly description, type, evidence, "
-            "citations, endpoint_id, trace, and candidate_disposition"
+            "citations, endpoint_id, trace, and candidate_disposition; provenance, "
+            "root_cause, and variants_checked are optional"
         )
     disposition = data.get("candidate_disposition")
     if not isinstance(disposition, dict):
@@ -719,6 +721,9 @@ def verification_outcome_fact(
         "evidence": json.dumps(envelope, ensure_ascii=False),
         "proof": vulnerability_trace_proof(
             trace, endpoint_id, outcome, plan["snapshot"]["id"],
+            provenance=data.get("provenance"),
+            root_cause=data.get("root_cause"),
+            variants_checked=data.get("variants_checked"),
         ),
     }
 

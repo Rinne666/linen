@@ -374,9 +374,12 @@ recipes:
           ],
           "trace": [
             {"file": "src/App.java", "line": 10, "symbol": "App.update",
-             "relation": "entry", "observation": "attacker controls id",
+             "kind": "source", "observation": "attacker controls id",
              "citation_id": "c1"}
           ],
+          "provenance": {"source_type": "llm", "source_ref": "optional reference"},
+          "root_cause": "Optional broken invariant in concise prose",
+          "variants_checked": ["Optional sibling endpoint or symbol labels"],
           "candidate_disposition": {
             "fingerprint": "the assigned fingerprint",
             "outcome": "confirmed | refuted | blocked",
@@ -389,8 +392,11 @@ recipes:
       the server-side Technical Confirmation Gate; it does not create a confirmed
       finding. Use type=vulnerability for compatibility. Its ordered trace must
       close attacker capability -> entry -> intermediate code or trust boundary
-      -> security-sensitive operation -> impact, using only entry, calls,
-      flows_to, crosses, guards, reaches, and impact relations. refuted preserves
+      -> security-sensitive operation -> impact. Use source, propagation, boundary,
+      state_write, state_read, and sink as causal step kinds. A state write/read
+      records a semantic handoff; it does not prove taint continuity. Optional
+      provenance identifies where path facts came from and never asserts
+      exploitability. refuted preserves
       the decisive protection path. blocked may return a partial or empty trace,
       but its rationale must name the missing hop. refuted and blocked require
       type=candidate_disposition. Include at least one exact frozen-source
