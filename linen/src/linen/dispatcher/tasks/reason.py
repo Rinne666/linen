@@ -11,7 +11,6 @@ from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.analysis.policy import (
     AUDIT_REASON_INSTRUCTIONS,
     SOURCE_DATA_BOUNDARY,
-    completion_blockers,
 )
 from linen.dispatcher.contracts import (
     extract_context_request,
@@ -726,10 +725,9 @@ def run_reason_task(
         if kind == "complete":
             if audit_enabled:
                 fresh = client.get_project(project.project.id)
-                blockers = (
-                    audit_graph.scope_blockers(fresh, Path(container_name), config.audit, data["from"])
-                    if scope_audit else completion_blockers(fresh, data["from"])
-                )
+                blockers = audit_graph.scope_blockers(
+                    fresh, Path(container_name), config.audit, data["from"],
+                ) if scope_audit else []
                 if blockers:
                     message = "Audit completion blocked:\n" + "\n".join(blockers)
                     LOG.warning("%s project=%s", message, project.project.id)
@@ -745,6 +743,28 @@ def run_reason_task(
                 ack_event_seq = project.project.event_seq
                 return "success"
             if not response.ok:
+                if response.status_code == 409 and audit_enabled:
+                    try:
+                        gate = client.get_completion_gate(
+                            project.project.id, data["from"],
+                        )
+                    except Exception as exc:
+                        LOG.warning(
+                            "completion gate refresh failed project=%s error=%s",
+                            project.project.id,
+                            exc,
+                        )
+                    else:
+                        if not gate.ready:
+                            message = "Audit completion blocked:\n" + "\n".join(gate.blockers)
+                            if not any(hint.content == message for hint in fresh.hints):
+                                hint_response = client.create_hint(
+                                    project.project.id, message, "audit-policy",
+                                )
+                                if not hint_response.ok:
+                                    return "failed"
+                            ack_event_seq = fresh.project.event_seq
+                            return "success"
                 LOG.warning(
                     "reason complete write failed project=%s worker=%s status=%s body=%s",
                     project.project.id,
@@ -767,16 +787,23 @@ def run_reason_task(
             created = 0
             for intent_data in data:
                 intent_type = intent_data.get("type")
-                if scope_audit:
+                if audit_enabled:
                     fresh = client.get_project(project.project.id)
-                    try:
-                        coverage.validate_intent(fresh, Path(container_name), config.audit.coverage, intent_data)
-                        if audit_graph.managed_description(intent_data["description"]):
-                            raise ValueError(
-                                "Reserved audit intents are materialized from graph state by the dispatcher"
+                    if scope_audit:
+                        try:
+                            coverage.validate_intent(
+                                fresh, Path(container_name), config.audit.coverage, intent_data,
                             )
-                    except ValueError as exc:
-                        message = f"Coverage intent blocked: {exc} ({intent_data['description']})"
+                        except ValueError as exc:
+                            message = f"Coverage intent blocked: {exc} ({intent_data['description']})"
+                            if not any(h.content == message for h in fresh.hints):
+                                client.create_hint(project.project.id, message, "audit-policy")
+                            continue
+                    if audit_graph.managed_description(intent_data["description"]):
+                        message = (
+                            "Audit intent blocked: reserved managed intents are materialized "
+                            f"from graph state by the dispatcher ({intent_data['description']})"
+                        )
                         if not any(h.content == message for h in fresh.hints):
                             client.create_hint(project.project.id, message, "audit-policy")
                         continue

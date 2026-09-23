@@ -456,6 +456,42 @@ def test_provider_blocked_review_falls_through_to_model_free_explore() -> None:
     assert dispatched == ["i-scan"]
 
 
+def test_ordinary_investigation_competes_with_managed_coverage_cell() -> None:
+    loop = _loop()
+    loop.config = make_config()
+    loop.futures = {}
+    project = make_project()
+    managed = make_intent("i-managed")
+    managed.worker = None
+    managed.type = "verify"
+    managed.creator = "dispatcher.audit"
+    managed.description = f"{coverage.CELL_PREFIX}cell-1"
+    managed.created_at = "2026-01-01T00:00:03Z"
+    ordinary = make_intent("i-investigation")
+    ordinary.worker = None
+    ordinary.type = "search"
+    ordinary.description = "search sibling endpoint"
+    ordinary.created_at = "2026-01-01T00:00:02Z"
+    project.intents = [managed, ordinary]
+    loop.container_manager = type(
+        "Containers", (), {"container_name": lambda _self, project_id: project_id}
+    )()
+    loop.client = type(
+        "Client",
+        (),
+        {
+            "get_project": lambda _self, _project_id: project,
+            "export_project": lambda _self, _project_id: "graph",
+        },
+    )()
+    loop._materialize_audit_intents = lambda _project: False
+    dispatched: list[str] = []
+    loop._dispatch_explore = lambda _project, _graph, intent: dispatched.append(intent.id) or True
+
+    assert loop._try_dispatch_project(_summary("proj_001", "active"))
+    assert dispatched == ["i-investigation"]
+
+
 def test_provider_failure_classifier_reads_only_explicit_error_fields() -> None:
     quota_event = {
         "type": "message_end",

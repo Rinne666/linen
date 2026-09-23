@@ -440,13 +440,6 @@ def audit_completion_blockers_from_db(
             )
     if audit_mode == "scope" and (len(required_ids) != 1 or from_ids != required_ids):
         blockers.append("Scope audit completion must reference exactly one audit_summary fact.")
-    open_intent = conn.execute(
-        "SELECT 1 FROM intents WHERE project_id = ? AND to_fact_id IS NULL AND concluded_at IS NULL LIMIT 1",
-        (project_id,),
-    ).fetchone()
-    if open_intent:
-        blockers.append("Open intents must finish before audit completion.")
-
     visited: set[str] = set()
     active: set[str] = set()
 

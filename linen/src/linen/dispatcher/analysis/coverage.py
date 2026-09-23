@@ -378,8 +378,6 @@ def scope_blockers(project: ProjectDetail, workdir: Path, config: CoverageConfig
     for skipped in state["skipped"]:
         if skipped["reason"] not in {"excluded", "analysis_artifacts"}:
             blockers.append(f"Unresolved skipped input: {skipped['path']} ({skipped['reason']}).")
-    if any(intent.to is None and intent.concluded_at is None for intent in project.intents):
-        blockers.append("Open intents must finish before scope completion.")
     for fact in project.facts:
         # Recon is an optional prioritization aid.  It is never evidence for
         # a vulnerability and must not turn an otherwise complete scope audit
@@ -389,9 +387,6 @@ def scope_blockers(project: ProjectDetail, workdir: Path, config: CoverageConfig
         if fact.id not in {"origin", "goal"} and fact.type not in {"coverage_plan", "coverage_result"}:
             if fact.status not in {"false_positive", "fixed", "accepted_risk"} and not reviewed(project, fact.id):
                 blockers.append(f"Unresolved finding/evidence: {fact.id}.")
-            if fact.type == "vulnerability" and fact.status == "triaged":
-                from linen.dispatcher.analysis.policy import completion_blockers
-                blockers.extend(completion_blockers(project, [fact.id]))
     return blockers
 
 

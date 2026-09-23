@@ -213,6 +213,10 @@ def test_scope_requires_all_reviewed_cells_and_allows_zero_findings(api, tmp_pat
     trace_fact = trace_response.data["fact"]["id"]
     approve(client, pid, trace_fact)
 
+    client.create_intent(
+        pid, [trace_fact], "search sibling endpoint", "reasoner", intent_type="search",
+    )
+
     current = client.get_project(pid)
     inputs = audit_graph.audit_summary_inputs(current, work, cfg.audit)
     assert set(inputs) == {module_fact, trace_fact}

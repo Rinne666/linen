@@ -491,19 +491,14 @@ class DispatcherLoop:
             explore_intents = [intent for intent in unclaimed_intents if intent not in review_intents]
             if not explore_intents:
                 return False
-            managed_intents = [
-                intent for intent in explore_intents
-                if audit_graph.managed_description(intent.description)
-            ]
             # Pick the least-recently attempted intent. A released intent keeps
             # its heartbeat timestamp, so failures rotate to the back of the
             # persisted blackboard queue instead of starving older work. For
-            # never-attempted intents this is ordinary FIFO ordering. Non-cell
-            # graph work (review, triage, synthesis) stays ahead of
-            # bulk coverage, including on boards created before ready-window
-            # bounding was introduced.
+            # never-attempted intents this is ordinary FIFO ordering. Every
+            # explore intent shares this ordering; coverage cells retain their
+            # existing penalty so bulk coverage cannot starve other work.
             next_intent = min(
-                managed_intents or explore_intents,
+                explore_intents,
                 key=lambda i: (
                     int(self._explore_requires_provider(project, i)),
                     int(i.description.strip().startswith(coverage.CELL_PREFIX)),

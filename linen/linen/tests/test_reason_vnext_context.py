@@ -598,6 +598,64 @@ def test_reason_context_continuation_stale_snapshot_is_controlled_failure(tmp_pa
     assert client.created_intents == []
 
 
+def test_stale_reason_does_not_ack_triggering_event_and_can_run_again(tmp_path, monkeypatch) -> None:
+    project = _project_with_two_edges()
+    project.project.event_seq = 12
+    project.project.reason_last_seen_event_seq = 11
+
+    class CursorClient(_CatalogClient):
+        def __init__(self, value):
+            super().__init__(value)
+            self.acknowledged: list[int | None] = []
+
+        def get_project(self, _project_id: str):
+            changed = self.project.model_copy(update={
+                "project": self.project.project.model_copy(update={
+                    "graph_revision": self.project.project.graph_revision + 1,
+                }),
+            })
+            return changed
+
+        def release_reason(self, _project_id, _worker, _lease_id, seen_event_seq=None):
+            self.acknowledged.append(seen_event_seq)
+            if seen_event_seq is not None:
+                self.project.project.reason_last_seen_event_seq = max(
+                    self.project.project.reason_last_seen_event_seq, seen_event_seq,
+                )
+            return ApiResult(200, {})
+
+    client = CursorClient(project)
+    backend = _Backend(tmp_path, ProcessResult(0, json.dumps({
+        "accepted": True,
+        "data": {"intents": [{
+            "from": ["f001"], "description": "fresh investigation",
+            "action": "inspect", "target": "fresh lead",
+        }]},
+    }), ""))
+    lease = FakeLease()
+    monkeypatch.setattr(reason, "get_driver", lambda *_a, **_k: _SequenceDriver())
+    monkeypatch.setattr(reason.HeartbeatLease, "for_reason", lambda *_a, **_k: lease)
+
+    assert reason.run_reason_task(
+        make_config(), client, backend, project, "FULL-EXPORT", make_config().workers[0],
+        reason.TaskCancellation(), trigger="events:11->12",
+    ) == "failed"
+    assert client.acknowledged == [None]
+    assert client.project.project.reason_last_seen_event_seq == 11
+    assert client.created_intents == []
+
+    from linen.dispatcher.scheduler.loop import DispatcherLoop
+
+    scheduler = DispatcherLoop.__new__(DispatcherLoop)
+    event = AuditEvent(
+        sequence=12, event_type="audit_task_concluded", actor="worker",
+        entity_kind="intent", entity_id="i-event", payload={"fact_id": "f002"},
+        created_at="2026-01-01T00:00:00Z",
+    )
+    assert scheduler._reason_trigger(client.project) == "events:11->12"
+    assert scheduler._reason_may_run(client.project, [event])
+
+
 def test_reason_prompt_filters_open_intents_to_projected_frontier(monkeypatch) -> None:
     project = make_project(intents=[make_intent(f"i{index:03d}") for index in range(40)])
     client = FakeClient(project)

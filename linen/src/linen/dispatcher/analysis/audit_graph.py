@@ -287,13 +287,6 @@ def audit_summary_inputs(
                 return None
             semantic_ids.append(semantic.id)
         summary_ids = sorted(set(gate_ids + module_ids + semantic_ids))
-        if any(
-            intent.to is None
-            and intent.concluded_at is None
-            and intent.description.strip() != AUDIT_SUMMARY_INTENT
-            for intent in project.intents
-        ):
-            return None
         covered = ancestor_ids(project, summary_ids)
         extra_ids = []
         for fact in project.facts:

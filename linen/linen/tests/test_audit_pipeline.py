@@ -8,7 +8,6 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from linen.dispatcher.analysis.policy import completion_blockers
 from linen.dispatcher.config import DispatchConfig
 from linen.dispatcher.protocol.client import LinenClient
 from linen.dispatcher.runtime.backend import LocalBackend
@@ -108,20 +107,26 @@ def test_legacy_review_migration_preserves_data(tmp_path, monkeypatch):
         db._ensure_review_columns(conn)  # migration is idempotent
 
 
-def test_gate_checks_reviews_ancestors_and_open_intents(api):
+def test_completion_gate_uses_evidence_not_unrelated_open_intents(api):
     http, client = api
-    pid = project(api).project.id
+    pid = project(api, audit_mode="hypothesis").project.id
     source = add_fact(client, pid, fact_type="source")
-    terminal = add_fact(client, pid, parent=source)
-    assert completion_blockers(client.get_project(pid), [terminal])
-    client.create_review(pid, terminal, "VALID", "yes", confidence="firm")
-    assert any(source in blocker for blocker in completion_blockers(client.get_project(pid), [terminal]))
-    client.create_review(pid, source, "VALID", "yes", confidence="certain")
-    assert completion_blockers(client.get_project(pid), [terminal]) == []
-    client.create_intent(pid, [source], "more work", "reasoner", intent_type="trace")
-    assert any("Open intents" in b for b in completion_blockers(client.get_project(pid), [terminal]))
-    client.create_review(pid, source, "NEEDS_REVIEW", "missing config", confidence="tentative")
-    assert any(source in b for b in completion_blockers(client.get_project(pid), [terminal]))
+    terminal = add_fact(client, pid, parent=source, fact_type="negative_assurance")
+    open_intent = client.create_intent(
+        pid, [source], "search sibling endpoint", "reasoner", intent_type="trace",
+    ).data["id"]
+
+    assert client.create_review(pid, terminal, "VALID", "yes", confidence="firm").ok
+    assert not client.get_completion_gate(pid, [terminal]).ready
+    assert client.create_review(pid, source, "VALID", "yes", confidence="certain").ok
+    assert client.get_completion_gate(pid, [terminal]).ready
+
+    completed = client.complete(pid, [terminal], "goal satisfied", "reasoner")
+    assert completed.ok, completed.text
+    current = client.get_project(pid)
+    assert current.project.status == "completed"
+    remaining = next(intent for intent in current.intents if intent.id == open_intent)
+    assert remaining.concluded_at is not None
 
 
 def test_hypothesis_completion_accepts_reviewed_negative_assurance(api):
@@ -138,7 +143,7 @@ def test_hypothesis_completion_accepts_reviewed_negative_assurance(api):
     client.create_review(pid, assurance, "INVALID", "initial concern", confidence="firm")
     client.create_review(pid, assurance, "VALID", "verified", confidence="firm")
 
-    assert completion_blockers(client.get_project(pid), [assurance]) == []
+    assert client.get_completion_gate(pid, [assurance]).ready
 
 
 def test_server_rejects_audit_completion_until_terminal_fact_is_confirmed(api):
@@ -365,6 +370,31 @@ def test_reason_gate_blocks_only_opted_in_dispatcher(api, tmp_path, monkeypatch,
     assert current.project.status == "completed"
     if enabled:
         assert not any("Audit completion blocked" in hint.content for hint in current.hints)
+
+
+def test_reason_cannot_create_reserved_managed_intent_in_hypothesis_audit(api, tmp_path, monkeypatch):
+    _, client = api
+    cfg = config(tmp_path, mode="hypothesis")
+    board = project(api, audit_mode="hypothesis")
+    monkeypatch.setattr(reason, "get_driver", lambda _: FakeDriver())
+    monkeypatch.setattr(reason, "run_worker_process", lambda *a, **k: ProcessResult(0, json.dumps({
+        "accepted": True,
+        "data": {"intents": [{
+            "from": ["origin"], "description": "@analysis:audit-summary",
+            "action": "synthesize", "target": "reserved system task",
+        }]},
+    }), ""))
+    backend = LocalBackend(cfg.local, client)
+
+    result = reason.run_reason_task(
+        cfg, client, backend, board, client.export_project(board.project.id),
+        cfg.workers[0], TaskCancellation(),
+    )
+
+    current = client.get_project(board.project.id)
+    assert result == "failed"
+    assert not any(item.description.startswith("@analysis:") for item in current.intents)
+    assert any("reserved managed intents" in hint.content for hint in current.hints)
 
 
 def test_audit_configuration_requires_review_and_local_rules(tmp_path):
