@@ -14,6 +14,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
+from linen.audit_charter import AUDIT_CHARTER_VERSION, project_goal
 from linen.server.db import get_conn
 from linen.server.audit_state import (
     append_event,
@@ -252,6 +253,7 @@ def create_project(body: CreateProjectRequest):
     # connection is still opened only after cloning, so other API operations
     # are not blocked by a long-lived SQLite transaction.
     with _CREATE_PROJECT_LOCK:
+        resolved_goal = project_goal(body.audit_mode, body.goal)
         preview_pid = peek_next_project_id(
             occupied=_clone_target_occupied if body.clone_url is not None else None
         )
@@ -289,7 +291,12 @@ def create_project(body: CreateProjectRequest):
             conn.execute(
                 "INSERT INTO facts (id, project_id, description, display_title, semantic_type, source_generation) "
                 "VALUES (?, ?, ?, ?, 'audit_objective', 1)",
-                ("goal", pid, body.goal, "Audit objective"),
+                (
+                    "goal",
+                    pid,
+                    resolved_goal,
+                    "Security audit charter" if body.audit_mode != "none" else "Goal",
+                ),
             )
 
             hints = []
@@ -313,6 +320,9 @@ def create_project(body: CreateProjectRequest):
                     "title": body.title,
                     "audit_mode": body.audit_mode,
                     "completion_policy": body.completion_policy,
+                    "audit_charter_version": (
+                        AUDIT_CHARTER_VERSION if body.audit_mode != "none" else None
+                    ),
                 },
                 created_at=now,
             )
@@ -326,7 +336,10 @@ def create_project(body: CreateProjectRequest):
                         semantic_type="audit_target",
                     ),
                     Fact(
-                        id="goal", description=body.goal, display_title="Audit objective",
+                        id="goal", description=resolved_goal,
+                        display_title=(
+                            "Security audit charter" if body.audit_mode != "none" else "Goal"
+                        ),
                         semantic_type="audit_objective",
                     ),
                 ],

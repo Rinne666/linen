@@ -164,13 +164,23 @@ def _canonical_citation(citation: dict, inspected: list[str], contents: dict[str
         if not 0 <= index < len(lines):
             return False
         if len(snippet) == 1:
-            return code in lines[index]
-        actual = "\n".join(lines[index:index + len(snippet)])
-        return len(lines[index:index + len(snippet)]) == len(snippet) and actual.strip() == code.strip()
+            return (
+                code in lines[index]
+                or lines[index].lstrip(" \t") == code.lstrip(" \t")
+            )
+        actual_lines = lines[index:index + len(snippet)]
+        return (
+            len(actual_lines) == len(snippet)
+            and all(
+                source_line.lstrip(" \t") == cited_line.lstrip(" \t")
+                for source_line, cited_line in zip(actual_lines, snippet, strict=True)
+            )
+        )
 
     claimed = line - 1
     if matches(claimed):
-        return {"file": filename, "line": line, "code": code}
+        canonical = lines[claimed:claimed + len(snippet)]
+        return {"file": filename, "line": line, "code": "\n".join(canonical)}
 
     # A model can preserve an exact excerpt but report the line from a grep
     # result or a zero-based count. Relocate only when the excerpt has one
@@ -295,7 +305,10 @@ def review_resolved(project: ProjectDetail, fid: str) -> bool:
 
 def coverage_state(project: ProjectDetail, workdir: Path, config: CoverageConfig) -> dict:
     plan_fact, path, plan = get_plan(project, workdir)
-    for key in ("topics", "files_per_cell", "max_target_bytes", "exclude"):
+    # The plan's cells and frozen snapshot are authoritative for an existing
+    # project. Changing files_per_cell only affects plans created afterward;
+    # it must not invalidate or rewrite this project's recorded cell layout.
+    for key in ("topics", "max_target_bytes", "exclude"):
         if plan["config"][key] != config.model_dump()[key]:
             raise ValueError("Coverage scope configuration changed; create a new project to replan")
     rows = []

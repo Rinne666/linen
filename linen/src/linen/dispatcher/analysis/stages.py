@@ -14,7 +14,7 @@ from typing import Any
 
 from linen.dispatcher.analysis.artifacts import load_artifact
 from linen.dispatcher.analysis import audit_recipes, coverage, scope_gate
-from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT
+from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT, has_java_sources
 from linen.dispatcher.config import AuditConfig
 from linen.server.models import AuditStage, Fact, Intent, ProjectDetail
 
@@ -139,10 +139,35 @@ def reconcile(config: AuditConfig, project: ProjectDetail, workdir: Path) -> lis
     """Derive the complete stage projection, with no network or writes."""
     if not config.enabled or project.project.audit_mode == "none":
         return []
-    return [
+    rows = [
         _definition_status(definition, config, project, workdir)
         for definition in stage_definitions(config, project.project.audit_mode)
     ]
+    if config.spring.enabled and not has_java_sources(project, workdir):
+        for row in rows:
+            if row["stage_id"] == "spring-routes":
+                row.update({
+                    "required": False,
+                    "status": "not_applicable",
+                    "detail": "Frozen source snapshot contains no Java files; Spring route scan skipped.",
+                })
+    active_ids = {row["stage_id"] for row in rows}
+    # Audit stages are an append-only read model.  Retire rows left by older
+    # dispatcher versions instead of deleting historical state or continuing
+    # to present removed built-in scanners as runnable work.
+    for stage in project.stages:
+        if stage.stage_id in active_ids:
+            continue
+        rows.append({
+            "stage_id": stage.stage_id,
+            "label": stage.label,
+            "phase_order": stage.phase_order,
+            "required": False,
+            "status": "not_applicable",
+            "capability": stage.capability,
+            "detail": "Retired stage retained for historical compatibility; the current dispatcher does not execute it.",
+        })
+    return rows
 
 
 def changed_rows(project: ProjectDetail, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

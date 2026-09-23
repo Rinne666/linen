@@ -57,7 +57,7 @@ workers:
     type: "claudecode"
     task_types: [reason, explore]
     max_running: 1
-    priority: 0
+    priority: 1
 
   # - name: "local-codex"
   #   type: "codex"
@@ -69,4 +69,4 @@ workers:
   #   type: "pi"
   #   task_types: [reason]
   #   max_running: 1
-  #   priority: 2
+  #   priority: 0

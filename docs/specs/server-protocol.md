@@ -295,7 +295,10 @@ Body：
 
 #### POST /projects
 
-创建新项目。`origin` 和 `goal` 写入 `facts` 作为特殊 Fact。`hints` 可选。`bootstrap_enabled` 可选，默认为 `true`；为 `false` 时消费者跳过 bootstrap。即使为 `true`，消费者没有 bootstrap 能力时也可直接进入 reason。
+创建新项目。`origin` 和 `goal` 写入 `facts` 作为特殊 Fact。`hints` 可选。通用项目
+（`audit_mode=none`）必须提交自由文本 `goal`；审计项目的 `goal` 由 Server 固定为版本化的
+Security Audit Charter，客户端提交的同名字段会被忽略。这样不同运行共享同一安全判定标准，
+用户输入只决定目标源码、审计模式和其他范围约束。
 
 源码可以通过两个互斥字段之一绑定：`clone_url` 由 Server 克隆到
 `~/.local/share/linen/clones/<project_id>`；`repo_root` 复用已经存在的本地源码目录。
@@ -333,12 +336,14 @@ Git 克隆示例：
 {
   "title": "源码审计",
   "origin": "https://github.com/example/repo.git",
-  "goal": "检查认证和命令执行漏洞",
-  "bootstrap_enabled": false,
   "audit_mode": "scope",
   "clone_url": "https://github.com/example/repo.git"
 }
 ```
+
+当前 `security-audit-charter/v1` 要求候选问题同时给出攻击者控制、可达性、被破坏的安全
+不变量或信任边界以及具体影响。维护者明确认可的设计只有在存在证据时才排除；完成条件由
+所选审计模式的覆盖与证据门禁决定，而不是发现一个候选问题即完成。
 
 复用本地源码时，将 `clone_url` 替换为例如
 `"repo_root": "/absolute/path/to/existing/checkout"`。

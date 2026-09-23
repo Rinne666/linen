@@ -534,8 +534,17 @@ def classify_provider_failure(result: ProcessResult) -> str | None:
             continue
         if isinstance(event, dict):
             _collect_provider_errors(event, messages)
-    if result.returncode != 0 and result.stderr:
-        messages.append(result.stderr[-4000:])
+    if result.returncode != 0:
+        if result.stderr:
+            messages.append(result.stderr[-4000:])
+        # Claude-style CLIs may emit a provider rejection as one plain-text
+        # stdout line while reserving stderr for an SDK diagnostic.  Do not
+        # scan arbitrary stdout (it can contain prompt/model text); accept
+        # only explicit provider-error prefixes on a failed process.
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if re.match(r"^(?:api|provider|request)\s+error\s*:", stripped, re.IGNORECASE):
+                messages.append(stripped[-4000:])
 
     normalized = "\n".join(messages).casefold()
     if not normalized:

@@ -390,6 +390,12 @@ def test_false_citations_and_changed_snapshots_rejected(api, tmp_path):
     }}, current, intent, Path(backend.container_name(pid)))
     normalized = json.loads(relocated["evidence"])["citations"][0]
     assert normalized == {"file": cell["files"][0], "line": 1, "code": "value = 1"}
+    indentation_drift = coverage.outcome_fact({"coverage": {
+        "outcome": "checked", "rationale": "done", "inspected_files": cell["files"],
+        "citations": [{"file": cell["files"][0], "line": 1, "code": "\t\tvalue = 1"}],
+    }}, current, intent, Path(backend.container_name(pid)))
+    canonical = json.loads(indentation_drift["evidence"])["citations"][0]
+    assert canonical == {"file": cell["files"][0], "line": 1, "code": "value = 1"}
     (path.parent / "source" / cell["files"][0]).write_text("changed")
     with pytest.raises(ValueError, match="changed"):
         coverage.cell_context(current, intent, Path(backend.container_name(pid)))

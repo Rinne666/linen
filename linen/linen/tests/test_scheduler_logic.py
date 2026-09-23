@@ -435,10 +435,20 @@ def test_provider_failure_classifier_reads_only_explicit_error_fields() -> None:
     assert classify_provider_failure(
         ProcessResult(1, "", "HTTP 429 Too Many Requests")
     ) == "rate_limited"
+    assert classify_provider_failure(
+        ProcessResult(
+            1,
+            "API Error: Request rejected (429) · 已达到 Token Plan 用量上限：请购买积分补充用量。",
+            '[claude-code:unrecognized_model] {"model":"example"}',
+        )
+    ) == "quota_exhausted"
 
     prompt_echo = {"type": "message", "content": "Investigate a 429 rate limit bug"}
     assert classify_provider_failure(
         ProcessResult(0, json.dumps(prompt_echo), "")
+    ) is None
+    assert classify_provider_failure(
+        ProcessResult(1, "The target prints: API Error: 429", "unrelated failure")
     ) is None
 
 

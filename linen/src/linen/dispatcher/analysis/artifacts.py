@@ -143,6 +143,7 @@ def canonical_source_citations(
         raise ValueError(f"{label} citation limit exceeded")
     result = []
     ids: set[str] = set()
+    mismatches: list[str] = []
     files = snapshot.get("files", {})
     for citation in raw:
         if not isinstance(citation, dict) or set(citation) != {"id", "file", "line", "code"}:
@@ -169,10 +170,30 @@ def canonical_source_citations(
         )
         lines = content.splitlines()
         excerpt = code.splitlines()
-        if line > len(lines) or lines[line - 1:line - 1 + len(excerpt)] != excerpt:
-            raise ValueError(f"{label} citation does not match frozen source: {filename}:{line}")
+        actual = lines[line - 1:line - 1 + len(excerpt)]
+        if actual != excerpt:
+            # Models occasionally lose one indentation level while copying an
+            # otherwise exact excerpt.  Canonicalize only that harmless case;
+            # every non-whitespace byte, file, and line must still match the
+            # immutable snapshot.  Content or line drift remains a hard error.
+            indentation_only = (
+                len(actual) == len(excerpt)
+                and all(
+                    source_line.lstrip(" \t") == cited_line.lstrip(" \t")
+                    for source_line, cited_line in zip(actual, excerpt, strict=True)
+                )
+            )
+            if indentation_only:
+                code = "\n".join(actual)
+            else:
+                mismatches.append(f"{citation_id}={filename}:{line}")
         ids.add(citation_id)
         result.append({"id": citation_id, "file": filename, "line": line, "code": code})
+    if mismatches:
+        raise ValueError(
+            f"{label} citation does not match frozen source "
+            f"({len(mismatches)} mismatch(es)): {', '.join(mismatches)}"
+        )
     return result
 
 

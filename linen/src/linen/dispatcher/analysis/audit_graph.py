@@ -12,7 +12,7 @@ from pathlib import Path
 
 from linen.dispatcher.analysis import audit_recipes, coverage, scope_gate, triage
 from linen.dispatcher.analysis.artifacts import ancestor_ids, digest, load_artifact, write_json
-from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT
+from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT, has_java_sources
 from linen.dispatcher.config import AuditConfig
 from linen.server.models import Fact, ProjectDetail
 from linen.server.uvpg import REQUIRED_ROLES
@@ -257,7 +257,7 @@ def audit_summary_inputs(
         if len(module_ids) != len(expected_modules) or not _reviewed(project, plan_fact.id):
             return None
         route_sources = _completed_sources(project, workdir, "route_scan")
-        if config.spring.enabled and not route_sources:
+        if config.spring.enabled and has_java_sources(project, workdir) and not route_sources:
             return None
         for source in route_sources:
             _, manifest = load_artifact(source, workdir)
@@ -364,6 +364,7 @@ def required_intents(
     """Derive missing graph edges in stable priority order."""
     if not config.enabled or project.project.audit_mode == "none":
         return []
+    spring_enabled = config.spring.enabled and has_java_sources(project, workdir)
     plan_anchor = "origin"
     # Keep the entire gate ahead of unrelated legacy work. This is important
     # when enabling the gate on an active board whose ready window is already
@@ -444,7 +445,7 @@ def required_intents(
         semantic_verifications = []
 
     spring_attempts = [fact for fact in project.facts if fact.type == "route_scan"]
-    if (config.spring.enabled and not _completed_sources(project, workdir, "route_scan")
+    if (spring_enabled and not _completed_sources(project, workdir, "route_scan")
             and len(spring_attempts) < config.spring.max_attempts
             and (not spring_attempts or _reviewed(project, spring_attempts[-1].id))
             and not _open(project, SPRING_SCAN_INTENT)):
@@ -545,7 +546,7 @@ def scope_blockers(
         blockers.append("Scope completion must reference a reviewed audit_summary fact.")
     elif not _reviewed(project, summary.id):
         blockers.append(f"{summary.id} requires a firm/certain VALID review.")
-    if config.spring.enabled:
+    if config.spring.enabled and has_java_sources(project, workdir):
         routes = _completed_sources(project, workdir, "route_scan")
         if len(routes) != 1:
             attempts = len([fact for fact in project.facts if fact.type == "route_scan"])

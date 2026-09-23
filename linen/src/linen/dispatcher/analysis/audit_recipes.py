@@ -530,7 +530,7 @@ def execution_prompt(
         _, candidate = verification_target(project, intent, workdir)
         context["assigned_candidate"] = candidate
     if validation_error:
-        context["previous_validation_error"] = validation_error
+        context["previous_validation_error"] = validation_error[:8000]
 
     bundle = load_bundle(prompt_group)
     sections = [

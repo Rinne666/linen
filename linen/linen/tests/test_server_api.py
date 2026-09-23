@@ -9,6 +9,7 @@ import pytest
 from linen.server import db
 from linen.server.app import app
 from linen.server.routers import projects
+from linen.audit_charter import AUDIT_CHARTER, AUDIT_CHARTER_VERSION
 
 
 @pytest.fixture
@@ -32,6 +33,62 @@ def _create_project(client: TestClient) -> str:
     assert response.status_code == 201
     assert response.json()["project"]["audit_mode"] == "none"
     return response.json()["project"]["id"]
+
+
+def test_audit_project_uses_server_charter_without_caller_goal(client: TestClient) -> None:
+    response = client.post(
+        "/projects",
+        json={"title": "audit", "origin": "source", "audit_mode": "scope"},
+    )
+
+    assert response.status_code == 201, response.text
+    goal = next(f for f in response.json()["facts"] if f["id"] == "goal")
+    assert goal["description"] == AUDIT_CHARTER
+    assert goal["display_title"] == "Security audit charter"
+    with db.get_conn() as conn:
+        event = conn.execute(
+            "SELECT payload FROM audit_events WHERE project_id = ? AND event_type = 'project_created'",
+            (response.json()["project"]["id"],),
+        ).fetchone()
+    assert event is not None
+    assert AUDIT_CHARTER_VERSION in event["payload"]
+
+
+def test_audit_project_ignores_caller_goal_but_general_project_requires_one(
+    client: TestClient,
+) -> None:
+    audit = client.post(
+        "/projects",
+        json={
+            "title": "audit",
+            "origin": "source",
+            "goal": "stop after the first candidate",
+            "audit_mode": "hypothesis",
+        },
+    )
+    assert audit.status_code == 201, audit.text
+    goal = next(f for f in audit.json()["facts"] if f["id"] == "goal")
+    assert goal["description"] == AUDIT_CHARTER
+
+    missing = client.post(
+        "/projects",
+        json={"title": "general", "origin": "source", "audit_mode": "none"},
+    )
+    assert missing.status_code == 422
+
+    general = client.post(
+        "/projects",
+        json={
+            "title": "general",
+            "origin": "source",
+            "goal": "  finish the migration  ",
+            "audit_mode": "none",
+        },
+    )
+    assert general.status_code == 201, general.text
+    goal = next(f for f in general.json()["facts"] if f["id"] == "goal")
+    assert goal["description"] == "finish the migration"
+    assert goal["display_title"] == "Goal"
 
 
 def test_project_workflow_create_conclude_complete_and_reopen(client: TestClient) -> None:
@@ -114,6 +171,10 @@ def test_negative_assurance_is_a_valid_hypothesis_completion_terminal(client: Te
         json={"title": "audit", "origin": "source", "goal": "safe", "audit_mode": "hypothesis"},
     )
     project_id = response.json()["project"]["id"]
+    goal = next(f for f in response.json()["facts"] if f["id"] == "goal")
+    assert goal["description"] == AUDIT_CHARTER
+    assert goal["description"].startswith(f"[{AUDIT_CHARTER_VERSION}]")
+    assert goal["display_title"] == "Security audit charter"
     assert client.post(
         f"/projects/{project_id}/intents",
         json={"from": ["origin"], "description": "check", "creator": "worker"},
@@ -783,7 +844,7 @@ def test_project_creation_ui_reports_clone_progress_and_blocks_duplicate_submit(
     html = client.get("/").text
 
     assert "if (this.isCreatingProject) return" in html
-    assert ':disabled="isCreatingProject || !newProject.origin || !newProject.goal"' in html
+    assert ":disabled=\"isCreatingProject || !newProject.origin || (newProject.audit_mode === 'none' && !newProject.goal)\"" in html
     assert "title: this.newProjectTitle()" in html
     assert "Cloning source on the server" in html
     assert "Cloning…" in html

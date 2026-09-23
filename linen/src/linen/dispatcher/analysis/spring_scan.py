@@ -13,14 +13,36 @@ from pathlib import Path
 
 from linen.dispatcher.analysis.artifacts import (
     digest,
+    load_artifact,
     snapshot_canonical_source,
     snapshot_source,
     write_json,
 )
 from linen.dispatcher.config import CoverageConfig, SpringScanConfig
+from linen.server.models import ProjectDetail
 
 
 SPRING_SCAN_INTENT = "@analysis:spring-route-auth"
+
+
+def has_java_sources(project: ProjectDetail, workdir: Path) -> bool:
+    """Return whether the frozen coverage snapshot contains Java source.
+
+    Spring route extraction is deterministic and only understands Java MVC.
+    Skip it for snapshots with no Java files, while failing open if the plan
+    cannot be inspected so a missing artifact never silently drops coverage.
+    """
+    plans = [fact for fact in project.facts if fact.type == "coverage_plan"]
+    if len(plans) != 1:
+        return True
+    try:
+        _path, plan = load_artifact(plans[0], workdir)
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return True
+    files = plan.get("snapshot", {}).get("files")
+    if not isinstance(files, dict):
+        return True
+    return any(str(name).lower().endswith(".java") for name in files)
 
 _MAPPING = re.compile(
     r"@(?P<kind>Request|Get|Post|Put|Delete|Patch)Mapping\s*(?:\((?P<args>.*?)\))?",

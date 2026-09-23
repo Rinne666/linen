@@ -20,11 +20,13 @@ def create_project_method(source: str) -> str:
     return source[start:end]
 
 
-def test_new_audit_main_path_only_asks_for_repository_and_goal() -> None:
+def test_new_audit_main_path_uses_fixed_security_charter() -> None:
     modal = new_audit_modal(html())
 
     assert ">Repository</label>" in modal
-    assert "<span>Goal</span>" in modal
+    assert "Security Audit Charter" in modal
+    assert "v1 · fixed" in modal
+    assert "newProject.audit_mode === 'none'" in modal
     assert "<span>Advanced</span>" in modal
     assert "'Start audit'" in modal
     assert "Audit profile" not in modal
@@ -52,6 +54,8 @@ def test_project_creation_does_not_generate_or_submit_hints() -> None:
     assert "body.hints" not in method
     assert "hintContents" not in method
     assert "completion_policy: this.newProject.completion_policy" in method
+    assert "if (this.newProject.audit_mode === 'none')" in method
+    assert "body.goal = this.newProject.goal" in method
 
 
 def test_running_project_uses_analyst_note_language_and_hint_api() -> None:

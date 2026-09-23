@@ -185,7 +185,7 @@ class WorkerConfig(BaseModel):
 class CoverageConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     topics: list[str] = Field(default_factory=lambda: ["input-validation", "authorization", "dangerous-operations"])
-    files_per_cell: int = Field(default=20, gt=0, le=200)
+    files_per_cell: int = Field(default=40, gt=0, le=200)
     max_cells: int = Field(default=1000, gt=0)
     max_attempts_per_cell: int = Field(default=3, gt=0)
     max_target_bytes: int = Field(default=2_000_000, gt=0)

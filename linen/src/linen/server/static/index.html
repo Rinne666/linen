@@ -331,6 +331,8 @@
     transition: border-color 140ms ease, background-color 140ms ease;
   }
   .outline-row:hover { border-color: #a5b4fc; background: #fafaff; }
+  .outline-row.outline-row-blocked { border-color: #fda4af; background: #fff1f2; }
+  .outline-row.outline-row-blocked:hover { border-color: #e11d48; background: #ffe4e6; }
   .graph-side-panel {
     border-color: var(--workbench-line) !important;
     box-shadow: -8px 0 24px rgba(16, 24, 40, 0.035);
@@ -812,35 +814,6 @@
     </button>
   </div>
 
-  <template x-if="primaryProjectError()">
-    <section class="flex shrink-0 flex-col gap-3 border-b border-orange-200 bg-orange-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
-      role="alert" aria-live="assertive">
-      <div class="min-w-0">
-        <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
-          <span class="inline-flex h-5 items-center rounded-md bg-orange-100 px-2 text-[10px] font-bold uppercase tracking-[0.1em] text-orange-800">Needs attention</span>
-          <h3 class="text-sm font-semibold text-orange-950" x-text="projectErrorTitle(primaryProjectError())"></h3>
-          <span x-show="unresolvedProjectErrors().length > 1" class="text-[11px] text-orange-800"
-            x-text="`+${unresolvedProjectErrors().length - 1} more`"></span>
-        </div>
-        <p class="mt-1 max-w-[75ch] break-words text-xs leading-relaxed text-orange-950"
-          x-text="projectErrorMessage(primaryProjectError())"></p>
-        <p class="mt-1 max-w-[75ch] break-words text-[11px] leading-relaxed text-orange-900"
-          x-text="projectErrorRecovery(primaryProjectError())"></p>
-      </div>
-      <div class="flex shrink-0 items-center gap-2">
-        <button type="button" @click="selectIntent(primaryProjectError().intent_id); sideTab = 'detail'"
-          class="inline-flex min-h-9 items-center justify-center rounded-lg px-3 text-xs font-medium text-orange-900 transition hover:bg-orange-100 hover:text-orange-950">
-          View work
-        </button>
-        <button type="button" @click="retryIntentError(primaryProjectError())"
-          :disabled="!canRetryIntentError(primaryProjectError()) || retryingIntentId === primaryProjectError().intent_id"
-          class="inline-flex min-h-9 items-center justify-center rounded-lg bg-orange-700 px-3 text-xs font-semibold text-white transition hover:bg-orange-800 disabled:cursor-not-allowed disabled:opacity-45"
-          x-text="retryingIntentId === primaryProjectError().intent_id ? 'Retrying…' : 'Retry now'">
-        </button>
-      </div>
-    </section>
-  </template>
-
   <div class="graph-workspace flex-1 flex overflow-hidden" id="graphLayout">
     <!-- Graph -->
     <div class="graph-canvas flex-1 relative min-w-0 min-h-0">
@@ -897,10 +870,6 @@
             @click="openFindingFact(currentSummary().actionTarget)"
             class="ml-2 text-[10px] font-semibold text-amber-700 hover:text-amber-900"
             x-text="currentSummary().actionLabel"></button>
-        </div>
-        <div x-show="currentSummary().blocked" class="mt-2 border-t border-slate-100 pt-2">
-          <span class="text-[9px] font-bold uppercase tracking-[0.13em] text-rose-500">Blocked</span>
-          <span class="ml-2 text-[11px] leading-relaxed text-rose-700" x-text="currentSummary().blocked"></span>
         </div>
         <div class="mt-2 flex items-center justify-between gap-3 border-t border-slate-100 pt-2">
           <span class="text-[10px] text-slate-500" x-text="currentContextSummary()"></span>
@@ -1102,7 +1071,8 @@
             </div>
             <div class="space-y-2">
               <template x-for="intent in outlineIntents()" :key="intent.id">
-                <button type="button" @click="focusOutlineIntent(intent.id)" class="outline-row block w-full p-3 text-left">
+                <button type="button" @click="focusOutlineIntent(intent.id)" class="outline-row block w-full p-3 text-left"
+                  :class="intentError(intent.id)?.classification === 'blocked' ? 'outline-row-blocked' : ''">
                   <div class="flex items-center justify-between gap-3">
                     <div class="flex min-w-0 items-center gap-2">
                       <span class="font-mono text-[10px] font-bold text-violet-700" x-text="intent.id"></span>
@@ -1132,6 +1102,10 @@
       <div class="flex border-b border-slate-100 shrink-0 select-none">
         <button @click="sideTab = 'detail'" class="flex-1 px-2 py-2.5 text-xs font-medium transition"
           :class="sideTab === 'detail' ? 'text-brand-600 border-b-2 border-brand-500' : 'text-slate-400 hover:text-slate-600'">Details</button>
+        <button @click="sideTab = 'blocked'" class="flex-1 px-2 py-2.5 text-xs font-medium transition"
+          :class="sideTab === 'blocked' ? 'text-brand-600 border-b-2 border-brand-500' : 'text-slate-400 hover:text-slate-600'">
+          Issues <span x-show="unresolvedProjectErrors().length" class="ml-0.5 text-[10px]" :class="sideTab === 'blocked' ? 'text-brand-500' : 'text-rose-500'" x-text="unresolvedProjectErrors().length"></span>
+        </button>
         <button @click="sideTab = 'gate'" class="flex-1 px-2 py-2.5 text-xs font-medium transition"
           :class="sideTab === 'gate' ? 'text-brand-600 border-b-2 border-brand-500' : 'text-slate-400 hover:text-slate-600'">Completion</button>
         <button @click="sideTab = 'log'" class="flex-1 px-2 py-2.5 text-xs font-medium transition"
@@ -1144,13 +1118,51 @@
       </div>
       <div class="flex items-center justify-between gap-3 border-b border-slate-100 bg-slate-50/80 px-3 py-2 shrink-0 select-none">
         <span class="min-w-0 truncate text-[10px] text-slate-400"
-          x-text="sideTab === 'pi' ? 'Worker archives and contract run metadata load on demand' : sideTab === 'gate' ? 'Completion is evidence-gated, not inferred from an idle queue' : sideTab === 'log' ? 'Audit events in execution order' : sideTab === 'hints' ? 'Analyst guidance and context' : 'Node and edge evidence is selectable'"></span>
+          x-text="sideTab === 'pi' ? 'Worker archives and contract run metadata load on demand' : sideTab === 'blocked' ? 'Blocked work and retryable failures, grouped by cause' : sideTab === 'gate' ? 'Completion is evidence-gated, not inferred from an idle queue' : sideTab === 'log' ? 'Audit events in execution order' : sideTab === 'hints' ? 'Analyst guidance and context' : 'Node and edge evidence is selectable'"></span>
         <button type="button" @click="copySidePanelText()"
           class="inline-flex h-7 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-[11px] font-medium text-slate-600 hover:border-brand-200 hover:bg-brand-50 hover:text-brand-700 transition"
           title="Copies highlighted text, or all text in the current sidebar tab">
           <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg>
           Copy
         </button>
+      </div>
+
+      <!-- Blocked work and execution failures -->
+      <div x-show="sideTab === 'blocked'" class="min-w-0 flex-1 overflow-x-hidden overflow-y-auto bg-slate-50/40 p-3 space-y-3 select-text">
+        <div x-show="unresolvedProjectErrors().length === 0" class="rounded-xl border border-dashed border-slate-300 bg-white p-5 text-center">
+          <p class="text-xs font-medium text-slate-600">No unresolved work errors</p>
+          <p class="mt-1 text-[11px] text-slate-400">Blocked items and deferred retries will appear here.</p>
+        </div>
+        <template x-for="error in unresolvedProjectErrors()" :key="`${error.intent_id}:${error.code}:${error.last_failed_at}`">
+          <article class="overflow-hidden rounded-xl border bg-white"
+            :class="error.classification === 'blocked' ? 'border-rose-200' : 'border-orange-200'">
+            <div class="flex items-start gap-2 border-b px-3 py-2.5"
+              :class="error.classification === 'blocked' ? 'border-rose-100 bg-rose-50/80' : 'border-orange-100 bg-orange-50/70'">
+              <span class="mt-1 h-2 w-2 shrink-0 rounded-full" :class="error.classification === 'blocked' ? 'bg-rose-500' : 'bg-orange-400'"></span>
+              <div class="min-w-0 flex-1">
+                <p class="text-[10px] font-bold uppercase tracking-wider"
+                  :class="error.classification === 'blocked' ? 'text-rose-700' : 'text-orange-700'"
+                  x-text="projectErrorReasonLabel(error)"></p>
+                <h3 class="mt-0.5 text-xs font-semibold leading-snug text-slate-800" x-text="projectErrorTitle(error)"></h3>
+              </div>
+              <span class="shrink-0 rounded bg-white/80 px-1.5 py-0.5 font-mono text-[9px] text-slate-500" x-text="error.code"></span>
+            </div>
+            <div class="space-y-2 p-3">
+              <p class="text-[11px] font-medium text-slate-600" x-text="projectErrorIntent(error) ? intentDisplayTitle(projectErrorIntent(error)) : error.intent_id"></p>
+              <p class="break-words text-xs leading-relaxed text-slate-700" x-text="error.message || 'The work item failed.'"></p>
+              <p class="break-words text-[11px] leading-relaxed text-slate-500" x-text="projectErrorRecovery(error)"></p>
+              <div class="flex items-center justify-between gap-2 border-t border-slate-100 pt-2">
+                <button type="button" @click="selectIntent(error.intent_id); sideTab = 'detail'"
+                  class="text-[11px] font-semibold text-brand-600 hover:text-brand-800">View work</button>
+                <button type="button" x-show="canRetryIntentError(error)" @click="retryIntentError(error)"
+                  :disabled="retryingIntentId === error.intent_id"
+                  class="rounded-lg bg-slate-900 px-2.5 py-1.5 text-[10px] font-semibold text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-45"
+                  x-text="retryingIntentId === error.intent_id ? 'Retrying…' : 'Retry now'"></button>
+                <span class="text-[10px] text-slate-400" x-text="formatTime(error.last_failed_at)"></span>
+              </div>
+            </div>
+          </article>
+        </template>
       </div>
 
       <!-- Completion gate -->
@@ -1234,14 +1246,14 @@
                 <span class="text-[10px] tabular-nums text-slate-400" x-text="auditStageSummaryLabel()"></span>
               </div>
               <div class="mt-3 space-y-2">
-                <template x-for="stage in (project.stages || [])" :key="`${stage.source_generation}-${stage.plan_revision}-${stage.stage_id}`">
+                <template x-for="stage in visibleAuditStages()" :key="`${stage.source_generation}-${stage.plan_revision}-${stage.stage_id}`">
                   <div class="flex items-start gap-2.5 rounded-lg bg-slate-50 px-3 py-2">
                     <span class="mt-0.5 h-2 w-2 shrink-0 rounded-full" :class="stageStatusDotClass(stage.status)"></span>
                     <div class="min-w-0 flex-1">
                       <div class="flex items-center justify-between gap-2">
                         <div class="flex min-w-0 items-center gap-2">
                           <span class="truncate text-xs font-medium text-slate-700" x-text="stage.label"></span>
-                          <span x-show="!stage.required" class="shrink-0 rounded bg-slate-200 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-slate-500">On demand</span>
+                          <span x-show="!stage.required" class="shrink-0 rounded bg-slate-200 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-slate-500">Optional</span>
                         </div>
                         <span class="shrink-0 text-[10px] text-slate-400" x-text="stageStatusLabel(stage.status)"></span>
                       </div>
@@ -1249,7 +1261,7 @@
                     </div>
                   </div>
                 </template>
-                <p x-show="!(project.stages || []).length" class="rounded-lg border border-dashed border-slate-200 px-3 py-5 text-center text-[11px] text-slate-400">Legacy project: deterministic stage ledger has not been materialized yet.</p>
+                <p x-show="!visibleAuditStages().length" class="rounded-lg border border-dashed border-slate-200 px-3 py-5 text-center text-[11px] text-slate-400">No active audit stages are recorded.</p>
               </div>
             </section>
 
@@ -1418,8 +1430,8 @@
                 </template>
                 <template x-if="selectedFactId() === 'goal'">
                   <div class="pt-4 border-t border-slate-100 space-y-3">
-                    <p class="text-[10px] font-semibold text-rose-500 uppercase tracking-widest">Goal</p>
-                    <div class="flex items-start justify-between gap-3"><span class="text-slate-400 shrink-0">Role</span><span class="text-slate-600 text-right break-words">Project target fact</span></div>
+                    <p class="text-[10px] font-semibold text-rose-500 uppercase tracking-widest" x-text="project?.project?.audit_mode === 'none' ? 'Goal' : 'Audit charter'"></p>
+                    <div class="flex items-start justify-between gap-3"><span class="text-slate-400 shrink-0">Role</span><span class="text-slate-600 text-right break-words" x-text="project?.project?.audit_mode === 'none' ? 'Project target fact' : 'Fixed security acceptance standard'"></span></div>
                     <template x-if="selectedFactProducingIntent()">
                       <div class="pt-1 space-y-3">
                         <div class="flex items-start justify-between gap-3"><span class="text-slate-400 shrink-0">Completed By</span><span class="font-mono text-slate-600 text-right break-all" x-text="selectedFactProducingIntent().id"></span></div>
@@ -1916,9 +1928,23 @@
         </template>
       </div>
 
-      <label class="block space-y-2 text-sm font-medium text-slate-700">
+      <template x-if="newProject.audit_mode !== 'none'">
+        <section class="rounded-xl border border-brand-100 bg-brand-50/50 px-3.5 py-3" aria-label="Security Audit Charter">
+          <div class="flex items-center justify-between gap-3">
+            <span class="text-xs font-semibold text-brand-800">Security Audit Charter</span>
+            <span class="rounded-md bg-white px-1.5 py-0.5 font-mono text-[9px] text-brand-600 ring-1 ring-brand-100">v1 · fixed</span>
+          </div>
+          <p class="mt-1.5 text-[11px] leading-5 text-slate-600">
+            Validate attacker-controlled, reachable behavior that crosses a trust boundary,
+            violates a security invariant, or compromises confidentiality, integrity, or availability.
+          </p>
+          <p class="mt-1 text-[10px] leading-4 text-slate-400">The server owns this objective. Audit mode and evidence gates determine completion.</p>
+        </section>
+      </template>
+
+      <label x-show="newProject.audit_mode === 'none'" class="block space-y-2 text-sm font-medium text-slate-700">
         <span>Goal</span>
-        <textarea x-model="newProject.goal" placeholder="What should the audit investigate?" rows="3" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm font-normal focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300"></textarea>
+        <textarea x-model="newProject.goal" placeholder="What should this project achieve?" rows="3" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm font-normal focus:outline-none focus:ring-2 focus:ring-brand-100 focus:border-brand-400 transition placeholder:text-slate-300"></textarea>
       </label>
 
       <div class="border-t border-slate-100 pt-3">
@@ -1953,7 +1979,7 @@
     </div>
     <div class="flex justify-end gap-2 mt-5">
       <button @click="showNewProject = false" :disabled="isCreatingProject" class="px-4 py-2 text-sm text-slate-500 hover:bg-slate-50 rounded-xl transition disabled:cursor-not-allowed disabled:opacity-40">Cancel</button>
-      <button @click="createProject()" :disabled="isCreatingProject || !newProject.origin || !newProject.goal"
+      <button @click="createProject()" :disabled="isCreatingProject || !newProject.origin || (newProject.audit_mode === 'none' && !newProject.goal)"
         class="inline-flex min-w-[96px] items-center justify-center gap-2 px-5 py-2 text-sm bg-brand-500 text-white rounded-xl font-medium hover:bg-brand-600 transition disabled:cursor-not-allowed disabled:opacity-50 shadow-sm shadow-brand-200">
         <svg x-show="isCreatingProject" x-cloak class="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <circle class="opacity-25" cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3"></circle>
@@ -2529,7 +2555,7 @@ function linenApp() {
     },
 
     executionStatusDisplay(status) {
-      const labels = { running: 'Running', ready: 'Ready', blocked: 'Blocked', paused: 'Paused', completed: 'Completed', complete: 'Completed', idle: 'Idle', idle_attention_required: 'Needs attention', retrying: 'Retrying', queued: 'Queued' };
+      const labels = { running: 'Running', ready: 'Ready', blocked: 'Blocked', paused: 'Paused', completed: 'Completed', complete: 'Completed', idle: 'Idle', idle_attention_required: 'Incomplete', retrying: 'Retrying', queued: 'Queued' };
       return labels[status] || String(status || 'Idle').replaceAll('_', ' ');
     },
 
@@ -2537,7 +2563,7 @@ function linenApp() {
       const status = this.projectExecutionStatus();
       const labels = {
         running: 'Running', ready: 'Ready', blocked: 'Blocked', paused: 'Paused',
-        completed: 'Completed', complete: 'Completed', idle_attention_required: 'Needs attention', reasoning: 'Reasoning', working: 'Working',
+        completed: 'Completed', complete: 'Completed', idle_attention_required: 'Incomplete', reasoning: 'Reasoning', working: 'Working',
         retrying: 'Retrying', queued: 'Queued', idle: 'Idle', active: 'Active', stopped: 'Paused',
       };
       return labels[status] || String(status || 'Idle').replaceAll('_', ' ');
@@ -2562,16 +2588,6 @@ function linenApp() {
           actionLabel: 'Review finding',
           actionTarget: candidates[0].id,
           completionAction: true,
-        };
-      }
-      const blocked = this.unresolvedProjectErrors().find(error => error.classification === 'blocked');
-      if (blocked) {
-        const intent = this.projectErrorIntent(blocked);
-        return {
-          eyebrow: 'Blocked',
-          title: 'Audit blocked',
-          detail: blocked.message || (intent ? this.intentDisplayTitle(intent) : 'The system could not continue this work.'),
-          tone: 'blocked',
         };
       }
       if (this.project.project.status === 'completed') {
@@ -2633,16 +2649,27 @@ function linenApp() {
     },
 
     auditStageProgressLabel() {
-      const required = (this.project?.stages || []).filter(stage => stage.required);
+      const stages = this.visibleAuditStages();
+      const required = stages.filter(stage => stage.required);
       if (!required.length) {
-        const available = (this.project?.stages || []).filter(stage => !stage.required && stage.status !== 'not_applicable');
-        return available.length ? `${available.length} tools on demand` : 'Not tracked';
+        const available = stages.filter(stage => !stage.required && stage.status !== 'not_applicable');
+        return available.length ? `${available.length} optional stage${available.length === 1 ? '' : 's'}` : 'Not tracked';
       }
       return `${this.satisfiedStageCount()} / ${required.length}`;
     },
 
+    isRetiredToolStage(stage) {
+      return new Set([
+        'semgrep', 'spotbugs-findsecbugs', 'osv-scanner', 'gitleaks', 'trivy',
+      ]).has(stage?.stage_id);
+    },
+
+    visibleAuditStages() {
+      return (this.project?.stages || []).filter(stage => !this.isRetiredToolStage(stage));
+    },
+
     auditStageSummaryLabel() {
-      const stages = this.project?.stages || [];
+      const stages = this.visibleAuditStages();
       const required = stages.filter(stage => stage.required);
       const onDemand = stages.filter(stage => !stage.required && stage.status !== 'not_applicable');
       const requiredLabel = required.length ? `${this.satisfiedStageCount()} / ${required.length} required` : 'No required stages';
@@ -3274,7 +3301,13 @@ function linenApp() {
 
     outlineIntents() {
       if (!this.project) return [];
-      return this.project.intents.filter(intent => this.graphIntentMatchesFilters(intent));
+      return this.project.intents
+        .filter(intent => this.graphIntentMatchesFilters(intent))
+        .sort((a, b) => {
+          const aBlocked = this.intentError(a.id)?.classification === 'blocked';
+          const bBlocked = this.intentError(b.id)?.classification === 'blocked';
+          return Number(bBlocked) - Number(aBlocked);
+        });
     },
 
     applyGraphFilters() {
@@ -3645,6 +3678,16 @@ function linenApp() {
           'Stages',
           ...(this.project.stages || []).map(stage => `${stage.phase_order}. ${stage.label} · ${stage.status}${stage.detail ? `\n${stage.detail}` : ''}`),
         ].join('\n');
+      }
+      if (this.sideTab === 'blocked') {
+        return this.unresolvedProjectErrors().map(error => [
+          `${this.projectErrorReasonLabel(error)} · ${this.projectErrorTitle(error)}`,
+          `Work: ${this.projectErrorIntent(error) ? this.intentDisplayTitle(this.projectErrorIntent(error)) : error.intent_id}`,
+          `Code: ${error.code}`,
+          error.message,
+          `Recovery: ${this.projectErrorRecovery(error)}`,
+          `Failed: ${this.formatTime(error.last_failed_at)}`,
+        ].filter(Boolean).join('\n')).join('\n\n');
       }
       if (this.sideTab === 'pi') {
         const detail = this.piExecutionDetails[this.expandedPiExecutionId];
@@ -4950,6 +4993,7 @@ function linenApp() {
       this.expandedTimelineRawIds = {};
       this.decisionForm = { decision: 'confirm', rationale: '', basis_quote: '', revival_condition: '' };
       await this.loadProject(id);
+      if (this.unresolvedProjectErrors().length) this.sideTab = 'blocked';
       if (this.project?.project?.audit_mode && this.project.project.audit_mode !== 'none') {
         this.graphView = 'findings';
         this.findingsMode = 'list';
@@ -6103,8 +6147,16 @@ function linenApp() {
         provider_quota_exhausted: 'Model provider quota exhausted',
         provider_rate_limited: 'Model provider rate limit reached',
         source_repository_missing: 'Repository source is unavailable',
+        invalid_blackboard_result: 'Invalid blackboard result',
+        blackboard_result_invalid: 'Invalid blackboard result',
       };
-      return titles[error.code] || (error.classification === 'blocked' ? 'Audit work is blocked' : 'Audit work could not continue');
+      if (titles[error.code]) return titles[error.code];
+      return String(error.code || 'Execution failure').replaceAll('_', ' ').replace(/\b\w/g, letter => letter.toUpperCase());
+    },
+
+    projectErrorReasonLabel(error) {
+      if (!error) return 'Work issue';
+      return error.classification === 'blocked' ? 'Permanent block · manual correction required' : 'Retry deferred · temporary failure';
     },
 
     projectErrorMessage(error) {
@@ -6120,7 +6172,10 @@ function linenApp() {
         const scheduled = error.retry_at ? ` Automatic retry was deferred until ${this.formatDate(error.retry_at)}.` : '';
         return `Restore the model provider quota, then retry this work item.${scheduled}`;
       }
-      return error.remediation || 'Correct the problem, then retry this work item.';
+      if (error.remediation) return error.remediation;
+      return error.classification === 'blocked'
+        ? 'Correct the cause before retrying this work item.'
+        : 'This failure is considered temporary; retry after the backoff window.';
     },
 
     canRetryIntentError(error) {
@@ -6766,10 +6821,12 @@ function linenApp() {
         const body = {
           title: this.newProjectTitle(),
           origin: this.newProject.origin,
-          goal: this.newProject.goal,
           audit_mode: this.newProject.audit_mode,
           completion_policy: this.newProject.completion_policy,
         };
+        if (this.newProject.audit_mode === 'none') {
+          body.goal = this.newProject.goal;
+        }
         // Origin field doubles as the source field in git/local modes. The
         // server treats `clone_url` and `repo_root` as mutually exclusive and
         // independent of `origin`; we just pass the same string through both

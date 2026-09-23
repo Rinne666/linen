@@ -69,7 +69,7 @@ audit:
     max_verify_attempts: 2
   coverage:
     topics: [input-validation, authorization, dangerous-operations]
-    files_per_cell: 20
+    files_per_cell: 40
     max_cells: 1000
     max_attempts_per_cell: 3
   review_sandbox:
@@ -135,7 +135,7 @@ workers:
     type: "claudecode"
     task_types: [reason, explore, review]
     max_running: 1
-    priority: 0
+    priority: 1
 
   - name: "audit-codex"
     type: "codex"
@@ -144,10 +144,10 @@ workers:
     priority: 1
 
   # Pi is good for focused reasoning AND for code reading (it has read, grep,
-  # find, bash tools). Use it for both phases if you want a second opinion
-  # alongside Claude/Codex.
+  # find, bash tools). Its lower numeric priority makes it the preferred worker;
+  # Claude/Codex remain available when Pi is busy or unhealthy.
   - name: "audit-pi"
     type: "pi"
     task_types: [reason, explore, review]
     max_running: 1
-    priority: 2
+    priority: 0

@@ -963,13 +963,21 @@ def _try_conclude_fallback(
         if semantic_recipe is not None
         else "explore_conclude"
     )
+    # A semantic recipe may need to re-read and repair many frozen-source
+    # citations.  The generic short conclude window is intended for concise
+    # response cleanup and repeatedly killed otherwise valid recipe repairs.
+    conclude_timeout = (
+        max(config.tasks.explore.conclude_timeout, config.tasks.explore.timeout)
+        if semantic_recipe is not None
+        else config.tasks.explore.conclude_timeout
+    )
     recipe_id = recipe_id or "explore_conclude"
     worker_manifest, run_envelope = build_context_execution_contracts(
         fresh_project,
         worker,
         projection,
         phase=conclude_phase,
-        timeout_seconds=config.tasks.explore.conclude_timeout,
+        timeout_seconds=conclude_timeout,
         prompt=prompt,
         logical_scope=(
             f"explore-conclude:{intent.id}:graph-{projection.graph_revision}:"
@@ -990,7 +998,7 @@ def _try_conclude_fallback(
         worker,
         conclude_argv,
         phase=conclude_phase,
-        timeout=config.tasks.explore.conclude_timeout,
+        timeout=conclude_timeout,
         lease=lease,
         cancellation=cancellation,
         recipe_id=recipe_id,

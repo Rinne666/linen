@@ -39,3 +39,13 @@ def test_known_provider_error_uses_user_facing_recovery_copy() -> None:
     assert "Restore the model provider quota, then retry this work item." in source
     assert "Automatic retry was deferred until" in source
     assert "error.remediation || 'Correct the problem, then retry this work item.'" in source
+
+
+def test_removed_scanner_stages_are_not_presented_as_runnable_tools() -> None:
+    source = html()
+
+    assert "visibleAuditStages()" in source
+    assert "isRetiredToolStage(stage)" in source
+    assert "'semgrep', 'spotbugs-findsecbugs', 'osv-scanner', 'gitleaks', 'trivy'" in source
+    assert "tools on demand" not in source
+    assert ">Optional</span>" in source

@@ -390,6 +390,81 @@ def test_semantic_recipe_rejects_citation_not_in_frozen_snapshot(tmp_path):
         )
 
 
+def test_semantic_recipe_canonicalizes_indentation_only_citation_drift(tmp_path):
+    board, workdir, plan_id = _board_with_plan(tmp_path)
+    config = _semantic_config()
+    intent = _intent(
+        "i-architecture",
+        [plan_id],
+        audit_recipes.recipe_description("architecture_map"),
+        "search",
+    )
+    result = audit_recipes.outcome_fact(
+        {
+            "accepted": True,
+            "data": {
+                "description": "canonical citation",
+                "type": "architecture_map",
+                "evidence": "inspected the frozen source",
+                "recipe_result": {
+                    "coverage": {"status": "complete", "summary": "all", "gaps": []},
+                    "citations": [{
+                        "id": "c1",
+                        "file": "Api.java",
+                        "line": 1,
+                        "code": '  class Api { void remove(String owner) { authorize(owner); delete(owner); } }',
+                    }],
+                    "items": [{
+                        "id": "component-api",
+                        "kind": "component",
+                        "title": "API",
+                        "summary": "one API component",
+                        "citations": ["c1"],
+                    }],
+                },
+            },
+        },
+        board,
+        intent,
+        workdir,
+        config,
+    )
+    artifact = Path(result["evidence"].splitlines()[0].removeprefix("artifact: "))
+    record = json.loads(artifact.read_text())
+    assert record["citations"][0]["code"].startswith("class Api")
+
+
+def test_semantic_recipe_reports_all_citation_mismatches(tmp_path):
+    board, workdir, plan_id = _board_with_plan(tmp_path)
+    config = _semantic_config()
+    intent = _intent(
+        "i-architecture",
+        [plan_id],
+        audit_recipes.recipe_description("architecture_map"),
+        "search",
+    )
+    payload = {
+        "accepted": True,
+        "data": {
+            "description": "bad citations",
+            "type": "architecture_map",
+            "evidence": "claimed inspection",
+            "recipe_result": {
+                "coverage": {"status": "complete", "summary": "all", "gaps": []},
+                "citations": [
+                    {"id": "c1", "file": "Api.java", "line": 1, "code": "wrong one"},
+                    {"id": "c2", "file": "Api.java", "line": 1, "code": "wrong two"},
+                ],
+                "items": [],
+            },
+        },
+    }
+    with pytest.raises(ValueError) as captured:
+        audit_recipes.outcome_fact(payload, board, intent, workdir, config)
+    assert "c1=Api.java:1" in str(captured.value)
+    assert "c2=Api.java:1" in str(captured.value)
+
+
 def test_sibling_endpoints_keep_stable_identities_for_hypotheses(tmp_path):
     board, workdir, plan_id = _board_with_plan(tmp_path)
     config = _semantic_config()

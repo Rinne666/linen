@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -683,7 +683,9 @@ class CreateHintInline(BaseModel):
 class CreateProjectRequest(BaseModel):
     title: str
     origin: str
-    goal: str
+    # Audit projects receive the server-owned, versioned security charter.
+    # `goal` remains caller-defined only for general blackboard projects.
+    goal: str | None = None
     completion_policy: Literal["goal_based", "exhaustive"] = "goal_based"
     audit_mode: Literal["none", "hypothesis", "scope"] = "none"
     hints: list[CreateHintInline] | None = None
@@ -697,13 +699,27 @@ class CreateProjectRequest(BaseModel):
     clone_url: str | None = None
     repo_root: str | None = None
 
-    @field_validator("title", "origin", "goal")
+    @field_validator("title", "origin")
     @classmethod
     def validate_non_empty_text(cls, value: str) -> str:
         text = value.strip()
         if not text:
             raise ValueError("must not be empty")
         return text
+
+    @field_validator("goal")
+    @classmethod
+    def validate_optional_goal(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        return text or None
+
+    @model_validator(mode="after")
+    def validate_general_project_goal(self) -> Self:
+        if self.audit_mode == "none" and self.goal is None:
+            raise ValueError("goal is required when audit_mode is none")
+        return self
 
     @field_validator("clone_url", "repo_root")
     @classmethod
