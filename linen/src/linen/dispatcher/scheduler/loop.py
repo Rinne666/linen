@@ -374,15 +374,10 @@ class DispatcherLoop:
                 container_name,
             )
             return False
-        if self._project_running_task_count(summary.id) >= self.config.runtime.max_project_workers:
-            self._log_changed(
-                f"{skip_scope}:max_project_workers",
-                logging.INFO,
-                "skip project=%s because max_project_workers reached running_tasks=%s",
-                summary.id,
-                self._project_running_task_summary(summary.id),
-            )
-            return False
+        at_capacity = (
+            self._project_running_task_count(summary.id)
+            >= self.config.runtime.max_project_workers
+        )
 
         project = self.client.get_project(summary.id)
         if project.project.status != "active":
@@ -417,8 +412,82 @@ class DispatcherLoop:
                 if reason_trigger is not None else []
             )
             if reason_trigger is not None and self._reason_may_run(project, trigger_events):
+                if at_capacity:
+                    self._log_changed(
+                        f"{skip_scope}:max_project_workers",
+                        logging.INFO,
+                        "skip project=%s because max_project_workers reached running_tasks=%s",
+                        summary.id,
+                        self._project_running_task_summary(summary.id),
+                    )
+                    return False
                 export_yaml = self.client.export_project(summary.id)
                 return self._dispatch_reason(project, export_yaml, reason_trigger, trigger_events)
+
+        completion_gate = None
+        if (
+            project.project.reason is None
+            and project.project.audit_mode != "none"
+            and hasattr(self.client, "get_completion_gate")
+        ):
+            try:
+                completion_gate = self.client.get_completion_gate(project.project.id)
+            except Exception as exc:
+                LOG.warning(
+                    "completion gate read failed project=%s error=%s",
+                    project.project.id,
+                    exc,
+                )
+            else:
+                if (
+                    completion_gate.ready
+                    and project.project.completion_policy == "goal_based"
+                ):
+                    sources = self._completion_sources(project)
+                    if sources:
+                        response = self.client.complete(
+                            project.project.id,
+                            sources,
+                            (
+                                "Audit pipeline converged: required stages, managed Skill "
+                                "receipts, independent reviews, and terminal evidence passed "
+                                "the Completion Gate."
+                            ),
+                            "dispatcher.completion-gate",
+                        )
+                        if response.ok:
+                            LOG.info(
+                                "completion gate committed project=%s sources=%s",
+                                project.project.id,
+                                sources,
+                            )
+                            return True
+                        if response.status_code not in {403, 409}:
+                            LOG.warning(
+                                "completion gate commit failed project=%s status=%s body=%s",
+                                project.project.id,
+                                response.status_code,
+                                response.text,
+                            )
+                elif not completion_gate.ready:
+                    self._log_changed(
+                        f"{skip_scope}:completion_gate",
+                        logging.INFO,
+                        "audit waiting for completion evidence project=%s execution=%s blockers=%s",
+                        project.project.id,
+                        completion_gate.execution_status,
+                        completion_gate.blockers,
+                    )
+
+        if at_capacity:
+            self._log_changed(
+                f"{skip_scope}:max_project_workers",
+                logging.INFO,
+                "skip project=%s because max_project_workers reached running_tasks=%s",
+                summary.id,
+                self._project_running_task_summary(summary.id),
+            )
+            return False
         running_intent_ids = self._project_running_explore_intents(summary.id)
         unclaimed_intents = [
             intent
@@ -519,53 +588,35 @@ class DispatcherLoop:
             )
             return False
         if (
-            project.project.audit_mode != "none"
-            and hasattr(self.client, "get_completion_gate")
+            completion_gate is not None
+            and project.project.completion_policy == "exhaustive"
+            and completion_gate.ready
         ):
-            try:
-                gate = self.client.get_completion_gate(project.project.id)
-            except Exception as exc:
-                LOG.warning(
-                    "completion gate read failed project=%s error=%s",
+            sources = self._completion_sources(project)
+            if sources:
+                response = self.client.complete(
                     project.project.id,
-                    exc,
+                    sources,
+                    (
+                        "Audit pipeline converged: required stages, managed Skill "
+                        "receipts, independent reviews, and terminal evidence passed "
+                        "the Completion Gate."
+                    ),
+                    "dispatcher.completion-gate",
                 )
-            else:
-                if gate.ready:
-                    sources = self._completion_sources(project)
-                    if sources:
-                        response = self.client.complete(
-                            project.project.id,
-                            sources,
-                            (
-                                "Audit pipeline converged: required stages, managed Skill "
-                                "receipts, independent reviews, and terminal evidence passed "
-                                "the Completion Gate."
-                            ),
-                            "dispatcher.completion-gate",
-                        )
-                        if response.ok:
-                            LOG.info(
-                                "completion gate committed project=%s sources=%s",
-                                project.project.id,
-                                sources,
-                            )
-                            return True
-                        if response.status_code not in {403, 409}:
-                            LOG.warning(
-                                "completion gate commit failed project=%s status=%s body=%s",
-                                project.project.id,
-                                response.status_code,
-                                response.text,
-                            )
-                else:
-                    self._log_changed(
-                        f"{skip_scope}:completion_gate",
-                        logging.INFO,
-                        "audit waiting for completion evidence project=%s execution=%s blockers=%s",
+                if response.ok:
+                    LOG.info(
+                        "completion gate committed project=%s sources=%s",
                         project.project.id,
-                        gate.execution_status,
-                        gate.blockers,
+                        sources,
+                    )
+                    return True
+                if response.status_code not in {403, 409}:
+                    LOG.warning(
+                        "completion gate commit failed project=%s status=%s body=%s",
+                        project.project.id,
+                        response.status_code,
+                        response.text,
                     )
         self._log_changed(
             f"{skip_scope}:graph_unchanged",

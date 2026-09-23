@@ -483,11 +483,21 @@ def audit_completion_blockers_from_db(
         visit(fact_id)
     if audit_mode == "scope":
         for fact_id, fact in facts.items():
-            if (fact_id in {"origin", "goal"} or fact["type"] == "recon"
-                    or fact["status"] in {"false_positive", "fixed", "accepted_risk"}):
+            if fact_id in {"origin", "goal"} or fact["status"] in {
+                "false_positive", "fixed", "accepted_risk",
+            }:
+                continue
+            if not (
+                fact["type"] in {"vulnerability", "candidate_triage", "candidate_disposition"}
+                or fact["semantic_type"] in {
+                    "candidate_finding", "confirmed_finding", "rejected_finding",
+                }
+            ):
                 continue
             if fact_id not in visited:
-                blockers.append(f"Scope audit fact {fact_id} is not included in audit_summary ancestry.")
+                blockers.append(
+                    f"Scope finding or disposition {fact_id} is not included in audit_summary ancestry."
+                )
     return blockers
 
 

@@ -127,6 +127,12 @@ def test_completion_gate_uses_evidence_not_unrelated_open_intents(api):
     assert current.project.status == "completed"
     remaining = next(intent for intent in current.intents if intent.id == open_intent)
     assert remaining.concluded_at is not None
+    assert remaining.worker is None
+    cancellation = next(
+        event for event in client.get_audit_events(pid, after=0, limit=2000)
+        if event.event_type == "audit_task_cancelled" and event.entity_id == open_intent
+    )
+    assert cancellation.payload["reason"] == "goal_satisfied"
 
 
 def test_hypothesis_completion_accepts_reviewed_negative_assurance(api):
@@ -162,7 +168,7 @@ def test_server_rejects_audit_completion_until_terminal_fact_is_confirmed(api):
     assert "confirmed finding" in still_blocked.text
 
 
-def test_server_rejects_scope_summary_that_omits_reviewed_fact(api):
+def test_server_allows_scope_summary_to_omit_ordinary_observation(api):
     _, client = api
     pid = project(api, audit_mode="scope").project.id
     summary = add_fact(client, pid, fact_type="audit_summary")
@@ -170,10 +176,63 @@ def test_server_rejects_scope_summary_that_omits_reviewed_fact(api):
     orphan = add_fact(client, pid, fact_type="observation")
     assert client.create_review(pid, orphan, "VALID", "trace checked", confidence="firm").ok
 
-    blocked = client.complete(pid, [summary], "incomplete summary", "reasoner")
+    gate = client.get_completion_gate(pid, [summary])
 
-    assert blocked.status_code == 409
-    assert f"Scope audit fact {orphan} is not included" in blocked.text
+    assert gate.ready
+    assert orphan not in next(check for check in gate.checks if check.id == "evidence_chain").evidence_ids
+
+
+def test_scope_candidate_finding_still_blocks_without_decisive_disposition(api):
+    _, client = api
+    pid = project(api, audit_mode="scope").project.id
+    candidate = add_fact(client, pid, fact_type="vulnerability")
+    assert client.create_review(pid, candidate, "VALID", "candidate verified", confidence="firm").ok
+    summary = add_fact(client, pid, parent=candidate, fact_type="audit_summary")
+    assert client.create_review(pid, summary, "VALID", "summary checked", confidence="firm").ok
+
+    gate = client.get_completion_gate(pid, [summary])
+
+    assert not gate.ready
+    finding_check = next(check for check in gate.checks if check.id == "finding_reviews")
+    confirmation_check = next(
+        (check for check in gate.checks if check.id == "technical_confirmation"),
+    )
+    assert finding_check.status == "pass"
+    assert confirmation_check.status == "fail"
+    assert candidate in confirmation_check.evidence_ids
+
+
+def test_goal_based_optional_execution_error_is_visible_but_nonblocking(api):
+    http, client = api
+    pid = project(api, audit_mode="hypothesis").project.id
+    source = add_fact(client, pid, fact_type="source")
+    assurance = add_fact(client, pid, parent=source, fact_type="negative_assurance")
+    assert client.create_review(pid, source, "VALID", "verified", confidence="certain").ok
+    assert client.create_review(pid, assurance, "VALID", "verified", confidence="firm").ok
+    intent_id = client.create_intent(
+        pid, [source], "optional sibling investigation", "reasoner", intent_type="search",
+    ).data["id"]
+    assert http.post(
+        f"/projects/{pid}/intents/{intent_id}/heartbeat", json={"worker": "tester"},
+    ).status_code == 200
+    failed = http.post(
+        f"/projects/{pid}/intents/{intent_id}/fail",
+        json={
+            "worker": "tester", "task_type": "explore", "code": "optional_failure",
+            "classification": "blocked", "message": "optional path is unavailable",
+        },
+    )
+    assert failed.status_code == 200
+
+    gate = client.get_completion_gate(pid, [assurance])
+    error_check = next(check for check in gate.checks if check.id == "operational_errors")
+
+    assert gate.ready
+    assert error_check.status == "fail"
+    assert error_check.blocking is False
+    assert failed.json()["id"] in error_check.evidence_ids
+    current = client.get_project(pid)
+    assert any(error.id == failed.json()["id"] and error.resolved_at is None for error in current.errors)
 
 
 def test_scope_is_the_default_audit_mode_and_recon_is_explicit(tmp_path):

@@ -39,10 +39,10 @@ that do not have a conventional taint sink.
 
 # Completion
 
-Return `complete` only when the graph contains a firm/certain VALID reviewed
+Return `complete` when the graph contains a firm/certain VALID reviewed
 `audit_summary`, it represents every configured terminal branch, and there are no
-open Intents or unresolved findings. Completion must reference that summary and
-describe the frozen snapshot and exclusions. Never claim the repository is safe.
+unresolved findings. Completion must reference that summary and describe the
+frozen snapshot and exclusions. Never claim the repository is safe.
 
 # Output contract
 

@@ -263,6 +263,8 @@ def audit_summary_inputs(
             _, manifest = load_artifact(source, workdir)
             if manifest.get("snapshot", {}).get("id") != plan["snapshot"]["id"]:
                 return None
+            if not _reviewed(project, source.id):
+                return None
         gate_ids = []
         if config.scope_adjudication.enabled:
             adjudication = scope_gate.result_for_intent(
@@ -286,19 +288,24 @@ def audit_summary_inputs(
             ):
                 return None
             semantic_ids.append(semantic.id)
-        summary_ids = sorted(set(gate_ids + module_ids + semantic_ids))
-        covered = ancestor_ids(project, summary_ids)
-        extra_ids = []
+        required_ids = set(gate_ids + module_ids + semantic_ids)
+        required_ids.update(fact.id for fact in route_sources)
         for fact in project.facts:
-            if (fact.id in {"origin", "goal"} or fact.type in {"recon", "audit_summary"}
-                    or fact.id in covered):
+            if fact.id in {"origin", "goal"} or fact.type in {"recon", "audit_summary"}:
                 continue
             if fact.status in {"false_positive", "fixed", "accepted_risk"}:
                 continue
+            if not (
+                fact.type in {"vulnerability", "candidate_triage", "candidate_disposition"}
+                or fact.semantic_type in {
+                    "candidate_finding", "confirmed_finding", "rejected_finding",
+                }
+            ):
+                continue
             if not _reviewed(project, fact.id):
                 return None
-            extra_ids.append(fact.id)
-        return sorted(set(summary_ids + extra_ids))
+            required_ids.add(fact.id)
+        return sorted(required_ids)
     except (ValueError, OSError, KeyError, TypeError):
         return None
 

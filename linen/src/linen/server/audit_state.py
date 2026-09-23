@@ -466,17 +466,22 @@ def completion_gate_from_db(
     ).fetchall()
     blocking_error_rows = [row for row in error_rows if row["phase"] != "baseline_scan"]
     on_demand_error_rows = [row for row in error_rows if row["phase"] == "baseline_scan"]
+    blocking_errors = exhaustive and bool(blocking_error_rows)
     add(
         "operational_errors",
         "No unresolved blocking execution errors",
-        not blocking_error_rows,
+        not blocking_errors,
         (
             f"{len(on_demand_error_rows)} on-demand tool error(s) remain visible but do not block completion."
-            if on_demand_error_rows and not blocking_error_rows
+            if exhaustive and on_demand_error_rows and not blocking_error_rows
+            else f"{len(error_rows)} unresolved execution error(s) remain visible but do not block goal-based completion."
+            if error_rows and not exhaustive
             else "No unresolved execution errors." if not error_rows
             else f"{len(blocking_error_rows)} unresolved execution error(s) block completion."
         ),
-        evidence_ids=[row["id"] for row in blocking_error_rows],
+        evidence_ids=[row["id"] for row in error_rows],
+        blocking=blocking_errors,
+        status="fail" if error_rows else "pass",
     )
 
     decisions = effective_human_decisions(conn, project_id)
@@ -537,11 +542,24 @@ def completion_gate_from_db(
         if row["id"] not in human_excluded_candidate_ids
         and (row["status"] == "draft" or not _decisively_reviewed(conn, project_id, row["id"]))
     ]
+    technically_confirmed_candidate_ids = {
+        row["source_id"]
+        for row in conn.execute(
+            "SELECT e.source_id FROM graph_edges e JOIN facts f "
+            "ON f.project_id = e.project_id AND f.id = e.target_id "
+            "WHERE e.project_id = ? AND e.source_kind = 'fact' "
+            "AND e.target_kind = 'fact' AND e.relation_type = 'promotes_to' "
+            "AND e.source_generation = ? AND f.source_generation = ? "
+            "AND f.semantic_type = 'confirmed_finding'",
+            (project_id, generation, generation),
+        )
+    }
     reviewed_candidates = [
         row for row in candidate_rows
         if row["semantic_type"] == "candidate_finding"
         and row["status"] == "triaged"
         and row["id"] not in human_excluded_candidate_ids
+        and row["id"] not in technically_confirmed_candidate_ids
         and _strongly_reviewed(conn, project_id, row["id"])
     ]
     add(
@@ -555,7 +573,6 @@ def completion_gate_from_db(
         # finding gate; this preserves the legacy completion contract.
         status="not_applicable" if audit_mode == "none" else None,
     )
-
     selected_ids = list(from_ids or [])
     if not selected_ids and project["status"] == "completed":
         completion = conn.execute(
@@ -589,6 +606,19 @@ def completion_gate_from_db(
             and row["status"] == "triaged"
             and _strongly_reviewed(conn, project_id, row["id"])
         ]
+    if audit_mode != "none" and selected_ids:
+        add(
+            "technical_confirmation",
+            "Reviewed positive candidates have Technical Confirmation",
+            not reviewed_candidates,
+            "No reviewed positive candidate is awaiting Technical Confirmation."
+            if not reviewed_candidates
+            else (
+                f"{len(reviewed_candidates)} reviewed positive candidate finding(s) "
+                "still require Technical Confirmation or explicit exclusion."
+            ),
+            evidence_ids=[row["id"] for row in reviewed_candidates],
+        )
     if audit_mode != "none" and selected_ids:
         evidence_blockers = audit_completion_blockers_from_db(conn, project_id, selected_ids)
         add(

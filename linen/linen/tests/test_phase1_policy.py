@@ -116,6 +116,26 @@ def test_goal_based_completion_does_not_require_empty_queue(client) -> None:
     assert open_work["blocking"] is False
 
 
+def test_exhaustive_completion_still_waits_for_open_work(client) -> None:
+    project = client.post(
+        "/projects",
+        json={
+            "title": "exhaustive", "origin": "repo", "goal": "done",
+            "completion_policy": "exhaustive",
+        },
+    ).json()["project"]["id"]
+    client.post(
+        f"/projects/{project}/intents",
+        json={"from": ["origin"], "description": "ordinary investigation", "creator": "reasoner"},
+    )
+
+    gate = client.get(f"/projects/{project}/completion-gate").json()
+    open_work = next(check for check in gate["checks"] if check["id"] == "open_work")
+    assert not gate["ready"]
+    assert open_work["status"] == "fail"
+    assert open_work["blocking"] is True
+
+
 def test_blocked_intent_can_be_resolved_by_retry_or_abandon(client) -> None:
     project = client.post(
         "/projects",

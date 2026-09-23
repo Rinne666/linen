@@ -378,15 +378,6 @@ def scope_blockers(project: ProjectDetail, workdir: Path, config: CoverageConfig
     for skipped in state["skipped"]:
         if skipped["reason"] not in {"excluded", "analysis_artifacts"}:
             blockers.append(f"Unresolved skipped input: {skipped['path']} ({skipped['reason']}).")
-    for fact in project.facts:
-        # Recon is an optional prioritization aid.  It is never evidence for
-        # a vulnerability and must not turn an otherwise complete scope audit
-        # into an unfinishable project merely because it was not reviewed.
-        if fact.type == "recon":
-            continue
-        if fact.id not in {"origin", "goal"} and fact.type not in {"coverage_plan", "coverage_result"}:
-            if fact.status not in {"false_positive", "fixed", "accepted_risk"} and not reviewed(project, fact.id):
-                blockers.append(f"Unresolved finding/evidence: {fact.id}.")
     return blockers
 
 
@@ -426,7 +417,7 @@ checked/not_applicable only count after VALID review. For needs_followup, trace 
 lead with an ordinary source-grounded intent; the dispatcher will schedule a repeat
 that references the prior result. Retry exhaustion and unexplained skips mean
 INCOMPLETE, not safe. Do not complete until a reviewed audit_summary exists, every
-required branch has fanned into it, and no intent or unresolved finding remains.
+required branch has fanned into it, and no unresolved finding remains.
 Completion may report zero findings and must reference that audit_summary. State
 precisely that this covers configured checks on frozen snapshots with declared
 exclusions, not that the entire repository is safe.

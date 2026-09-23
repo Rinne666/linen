@@ -5,6 +5,7 @@ import json
 
 from linen.dispatcher.analysis import coverage
 from linen.dispatcher.models import RunningTask
+from linen.dispatcher.protocol.client import ApiResult
 from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.process import ProcessResult
 from linen.dispatcher.scheduler.loop import DispatcherLoop
@@ -490,6 +491,120 @@ def test_ordinary_investigation_competes_with_managed_coverage_cell() -> None:
 
     assert loop._try_dispatch_project(_summary("proj_001", "active"))
     assert dispatched == ["i-investigation"]
+
+
+def test_goal_based_completion_precedes_unrelated_explore_when_gate_ready() -> None:
+    loop = _loop()
+    loop.config = make_config()
+    loop.futures = {}
+    project = make_project(intents=[make_intent("i-optional")])
+    project.project.audit_mode = "hypothesis"
+    project.project.reason_last_seen_event_seq = 5
+    project.project.event_seq = 5
+    terminal = Fact(
+        id="f-terminal", description="reviewed negative assurance",
+        type="negative_assurance", semantic_type="negative_assurance",
+        status="triaged", source_generation=1,
+    )
+    project.facts.append(terminal)
+    project.intents[0].worker = None
+    gate = CompletionGate(
+        project_id=project.project.id, lifecycle_status="active", execution_status="idle",
+        audit_mode="hypothesis", source_generation=1, plan_revision=1,
+        ready=True, checks=[], blockers=[],
+    )
+    completed: list[list[str]] = []
+    explored: list[str] = []
+    loop.container_manager = type(
+        "Containers", (), {"container_name": lambda _self, project_id: project_id}
+    )()
+
+    class Client:
+        def get_project(self, _project_id):
+            return project
+
+        def get_completion_gate(self, _project_id):
+            return gate
+
+        def export_project(self, _project_id):
+            return "graph"
+
+        def complete(self, _project_id, sources, _description, _worker):
+            completed.append(sources)
+            return ApiResult(200, {})
+
+    loop.client = Client()
+    loop._materialize_audit_intents = lambda _project: False
+    loop._reconcile_audit_stages = lambda _project: False
+    loop._dispatch_explore = lambda _project, _graph, intent: explored.append(intent.id) or True
+    loop._dispatch_review = lambda *_args: False
+
+    assert loop._try_dispatch_project(_summary("proj_001", "active"))
+    assert completed == [["f-terminal"]]
+    assert explored == []
+
+
+def test_fresh_reason_event_precedes_ready_goal_based_completion() -> None:
+    loop = _loop()
+    loop.config = make_config()
+    loop.futures = {}
+    project = make_project(intents=[make_intent("i-optional")])
+    project.project.audit_mode = "hypothesis"
+    project.project.reason_last_seen_event_seq = 8
+    project.project.event_seq = 9
+    project.intents[0].worker = None
+    project.facts.append(Fact(
+        id="f-terminal", description="reviewed negative assurance",
+        type="negative_assurance", semantic_type="negative_assurance",
+        status="triaged", source_generation=1,
+    ))
+    event = AuditEvent(
+        sequence=9, event_type="audit_task_concluded", actor="worker",
+        entity_kind="intent", entity_id="i-source", payload={"fact_id": "f004"},
+        created_at="2026-01-01T00:00:00Z",
+    )
+    gate = CompletionGate(
+        project_id=project.project.id, lifecycle_status="active", execution_status="idle",
+        audit_mode="hypothesis", source_generation=1, plan_revision=1,
+        ready=True, checks=[], blockers=[],
+    )
+    completed: list[list[str]] = []
+    reason_triggers: list[str] = []
+    loop.container_manager = type(
+        "Containers", (), {"container_name": lambda _self, project_id: project_id}
+    )()
+
+    class Client:
+        def get_project(self, _project_id):
+            return project
+
+        def get_audit_events(self, _project_id, *, after, limit):
+            return [item for item in [event] if item.sequence > after][:limit]
+
+        def get_completion_gate(self, _project_id):
+            return gate
+
+        def export_project(self, _project_id):
+            return "graph"
+
+        def complete(self, _project_id, sources, _description, _worker):
+            completed.append(sources)
+            return ApiResult(200, {})
+
+    loop.client = Client()
+    loop._materialize_audit_intents = lambda _project: False
+    loop._reconcile_audit_stages = lambda _project: False
+    loop._dispatch_reason = lambda _project, _graph, trigger, _events: reason_triggers.append(trigger) or True
+    loop._dispatch_explore = lambda *_args: False
+    loop._dispatch_review = lambda *_args: False
+
+    assert loop._try_dispatch_project(_summary("proj_001", "active"))
+    assert reason_triggers == ["events:8->9"]
+    assert completed == []
+
+    project.project.reason_last_seen_event_seq = 9
+    assert loop._try_dispatch_project(_summary("proj_001", "active"))
+    assert completed == [["f-terminal"]]
 
 
 def test_provider_failure_classifier_reads_only_explicit_error_fields() -> None:

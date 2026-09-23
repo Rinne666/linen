@@ -219,7 +219,7 @@ def test_scope_requires_all_reviewed_cells_and_allows_zero_findings(api, tmp_pat
 
     current = client.get_project(pid)
     inputs = audit_graph.audit_summary_inputs(current, work, cfg.audit)
-    assert set(inputs) == {module_fact, trace_fact}
+    assert set(inputs) == {module_fact}
     summary_intent_id = client.create_intent(
         pid, inputs, audit_graph.AUDIT_SUMMARY_INTENT,
         "dispatcher.audit", intent_type="synthesize",
@@ -233,7 +233,42 @@ def test_scope_requires_all_reviewed_cells_and_allows_zero_findings(api, tmp_pat
     ) == "success"
     summary_fact = next(i.to for i in client.get_project(pid).intents if i.id == summary_intent_id)
     approve(client, pid, summary_fact)
+
+    optional_intent_id = client.create_intent(
+        pid, [trace_fact], "inspect sibling endpoint", "reasoner", intent_type="search",
+    ).data["id"]
+    client.heartbeat(pid, optional_intent_id, "tester")
+    optional_result = client.conclude(
+        pid, optional_intent_id, "tester", "No candidate found on sibling path",
+        fact_type="observation", evidence="a.py:2",
+    )
+    assert optional_result.ok
+    assert client.get_completion_gate(pid, [summary_fact]).ready
     assert audit_graph.scope_blockers(client.get_project(pid), work, cfg.audit, [summary_fact]) == []
+
+    required_stage = client.upsert_audit_stage(
+        pid, "required-observation", label="Required observation stage", phase_order=99,
+        status="pending", detail=f"Review required output {optional_result.data['fact']['id']}",
+    )
+    assert required_stage.ok
+    gate = client.get_completion_gate(pid, [summary_fact])
+    assert not gate.ready
+    assert any("Required observation stage" in blocker for blocker in gate.blockers)
+    assert client.upsert_audit_stage(
+        pid, "required-observation", label="Required observation stage", phase_order=99,
+        status="satisfied",
+    ).ok
+    assert client.get_completion_gate(pid, [summary_fact]).ready
+
+    scope_prompt = (Path(__file__).parents[2] / "src/linen/dispatcher/prompts/vuln_audit/reason_scope.md").read_text()
+    completion_instructions = coverage.reason_instructions(
+        client.get_project(pid), work, cfg.audit.coverage,
+    )
+    for prompt_text in (scope_prompt, completion_instructions):
+        lowered = prompt_text.lower()
+        assert "no open intents" not in lowered
+        assert "no intent remains" not in lowered
+        assert "all intents finished" not in lowered
 
     monkeypatch.setattr(reason, "get_driver", lambda _: FakeDriver())
     monkeypatch.setattr(reason, "run_worker_process", lambda *a, **k: ProcessResult(0, json.dumps({
