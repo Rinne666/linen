@@ -114,26 +114,55 @@ def coverage_report(config_path: Path, project_id: str):
 )
 @click.option(
     "--run", "run_paths", type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    multiple=True, required=True, help="Independent run result containing a confirmed array; pass exactly three",
+    multiple=True, help="Independent run result containing a confirmed array; pass exactly three",
+)
+@click.option(
+    "--file-topic-run", "file_topic_paths",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True, help="A/B lane using file × topic coverage; pass exactly three measured runs",
+)
+@click.option(
+    "--trust-boundary-run", "trust_boundary_paths",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True, help="A/B lane using trust-boundary coverage; pass exactly three measured runs",
 )
 @click.option("--min-recall", type=click.FloatRange(0, 1), default=0.0, show_default=True)
 @click.option("--min-stability", type=click.FloatRange(0, 1), default=0.0, show_default=True)
 def audit_benchmark(
     expected_path: Path,
     run_paths: tuple[Path, ...],
+    file_topic_paths: tuple[Path, ...],
+    trust_boundary_paths: tuple[Path, ...],
     min_recall: float,
     min_stability: float,
 ):
-    """Compare exactly three independent audit runs against a truth set."""
-    from linen.dispatcher.analysis.benchmark import evaluate_files
+    """Compare audit runs against a truth set, optionally in two A/B lanes."""
+    from linen.dispatcher.analysis.benchmark import evaluate_files, evaluate_strategy_files
 
     try:
-        report = evaluate_files(expected_path, run_paths)
+        if file_topic_paths or trust_boundary_paths:
+            if run_paths or not file_topic_paths or not trust_boundary_paths:
+                raise ValueError("A/B mode requires both strategy lanes and no plain --run inputs")
+            report = evaluate_strategy_files(
+                expected_path, file_topic_paths, trust_boundary_paths,
+            )
+            minimum_recall = min(
+                value["stability"]["minimum_recall"]
+                for value in report["strategies"].values()
+            )
+            stability = min(
+                value["stability"]["all_run_jaccard"]
+                for value in report["strategies"].values()
+            )
+        else:
+            if not run_paths:
+                raise ValueError("Pass three --run inputs or both A/B strategy lanes")
+            report = evaluate_files(expected_path, run_paths)
+            minimum_recall = report["stability"]["minimum_recall"]
+            stability = report["stability"]["all_run_jaccard"]
     except (ValueError, OSError, json.JSONDecodeError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(json.dumps(report, ensure_ascii=False, indent=2))
-    minimum_recall = report["stability"]["minimum_recall"]
-    stability = report["stability"]["all_run_jaccard"]
     if minimum_recall < min_recall or stability < min_stability:
         raise click.ClickException(
             f"benchmark thresholds failed: minimum_recall={minimum_recall}, stability={stability}"

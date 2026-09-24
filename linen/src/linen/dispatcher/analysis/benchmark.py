@@ -67,6 +67,7 @@ def evaluate(expected: set[str], runs: list[set[str]]) -> dict:
             "true_positives": sorted(true_positive),
             "missed": sorted(expected - found),
             "unexpected": sorted(found - expected),
+            "confirmed_count": len(found),
             "recall": _ratio(len(true_positive), len(expected)),
             "precision": _ratio(len(true_positive), len(found)),
         })
@@ -95,3 +96,85 @@ def evaluate(expected: set[str], runs: list[set[str]]) -> dict:
 
 def evaluate_files(expected_path: Path, run_paths: tuple[Path, ...]) -> dict:
     return evaluate(expected_ids(expected_path), [confirmed_ids(path) for path in run_paths])
+
+
+_WORKFLOW_METRICS = (
+    "review_calls", "pi_calls", "tokens", "wall_time_ms", "repeated_reads",
+    "cross_endpoint_chains",
+)
+
+
+def compare_strategies(
+    expected: set[str],
+    file_topic_runs: list[dict],
+    trust_boundary_runs: list[dict],
+) -> dict:
+    """Compare three runs per coverage strategy using the same truth set.
+
+    Each run contains ``confirmed`` IDs and measured ``metrics``. This keeps
+    the comparison in the existing truth-set benchmark instead of adding a
+    second coverage planner or test-only workflow.
+    """
+    strategies = {
+        "file_topic": file_topic_runs,
+        "trust_boundary": trust_boundary_runs,
+    }
+    report = {"schema_version": 1, "expected": sorted(expected), "strategies": {}}
+    for name, runs in strategies.items():
+        if len(runs) != 3:
+            raise ValueError(f"{name} requires exactly three independent runs")
+        confirmed = []
+        metric_rows = []
+        for index, run in enumerate(runs, start=1):
+            if not isinstance(run.get("confirmed"), list):
+                raise ValueError(f"{name} run {index} requires confirmed IDs")
+            if not isinstance(run.get("rejected"), list):
+                raise ValueError(f"{name} run {index} requires rejected IDs")
+            if len(set(run["confirmed"])) != len(run["confirmed"]):
+                raise ValueError(f"{name} run {index} contains duplicate confirmed IDs")
+            if len(set(run["rejected"])) != len(run["rejected"]):
+                raise ValueError(f"{name} run {index} contains duplicate rejected IDs")
+            if set(run["confirmed"]) & set(run["rejected"]):
+                raise ValueError(f"{name} run {index} cannot confirm and reject the same ID")
+            metrics = run.get("metrics")
+            if not isinstance(metrics, dict):
+                raise ValueError(f"{name} run {index} requires metrics")
+            missing = [key for key in _WORKFLOW_METRICS if not isinstance(metrics.get(key), (int, float))]
+            if missing:
+                raise ValueError(f"{name} run {index} is missing metrics: {', '.join(missing)}")
+            if not isinstance(metrics.get("completion_correct"), bool):
+                raise ValueError(f"{name} run {index} requires completion_correct")
+            confirmed.append(set(run["confirmed"]))
+            metric_rows.append(metrics)
+        quality = evaluate(expected, confirmed)
+        averages = {
+            key: round(sum(float(row[key]) for row in metric_rows) / len(metric_rows), 3)
+            for key in _WORKFLOW_METRICS
+        }
+        averages["completion_correct_runs"] = sum(
+            bool(row["completion_correct"]) for row in metric_rows
+        )
+        averages["confirmed_findings"] = round(
+            sum(len(run["confirmed"]) for run in runs) / len(runs), 3,
+        )
+        averages["rejected_findings"] = round(
+            sum(len(run["rejected"]) for run in runs) / len(runs), 3,
+        )
+        report["strategies"][name] = {
+            **quality,
+            "mean_metrics": averages,
+            "completion_stability": all(row["completion_correct"] for row in metric_rows),
+        }
+    return report
+
+
+def evaluate_strategy_files(
+    expected_path: Path,
+    file_topic_paths: tuple[Path, ...],
+    trust_boundary_paths: tuple[Path, ...],
+) -> dict:
+    return compare_strategies(
+        expected_ids(expected_path),
+        [_load(path) for path in file_topic_paths],
+        [_load(path) for path in trust_boundary_paths],
+    )

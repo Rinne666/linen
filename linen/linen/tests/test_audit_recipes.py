@@ -118,21 +118,16 @@ def _semantic_config() -> SemanticAuditConfig:
     )
 
 
-def test_recipe_bundle_selects_only_the_graph_assigned_prompt(tmp_path):
+def test_reason_can_select_a_registered_recipe_without_a_forced_stage(tmp_path):
     board, workdir, plan_id = _board_with_plan(tmp_path)
     config = _semantic_config()
-    proposal = audit_recipes.recipe_proposals(board, workdir, config)[0]
-    assert proposal == {
-        "from": [plan_id],
-        "type": "search",
-        "description": "@analysis:semantic:architecture_map:v1",
-    }
+    assert audit_recipes.enabled_recipe_ids(config) == ["architecture_map", "hypothesis_backward"]
 
-    intent = _intent("i-architecture", **{
-        "from_ids": proposal["from"],
-        "description": proposal["description"],
-        "intent_type": proposal["type"],
-    })
+    intent = _intent(
+        "i-architecture", [plan_id],
+        audit_recipes.recipe_description("architecture_map"), "search",
+    ).model_copy(update={"creator": "reason-worker"})
+    assert audit_recipes.parse_recipe_intent(intent) is not None
     prompt, recipe_id, recipe = audit_recipes.execution_prompt(board, intent, workdir)
     assert recipe_id == "architecture_map"
     assert recipe.label == "Architecture map"
@@ -141,7 +136,7 @@ def test_recipe_bundle_selects_only_the_graph_assigned_prompt(tmp_path):
     assert "hypothesis_backward" not in prompt
 
 
-def test_semantic_recipe_result_is_cited_then_verified_and_summarized(tmp_path):
+def test_semantic_recipe_result_is_cited_then_verified(tmp_path):
     board, workdir, plan_id = _board_with_plan(tmp_path)
     config = _semantic_config()
     citation = {
@@ -187,13 +182,12 @@ def test_semantic_recipe_result_is_cited_then_verified_and_summarized(tmp_path):
     board.intents.append(architecture_intent)
     board.reviews.append(_review(architecture_fact.id))
 
-    hypothesis_proposal = audit_recipes.recipe_proposals(board, workdir, config)[0]
-    assert hypothesis_proposal["description"] == "@analysis:semantic:hypothesis_backward:v1"
+    hypothesis_description = audit_recipes.recipe_description("hypothesis_backward")
     hypothesis_intent = _intent(
         "i-hypothesis",
-        hypothesis_proposal["from"],
-        hypothesis_proposal["description"],
-        hypothesis_proposal["type"],
+        [architecture_fact.id],
+        hypothesis_description,
+        "search",
     )
     hypothesis = audit_recipes.outcome_fact(
         {
@@ -308,17 +302,6 @@ def test_semantic_recipe_result_is_cited_then_verified_and_summarized(tmp_path):
     source_context = audit_recipes._source_context(board, follow_up, workdir)
     assert source_context[0]["proof"]["attributes"]["trace"] == disposition_fact.proof.attributes["trace"]
 
-    inputs = audit_recipes.semantic_summary_inputs(board, workdir, config)
-    assert inputs == sorted([architecture_fact.id, batch.id, disposition_fact.id])
-    summary_proposal = audit_recipes.summary_proposal(board, workdir, config)
-    summary_intent = _intent(
-        "i-summary",
-        summary_proposal["from"],
-        summary_proposal["description"],
-        summary_proposal["type"],
-    )
-    summary = audit_recipes.summary_fact(board, summary_intent, workdir, config)
-    assert summary["type"] == "semantic_summary"
 
 
 def test_confirmed_trace_has_no_deterministic_topology_requirement(tmp_path):
@@ -622,7 +605,7 @@ def test_sibling_endpoints_keep_stable_identities_for_hypotheses(tmp_path):
     assert audit_recipes.candidate_items(hypothesis_fact, workdir)[0]["endpoint_id"] == endpoint_ids[2]
 
 
-def test_audit_graph_materializes_semantic_recipe_without_a_new_worker_role(tmp_path):
+def test_audit_graph_does_not_force_semantic_recipe_order(tmp_path):
     board, workdir, plan_id = _board_with_plan(tmp_path)
     config = AuditConfig(
         enabled=True,
@@ -631,8 +614,5 @@ def test_audit_graph_materializes_semantic_recipe_without_a_new_worker_role(tmp_
         coverage=CoverageConfig(topics=["authorization"], files_per_cell=20),
     )
     proposals = audit_graph.required_intents(board, workdir, config)
-    assert {
-        "from": [plan_id],
-        "type": "search",
-        "description": "@analysis:semantic:architecture_map:v1",
-    } in proposals
+    assert all(not item["description"].startswith(audit_recipes.RECIPE_PREFIX) for item in proposals)
+    assert "architecture_map" in audit_recipes.enabled_recipe_ids(config.semantic)

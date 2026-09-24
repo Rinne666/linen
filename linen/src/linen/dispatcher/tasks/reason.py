@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from linen.dispatcher.analysis import audit_graph, coverage
+from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage
 
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.analysis.policy import (
@@ -41,7 +41,7 @@ from linen.dispatcher.tasks.common import (
     write_context_projection_reference,
 )
 from linen.dispatcher.workers.registry import get_driver
-from linen.server.models import AuditEvent, ProjectDetail
+from linen.server.models import AuditEvent, Intent, ProjectDetail
 
 LOG = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ REASON_HINT_SEED_LIMIT = 4
 HIGH_VALUE_FACT_TYPES = (
     "scope", "summary", "candidate_finding", "confirmed_finding",
     "negative_assurance", "coverage", "coverage_plan", "coverage_result",
-    "candidate_triage", "candidate_disposition", "audit_summary",
+    "candidate_disposition", "audit_summary",
     "source", "sink", "dataflow", "sanitizer", "validation", "reachability",
 )
 
@@ -528,6 +528,26 @@ def run_reason_task(
         if audit_enabled:
             if scope_audit:
                 prompt += coverage.reason_instructions(project, Path(container_name), config.audit.coverage)
+                if config.audit.semantic.enabled:
+                    bundle = audit_recipes.load_bundle(config.runtime.prompt_group)
+                    method_lines = []
+                    for recipe_id in audit_recipes.enabled_recipe_ids(config.audit.semantic):
+                        recipe = bundle.recipes[recipe_id]
+                        description = (
+                            f"@analysis:semantic:{recipe_id}:v{recipe.version}:<vulnerability-id>"
+                            if recipe_id == "variant_search"
+                            else f"@analysis:semantic:{recipe_id}:v{recipe.version}"
+                        )
+                        method_lines.append(
+                            f"- {recipe.label}: type={recipe.intent_type}; description={description}"
+                        )
+                    if method_lines:
+                        prompt += (
+                            "\nOptional semantic methods. Choose only a method that addresses a concrete "
+                            "unresolved security question; these are capabilities, not required stages. "
+                            "Create an ordinary Intent with a canonical type and description when useful:\n"
+                            + "\n".join(method_lines)
+                        )
                 if not config.audit.poc_sandbox.enabled:
                     prompt += (
                         "\nThe isolated PoC sandbox is disabled. Do not propose "
@@ -799,7 +819,33 @@ def run_reason_task(
                             if not any(h.content == message for h in fresh.hints):
                                 client.create_hint(project.project.id, message, "audit-policy")
                             continue
-                    if audit_graph.managed_description(intent_data["description"]):
+                    semantic_method = False
+                    if (
+                        scope_audit
+                        and config.audit.semantic.enabled
+                        and intent_data["description"].startswith(audit_recipes.RECIPE_PREFIX)
+                    ):
+                        candidate = Intent(
+                            id="reason-method-validation",
+                            from_=intent_data["from"],
+                            description=intent_data["description"],
+                            type=intent_type,
+                            creator=worker.name,
+                            created_at="1970-01-01T00:00:00Z",
+                        )
+                        try:
+                            parsed_recipe = audit_recipes.parse_recipe_intent(
+                                candidate, config.runtime.prompt_group,
+                            )
+                            semantic_method = bool(
+                                parsed_recipe
+                                and parsed_recipe[0] in audit_recipes.enabled_recipe_ids(
+                                    config.audit.semantic,
+                                )
+                            )
+                        except ValueError:
+                            semantic_method = False
+                    if audit_graph.managed_description(intent_data["description"]) and not semantic_method:
                         message = (
                             "Audit intent blocked: reserved managed intents are materialized "
                             f"from graph state by the dispatcher ({intent_data['description']})"

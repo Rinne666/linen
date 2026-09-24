@@ -10,26 +10,21 @@ import json
 import uuid
 from pathlib import Path
 
-from linen.dispatcher.analysis import audit_recipes, coverage, scope_gate, triage
-from linen.dispatcher.analysis.artifacts import ancestor_ids, digest, load_artifact, write_json
-from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT, has_java_sources
+from linen.dispatcher.analysis import audit_recipes, coverage, scope_gate
+from linen.dispatcher.analysis.artifacts import ancestor_ids, digest, write_json
 from linen.dispatcher.config import AuditConfig
-from linen.server.models import Fact, ProjectDetail
+from linen.server.models import Fact, ProjectDetail, REVIEWLESS_INTERMEDIATE_FACT_TYPES
 from linen.server.uvpg import REQUIRED_ROLES
 
 
 CREATOR = "dispatcher.audit"
 AUDIT_SUMMARY_INTENT = "@analysis:audit-summary"
-
-
 def managed_description(description: str) -> bool:
     value = description.strip()
     return (
         value.startswith("@analysis:")
         or value.startswith("@uvpg:proof:")
         or value.startswith(coverage.CELL_PREFIX)
-        or value.startswith(triage.TRIAGE_PREFIX)
-        or value.startswith(triage.VERIFY_PREFIX)
     )
 
 
@@ -73,20 +68,6 @@ def _has_unified_vulnerability_review(project: ProjectDetail, fact_id: str) -> b
     return False
 
 
-def _completed_sources(project: ProjectDetail, workdir: Path, fact_type: str) -> list[Fact]:
-    result = []
-    for fact in project.facts:
-        if fact.type != fact_type:
-            continue
-        try:
-            _, manifest = load_artifact(fact, workdir)
-            if manifest.get("status") == "completed":
-                result.append(fact)
-        except (ValueError, OSError, KeyError, TypeError):
-            continue
-    return result
-
-
 def _review_proposals(project: ProjectDetail) -> list[dict]:
     proposals = []
     open_reviews = {
@@ -107,27 +88,21 @@ def _review_proposals(project: ProjectDetail) -> list[dict]:
     for fact in project.facts:
         if fact.id in {"origin", "goal"} or fact.type == "recon":
             continue
+        if fact.type in REVIEWLESS_INTERMEDIATE_FACT_TYPES:
+            continue
+        if not (
+            fact.type in {
+                "coverage_result", "policy_evidence", "scope_adjudication", "vulnerability",
+            }
+            or fact.semantic_type in {
+                "candidate_finding", "confirmed_finding", "rejected_finding",
+            }
+        ):
+            continue
         all_reviews = sorted(
             reviews_by_fact.get(fact.id, []), key=lambda review: (review.created_at, review.id),
         )
         reviews = coverage.effective_reviews(project, fact.id)
-        # Legacy coverage plans were accidentally sent through the vulnerability
-        # review prompt.  Their rows remain visible, but one new attestation is
-        # needed before the plan may fan out recipe or coverage work.
-        if (
-            fact.type == "coverage_plan"
-            and all_reviews
-            and not reviews
-            and fact.id not in open_reviews
-        ):
-            description = f"@analysis:review:{fact.id}:attestation"
-            if not _proposal_exists(project, description):
-                proposals.append({
-                    "from": [fact.id],
-                    "type": "review:devils-advocate",
-                    "description": description,
-                })
-            continue
         if (
             fact.type == "vulnerability"
             and fact.semantic_type == "candidate_finding"
@@ -178,52 +153,6 @@ def _proposal_exists(project: ProjectDetail, description: str) -> bool:
     return any(intent.description.strip() == description for intent in project.intents)
 
 
-def _candidate_verify_proposals(
-    project: ProjectDetail,
-    workdir: Path,
-    config: AuditConfig,
-) -> list[dict]:
-    proposals = []
-    for triage_fact in project.facts:
-        if triage_fact.type != "candidate_triage" or not _reviewed(project, triage_fact.id):
-            continue
-        record = triage.triage_record(triage_fact, workdir)
-        source_id = record["source_fact_id"]
-        for decision in record["decisions"]:
-            if decision["outcome"] != "keep":
-                continue
-            fingerprint = decision["fingerprint"]
-            terminal = triage.terminal_verification(project, source_id, fingerprint)
-            if terminal is not None and _reviewed(project, terminal.id):
-                continue
-            attempts = triage.verification_attempts(project, source_id, fingerprint)
-            if attempts:
-                latest = attempts[-1]
-                if latest.to is None and latest.concluded_at is None:
-                    continue
-                latest_fact = next((fact for fact in project.facts if fact.id == latest.to), None)
-                if latest_fact is None or not _reviewed(project, latest_fact.id):
-                    continue
-                try:
-                    outcome = json.loads(latest_fact.evidence or "").get("outcome")
-                except (ValueError, TypeError):
-                    outcome = None
-                if outcome != "blocked" or len(attempts) >= config.triage.max_verify_attempts:
-                    continue
-                from_ids = [triage_fact.id, latest_fact.id]
-            else:
-                from_ids = [triage_fact.id]
-            attempt = len(attempts) + 1
-            description = triage.verify_description(source_id, fingerprint, attempt)
-            if not _proposal_exists(project, description):
-                proposals.append({
-                    "from": from_ids,
-                    "type": f"verify:{decision['category']}",
-                    "description": description,
-                })
-    return proposals
-
-
 def _coverage_summary_proposals(
     project: ProjectDetail,
     workdir: Path,
@@ -256,15 +185,6 @@ def audit_summary_inputs(
             module_ids.append(fact.id)
         if len(module_ids) != len(expected_modules) or not _reviewed(project, plan_fact.id):
             return None
-        route_sources = _completed_sources(project, workdir, "route_scan")
-        if config.spring.enabled and has_java_sources(project, workdir) and not route_sources:
-            return None
-        for source in route_sources:
-            _, manifest = load_artifact(source, workdir)
-            if manifest.get("snapshot", {}).get("id") != plan["snapshot"]["id"]:
-                return None
-            if not _reviewed(project, source.id):
-                return None
         gate_ids = []
         if config.scope_adjudication.enabled:
             adjudication = scope_gate.result_for_intent(
@@ -278,25 +198,14 @@ def audit_summary_inputs(
                 return None
             scope_gate.adjudication_record(adjudication, workdir)
             gate_ids.append(adjudication.id)
-        semantic_ids = []
-        if config.semantic.enabled:
-            semantic = _result(project, audit_recipes.SUMMARY_INTENT)
-            if (
-                semantic is None
-                or semantic.type != "semantic_summary"
-                or not _reviewed(project, semantic.id)
-            ):
-                return None
-            semantic_ids.append(semantic.id)
-        required_ids = set(gate_ids + module_ids + semantic_ids)
-        required_ids.update(fact.id for fact in route_sources)
+        required_ids = set(gate_ids + module_ids)
         for fact in project.facts:
             if fact.id in {"origin", "goal"} or fact.type in {"recon", "audit_summary"}:
                 continue
             if fact.status in {"false_positive", "fixed", "accepted_risk"}:
                 continue
             if not (
-                fact.type in {"vulnerability", "candidate_triage", "candidate_disposition"}
+                fact.type == "vulnerability"
                 or fact.semantic_type in {
                     "candidate_finding", "confirmed_finding", "rejected_finding",
                 }
@@ -319,7 +228,7 @@ def audit_summary_fact(
     inputs = audit_summary_inputs(project, workdir, config)
     if (intent.description.strip() != AUDIT_SUMMARY_INTENT or (intent.type or "") != "synthesize"
             or inputs is None or set(intent.from_) != set(inputs)):
-        raise ValueError("Audit summary requires every reviewed coverage module summary")
+        raise ValueError("Audit summary requires every validated coverage module summary")
     vulnerabilities = [
         fact.id for fact in project.facts
         if fact.type == "vulnerability" and fact.status == "triaged" and _reviewed(project, fact.id)
@@ -331,7 +240,7 @@ def audit_summary_fact(
         "input_fact_ids": inputs,
         "confirmed_vulnerability_ids": sorted(vulnerabilities),
         "statement": (
-            "The scope gate and required coverage and semantic recipe branches completed on "
+        "The scope gate and required coverage branches completed on "
             "frozen evidence. Policy eligibility "
             "remains separate from technical exploitability."
         ),
@@ -344,7 +253,7 @@ def audit_summary_fact(
         "type": "audit_summary",
         "description": (
             f"Scope audit synthesis completed with {len(vulnerabilities)} confirmed vulnerabilities. "
-            "All required coverage and semantic recipe branches reached reviewed summaries. "
+            "All required coverage branches reached validated summaries. "
             "This does not prove the repository universally safe."
         ),
         "evidence": (
@@ -364,7 +273,6 @@ def required_intents(
     """Derive missing graph edges in stable priority order."""
     if not config.enabled or project.project.audit_mode == "none":
         return []
-    spring_enabled = config.spring.enabled and has_java_sources(project, workdir)
     plan_anchor = "origin"
     # Keep the entire gate ahead of unrelated legacy work. This is important
     # when enabling the gate on an active board whose ready window is already
@@ -434,45 +342,13 @@ def required_intents(
         return []
 
     try:
-        semantic_proposals = audit_recipes.recipe_proposals(
-            project, workdir, config.semantic,
-        )
         semantic_verifications = audit_recipes.verification_proposals(
             project, workdir, config.semantic,
         )
     except (ValueError, OSError, KeyError, TypeError):
-        semantic_proposals = []
         semantic_verifications = []
 
-    spring_attempts = [fact for fact in project.facts if fact.type == "route_scan"]
-    if (spring_enabled and not _completed_sources(project, workdir, "route_scan")
-            and len(spring_attempts) < config.spring.max_attempts
-            and (not spring_attempts or _reviewed(project, spring_attempts[-1].id))
-            and not _open(project, SPRING_SCAN_INTENT)):
-        proposals.append({
-            "from": [plan_fact.id, *(fact.id for fact in spring_attempts[-1:])],
-            "type": "search",
-            "description": SPRING_SCAN_INTENT,
-        })
-    proposals.extend(semantic_proposals)
     proposals.extend(semantic_verifications)
-    if proposals:
-        return proposals[:limit]
-
-    # Candidate evidence is triaged before the larger deterministic coverage grid.
-    if config.triage.enabled:
-        for source in project.facts:
-            if source.type not in triage.CANDIDATE_FACT_TYPES or not _reviewed(project, source.id):
-                continue
-            try:
-                for batch in triage.batches(source, workdir, config.triage):
-                    if not _proposal_exists(project, batch["description"]):
-                        proposals.append({
-                            "from": [source.id], "type": "triage", "description": batch["description"],
-                        })
-            except (ValueError, OSError, KeyError, TypeError):
-                pass
-        proposals.extend(_candidate_verify_proposals(project, workdir, config))
     if proposals:
         return proposals[:limit]
 
@@ -502,12 +378,6 @@ def required_intents(
     if proposals:
         return proposals[:limit]
     proposals.extend(_coverage_summary_proposals(project, workdir, config))
-    if config.semantic.enabled:
-        semantic_summary = audit_recipes.summary_proposal(
-            project, workdir, config.semantic,
-        )
-        if semantic_summary is not None:
-            proposals.append(semantic_summary)
     if proposals:
         return proposals[:limit]
     inputs = audit_summary_inputs(project, workdir, config)
@@ -543,46 +413,9 @@ def scope_blockers(
                 blockers.append(f"Invalid scope adjudication evidence {adjudication.id}: {exc}")
     summary = next((fact for fact in project.facts if fact.id in from_ids and fact.type == "audit_summary"), None)
     if summary is None:
-        blockers.append("Scope completion must reference a reviewed audit_summary fact.")
+        blockers.append("Scope completion must reference a validated audit_summary fact.")
     elif not _reviewed(project, summary.id):
         blockers.append(f"{summary.id} requires a firm/certain VALID review.")
-    if config.spring.enabled and has_java_sources(project, workdir):
-        routes = _completed_sources(project, workdir, "route_scan")
-        if len(routes) != 1:
-            attempts = len([fact for fact in project.facts if fact.type == "route_scan"])
-            blockers.append(
-                f"Scope audit requires one completed Spring route_scan (attempts {attempts}/{config.spring.max_attempts})."
-            )
-        for fact in routes:
-            try:
-                _, manifest = load_artifact(fact, workdir)
-                if manifest.get("status") != "completed":
-                    blockers.append(f"Spring route scan {fact.id} is not completed.")
-            except (ValueError, OSError, KeyError, TypeError) as exc:
-                blockers.append(f"Invalid Spring route evidence {fact.id}: {exc}")
-    if config.semantic.enabled:
-        semantic = next(
-            (
-                fact for fact in project.facts
-                if fact.id in from_ids and fact.type == "semantic_summary"
-            ),
-            None,
-        )
-        if semantic is None:
-            blockers.append(
-                "Scope completion must reference the reviewed semantic recipe summary."
-            )
-        elif not _reviewed(project, semantic.id):
-            blockers.append(f"{semantic.id} requires a firm/certain VALID review.")
-        try:
-            if audit_recipes.semantic_summary_inputs(
-                project, workdir, config.semantic,
-            ) is None:
-                blockers.append(
-                    "Semantic recipe hypotheses and variants have not reached reviewed dispositions."
-                )
-        except (ValueError, OSError, KeyError, TypeError) as exc:
-            blockers.append(f"Invalid semantic recipe evidence: {exc}")
     if audit_summary_inputs(project, workdir, config) is None:
-        blockers.append("Coverage branches have not reached reviewed module summaries.")
+        blockers.append("Coverage branches have not reached validated module summaries.")
     return list(dict.fromkeys(blockers))

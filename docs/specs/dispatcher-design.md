@@ -32,10 +32,10 @@ Agent 不直接认领 Intent，不直接 heartbeat，不直接调用 linen API�
     Fact/Intent/Review 与哈希 artifact 重新推导缺失边，以
     `creator=dispatcher.audit` 写回普通 Intent；重启只会重算，不会丢步骤，也不会
     形成第二真相源。单次 fan-out 最多 8 条，仍受全局和项目 Worker 配额约束。
-14. scope 扫描先生成并复核唯一 coverage snapshot，再从该冻结源并行运行
-    所有启用的受管扫描器、Spring 路由抽取和覆盖单元。候选按 Intent 分批 triage；每个保留候选
-    再形成独立 verify 分支；模块与扫描器分支通过多源 Intent 分层 fan-in 到
-    `audit_summary`。这些是自由的 Intent.type 模式，不是固定 Worker 角色。
+14. scope 审计先固定 source snapshot 与 coverage plan。Reason 可选择语义分析方法，
+    但这些方法不构成强制阶段顺序；发现通过普通 Intent、Fact、证据与统一 proof
+    review 推进到 `audit_summary`。这些是自由的 Intent.type 模式，不是固定 Worker
+    角色。
 15. `poc:isolated` Intent 只有在 `audit.poc_sandbox.enabled=true` 时可运行；源码以
     只读冻结快照挂载到一次性容器，不挂载 host HOME、图历史或 Docker socket，且
     失败后禁止切回 host conclude fallback。

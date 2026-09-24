@@ -12,16 +12,16 @@ from linen.server.audit_state import (
     list_audit_events,
     list_audit_stages,
     list_human_decisions,
-    _stage_from_row,
 )
 from linen.server.db import get_conn
 from linen.server.models import (
     AuditEvent,
     AuditStage,
     CompletionGate,
+    ReplanAuditRequest,
+    ReconcileAuditStagesRequest,
     CreateHumanDecisionRequest,
     HumanDecision,
-    UpsertAuditStageRequest,
 )
 from linen.server.services import (
     bump_graph_revision,
@@ -111,85 +111,108 @@ def get_audit_stages(project_id: str):
 
 
 @router.put(
-    "/projects/{project_id}/stages/{stage_id}",
-    response_model=AuditStage,
+    "/projects/{project_id}/stages",
+    response_model=list[AuditStage],
 )
-def upsert_audit_stage(
+def reconcile_audit_stages(
     project_id: str,
-    stage_id: str,
-    body: UpsertAuditStageRequest,
+    body: ReconcileAuditStagesRequest,
 ):
     with get_conn() as conn:
         project = check_project_active(conn, project_id)
         generation = project["source_generation"]
         revision = project["plan_revision"]
-        if body.source_generation is not None and body.source_generation != generation:
+        if body.source_generation != generation:
             raise HTTPException(409, "Stage source_generation is stale")
-        if body.plan_revision is not None and body.plan_revision != revision:
+        if body.plan_revision != revision:
             raise HTTPException(409, "Stage plan_revision is stale")
-        now = utcnow()
-        existing = conn.execute(
+        existing_rows = conn.execute(
             "SELECT * FROM audit_stages WHERE project_id = ? AND source_generation = ? "
-            "AND plan_revision = ? AND stage_id = ?",
-            (project_id, generation, revision, stage_id),
+            "AND plan_revision = ? ORDER BY stage_id",
+            (project_id, generation, revision),
+        ).fetchall()
+        requested = {stage.stage_id: stage for stage in body.stages}
+        existing = {row["stage_id"]: row for row in existing_rows}
+        if existing and set(existing) != set(requested):
+            raise HTTPException(
+                409,
+                "Audit stage set is frozen for this plan; explicitly replan to change obligations",
+            )
+        now = utcnow()
+        changed = False
+        for stage_id, stage in requested.items():
+            prior = existing.get(stage_id)
+            if prior is None:
+                conn.execute(
+                    "INSERT INTO audit_stages (project_id, source_generation, plan_revision, stage_id, "
+                    "label, phase_order, required, status, capability, detail, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        project_id, generation, revision, stage_id, stage.label,
+                        stage.phase_order, int(stage.required), stage.status,
+                        stage.capability, stage.detail, now,
+                    ),
+                )
+                label, required, capability = stage.label, stage.required, stage.capability
+                changed = True
+            else:
+                label, required, capability = prior["label"], bool(prior["required"]), prior["capability"]
+                if prior["status"] == stage.status and prior["detail"] == stage.detail:
+                    continue
+                conn.execute(
+                    "UPDATE audit_stages SET status = ?, detail = ?, updated_at = ? "
+                    "WHERE project_id = ? AND source_generation = ? AND plan_revision = ? AND stage_id = ?",
+                    (stage.status, stage.detail, now, project_id, generation, revision, stage_id),
+                )
+                changed = True
+            append_event(
+                conn, project_id, "audit_stage_updated", body.actor,
+                entity_kind="stage", entity_id=stage_id,
+                payload={
+                    "label": label, "status": stage.status,
+                    "required": required, "capability": capability,
+                    "detail": stage.detail,
+                },
+                created_at=now,
+            )
+        if changed:
+            bump_graph_revision(conn, project_id)
+        return list_audit_stages(conn, project_id)
+
+
+@router.post("/projects/{project_id}/replan")
+def replan_audit(project_id: str, body: ReplanAuditRequest):
+    """Advance the audit plan only after all work from the current plan is settled."""
+    with get_conn() as conn:
+        project = check_project_active(conn, project_id)
+        if body.source_generation != project["source_generation"]:
+            raise HTTPException(409, "Replan source_generation is stale")
+        if body.plan_revision != project["plan_revision"]:
+            raise HTTPException(409, "Replan plan_revision is stale")
+        open_intent = conn.execute(
+            "SELECT id FROM intents WHERE project_id = ? AND source_generation = ? "
+            "AND plan_revision = ? AND to_fact_id IS NULL AND concluded_at IS NULL LIMIT 1",
+            (project_id, project["source_generation"], project["plan_revision"]),
         ).fetchone()
-        values = {
-            "label": body.label,
-            "phase_order": body.phase_order,
-            "required": int(body.required),
-            "status": body.status,
-            "capability": body.capability,
-            "detail": body.detail,
-        }
-        # PUT is a reconciliation operation.  Replaying the same ledger
-        # state must not create activity noise or advance graph_revision.
-        if existing is not None and all(existing[key] == value for key, value in values.items()):
-            return _stage_from_row(existing)
+        if open_intent is not None:
+            raise HTTPException(409, "Cannot replan while current-plan intents are unresolved")
+        next_revision = project["plan_revision"] + 1
         conn.execute(
-            "INSERT INTO audit_stages (project_id, source_generation, plan_revision, stage_id, "
-            "label, phase_order, required, status, capability, detail, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(project_id, source_generation, plan_revision, stage_id) DO UPDATE SET "
-            "label=excluded.label, phase_order=excluded.phase_order, required=excluded.required, "
-            "status=excluded.status, capability=excluded.capability, detail=excluded.detail, updated_at=excluded.updated_at",
-            (
-                project_id,
-                generation,
-                revision,
-                stage_id,
-                body.label,
-                body.phase_order,
-                int(body.required),
-                body.status,
-                body.capability,
-                body.detail,
-                now,
-            ),
-        )
-        append_event(
-            conn,
-            project_id,
-            "audit_stage_updated",
-            body.actor,
-            entity_kind="stage",
-            entity_id=stage_id,
-            payload={
-                "label": body.label,
-                "status": body.status,
-                "required": body.required,
-                "capability": body.capability,
-                "detail": body.detail,
-            },
-            created_at=now,
+            "UPDATE projects SET plan_revision = ? WHERE id = ?",
+            (next_revision, project_id),
         )
         bump_graph_revision(conn, project_id)
-        row = conn.execute(
-            "SELECT * FROM audit_stages WHERE project_id = ? AND source_generation = ? "
-            "AND plan_revision = ? AND stage_id = ?",
-            (project_id, generation, revision, stage_id),
-        ).fetchone()
-        assert row is not None
-        return _stage_from_row(row)
+        append_event(
+            conn, project_id, "audit_plan_replanned", body.actor,
+            entity_kind="plan", entity_id=str(next_revision),
+            payload={"previous_plan_revision": project["plan_revision"], "rationale": body.rationale},
+            created_at=utcnow(),
+        )
+        return {
+            "project_id": project_id,
+            "source_generation": project["source_generation"],
+            "plan_revision": next_revision,
+        }
 
 
 @router.get(

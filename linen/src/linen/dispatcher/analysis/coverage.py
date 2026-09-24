@@ -7,7 +7,7 @@ from pathlib import Path
 
 from linen.dispatcher.analysis.artifacts import ancestor_ids, digest, load_artifact, snapshot_source, source_bytes, write_json
 from linen.dispatcher.config import CoverageConfig
-from linen.server.models import Fact, Intent, ProjectDetail
+from linen.server.models import Fact, Intent, ProjectDetail, REVIEWLESS_INTERMEDIATE_FACT_TYPES
 
 PLAN_INTENT = "@analysis:coverage-plan"
 CELL_PREFIX = "@coverage:"
@@ -263,6 +263,15 @@ def outcome_fact(payload: dict, project: ProjectDetail, intent: Intent, workdir:
 
 def reviewed(project: ProjectDetail, fid: str) -> bool:
     fact = next((fact for fact in project.facts if fact.id == fid), None)
+    if (
+        fact is not None
+        and fact.status == "triaged"
+        and fact.type in REVIEWLESS_INTERMEDIATE_FACT_TYPES
+    ):
+        # These are intermediate artifacts with deterministic producer-side
+        # validation (frozen citations, schemas, and graph references). They
+        # are not vulnerability claims and do not need an additional LLM vote.
+        return True
     reviews = effective_reviews(project, fid)
     return bool(
         fact
@@ -295,11 +304,14 @@ def effective_reviews(project: ProjectDetail, fid: str) -> list:
 def review_resolved(project: ProjectDetail, fid: str) -> bool:
     """Return whether review reached a decisive result suitable for ancestry."""
     fact = next((fact for fact in project.facts if fact.id == fid), None)
-    reviews = effective_reviews(project, fid)
-    if fact is None or not reviews:
+    if fact is None:
         return False
+    reviews = effective_reviews(project, fid)
     if fact.status == "false_positive":
         return any(review.verdict == "INVALID" for review in reviews)
+    # Deterministically validated intermediate artifacts resolve without an
+    # LLM review. This also lets a new coverage attempt cite an earlier
+    # reviewless result in its ancestry.
     return reviewed(project, fid)
 
 
@@ -410,13 +422,13 @@ def reason_instructions(project: ProjectDetail, workdir: Path, config: CoverageC
         state = coverage_state(project, workdir, config)
     return """
 Scope audit policy (overrides hypothesis completion): Finding one vulnerability does
-NOT finish this project. Reserved @analysis, @coverage, @candidate-triage, and
-@candidate-verify intents are derived from the blackboard and materialized by the
-dispatcher; do not emit or duplicate them. Review results as graph facts.
-checked/not_applicable only count after VALID review. For needs_followup, trace every
+NOT finish this project. Reserved @analysis and @coverage intents are derived from
+the blackboard and materialized by the dispatcher; do not emit or duplicate them.
+Coverage results count only after deterministic validation against the frozen source.
+For needs_followup, trace every
 lead with an ordinary source-grounded intent; the dispatcher will schedule a repeat
 that references the prior result. Retry exhaustion and unexplained skips mean
-INCOMPLETE, not safe. Do not complete until a reviewed audit_summary exists, every
+INCOMPLETE, not safe. Do not complete until a validated audit_summary exists, every
 required branch has fanned into it, and no unresolved finding remains.
 Completion may report zero findings and must reference that audit_summary. State
 precisely that this covers configured checks on frozen snapshots with declared

@@ -22,8 +22,8 @@ read host credentials, or make network calls. Only an explicit `poc:isolated`
 Intent may authorize bounded execution in its declared sandbox.
 
 Use read-only inspection tools such as `rg`, `find`, `cat`, `head`, `tail`,
-`tree`, and read-only `git show/log/diff`. Route inventory is the only
-dispatcher-provided deterministic source analysis. Do not launch broad scans,
+`tree`, and read-only `git show/log/diff`. Linen provides no deterministic
+source scanner. Do not launch broad scans,
 download rule packs, build a CodeQL database, or install tools from an ordinary
 Explore task. Verify every assigned candidate against the frozen source.
 
@@ -110,8 +110,8 @@ If a fact is too long for the description (e.g., a multi-page taint trace), writ
 
 ## Quality bar
 
-- **Read code, don't pattern-match.** Route inventory and `rg` are starting
-  points, not conclusions. Every finding needs a human-style read of the relevant
+- **Read code, don't pattern-match.** `rg` is a starting point, not a conclusion.
+  Every finding needs a human-style read of the relevant
   path and surrounding code.
 - **Bypass-aware.** If a sanitizer exists, ask: is it applied to all paths? Is it correct? Is it bypassable (e.g., URL-decoded before sanitization)?
 - **Cite evidence.** File and line for every claim. "I think there might be an XSS somewhere in the auth flow" is not a finding.

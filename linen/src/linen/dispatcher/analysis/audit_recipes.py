@@ -36,7 +36,6 @@ from linen.server.models import Fact, Intent, ProjectDetail
 CREATOR = "dispatcher.audit"
 RECIPE_PREFIX = "@analysis:semantic:"
 VERIFY_PREFIX = "@analysis:semantic-verify:"
-SUMMARY_INTENT = "@analysis:semantic-summary"
 PROMPT_BUNDLE_NAME = "audit_recipes.yaml"
 
 MAP_RECIPES = (
@@ -151,8 +150,6 @@ def recipe_description(recipe_id: str, *, subject: str | None = None,
 
 
 def parse_recipe_intent(intent: Intent, prompt_group: str = "vuln_audit") -> tuple[str, RecipeDefinition, str | None] | None:
-    if intent.creator != CREATOR:
-        return None
     description = intent.description.strip()
     verification = _VERIFY_DESCRIPTION.fullmatch(description)
     if verification:
@@ -184,24 +181,14 @@ def _fact(project: ProjectDetail, fact_id: str) -> Fact | None:
     return next((fact for fact in project.facts if fact.id == fact_id), None)
 
 
-def _intent(project: ProjectDetail, description: str) -> Intent | None:
-    return next(
-        (intent for intent in project.intents if intent.description.strip() == description),
-        None,
-    )
-
-
-def _result(project: ProjectDetail, description: str) -> Fact | None:
-    intent = _intent(project, description)
-    return _fact(project, intent.to) if intent is not None and intent.to else None
-
-
 def _proposal_exists(project: ProjectDetail, description: str) -> bool:
     return any(intent.description.strip() == description for intent in project.intents)
 
 
-def _enabled_map_recipes(config: SemanticAuditConfig) -> list[str]:
-    enabled = []
+def enabled_recipe_ids(config: SemanticAuditConfig) -> list[str]:
+    if not config.enabled:
+        return []
+    enabled = ["architecture_map"] if config.architecture else []
     if config.authorization:
         enabled.append("authz_matrix")
     if config.state_concurrency:
@@ -210,115 +197,10 @@ def _enabled_map_recipes(config: SemanticAuditConfig) -> list[str]:
         enabled.append("cross_service_map")
     if config.contract:
         enabled.append("contract_map")
+    enabled.extend(PROFILE_RECIPES[name] for name in config.hypothesis_profiles)
+    if config.variant_search:
+        enabled.append("variant_search")
     return enabled
-
-
-def required_recipe_ids(config: SemanticAuditConfig) -> list[str]:
-    if not config.enabled:
-        return []
-    result = ["architecture_map"] if config.architecture else []
-    result.extend(_enabled_map_recipes(config))
-    result.extend(PROFILE_RECIPES[name] for name in config.hypothesis_profiles)
-    return result
-
-
-def recipe_proposals(
-    project: ProjectDetail,
-    workdir: Path,
-    config: SemanticAuditConfig,
-    *,
-    prompt_group: str = "vuln_audit",
-) -> list[dict[str, Any]]:
-    """Derive the next semantic recipe layer from reviewed recipe facts."""
-    if not config.enabled or project.project.audit_mode != "scope":
-        return []
-    plan_fact, _, _ = coverage.get_plan(project, workdir)
-    if not coverage.reviewed(project, plan_fact.id):
-        return []
-
-    bundle = load_bundle(prompt_group)
-    architecture_description = recipe_description(
-        "architecture_map", prompt_group=prompt_group,
-    )
-    architecture = _result(project, architecture_description)
-    if config.architecture:
-        if architecture is None:
-            if not _proposal_exists(project, architecture_description):
-                recipe = bundle.recipes["architecture_map"]
-                return [{
-                    "from": [plan_fact.id],
-                    "type": recipe.intent_type,
-                    "description": architecture_description,
-                }]
-            return []
-        if not coverage.reviewed(project, architecture.id):
-            return []
-
-    map_facts: list[Fact] = []
-    map_proposals = []
-    for recipe_id in _enabled_map_recipes(config):
-        description = recipe_description(recipe_id, prompt_group=prompt_group)
-        result = _result(project, description)
-        if result is None:
-            if not _proposal_exists(project, description):
-                recipe = bundle.recipes[recipe_id]
-                map_proposals.append({
-                    "from": [architecture.id if architecture is not None else plan_fact.id],
-                    "type": recipe.intent_type,
-                    "description": description,
-                })
-            continue
-        if not coverage.reviewed(project, result.id):
-            return map_proposals
-        map_facts.append(result)
-    if map_proposals:
-        return map_proposals
-
-    inputs = [
-        architecture.id if architecture is not None else plan_fact.id,
-        *(fact.id for fact in map_facts),
-    ]
-    profile_proposals = []
-    for profile in config.hypothesis_profiles:
-        recipe_id = PROFILE_RECIPES[profile]
-        description = recipe_description(recipe_id, prompt_group=prompt_group)
-        result = _result(project, description)
-        if result is None:
-            if not _proposal_exists(project, description):
-                recipe = bundle.recipes[recipe_id]
-                profile_proposals.append({
-                    "from": inputs,
-                    "type": recipe.intent_type,
-                    "description": description,
-                })
-            continue
-        if not coverage.reviewed(project, result.id):
-            return profile_proposals
-    if profile_proposals:
-        return profile_proposals
-
-    if not config.variant_search:
-        return []
-    variant_proposals = []
-    for vulnerability in project.facts:
-        if (
-            vulnerability.type != "vulnerability"
-            or not coverage.reviewed(project, vulnerability.id)
-            or _is_variant_vulnerability(project, vulnerability.id)
-            or plan_fact.id not in ancestor_ids(project, [vulnerability.id])
-        ):
-            continue
-        description = recipe_description(
-            "variant_search", subject=vulnerability.id, prompt_group=prompt_group,
-        )
-        if not _proposal_exists(project, description):
-            recipe = bundle.recipes["variant_search"]
-            variant_proposals.append({
-                "from": [vulnerability.id],
-                "type": recipe.intent_type,
-                "description": description,
-            })
-    return variant_proposals
 
 
 def _canonical_citations(raw: Any, source: Path, snapshot: dict) -> list[dict[str, Any]]:
@@ -813,142 +695,3 @@ def _is_variant_vulnerability(project: ProjectDetail, fact_id: str) -> bool:
         (source := _fact(project, source_id)) is not None and source.type == "variant_batch"
         for source_id in incoming.from_
     )
-
-
-def semantic_summary_inputs(
-    project: ProjectDetail,
-    workdir: Path,
-    config: SemanticAuditConfig,
-    *,
-    prompt_group: str = "vuln_audit",
-) -> list[str] | None:
-    if not config.enabled:
-        return []
-    plan_fact, _, _ = coverage.get_plan(project, workdir)
-    inputs: list[str] = []
-    for recipe_id in required_recipe_ids(config):
-        fact = _result(project, recipe_description(recipe_id, prompt_group=prompt_group))
-        if fact is None or fact.type not in RECIPE_FACT_TYPES or not coverage.reviewed(project, fact.id):
-            return None
-        inputs.append(fact.id)
-
-    for vulnerability in project.facts:
-        if (
-            not config.variant_search
-            or vulnerability.type != "vulnerability"
-            or not coverage.reviewed(project, vulnerability.id)
-            or _is_variant_vulnerability(project, vulnerability.id)
-            or plan_fact.id not in ancestor_ids(project, [vulnerability.id])
-        ):
-            continue
-        description = recipe_description(
-            "variant_search", subject=vulnerability.id, prompt_group=prompt_group,
-        )
-        batch = _result(project, description)
-        if batch is None or batch.type != "variant_batch" or not coverage.reviewed(project, batch.id):
-            return None
-        inputs.append(batch.id)
-
-    expected_batch_ids = {
-        fact.id for fact in project.facts
-        if fact.id in inputs and fact.type in CANDIDATE_BATCH_TYPES
-    }
-    seen_fingerprints: set[str] = set()
-    for batch in project.facts:
-        if batch.id not in expected_batch_ids:
-            continue
-        try:
-            items = candidate_items(batch, workdir)
-        except (ValueError, OSError, KeyError, TypeError):
-            return None
-        for candidate in items:
-            if candidate["fingerprint"] in seen_fingerprints:
-                continue
-            seen_fingerprints.add(candidate["fingerprint"])
-            terminal = terminal_verification(project, batch.id, candidate["fingerprint"])
-            if terminal is None or not coverage.reviewed(project, terminal.id):
-                attempts = verification_attempts(project, batch.id, candidate["fingerprint"])
-                if len(attempts) < config.max_verify_attempts:
-                    return None
-                latest = _fact(project, attempts[-1].to or "") if attempts else None
-                if latest is None or not coverage.reviewed(project, latest.id):
-                    return None
-                inputs.append(latest.id)
-            else:
-                inputs.append(terminal.id)
-    return sorted(set(inputs))
-
-
-def summary_proposal(
-    project: ProjectDetail,
-    workdir: Path,
-    config: SemanticAuditConfig,
-    *,
-    prompt_group: str = "vuln_audit",
-) -> dict[str, Any] | None:
-    inputs = semantic_summary_inputs(
-        project, workdir, config, prompt_group=prompt_group,
-    )
-    if inputs is None or _proposal_exists(project, SUMMARY_INTENT):
-        return None
-    return {"from": inputs, "type": "synthesize", "description": SUMMARY_INTENT}
-
-
-def summary_fact(
-    project: ProjectDetail,
-    intent: Intent,
-    workdir: Path,
-    config: SemanticAuditConfig,
-    *,
-    prompt_group: str = "vuln_audit",
-) -> dict[str, str]:
-    inputs = semantic_summary_inputs(
-        project, workdir, config, prompt_group=prompt_group,
-    )
-    if (
-        intent.description.strip() != SUMMARY_INTENT
-        or intent.type != "synthesize"
-        or inputs is None
-        or set(intent.from_) != set(inputs)
-    ):
-        raise ValueError("Semantic summary requires every reviewed semantic branch")
-    batches = [fact for fact in project.facts if fact.id in inputs and fact.type in CANDIDATE_BATCH_TYPES]
-    candidate_count = len({
-        item["fingerprint"]
-        for fact in batches
-        for item in candidate_items(fact, workdir)
-    })
-    vulnerabilities = sorted(
-        fact.id for fact in project.facts
-        if fact.id in inputs and fact.type == "vulnerability" and coverage.reviewed(project, fact.id)
-    )
-    record = {
-        "schema_version": 1,
-        "kind": "semantic_summary",
-        "status": "completed",
-        "input_fact_ids": inputs,
-        "recipe_fact_ids": sorted(
-            fact.id for fact in project.facts if fact.id in inputs and fact.type in RECIPE_FACT_TYPES
-        ),
-        "candidate_count": candidate_count,
-        "confirmed_vulnerability_ids": vulnerabilities,
-        "statement": (
-            "Configured semantic recipes and candidate branches completed on the frozen snapshot; "
-            "coverage gaps remain evidence and this is not proof of repository safety."
-        ),
-    }
-    directory = workdir / ".linen-analysis" / f"semantic-summary-{uuid.uuid4().hex}"
-    directory.mkdir(parents=True)
-    path = directory / "semantic-summary.json"
-    write_json(path, record)
-    return {
-        "type": "semantic_summary",
-        "description": (
-            f"Semantic audit synthesis completed: {candidate_count} candidates, "
-            f"{len(vulnerabilities)} confirmed vulnerabilities."
-        ),
-        "evidence": (
-            f"artifact: {path}\nmanifest_sha256: {digest(path.read_bytes())}\n"
-            "status: completed"
-        ),
-    }

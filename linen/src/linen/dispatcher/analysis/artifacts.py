@@ -389,7 +389,7 @@ def select_snapshot(project: ProjectDetail, fact_id: str, workdir: Path) -> tupl
         allowed_types = (
             {"policy_evidence"}
             if policy_review
-            else {"route_scan", "coverage_plan"}
+            else {"coverage_plan"}
         )
         if fact.id in ancestors and fact.type in allowed_types:
             path, artifact = load_artifact(fact, workdir)
@@ -407,7 +407,7 @@ def review_inputs(project: ProjectDetail, fact: Fact, workdir: Path) -> dict[str
     """Selected execution records, never other reviews or graph history."""
     inputs: dict[str, bytes] = {}
     artifact_fact_types = {
-        "route_scan", "coverage_plan", "module_summary", "audit_summary",
+        "coverage_plan", "module_summary", "audit_summary",
         "architecture_map", "authz_matrix", "state_model", "cross_service_map",
         "contract_map", "hypothesis_batch", "variant_batch", "semantic_summary",
         "policy_evidence", "scope_adjudication",
@@ -424,15 +424,6 @@ def review_inputs(project: ProjectDetail, fact: Fact, workdir: Path) -> dict[str
             "technical_exploitability_unchanged", "evidence_gaps",
         ) if key in artifact}
         inputs["record.json"] = json.dumps(record, ensure_ascii=False).encode()
-        if fact.type == "route_scan":
-            names = ("routes.json", "guards.json", "candidates.json")
-            for name in names:
-                expected = artifact.get("artifact_hashes", {}).get(name)
-                if expected:
-                    data = (path.parent / name).read_bytes()
-                    if digest(data) != expected:
-                        raise ValueError(f"Scan evidence changed: {name}")
-                    inputs[name] = data
     elif fact.type == "coverage_result":
         result = json.loads(fact.evidence or "")
         for parent in project.facts:

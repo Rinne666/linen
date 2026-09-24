@@ -9,15 +9,11 @@ from click.testing import CliRunner
 
 from test_audit_pipeline import FakeDriver, api, config, project
 from linen.cli import main
-from linen.dispatcher.analysis import audit_graph, coverage, scope_gate, triage
-from linen.dispatcher.analysis.benchmark import evaluate
-from linen.dispatcher.analysis.artifacts import digest, write_json
-from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT, extract_routes, run_spring_scan
+from linen.dispatcher.analysis import audit_graph, coverage, scope_gate
+from linen.dispatcher.analysis.benchmark import compare_strategies, evaluate
 from linen.dispatcher.config import (
-    CandidateTriageConfig,
     PocSandboxConfig,
     ScopeAdjudicationConfig,
-    SpringScanConfig,
 )
 from linen.dispatcher.runtime.backend import LocalBackend
 from linen.dispatcher.runtime.cancellation import TaskCancellation
@@ -54,36 +50,8 @@ def _conclude(client, project_id: str, parents: list[str], description: str,
     return response.data["fact"]["id"]
 
 
-def _scanner_fact(client, project_id: str, workdir: Path) -> tuple[str, list[dict]]:
-    run = workdir / ".linen-analysis" / "fixture"
-    source = run / "source"
-    source.mkdir(parents=True)
-    content = b"danger();\nsafe();\n"
-    (source / "App.java").write_bytes(content)
-    candidates = [
-        {"fingerprint": "keep-me", "rule_id": "danger", "locations": [], "status": "unverified"},
-        {"fingerprint": "drop-me", "rule_id": "noise", "locations": [], "status": "unverified"},
-    ]
-    write_json(run / "candidates.json", candidates)
-    manifest = {
-        "schema_version": 1,
-        "status": "completed",
-        "scanner": {"name": "fixture"},
-        "snapshot": {"id": digest(content), "files": {"App.java": digest(content)}, "skipped": []},
-        "artifact_hashes": {"candidates.json": digest((run / "candidates.json").read_bytes())},
-    }
-    write_json(run / "manifest.json", manifest)
-    evidence = (
-        f"artifact: {run / 'manifest.json'}\n"
-        f"manifest_sha256: {digest((run / 'manifest.json').read_bytes())}\n"
-        "status: completed"
-    )
-    return _conclude(client, project_id, ["origin"], "fixture scan", "route_scan", evidence), candidates
-
-
 def test_scope_initial_intents_are_derived_from_graph(tmp_path):
     cfg = config(tmp_path, mode="scope")
-    cfg.audit.spring = SpringScanConfig(enabled=True)
     from linen.server.models import ProjectDetail, ProjectMeta
 
     board = ProjectDetail(
@@ -209,7 +177,48 @@ def test_uvpg_proof_atom_does_not_get_generic_review_proposal() -> None:
     assert audit_graph._review_proposals(board) == []
 
 
-def test_legacy_plan_review_is_preserved_but_requires_fresh_attestation(tmp_path):
+def test_validated_intermediate_facts_do_not_schedule_generic_review():
+    intermediate_types = [
+        "coverage_plan", "architecture_map", "authz_matrix",
+        "state_model", "cross_service_map", "contract_map", "hypothesis_batch",
+        "variant_batch", "module_summary", "semantic_summary", "audit_summary",
+    ]
+    board = ProjectDetail(
+        project=ProjectMeta(
+            id="proj_reviewless", title="audit", status="active", bootstrap_enabled=False,
+            audit_mode="scope", created_at="2026-01-01T00:00:00Z",
+        ),
+        facts=[
+            Fact(id="origin", description="repo"), Fact(id="goal", description="audit"),
+            *(Fact(id=f"f-{kind}", description=kind, type=kind, status="triaged")
+              for kind in intermediate_types),
+        ],
+        intents=[], hints=[], reviews=[],
+    )
+
+    assert audit_graph._review_proposals(board) == []
+
+
+def test_coverage_result_keeps_review_because_it_carries_negative_assurance():
+    board = ProjectDetail(
+        project=ProjectMeta(
+            id="proj_coverage_review", title="audit", status="active",
+            bootstrap_enabled=False, audit_mode="scope", created_at="2026-01-01T00:00:00Z",
+        ),
+        facts=[
+            Fact(id="origin", description="repo"), Fact(id="goal", description="audit"),
+            Fact(id="f-coverage", description="checked cell", type="coverage_result", status="draft"),
+        ],
+        intents=[], hints=[], reviews=[],
+    )
+
+    proposals = audit_graph._review_proposals(board)
+
+    assert len(proposals) == 1
+    assert proposals[0]["from"] == ["f-coverage"]
+
+
+def test_legacy_plan_review_does_not_trigger_a_second_llm_attestation(tmp_path):
     board = ProjectDetail(
         project=ProjectMeta(
             id="proj_001", title="audit", status="active", bootstrap_enabled=False,
@@ -237,11 +246,7 @@ def test_legacy_plan_review_is_preserved_but_requires_fresh_attestation(tmp_path
     )
 
     assert coverage.effective_reviews(board, "f001") == []
-    assert audit_graph._review_proposals(board) == [{
-        "from": ["f001"],
-        "type": "review:devils-advocate",
-        "description": "@analysis:review:f001:attestation",
-    }]
+    assert audit_graph._review_proposals(board) == []
 
     board.reviews.append(Review(
         id="r002", fact_id="f001", verdict="VALID", confidence="firm",
@@ -262,7 +267,6 @@ def test_legacy_plan_review_is_preserved_but_requires_fresh_attestation(tmp_path
 def test_scheduler_materializes_graph_intents_idempotently(api, tmp_path):
     _, client = api
     cfg = config(tmp_path, mode="scope")
-    cfg.audit.spring = SpringScanConfig(enabled=True)
     board = project(api, audit_mode="scope")
     loop = DispatcherLoop.__new__(DispatcherLoop)
     loop.config = cfg
@@ -345,139 +349,6 @@ def test_scope_evidence_missing_repository_becomes_visible_blocker(api, tmp_path
     assert fresh.errors[0].code == "source_repository_missing"
 
 
-def test_reviewed_plan_fans_out_route_inventory_from_one_canonical_snapshot(api, tmp_path):
-    _, client = api
-    cfg = config(tmp_path, mode="scope")
-    cfg.audit.spring = SpringScanConfig(enabled=True)
-    current = project(api, audit_mode="scope")
-    pid = current.project.id
-    backend = LocalBackend(cfg.local, client)
-    workdir = Path(backend.ensure_running(pid))
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / "Api.java").write_text(
-        '@RestController class Api { @GetMapping("/health") String health() { return "ok"; } }'
-    )
-    plan = coverage.create_plan(repo, workdir, cfg.audit.coverage)
-    plan_id = _conclude(
-        client, pid, ["origin"], coverage.PLAN_INTENT,
-        plan["type"], plan["evidence"],
-    )
-    _approve(client, pid, plan_id)
-
-    current = client.get_project(pid)
-    proposals = audit_graph.required_intents(current, workdir, cfg.audit)
-    assert {(item["type"], item["description"]) for item in proposals} == {
-        ("search", SPRING_SCAN_INTENT),
-    }
-    assert all(item["from"] == [plan_id] for item in proposals)
-    _, plan_path, plan_record = coverage.get_plan(current, workdir)
-    route_fact = run_spring_scan(
-        plan_path.parent / "source",
-        workdir / ".linen-analysis",
-        cfg.audit.spring,
-        canonical_snapshot=plan_record["snapshot"],
-    )
-    route_manifest = Path(route_fact["evidence"].splitlines()[0].removeprefix("artifact: "))
-    assert json.loads(route_manifest.read_text())["snapshot"]["id"] == plan_record["snapshot"]["id"]
-
-
-def test_spring_route_extractor_marks_only_uncovered_literal_route(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    source = """
-@RestController
-@RequestMapping("/api")
-class ApiController {
-  @GetMapping("/admin") public String admin() { return "ok"; }
-  @GetMapping("/public") public String publicRoute() { return "ok"; }
-}
-class Config implements WebMvcConfigurer {
-  void configure(InterceptorRegistry registry) {
-    registry.addInterceptor(auth).addPathPatterns("/api/**").excludePathPatterns("/api/public");
-  }
-}
-"""
-    (repo / "ApiController.java").write_text(source)
-    routes = extract_routes("ApiController.java", source)
-    assert {(route["http_method"], route["path"]) for route in routes} == {
-        ("GET", "/api/admin"), ("GET", "/api/public"),
-    }
-    fact = run_spring_scan(repo, tmp_path / "analysis", SpringScanConfig(enabled=True))
-    manifest_path = Path(fact["evidence"].splitlines()[0].removeprefix("artifact: "))
-    candidates = json.loads((manifest_path.parent / "candidates.json").read_text())
-    assert [(item["properties"]["http_method"], item["properties"]["route"])
-            for item in candidates] == [("GET", "/api/public")]
-    assert candidates[0]["status"] == "unverified"
-
-
-def test_triage_kept_candidate_becomes_independent_verification_branch(api, tmp_path):
-    _, client = api
-    cfg = config(tmp_path, mode="scope")
-    cfg.audit.triage = CandidateTriageConfig(candidates_per_batch=20)
-    current = project(api, audit_mode="scope")
-    pid = current.project.id
-    backend = LocalBackend(cfg.local, client)
-    workdir = Path(backend.ensure_running(pid))
-    source_id, _ = _scanner_fact(client, pid, workdir)
-    _approve(client, pid, source_id)
-    current = client.get_project(pid)
-    source = next(fact for fact in current.facts if fact.id == source_id)
-    batch = triage.batches(source, workdir, cfg.audit.triage)[0]
-    intent_id = client.create_intent(
-        pid, [source_id], batch["description"], "dispatcher.audit", intent_type="triage",
-    ).data["id"]
-    client.heartbeat(pid, intent_id, "tester")
-    current = client.get_project(pid)
-    intent = next(item for item in current.intents if item.id == intent_id)
-    fact = triage.triage_outcome_fact({"data": {
-        "description": "classified candidates", "type": "candidate_triage", "evidence": "source read",
-        "triage": [
-            {"fingerprint": "keep-me", "outcome": "keep", "category": "command-injection", "rationale": "reachable sink"},
-            {"fingerprint": "drop-me", "outcome": "drop", "category": "noise", "rationale": "constant only"},
-        ],
-    }}, current, intent, workdir, cfg.audit.triage)
-    response = client.conclude(
-        pid, intent_id, "tester", fact["description"], fact_type=fact["type"], evidence=fact["evidence"],
-    )
-    triage_id = response.data["fact"]["id"]
-    _approve(client, pid, triage_id)
-
-    proposals = audit_graph._candidate_verify_proposals(  # graph contract, not a private queue
-        client.get_project(pid), workdir, cfg.audit,
-    )
-    assert len(proposals) == 1
-    assert proposals[0]["from"] == [triage_id]
-    assert proposals[0]["description"] == triage.verify_description(source_id, "keep-me", 1)
-    assert "drop-me" not in proposals[0]["description"]
-
-    verify_id = client.create_intent(
-        pid, proposals[0]["from"], proposals[0]["description"], "dispatcher.audit",
-        intent_type=proposals[0]["type"],
-    ).data["id"]
-    current = client.get_project(pid)
-    verify_intent = next(item for item in current.intents if item.id == verify_id)
-    outcome = triage.verification_outcome_fact({"data": {
-        "description": "scanner candidate confirmed without a logical endpoint",
-        "type": "vulnerability",
-        "evidence": "App.java:1 reaches the operation",
-        "endpoint_id": None,
-        "citations": [
-            {"id": "c1", "file": "App.java", "line": 1, "code": "danger();"},
-        ],
-        "trace": [{
-            "file": "App.java", "line": 1, "symbol": "danger",
-            "relation": "flows_to", "observation": "scanner location verified",
-            "citation_id": "c1",
-        }],
-        "candidate_disposition": {
-            "fingerprint": "keep-me", "outcome": "confirmed",
-            "rationale": "the finding has no HTTP, RPC, or queue entry",
-        },
-    }}, current, verify_intent, workdir)
-    assert outcome["proof"]["attributes"]["endpoint_id"] is None
-
-
 def test_isolated_poc_uses_sandbox_backend_without_host_fallback(api, tmp_path, monkeypatch):
     _, client = api
     cfg = config(tmp_path, mode="scope")
@@ -486,7 +357,13 @@ def test_isolated_poc_uses_sandbox_backend_without_host_fallback(api, tmp_path, 
     pid = current.project.id
     host = LocalBackend(cfg.local, client)
     workdir = Path(host.ensure_running(pid))
-    source_id, _ = _scanner_fact(client, pid, workdir)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def handler(value):\n    return value\n")
+    plan = coverage.create_plan(repo, workdir, cfg.audit.coverage)
+    source_id = _conclude(
+        client, pid, ["origin"], coverage.PLAN_INTENT, plan["type"], plan["evidence"],
+    )
     intent_id = client.create_intent(
         pid, [source_id], "reproduce candidate safely", "reasoner", intent_type="poc:isolated",
     ).data["id"]
@@ -538,3 +415,31 @@ def test_benchmark_requires_three_runs_and_reports_stability(tmp_path):
     result = CliRunner().invoke(main, args)
     assert result.exit_code == 0, result.output
     assert '"minimum_recall": 0.5' in result.output
+
+
+def test_coverage_strategy_benchmark_reports_cost_recall_and_completion():
+    run = {
+        "confirmed": ["known-1"],
+        "rejected": ["candidate-fp"],
+        "metrics": {
+            "review_calls": 2,
+            "pi_calls": 6,
+            "tokens": 12000,
+            "wall_time_ms": 45000,
+            "repeated_reads": 1,
+            "cross_endpoint_chains": 1,
+            "completion_correct": True,
+        },
+    }
+    report = compare_strategies(
+        {"known-1", "known-2"}, [run, run, run], [run, run, run],
+    )
+    file_topic = report["strategies"]["file_topic"]
+    assert file_topic["stability"]["minimum_recall"] == 0.5
+    assert file_topic["mean_metrics"]["review_calls"] == 2
+    assert file_topic["mean_metrics"]["tokens"] == 12000
+    assert file_topic["mean_metrics"]["wall_time_ms"] == 45000
+    assert file_topic["mean_metrics"]["completion_correct_runs"] == 3
+    assert file_topic["mean_metrics"]["confirmed_findings"] == 1
+    assert file_topic["mean_metrics"]["rejected_findings"] == 1
+    assert file_topic["completion_stability"] is True

@@ -269,7 +269,7 @@ tasks:
 | `fp_pattern_check` | devils-advocate | 8 个 Claude FP pattern 的 matched / not applicable 列表 |
 | `cold_verification` | cold-verifier | sub-claims + prosecution + defense + severity_challenged + isolation_observed |
 | `contradiction_analysis` | contradiction-reasoner | TRIZ tension + sacrifice + Game Theory mechanism + adaptive path |
-| `attestation_check` | source inventory / triage execution record | artifact integrity + frozen-source consistency + scope completeness |
+| `attestation_check` | source inventory / coverage execution record | artifact integrity + frozen-source consistency + scope completeness |
 | `summary_check` | module / audit summary | expected/referenced/missing input IDs + contradiction + fan-in completeness |
 
 **Contract 校验**（`linen/src/linen/dispatcher/contracts.py:201-260`）：

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from test_audit_pipeline import api, config, project, FakeDriver
-from linen.dispatcher.analysis import audit_graph, coverage
+from linen.dispatcher.analysis import audit_graph, coverage, stages
 from linen.dispatcher.analysis.artifacts import load_artifact, select_snapshot
 from linen.dispatcher.analysis.artifacts import digest
 from linen.dispatcher.config import CoverageConfig, ReviewSandboxConfig
@@ -18,6 +18,7 @@ from linen.dispatcher.runtime.process import ProcessResult
 from linen.dispatcher.runtime.review_sandbox import DockerReviewProcess
 from linen.dispatcher.tasks import explore, reason, review
 from linen.dispatcher.workers.base import DriverResult
+from linen.server.models import AuditStage, Fact, ProjectDetail, ProjectMeta
 
 
 def scope_setup(api, tmp_path, *, topics=None):
@@ -41,6 +42,49 @@ def scope_setup(api, tmp_path, *, topics=None):
     current = client.get_project(pid)
     fact, path, plan = coverage.get_plan(current, Path(backend.container_name(pid)))
     return cfg, backend, pid, fact, path, plan
+
+
+def test_stage_obligations_are_frozen_until_plan_revision_changes(tmp_path):
+    cfg = config(tmp_path)
+    cfg.audit.mode = "scope"
+    cfg.audit.semantic.enabled = True
+    board = ProjectDetail(
+        project=ProjectMeta(
+            id="proj_frozen", title="audit", status="active", bootstrap_enabled=False,
+            audit_mode="scope", created_at="2026-01-01T00:00:00Z",
+        ),
+        facts=[Fact(id="origin", description="repo"), Fact(id="goal", description="audit")],
+        intents=[], hints=[], reviews=[],
+    )
+    registered = stages.reconcile(cfg.audit, board, tmp_path)
+    semantic = next(row for row in registered if row["stage_id"] == "semantic-analysis")
+    assert semantic["required"] is True
+    board.stages = [AuditStage(
+        **row, source_generation=1, plan_revision=1, updated_at="2026-01-01T00:00:00Z",
+    ) for row in registered]
+
+    cfg.audit.semantic.enabled = False
+    reconciled = stages.reconcile(cfg.audit, board, tmp_path)
+    semantic = next(row for row in reconciled if row["stage_id"] == "semantic-analysis")
+    assert semantic["required"] is True
+    assert semantic["status"] == "pending"
+
+    replanned = board.model_copy(deep=True)
+    replanned.project.plan_revision += 1
+    replanned.stages = []
+    semantic_after_replan = next(
+        row for row in stages.reconcile(cfg.audit, replanned, tmp_path)
+        if row["stage_id"] == "semantic-analysis"
+    )
+    assert semantic_after_replan["required"] is False
+
+    cfg.audit.semantic.enabled = True
+    replanned.project.plan_revision += 1
+    semantic_after_second_replan = next(
+        row for row in stages.reconcile(cfg.audit, replanned, tmp_path)
+        if row["stage_id"] == "semantic-analysis"
+    )
+    assert semantic_after_second_replan["required"] is True
 
 
 def approve(client, pid, fid):
@@ -172,17 +216,22 @@ def test_plan_covers_every_file_topic_pair(tmp_path):
         coverage.create_plan(repo, work, CoverageConfig(max_cells=1, files_per_cell=1))
 
 
-def test_scope_requires_all_reviewed_cells_and_allows_zero_findings(api, tmp_path, monkeypatch):
+def test_scope_reviews_coverage_results_but_not_plan_or_summaries(api, tmp_path, monkeypatch):
     _, client = api
     cfg, backend, pid, fact, path, plan = scope_setup(api, tmp_path)
     work = Path(backend.container_name(pid))
     assert len(plan["cells"]) == 2
-    approve(client, pid, fact.id)
+    assert fact.status == "triaged"
     first = run_cell(api, cfg, backend, pid, fact, plan, plan["cells"][0], monkeypatch)
-    assert any("awaiting_review" in b for b in coverage.scope_blockers(client.get_project(pid), work, cfg.audit.coverage, [fact.id]))
+    assert next(item for item in client.get_project(pid).facts if item.id == first).status == "draft"
+    first_blockers = coverage.scope_blockers(
+        client.get_project(pid), work, cfg.audit.coverage, [fact.id],
+    )
+    assert any("awaiting_review" in blocker for blocker in first_blockers)
+    assert first_blockers
     approve(client, pid, first)
-    assert coverage.scope_blockers(client.get_project(pid), work, cfg.audit.coverage, [fact.id])
     second = run_cell(api, cfg, backend, pid, fact, plan, plan["cells"][1], monkeypatch)
+    assert next(item for item in client.get_project(pid).facts if item.id == second).status == "draft"
     approve(client, pid, second)
     assert coverage.scope_blockers(client.get_project(pid), work, cfg.audit.coverage, [fact.id]) == []
 
@@ -200,7 +249,7 @@ def test_scope_requires_all_reviewed_cells_and_allows_zero_findings(api, tmp_pat
         cfg.workers[0], TaskCancellation(),
     ) == "success"
     module_fact = next(i.to for i in client.get_project(pid).intents if i.id == module_intent_id)
-    approve(client, pid, module_fact)
+    assert next(item for item in client.get_project(pid).facts if item.id == module_fact).status == "triaged"
 
     trace_intent = client.create_intent(
         pid, [fact.id], "ordinary reviewed trace", "reasoner", intent_type="trace",
@@ -232,7 +281,7 @@ def test_scope_requires_all_reviewed_cells_and_allows_zero_findings(api, tmp_pat
         cfg.workers[0], TaskCancellation(),
     ) == "success"
     summary_fact = next(i.to for i in client.get_project(pid).intents if i.id == summary_intent_id)
-    approve(client, pid, summary_fact)
+    assert next(item for item in client.get_project(pid).facts if item.id == summary_fact).status == "triaged"
 
     optional_intent_id = client.create_intent(
         pid, [trace_fact], "inspect sibling endpoint", "reasoner", intent_type="search",
@@ -246,18 +295,43 @@ def test_scope_requires_all_reviewed_cells_and_allows_zero_findings(api, tmp_pat
     assert client.get_completion_gate(pid, [summary_fact]).ready
     assert audit_graph.scope_blockers(client.get_project(pid), work, cfg.audit, [summary_fact]) == []
 
-    required_stage = client.upsert_audit_stage(
-        pid, "required-observation", label="Required observation stage", phase_order=99,
-        status="pending", detail=f"Review required output {optional_result.data['fact']['id']}",
+    current_project = client.get_project(pid)
+    stage_row = {
+        "stage_id": "required-observation",
+        "label": "Required observation stage",
+        "phase_order": 99,
+        "required": True,
+        "status": "pending",
+        "detail": f"Review required output {optional_result.data['fact']['id']}",
+    }
+    required_stage = client.reconcile_audit_stages(
+        pid, [stage_row], source_generation=current_project.project.source_generation,
+        plan_revision=current_project.project.plan_revision,
     )
     assert required_stage.ok
     gate = client.get_completion_gate(pid, [summary_fact])
     assert not gate.ready
     assert any("Required observation stage" in blocker for blocker in gate.blockers)
-    assert client.upsert_audit_stage(
-        pid, "required-observation", label="Required observation stage", phase_order=99,
-        status="satisfied",
-    ).ok
+    changed_stage = client.reconcile_audit_stages(
+        pid, [{**stage_row, "label": "Changed label", "phase_order": 1,
+              "required": False, "status": "satisfied", "detail": None}],
+        source_generation=current_project.project.source_generation,
+        plan_revision=current_project.project.plan_revision,
+    )
+    assert changed_stage.ok
+    frozen_stage = next(
+        stage for stage in client.get_project(pid).stages
+        if stage.stage_id == "required-observation"
+    )
+    assert frozen_stage.label == "Required observation stage"
+    assert frozen_stage.phase_order == 99
+    assert frozen_stage.required is True
+    rejected_stage_set_change = client.reconcile_audit_stages(
+        pid, [stage_row, {**stage_row, "stage_id": "new-obligation"}],
+        source_generation=current_project.project.source_generation,
+        plan_revision=current_project.project.plan_revision,
+    )
+    assert rejected_stage_set_change.status_code == 409
     assert client.get_completion_gate(pid, [summary_fact]).ready
 
     scope_prompt = (Path(__file__).parents[2] / "src/linen/dispatcher/prompts/vuln_audit/reason_scope.md").read_text()

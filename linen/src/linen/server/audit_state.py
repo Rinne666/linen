@@ -34,7 +34,6 @@ FACT_SEMANTIC_TYPES: dict[str, str] = {
     "scope_adjudication": "scope",
     "coverage_plan": "coverage",
     "coverage_result": "coverage",
-    "route_scan": "observation",
     "source": "observation",
     "sink": "observation",
     "dataflow": "observation",
@@ -48,7 +47,6 @@ FACT_SEMANTIC_TYPES: dict[str, str] = {
     "contract_map": "observation",
     "hypothesis_batch": "hypothesis",
     "variant_batch": "hypothesis",
-    "candidate_triage": "hypothesis",
     "candidate_disposition": "observation",
     "vulnerability": "candidate_finding",
     "negative_assurance": "negative_assurance",
@@ -62,7 +60,6 @@ FACT_TITLES: dict[str, str] = {
     "scope_adjudication": "Scope decision",
     "coverage_plan": "Coverage plan",
     "coverage_result": "Coverage result",
-    "route_scan": "Route evidence",
     "architecture_map": "Architecture map",
     "authz_matrix": "Authorization map",
     "state_model": "State model",
@@ -70,7 +67,6 @@ FACT_TITLES: dict[str, str] = {
     "contract_map": "Contract map",
     "hypothesis_batch": "Hypotheses",
     "variant_batch": "Variant search",
-    "candidate_triage": "Triage decision",
     "candidate_disposition": "Candidate verdict",
     "vulnerability": "Candidate finding",
     "negative_assurance": "Negative assurance",
@@ -84,7 +80,6 @@ INTENT_METADATA: tuple[tuple[str, str, str, str], ...] = (
     ("@analysis:scope-adjudication", "Decide audit scope", "scope", "defines"),
     ("@analysis:coverage-plan", "Plan coverage", "coverage", "defines"),
     ("@analysis:audit-summary", "Build audit summary", "report", "produces"),
-    ("@analysis:semantic-summary", "Summarize reasoning", "hypothesis", "produces"),
 )
 
 
@@ -139,10 +134,6 @@ def intent_metadata(description: str, intent_type: str | None) -> tuple[str, str
         return "Verify coverage unit", "audit_task", "coverage", "produces"
     if value.startswith("@analysis:review:") or (intent_type or "").startswith("review"):
         return "Review finding", "review_task", "review", "reviews"
-    if value.startswith("@candidate-triage:"):
-        return "Triage candidates", "audit_task", "hypothesis", "produces"
-    if value.startswith("@candidate-verify:"):
-        return "Verify candidate", "audit_task", "verification", "supports"
     if value.startswith("@analysis:semantic:variant_search"):
         return "Search for variants", "audit_task", "variants", "variant_of"
     if value.startswith("@analysis:semantic-verify:"):
@@ -466,6 +457,8 @@ def completion_gate_from_db(
     ).fetchall()
     blocking_error_rows = [row for row in error_rows if row["phase"] != "baseline_scan"]
     on_demand_error_rows = [row for row in error_rows if row["phase"] == "baseline_scan"]
+    # In goal-based mode execution errors are visible diagnostics, not a
+    # completion invariant. Keep execution_status aligned with that contract.
     blocking_errors = exhaustive and bool(blocking_error_rows)
     add(
         "operational_errors",
@@ -682,7 +675,7 @@ def completion_gate_from_db(
     claimed_rows = [row for row in open_rows if row["worker"] is not None]
     execution_status = "complete" if project["status"] == "completed" else (
         "paused" if project["status"] in {"paused", "stopped"} else
-        "blocked" if blocking_error_rows else
+        "blocked" if exhaustive and blocking_error_rows else
         "reasoning" if project["reason_worker"] else
         "working" if claimed_rows else
         "idle_attention_required" if on_demand_error_rows else

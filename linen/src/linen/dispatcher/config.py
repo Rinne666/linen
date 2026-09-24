@@ -312,31 +312,6 @@ class ScopeAdjudicationConfig(BaseModel):
         return value
 
 
-class CandidateTriageConfig(BaseModel):
-    """Graph-backed batching for bounded candidate evidence.
-
-    The batches are represented by ordinary Intents and Facts.  This config
-    only controls how an immutable candidate artifact is partitioned; it does
-    not introduce a dispatcher-private queue.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = True
-    candidates_per_batch: int = Field(default=20, gt=0, le=100)
-    max_batches: int = Field(default=500, gt=0)
-    max_verify_attempts: int = Field(default=3, gt=0, le=10)
-
-
-class SpringScanConfig(BaseModel):
-    """Cheap, deterministic Spring route/interceptor candidate extraction."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False
-    max_attempts: int = Field(default=3, gt=0, le=10)
-
-
 class PocSandboxConfig(ReviewSandboxConfig):
     """Disposable isolation used by ``poc:isolated`` explore intents."""
 
@@ -381,8 +356,6 @@ class AuditConfig(BaseModel):
     coverage: CoverageConfig = Field(default_factory=CoverageConfig)
     review_sandbox: ReviewSandboxConfig = Field(default_factory=ReviewSandboxConfig)
     poc_sandbox: PocSandboxConfig = Field(default_factory=PocSandboxConfig)
-    triage: CandidateTriageConfig = Field(default_factory=CandidateTriageConfig)
-    spring: SpringScanConfig = Field(default_factory=SpringScanConfig)
     recon: ReconConfig = Field(default_factory=ReconConfig)
     scope_adjudication: ScopeAdjudicationConfig = Field(
         default_factory=ScopeAdjudicationConfig
@@ -443,10 +416,6 @@ class DispatchConfig(BaseModel):
                 raise ValueError("audit recon requires scope mode")
             if not any("review" in worker.task_types for worker in self.workers):
                 raise ValueError("audit mode requires at least one review worker")
-        if self.audit.spring.enabled and not self.audit.enabled:
-            raise ValueError("spring scan requires audit.enabled")
-        if self.audit.spring.enabled and self.audit.mode != "scope":
-            raise ValueError("spring scan requires scope audit mode")
         if self.audit.scope_adjudication.enabled and not self.audit.enabled:
             raise ValueError("scope adjudication requires audit.enabled")
         if self.audit.scope_adjudication.enabled and self.audit.mode != "scope":

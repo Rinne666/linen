@@ -832,7 +832,6 @@
           class="graph-inline-filter h-7 rounded-md border-0 bg-slate-50 px-2 text-[11px] font-medium text-slate-600 focus:ring-2 focus:ring-brand-100">
           <option value="all">All evidence</option>
           <option value="findings">Hypothesis chain</option>
-          <option value="routes">Route inventory</option>
           <option value="scope">Scope and trust</option>
           <option value="coverage">Coverage and summaries</option>
           <option value="semantic">Semantic recipes</option>
@@ -925,7 +924,6 @@
             class="h-8 w-full rounded-lg border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-600 focus:ring-2 focus:ring-brand-100">
             <option value="all">All evidence</option>
             <option value="findings">Hypothesis chain</option>
-            <option value="routes">Route inventory</option>
             <option value="scope">Scope and trust</option>
             <option value="coverage">Coverage and summaries</option>
             <option value="semantic">Semantic recipes</option>
@@ -2981,7 +2979,7 @@ function linenApp() {
 
     findingContextTypes() {
       return new Set([
-        'hypothesis', 'candidate', 'candidate_triage', 'candidate_disposition',
+        'hypothesis', 'candidate', 'candidate_disposition',
         'hypothesis_batch', 'variant_batch', 'finding', 'source', 'sink',
         'dataflow', 'sanitizer', 'validation', 'reachability', 'vulnerability',
         'confirmed_finding',
@@ -3057,7 +3055,7 @@ function linenApp() {
     isCurrentFallbackFact(fact) {
       if (!fact || !this.isFindingContextFact(fact)) return false;
       const kind = fact.type || fact.semantic_type;
-      const candidate = ['candidate', 'candidate_triage', 'candidate_disposition', 'hypothesis', 'hypothesis_batch', 'variant_batch'].includes(kind);
+      const candidate = ['candidate', 'candidate_disposition', 'hypothesis', 'hypothesis_batch', 'variant_batch'].includes(kind);
       const confirmed = fact.semantic_type === 'confirmed_finding'
         || (fact.type === 'vulnerability' && ['triaged', 'fixed', 'confirmed'].includes(fact.status || 'triaged'))
         || fact.status === 'confirmed';
@@ -3259,9 +3257,6 @@ function linenApp() {
       if (this.graphKindFilter === 'findings') {
         return this.isFindingContextFact(fact);
       }
-      if (this.graphKindFilter === 'routes') {
-        return ['route_scan', 'candidate_triage', 'candidate_disposition'].includes(type);
-      }
       if (this.graphKindFilter === 'scope') {
         return ['policy_evidence', 'scope_adjudication'].includes(type);
       }
@@ -3295,7 +3290,6 @@ function linenApp() {
       if (this.graphStateFilter === 'open' && !open) return false;
       if (!['all', 'open'].includes(this.graphStateFilter)) return false;
       if (this.graphKindFilter === 'all') return true;
-      if (this.graphKindFilter === 'routes') return Boolean(this.auditIntentLabel(intent));
       if (this.graphKindFilter === 'scope') {
         const description = intent.description || '';
         return description === '@analysis:scope-evidence'
@@ -3444,7 +3438,6 @@ function linenApp() {
       if (description === '@analysis:scope-evidence') return 'Policy evidence';
       if (description === '@analysis:scope-adjudication') return 'Scope gate';
       if (description === '@analysis:coverage-plan') return 'Plan';
-      if (description === '@analysis:spring-route-auth') return 'Routes';
       if (description === '@analysis:audit-summary') return 'Audit summary';
       if (description === '@analysis:semantic-summary') return 'Semantic summary';
       if (description.startsWith('@analysis:semantic-verify:')) return 'Hypothesis check';
@@ -3465,8 +3458,6 @@ function linenApp() {
       }
       if (description.startsWith('@analysis:review:')) return 'Review';
       if (description.startsWith('@coverage:')) return 'Coverage';
-      if (description.startsWith('@candidate-triage:')) return 'Triage';
-      if (description.startsWith('@candidate-verify:')) return 'Verify';
       if (description.startsWith('@analysis:module-summary:') || description.startsWith('@analysis:candidate-summary:')) return 'Summarize';
       if ((intent?.type || '').startsWith('poc:isolated')) return 'PoC';
       return '';
@@ -3516,8 +3507,8 @@ function linenApp() {
       if (['confirmed_finding', 'rejected_finding', 'negative_assurance', 'summary'].includes(semantic)) return 'outcome';
       if (record?.id === 'origin' || record?.id === 'goal') return 'scope';
       if (['policy_evidence', 'scope_adjudication'].includes(record?.type)) return 'scope';
-      if (['coverage_plan', 'coverage_result', 'route_scan', 'source', 'sink', 'dataflow', 'sanitizer', 'validation', 'reachability'].includes(record?.type)) return 'evidence';
-      if (['candidate_triage', 'hypothesis_batch', 'variant_batch'].includes(record?.type)) return 'reasoning';
+      if (['coverage_plan', 'coverage_result', 'source', 'sink', 'dataflow', 'sanitizer', 'validation', 'reachability'].includes(record?.type)) return 'evidence';
+      if (['hypothesis_batch', 'variant_batch'].includes(record?.type)) return 'reasoning';
       if (['candidate_disposition', 'module_summary', 'semantic_summary', 'audit_summary', 'vulnerability'].includes(record?.type)) return 'outcome';
       return 'evidence';
     },
@@ -3545,8 +3536,6 @@ function linenApp() {
       if (fact.id === 'goal') return 'goal';
       if (fact.type === 'policy_evidence' || fact.type === 'scope_adjudication') return 'scope_fact';
       if (fact.type === 'coverage_plan' || fact.type === 'coverage_result') return 'coverage_fact';
-      if (fact.type === 'route_scan') return 'route_fact';
-      if (fact.type === 'candidate_triage') return 'triage_fact';
       if (fact.type === 'candidate_disposition') return 'disposition_fact';
       if (['architecture_map', 'authz_matrix', 'state_model', 'cross_service_map', 'contract_map'].includes(fact.type)) return 'semantic_map_fact';
       if (fact.type === 'hypothesis_batch' || fact.type === 'variant_batch') return 'hypothesis_fact';
@@ -5225,8 +5214,6 @@ function linenApp() {
         { selector: 'node[nodeType="fact"]', style: { ...common, shape:'round-rectangle','background-color':'#ffffff',label:'data(label)',color:'#344054','font-size':'11px','font-weight':'bold','text-wrap':'wrap','text-max-width':'132px','text-overflow-wrap':'anywhere',width:'data(width)',height:'data(height)','border-width':1.5,'border-color':'#a5b4fc' }},
         { selector: 'node[nodeType="scope_fact"]', style: { ...common, shape:'round-rectangle','background-color':'#eef2ff',label:'data(label)',color:'#3730a3','font-size':'11px','font-weight':'bold','text-wrap':'wrap','text-max-width':'132px','text-overflow-wrap':'anywhere',width:'data(width)',height:'data(height)','border-width':1.8,'border-color':'#818cf8' }},
         { selector: 'node[nodeType="coverage_fact"]', style: { ...common, shape:'round-rectangle','background-color':'#eff6ff',label:'data(label)',color:'#1d4ed8','font-size':'11px','font-weight':'bold','text-wrap':'wrap','text-max-width':'132px',width:'data(width)',height:'data(height)','border-width':1.5,'border-color':'#93c5fd' }},
-        { selector: 'node[nodeType="scan_fact"]', style: { ...common, shape:'round-rectangle','background-color':'#f0fdfa',label:'data(label)',color:'#0f766e','font-size':'11px','font-weight':'bold','text-wrap':'wrap','text-max-width':'132px',width:'data(width)',height:'data(height)','border-width':1.5,'border-color':'#5eead4' }},
-        { selector: 'node[nodeType="triage_fact"]', style: { ...common, shape:'diamond','background-color':'#fffbeb',label:'data(label)',color:'#92400e','font-size':'10px','font-weight':'bold','text-wrap':'wrap','text-max-width':'112px',width:'data(width)',height:'data(height)','border-width':1.5,'border-color':'#fcd34d' }},
         { selector: 'node[nodeType="disposition_fact"]', style: { ...common, shape:'round-rectangle','background-color':'#f8fafc',label:'data(label)',color:'#475569','font-size':'11px','font-weight':'bold','text-wrap':'wrap','text-max-width':'132px',width:'data(width)',height:'data(height)','border-width':1.5,'border-color':'#cbd5e1' }},
         { selector: 'node[nodeType="summary_fact"]', style: { ...common, shape:'hexagon','background-color':'#f5f3ff',label:'data(label)',color:'#6d28d9','font-size':'10px','font-weight':'bold','text-wrap':'wrap','text-max-width':'116px',width:'data(width)',height:'data(height)','border-width':1.5,'border-color':'#c4b5fd' }},
         { selector: 'node[nodeType="semantic_map_fact"]', style: { ...common, shape:'round-rectangle','background-color':'#fdf4ff',label:'data(label)',color:'#86198f','font-size':'10px','font-weight':'bold','text-wrap':'wrap','text-max-width':'122px',width:'data(width)',height:'data(height)','border-width':1.5,'border-color':'#e879f9' }},
@@ -5252,12 +5239,10 @@ function linenApp() {
         { selector: 'node[semanticType="reach"]', style: { 'background-color':'#e0e7ff',color:'#3730a3','border-color':'#6366f1' }},
         { selector: 'node[semanticType="characterize"]', style: { 'background-color':'#ffe4e6',color:'#9f1239','border-color':'#f43f5e' }},
         { selector: 'node[semanticType="review"]', style: { 'background-color':'#fef3c7',color:'#92400e','border-color':'#f59e0b' }},
-        { selector: 'node[semanticType="route_scan"]', style: { 'background-color':'#cffafe',color:'#155e75','border-color':'#06b6d4' }},
         { selector: 'node[semanticType="policy_evidence"]', style: { 'background-color':'#ecfeff',color:'#155e75','border-color':'#22d3ee' }},
         { selector: 'node[semanticType="scope_adjudication"]', style: { 'background-color':'#eef2ff',color:'#3730a3','border-color':'#6366f1' }},
         { selector: 'node[semanticType="coverage_plan"]', style: { 'background-color':'#dbeafe',color:'#1e40af','border-color':'#3b82f6' }},
         { selector: 'node[semanticType="coverage_result"]', style: { 'background-color':'#e0f2fe',color:'#075985','border-color':'#38bdf8' }},
-        { selector: 'node[semanticType="candidate_triage"]', style: { 'background-color':'#fef3c7',color:'#92400e','border-color':'#f59e0b' }},
         { selector: 'node[semanticType="candidate_disposition"]', style: { 'background-color':'#f8fafc',color:'#475569','border-color':'#94a3b8' }},
         { selector: 'node[semanticType="module_summary"]', style: { 'background-color':'#ede9fe',color:'#5b21b6','border-color':'#8b5cf6' }},
         { selector: 'node[semanticType="architecture_map"]', style: { 'background-color':'#fae8ff',color:'#86198f','border-color':'#d946ef' }},

@@ -11,10 +11,10 @@ not run Semgrep, SpotBugs/FindSecBugs, OSV-Scanner, Gitleaks, or Trivy, and it
 does not maintain a scanner registry or scanner receipts.
 
 Retained deterministic evidence paths are deliberately narrow: source
-snapshots and digests, coverage planning, bounded candidate triage, optional
-Spring route inventory, semantic recipes, review attestations, and proof gates.
-Workers inspect the frozen source and report through the normal Explore
-contract; candidate findings still require review and technical gates.
+snapshots and digests, coverage planning, optional semantic analysis methods,
+scope adjudication, review attestations, and proof gates. Workers inspect the
+frozen source and report through the normal Explore contract; candidate
+findings still require unified proof review and technical gates.
 
 Use `dispatch.vuln.example.yaml` for the current configuration. Existing
 databases may retain historical `skill_runs` schema from old migrations, but

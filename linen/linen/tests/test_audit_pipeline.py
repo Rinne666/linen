@@ -61,12 +61,15 @@ def test_candidate_disposition_is_project_observation_not_finding() -> None:
     assert fact_semantic_type("fact-1", "candidate_disposition", "triaged") == "observation"
 
 
-def add_fact(client, pid, *, parent="origin", fact_type="vulnerability"):
+def add_fact(client, pid, *, parent="origin", fact_type="vulnerability", status="draft"):
     description = f"verify {fact_type} from {parent}"
     response = client.create_intent(pid, [parent], description, "reasoner", intent_type="characterize")
     iid = response.data["id"]
     assert client.heartbeat(pid, iid, "tester").ok
-    response = client.conclude(pid, iid, "tester", "candidate", fact_type=fact_type, evidence="file: app.py:1")
+    response = client.conclude(
+        pid, iid, "tester", "candidate", fact_type=fact_type,
+        evidence="file: app.py:1", status=status,
+    )
     assert response.ok, response.text
     return response.data["fact"]["id"]
 
@@ -180,6 +183,26 @@ def test_server_allows_scope_summary_to_omit_ordinary_observation(api):
 
     assert gate.ready
     assert orphan not in next(check for check in gate.checks if check.id == "evidence_chain").evidence_ids
+
+
+def test_scope_completion_requires_coverage_result_review_but_not_summary_reviews(api):
+    _, client = api
+    pid = project(api, audit_mode="scope").project.id
+    plan = add_fact(client, pid, fact_type="coverage_plan", status="triaged")
+    result = add_fact(
+        client, pid, parent=plan, fact_type="coverage_result", status="triaged",
+    )
+    assert client.create_review(
+        pid, result, "VALID", "independently checked coverage completeness", confidence="firm",
+    ).ok
+    summary = add_fact(
+        client, pid, parent=result, fact_type="audit_summary", status="triaged",
+    )
+
+    gate = client.get_completion_gate(pid, [summary])
+
+    assert gate.ready
+    assert gate.blockers == []
 
 
 def test_scope_candidate_finding_still_blocks_without_decisive_disposition(api):

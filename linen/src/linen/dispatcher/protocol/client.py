@@ -200,40 +200,24 @@ class LinenClient:
     def plan_proof_gap(self, project_id: str, fact_id: str) -> ApiResult:
         return self._request_json("POST", f"/projects/{project_id}/facts/{fact_id}/proof-gaps/plan", json={})
 
-    def upsert_audit_stage(
+    def reconcile_audit_stages(
         self,
         project_id: str,
-        stage_id: str,
+        stages: list[dict[str, Any]],
         *,
-        label: str,
-        phase_order: int,
-        status: str,
-        required: bool = True,
-        capability: str | None = None,
-        detail: str | None = None,
-        source_generation: int | None = None,
-        plan_revision: int | None = None,
+        source_generation: int,
+        plan_revision: int,
         actor: str = "dispatcher",
     ) -> ApiResult:
-        body: dict[str, Any] = {
-            "label": label,
-            "phase_order": phase_order,
-            "required": required,
-            "status": status,
-            "actor": actor,
-        }
-        for key, value in {
-            "capability": capability,
-            "detail": detail,
-            "source_generation": source_generation,
-            "plan_revision": plan_revision,
-        }.items():
-            if value is not None:
-                body[key] = value
         return self._request_json(
             "PUT",
-            f"/projects/{project_id}/stages/{stage_id}",
-            json=body,
+            f"/projects/{project_id}/stages",
+            json={
+                "stages": stages,
+                "source_generation": source_generation,
+                "plan_revision": plan_revision,
+                "actor": actor,
+            },
         )
 
     def list_audit_stages(self, project_id: str) -> list[AuditStage]:

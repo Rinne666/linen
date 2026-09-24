@@ -19,6 +19,7 @@ from linen.server.models import (
     ProjectMeta,
     ProjectReason,
     Review,
+    REVIEWLESS_INTERMEDIATE_FACT_TYPES,
 )
 
 def utcnow() -> str:
@@ -466,7 +467,11 @@ def audit_completion_blockers_from_db(
                 technical_confirmation = json.loads(fact["proof"] or "{}").get("attributes", {}).get("gate_version") == "uvpg-proof-v1"
             except (TypeError, ValueError):
                 technical_confirmation = False
-        if not technical_confirmation and (
+        deterministic_intermediate = (
+            fact["status"] == "triaged"
+            and fact["type"] in REVIEWLESS_INTERMEDIATE_FACT_TYPES
+        )
+        if not technical_confirmation and not deterministic_intermediate and (
             latest_review is None
             or latest_review["verdict"] != "VALID"
             or latest_review["confidence"] not in {"firm", "certain"}
@@ -488,7 +493,7 @@ def audit_completion_blockers_from_db(
             }:
                 continue
             if not (
-                fact["type"] in {"vulnerability", "candidate_triage", "candidate_disposition"}
+                fact["type"] in {"vulnerability", "candidate_disposition"}
                 or fact["semantic_type"] in {
                     "candidate_finding", "confirmed_finding", "rejected_finding",
                 }

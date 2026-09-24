@@ -86,14 +86,6 @@ audit:
     image: "linen-worker-poc:latest"
     network: none
     env_allowlist: []
-  spring:
-    enabled: true
-  triage:
-    enabled: true
-    candidates_per_batch: 20
-    max_batches: 500
-    max_verify_attempts: 3
-
 runtime:
   worker_healthcheck: disabled
   max_workers: 3

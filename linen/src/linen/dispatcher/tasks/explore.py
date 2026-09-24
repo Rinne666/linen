@@ -5,11 +5,10 @@ import logging
 import time
 from pathlib import Path
 from typing import Any
-from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, scope_gate, triage
+from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, scope_gate
 from linen.dispatcher.analysis.artifacts import review_inputs, select_snapshot
 
 from linen.dispatcher.analysis.policy import SOURCE_DATA_BOUNDARY
-from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT, run_spring_scan
 
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.contracts.common import canonical_digest
@@ -242,27 +241,7 @@ def run_explore_task(
                 client, project.project.id, intent.id, worker.name, fact["description"],
                 source="coverage_plan", phase_ms=int((time.perf_counter() - task_started) * 1000),
                 fact_type=fact["type"], evidence=fact["evidence"],
-            )
-
-        if (scope_audit and config.audit.spring.enabled and intent.type == "search"
-                and intent.description.strip() == SPRING_SCAN_INTENT):
-            _, plan_path, plan = coverage.get_plan(
-                client.get_project(project.project.id), Path(container_name),
-            )
-            fact = run_spring_scan(
-                plan_path.parent / "source",
-                Path(container_name) / ".linen-analysis",
-                config.audit.spring,
-                canonical_snapshot=plan["snapshot"],
-            )
-            if cancellation.is_cancelled or lease.failure is not None:
-                best_effort_release(client, project.project.id, intent.id, worker.name)
-                return "cancelled" if cancellation.is_cancelled else "failed"
-            return write_conclude_result(
-                client, project.project.id, intent.id, worker.name,
-                fact["description"], source="spring_route_scan",
-                phase_ms=int((time.perf_counter() - task_started) * 1000),
-                fact_type=fact["type"], evidence=fact["evidence"],
+                fact_status="triaged",
             )
 
         if scope_audit:
@@ -276,6 +255,7 @@ def run_explore_task(
                     mechanical["description"], source="audit_graph_synthesis",
                     phase_ms=int((time.perf_counter() - task_started) * 1000),
                     fact_type=mechanical["type"], evidence=mechanical["evidence"],
+                    fact_status="triaged",
                 )
 
         if task_healthcheck_enabled(config):
@@ -408,10 +388,6 @@ def run_explore_task(
                     "intent_description": intent.description,
                 },
             )
-        if scope_audit and intent.description.startswith(triage.TRIAGE_PREFIX):
-            prompt += triage.triage_context_prompt(project, intent, Path(container_name), config.audit.triage)
-        if scope_audit and intent.description.startswith(triage.VERIFY_PREFIX):
-            prompt += triage.verification_context_prompt(project, intent, Path(container_name))
         if config.audit.enabled and project.project.audit_mode != "none":
             prompt += "\n" + SOURCE_DATA_BOUNDARY
         prompt += _proof_obligation_contract(intent)
@@ -606,6 +582,10 @@ def run_explore_task(
                 total_ms=int((time.perf_counter() - task_started) * 1000),
                 fact_type=fact["type"],
                 evidence=fact["evidence"],
+                fact_status=(
+                    "triaged" if fact["type"] in audit_graph.REVIEWLESS_INTERMEDIATE_FACT_TYPES
+                    else "draft"
+                ),
                 proof=fact.get("proof"),
             )
         if did_timeout(first):
@@ -785,6 +765,10 @@ def _run_context_continuation(
             total_ms=int((time.perf_counter() - continuation_started) * 1000),
             fact_type=fact["type"],
             evidence=fact["evidence"],
+            fact_status=(
+                "triaged" if fact["type"] in audit_graph.REVIEWLESS_INTERMEDIATE_FACT_TYPES
+                else "draft"
+            ),
             proof=fact.get("proof"),
         )
     except ProofContractError as exc:
@@ -944,14 +928,6 @@ def _try_conclude_fallback(
                 "intent_description": intent.description,
             },
         )
-    if scope_audit and intent.description.startswith(triage.TRIAGE_PREFIX):
-        prompt += triage.triage_context_prompt(
-            fresh_project, intent, Path(container_name), config.audit.triage,
-        )
-    if scope_audit and intent.description.startswith(triage.VERIFY_PREFIX):
-        prompt += triage.verification_context_prompt(
-            fresh_project, intent, Path(container_name),
-        )
     if config.audit.enabled and fresh_project.project.audit_mode != "none":
         prompt += "\n" + SOURCE_DATA_BOUNDARY
     prompt += _proof_obligation_contract(intent)
@@ -1100,6 +1076,10 @@ def _try_conclude_fallback(
         phase_ms=conclude_ms,
         fact_type=fact["type"],
         evidence=fact["evidence"],
+        fact_status=(
+            "triaged" if fact["type"] in audit_graph.REVIEWLESS_INTERMEDIATE_FACT_TYPES
+            else "draft"
+        ),
         proof=fact.get("proof"),
     )
 
@@ -1129,14 +1109,8 @@ def _managed_result(config, project, intent, container_name, payload, fact):
             )
         if intent.description.startswith(coverage.CELL_PREFIX):
             return coverage.outcome_fact(payload, project, intent, Path(container_name))
-        if intent.description.startswith(triage.TRIAGE_PREFIX):
-            return triage.triage_outcome_fact(
-                payload, project, intent, Path(container_name), config.audit.triage,
-            )
-        if intent.description.startswith(triage.VERIFY_PREFIX):
-            return triage.verification_outcome_fact(payload, project, intent, Path(container_name))
         if fact["type"] in {
-            "coverage_plan", "coverage_result", "route_scan", "candidate_triage",
+            "coverage_plan", "coverage_result",
             "module_summary", "audit_summary", *audit_recipes.SEMANTIC_ARTIFACT_FACT_TYPES,
             "policy_evidence", "scope_adjudication",
         }:
@@ -1148,14 +1122,6 @@ def _managed_summary_fact(config, project, intent, workdir):
     description = intent.description.strip()
     if description.startswith(coverage.MODULE_SUMMARY_PREFIX):
         return coverage.module_summary_fact(project, intent, workdir, config.audit.coverage)
-    if description == audit_recipes.SUMMARY_INTENT:
-        return audit_recipes.summary_fact(
-            project,
-            intent,
-            workdir,
-            config.audit.semantic,
-            prompt_group=config.runtime.prompt_group,
-        )
     if description == audit_graph.AUDIT_SUMMARY_INTENT:
         return audit_graph.audit_summary_fact(project, intent, workdir, config.audit)
     return None

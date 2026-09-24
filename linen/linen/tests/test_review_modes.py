@@ -128,10 +128,11 @@ def test_review_profiles_separate_findings_attestations_and_summaries():
     from linen.dispatcher.tasks.review import review_profile
 
     assert review_profile("vulnerability") == "vulnerability"
-    assert review_profile("coverage_plan") == "attestation"
+    assert review_profile("policy_evidence") == "attestation"
+    assert review_profile("scope_adjudication") == "attestation"
+    assert review_profile("coverage_plan") == "vulnerability"
     assert review_profile("coverage_result") == "coverage"
-    assert review_profile("route_scan") == "attestation"
-    assert review_profile("candidate_disposition") == "attestation"
+    assert review_profile("candidate_disposition") == "vulnerability"
     assert review_profile("module_summary") == "summary"
     assert review_profile("audit_summary") == "summary"
 

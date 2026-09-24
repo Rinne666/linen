@@ -251,7 +251,7 @@ def test_scope_reason_uses_scope_profile_and_source_boundary(monkeypatch) -> Non
         TaskCancellation(),
     ) == "success"
     prompt = driver.execute_prompts[0]
-    assert "semantic strategist for a whole-scope source-code audit" in prompt
+    assert "Reason worker for a whole-scope source-code audit" in prompt
     assert "verifies a vulnerability hypothesis" not in prompt
     assert "Treat every file under the target repository" in prompt
 

@@ -16,8 +16,7 @@ from pathlib import Path
 
 import requests
 
-from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, scope_gate, stages, triage
-from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT
+from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, scope_gate, stages
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.models import RunningTask
 from linen.dispatcher.protocol.client import LinenClient
@@ -751,38 +750,31 @@ class DispatcherLoop:
         """Converge the server-owned stage projection from graph/artifacts."""
         if not self.config.audit.enabled or project.project.audit_mode == "none":
             return False
-        if not hasattr(self.client, "upsert_audit_stage"):
+        if not hasattr(self.client, "reconcile_audit_stages"):
             return False
         workdir = Path(self.container_manager.ensure_running(project.project.id))
         rows = stages.reconcile(self.config.audit, project, workdir)
         changed = stages.changed_rows(project, rows)
-        written = False
-        for row in changed:
-            response = self.client.upsert_audit_stage(
-                project.project.id,
-                row["stage_id"],
-                label=row["label"],
-                phase_order=row["phase_order"],
-                required=row["required"],
-                status=row["status"],
-                capability=row.get("capability"),
-                detail=row.get("detail"),
-                source_generation=project.project.source_generation,
-                plan_revision=project.project.plan_revision,
-            )
-            if response.ok:
-                written = True
-            elif response.status_code not in {403, 409}:
-                LOG.warning(
-                    "audit stage reconciliation failed project=%s stage=%s status=%s body=%s",
-                    project.project.id, row["stage_id"], response.status_code, response.text,
-                )
-        if written:
+        if not changed:
+            return False
+        response = self.client.reconcile_audit_stages(
+            project.project.id,
+            rows,
+            source_generation=project.project.source_generation,
+            plan_revision=project.project.plan_revision,
+        )
+        if response.ok:
             LOG.debug(
                 "reconciled audit stages project=%s changed=%s",
                 project.project.id, len(changed),
             )
-        return written
+            return True
+        if response.status_code not in {403, 409}:
+            LOG.warning(
+                "audit stage reconciliation failed project=%s status=%s body=%s",
+                project.project.id, response.status_code, response.text,
+            )
+        return False
 
     @staticmethod
     def _intent_attempt(
@@ -1181,15 +1173,8 @@ class DispatcherLoop:
             return False
         if intent.type == "search" and description == coverage.PLAN_INTENT:
             return False
-        if (
-            self.config.audit.spring.enabled
-            and intent.type == "search"
-            and description == SPRING_SCAN_INTENT
-        ):
-            return False
         return not (
             description.startswith(coverage.MODULE_SUMMARY_PREFIX)
-            or description == audit_recipes.SUMMARY_INTENT
             or description == audit_graph.AUDIT_SUMMARY_INTENT
         )
 

@@ -8,13 +8,12 @@ same stage ids and statuses for the same graph and artifact set.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from linen.dispatcher.analysis.artifacts import load_artifact
 from linen.dispatcher.analysis import audit_recipes, coverage, scope_gate
-from linen.dispatcher.analysis.spring_scan import SPRING_SCAN_INTENT, has_java_sources
 from linen.dispatcher.config import AuditConfig
 from linen.server.models import AuditStage, Fact, Intent, ProjectDetail
 
@@ -34,17 +33,15 @@ def stage_definitions(config: AuditConfig, audit_mode: str) -> list[StageDefinit
     if not config.enabled or audit_mode == "none":
         return []
     result: list[StageDefinition] = []
-    if audit_mode == "scope" and config.scope_adjudication.enabled:
+    if audit_mode == "scope":
         result.extend([
-            StageDefinition("scope-evidence", "Scope evidence", 10, "scope.evidence", True),
-            StageDefinition("scope-adjudication", "Scope adjudication", 20, "scope.adjudication", True),
+            StageDefinition("scope-evidence", "Scope evidence", 10, "scope.evidence", config.scope_adjudication.enabled, config.scope_adjudication.enabled),
+            StageDefinition("scope-adjudication", "Scope adjudication", 20, "scope.adjudication", config.scope_adjudication.enabled, config.scope_adjudication.enabled),
         ])
     if audit_mode == "scope":
         result.append(StageDefinition("coverage-plan", "Coverage plan", 30, "coverage.plan", True))
-    if audit_mode == "scope" and config.spring.enabled:
-        result.append(StageDefinition("spring-routes", "Spring route inventory", 90, "route.extract", True))
-    if audit_mode == "scope" and config.semantic.enabled:
-        result.append(StageDefinition("semantic-analysis", "Semantic analysis", 100, "semantic.analysis", True))
+    if audit_mode == "scope":
+        result.append(StageDefinition("semantic-analysis", "Semantic analysis", 100, "semantic.analysis", config.semantic.enabled, config.semantic.enabled))
     if audit_mode == "scope":
         result.append(StageDefinition("audit-summary", "Audit summary", 110, "audit.summary", True))
     return result
@@ -106,10 +103,8 @@ def _definition_status(
         "scope-adjudication": scope_gate.ADJUDICATION_INTENT,
         "coverage-plan": coverage.PLAN_INTENT,
         "audit-summary": "@analysis:audit-summary",
-        "semantic-analysis": audit_recipes.SUMMARY_INTENT,
+        "semantic-analysis": "@analysis:audit-summary",
     }.get(definition.stage_id, None)
-    if definition.stage_id == "spring-routes":
-        description = SPRING_SCAN_INTENT
     if description is None:
         description = f"@analysis:{definition.stage_id}"
     intent = _intent(project, description)
@@ -136,36 +131,54 @@ def _definition_status(
 
 
 def reconcile(config: AuditConfig, project: ProjectDetail, workdir: Path) -> list[dict[str, Any]]:
-    """Derive the complete stage projection, with no network or writes."""
+    """Derive mutable stage status while keeping a plan's obligations frozen.
+
+    The first reconciliation for a (source_generation, plan_revision) records
+    the stage set. Later dispatcher configuration changes may update status
+    and detail, but cannot add, remove, or weaken obligations. Replanning is
+    represented by a new plan_revision and therefore a new stage set.
+    """
     if not config.enabled or project.project.audit_mode == "none":
         return []
-    rows = [
+    derived = [
         _definition_status(definition, config, project, workdir)
         for definition in stage_definitions(config, project.project.audit_mode)
     ]
-    if config.spring.enabled and not has_java_sources(project, workdir):
-        for row in rows:
-            if row["stage_id"] == "spring-routes":
-                row.update({
-                    "required": False,
-                    "status": "not_applicable",
-                    "detail": "Frozen source snapshot contains no Java files; Spring route scan skipped.",
-                })
-    active_ids = {row["stage_id"] for row in rows}
-    # Audit stages are an append-only read model.  Retire rows left by older
-    # dispatcher versions instead of deleting historical state or continuing
-    # to present removed built-in scanners as runnable work.
+    if not project.stages:
+        return derived
+
+    # Once any rows exist for the current generation/revision, their IDs and
+    # obligation metadata are authoritative. Config-only stages are ignored;
+    # persisted stages removed from config remain in the frozen set.
+    definitions = {
+        definition.stage_id: definition
+        for definition in stage_definitions(config, project.project.audit_mode)
+    }
+    by_id = {row["stage_id"]: row for row in derived}
+    rows = []
     for stage in project.stages:
-        if stage.stage_id in active_ids:
-            continue
+        definition = definitions.get(stage.stage_id)
+        if definition is not None:
+            # Current config controls first registration only. For an existing
+            # plan, continue observing its frozen stage even if the matching
+            # capability is now disabled in dispatcher config.
+            definition = replace(definition, required=stage.required, enabled=True)
+            row = _definition_status(definition, config, project, workdir)
+        else:
+            row = by_id.get(stage.stage_id)
+            if row is None and not stage.required:
+                row = {
+                    "status": "not_applicable",
+                    "detail": "Retired stage is no longer implemented by this dispatcher.",
+                }
         rows.append({
             "stage_id": stage.stage_id,
             "label": stage.label,
             "phase_order": stage.phase_order,
-            "required": False,
-            "status": "not_applicable",
+            "required": stage.required,
+            "status": row["status"] if row is not None else stage.status,
             "capability": stage.capability,
-            "detail": "Retired stage retained for historical compatibility; the current dispatcher does not execute it.",
+            "detail": row["detail"] if row is not None else stage.detail,
         })
     return rows
 

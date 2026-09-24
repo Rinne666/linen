@@ -274,17 +274,60 @@ def test_gate_identifies_reviewed_candidates_waiting_for_technical_confirmation(
     assert "Technical Confirmation" not in " ".join(gate["blockers"])
 
 
-def test_stage_put_is_idempotent_and_decision_targets_are_validated(client: TestClient) -> None:
+def test_stage_set_registration_is_atomic_idempotent_and_decision_targets_are_validated(client: TestClient) -> None:
     project_id = _create_project(client)
-    body = {"label": "coverage", "phase_order": 1, "status": "pending"}
-    first = client.put(f"/projects/{project_id}/stages/coverage", json=body)
+    project = client.get(f"/projects/{project_id}").json()["project"]
+    body = {
+        "source_generation": project["source_generation"],
+        "plan_revision": project["plan_revision"],
+        "stages": [{
+            "stage_id": "coverage", "label": "coverage", "phase_order": 1,
+            "status": "pending",
+        }],
+    }
+    first = client.put(f"/projects/{project_id}/stages", json=body)
     assert first.status_code == 200
     revision = client.get("/projects").json()[0]["graph_revision"]
     events = len(client.get(f"/projects/{project_id}/events").json())
-    second = client.put(f"/projects/{project_id}/stages/coverage", json=body)
+    second = client.put(f"/projects/{project_id}/stages", json=body)
     assert second.status_code == 200
     assert client.get("/projects").json()[0]["graph_revision"] == revision
     assert len(client.get(f"/projects/{project_id}/events").json()) == events
+    drifted = {
+        **body,
+        "stages": [{
+            **body["stages"][0], "label": "rewritten", "phase_order": 99,
+            "required": False, "capability": "changed", "status": "running",
+            "detail": "status may move while obligations stay frozen",
+        }],
+    }
+    reconciled = client.put(f"/projects/{project_id}/stages", json=drifted)
+    assert reconciled.status_code == 200
+    frozen_stage = reconciled.json()[0]
+    assert (frozen_stage["label"], frozen_stage["phase_order"]) == ("coverage", 1)
+    assert frozen_stage["required"] is True
+    assert frozen_stage["capability"] is None
+    assert frozen_stage["status"] == "running"
+    changed_set = {**body, "stages": [*body["stages"], {
+        "stage_id": "extra", "label": "extra", "phase_order": 2,
+    }]}
+    assert client.put(f"/projects/{project_id}/stages", json=changed_set).status_code == 409
+    replan = client.post(
+        f"/projects/{project_id}/replan",
+        json={
+            "source_generation": project["source_generation"],
+            "plan_revision": project["plan_revision"],
+            "rationale": "Update the audit obligations after reviewing the plan.",
+            "actor": "human",
+        },
+    )
+    assert replan.status_code == 200, replan.text
+    assert replan.json()["plan_revision"] == project["plan_revision"] + 1
+    revised = {
+        **changed_set,
+        "plan_revision": project["plan_revision"] + 1,
+    }
+    assert client.put(f"/projects/{project_id}/stages", json=revised).status_code == 200
     assert client.post(
         f"/projects/{project_id}/decisions",
         json={"target_kind": "fact", "target_id": "missing", "decision": "exclude", "rationale": "typo", "actor": "human"},
@@ -642,6 +685,7 @@ def test_intent_error_blocks_dispatch_is_visible_and_can_be_retried(client: Test
     assert detail["errors"][0]["resolved_at"] is None
     summary = next(p for p in client.get("/projects").json() if p["id"] == project_id)
     assert summary["activity_status"] == "blocked"
+    assert summary["execution_status"] != "blocked"
     assert summary["blocked_intent_count"] == 1
     assert client.post(
         f"/projects/{project_id}/intents/i001/heartbeat",

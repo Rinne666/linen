@@ -1,8 +1,8 @@
 # Role
 
-You independently verify one audit-process attestation. The target Fact is an
-execution, classification, semantic map, or hypothesis-batch record—not a
-confirmed vulnerability claim.
+You independently verify one policy-evidence or scope-adjudication Fact. It is
+an attestation about source collection or scope decisions, not a confirmed
+vulnerability claim.
 
 # Task
 
@@ -17,9 +17,9 @@ Check all of the following:
 1. The evidence artifact exists and its declared digest matches.
 2. Producer identity, snapshot, status, exclusions, errors, and applicability
    agree with the artifact.
-3. Candidate/triage fingerprints are complete, unique, and tied to the stated
-   source batch.
-4. Every drop, duplicate, confirmation, or refutation is supported by the
+3. Artifact fingerprints and cited records are complete, unique, and tied to
+   the stated frozen source.
+4. Every exclusion, duplicate, confirmation, or refutation is supported by the
    frozen source rather than by tool confidence or analogy.
 5. Partial, failed, blocked, and unexplained skipped work is not represented as
    completed coverage.

@@ -32,10 +32,8 @@ FACT_TYPE_VALIDATION = "validation"
 FACT_TYPE_REACHABILITY = "reachability"
 FACT_TYPE_VULNERABILITY = "vulnerability"
 FACT_TYPE_RECON = "recon"
-FACT_TYPE_ROUTE_SCAN = "route_scan"
 FACT_TYPE_COVERAGE_PLAN = "coverage_plan"
 FACT_TYPE_COVERAGE_RESULT = "coverage_result"
-FACT_TYPE_CANDIDATE_TRIAGE = "candidate_triage"
 FACT_TYPE_CANDIDATE_DISPOSITION = "candidate_disposition"
 FACT_TYPE_MODULE_SUMMARY = "module_summary"
 FACT_TYPE_ARCHITECTURE_MAP = "architecture_map"
@@ -55,6 +53,14 @@ FACT_TYPE_ATTACKER_CONTROL = "attacker_control"
 FACT_TYPE_PRECONDITION = "precondition"
 FACT_TYPE_SECURITY_INVARIANT = "security_invariant"
 FACT_TYPE_SECURITY_BOUNDARY = "security_boundary"
+
+REVIEWLESS_INTERMEDIATE_FACT_TYPES = frozenset({
+    FACT_TYPE_COVERAGE_PLAN, FACT_TYPE_ARCHITECTURE_MAP,
+    FACT_TYPE_AUTHZ_MATRIX, FACT_TYPE_STATE_MODEL, FACT_TYPE_CROSS_SERVICE_MAP,
+    FACT_TYPE_CONTRACT_MAP, FACT_TYPE_HYPOTHESIS_BATCH, FACT_TYPE_VARIANT_BATCH,
+    FACT_TYPE_MODULE_SUMMARY, FACT_TYPE_SEMANTIC_SUMMARY, FACT_TYPE_AUDIT_SUMMARY,
+    FACT_TYPE_CANDIDATE_DISPOSITION,
+})
 FACT_TYPE_SECURITY_CONTROL_ASSESSMENT = "security_control_assessment"
 FACT_TYPE_CAPABILITY_BEFORE = "capability_before"
 FACT_TYPE_CAPABILITY_AFTER = "capability_after"
@@ -102,41 +108,12 @@ GRAPH_RELATION_TYPES: frozenset[str] = frozenset(
     }
 )
 
-# Audit-process records are reviewed as attestations: reviewers verify artifact
-# integrity, snapshot consistency, and declared scope rather than looking for an
-# attacker-to-sink path.  Keep this vocabulary in the shared protocol model so
-# the server and dispatcher cannot silently disagree about review semantics.
+# Scope-gate attestations establish the audit's policy boundary. Intermediate
+# artifacts use deterministic validation and are not sent through generic Review.
 AUDIT_ATTESTATION_FACT_TYPES: frozenset[str] = frozenset(
     {
-        FACT_TYPE_COVERAGE_PLAN,
-        FACT_TYPE_ROUTE_SCAN,
-        FACT_TYPE_CANDIDATE_TRIAGE,
-        FACT_TYPE_CANDIDATE_DISPOSITION,
-        FACT_TYPE_ARCHITECTURE_MAP,
-        FACT_TYPE_AUTHZ_MATRIX,
-        FACT_TYPE_STATE_MODEL,
-        FACT_TYPE_CROSS_SERVICE_MAP,
-        FACT_TYPE_CONTRACT_MAP,
-        FACT_TYPE_HYPOTHESIS_BATCH,
-        FACT_TYPE_VARIANT_BATCH,
         FACT_TYPE_POLICY_EVIDENCE,
         FACT_TYPE_SCOPE_ADJUDICATION,
-        FACT_TYPE_NEGATIVE_ASSURANCE,
-        FACT_TYPE_PRINCIPAL,
-        FACT_TYPE_ATTACKER_CONTROL,
-        FACT_TYPE_PRECONDITION,
-        FACT_TYPE_SECURITY_INVARIANT,
-        FACT_TYPE_SECURITY_BOUNDARY,
-        FACT_TYPE_SECURITY_CONTROL_ASSESSMENT,
-        FACT_TYPE_CAPABILITY_BEFORE,
-        FACT_TYPE_CAPABILITY_AFTER,
-        FACT_TYPE_CAPABILITY_DELTA,
-        FACT_TYPE_IMPACT_OBSERVATION,
-        FACT_TYPE_NEGATIVE_CONTROL,
-        FACT_TYPE_CONFIG_SOURCE,
-        FACT_TYPE_CONFIG_RESOLUTION,
-        FACT_TYPE_EFFECTIVE_CONFIG,
-        FACT_TYPE_REPRODUCTION,
     }
 )
 
@@ -150,10 +127,8 @@ ALL_FACT_TYPES: frozenset[str] = frozenset(
         FACT_TYPE_REACHABILITY,
         FACT_TYPE_VULNERABILITY,
         FACT_TYPE_RECON,
-        FACT_TYPE_ROUTE_SCAN,
         FACT_TYPE_COVERAGE_PLAN,
         FACT_TYPE_COVERAGE_RESULT,
-        FACT_TYPE_CANDIDATE_TRIAGE,
         FACT_TYPE_CANDIDATE_DISPOSITION,
         FACT_TYPE_MODULE_SUMMARY,
         FACT_TYPE_ARCHITECTURE_MAP,
@@ -193,7 +168,6 @@ INTENT_TYPE_SEARCH = "search"          # find candidates (sinks, sources, saniti
 INTENT_TYPE_VALIDATE = "validate"      # validate a sanitizer / guard
 INTENT_TYPE_REACH = "reach"            # determine if a call site is reachable
 INTENT_TYPE_CHARACTERIZE = "characterize"  # fully characterize a confirmed vuln
-INTENT_TYPE_TRIAGE = "triage"          # classify a bounded candidate batch
 INTENT_TYPE_SYNTHESIZE = "synthesize"  # fan-in reviewed graph branches
 
 ALL_INTENT_TYPES: frozenset[str] = frozenset(
@@ -204,7 +178,6 @@ ALL_INTENT_TYPES: frozenset[str] = frozenset(
         INTENT_TYPE_VALIDATE,
         INTENT_TYPE_REACH,
         INTENT_TYPE_CHARACTERIZE,
-        INTENT_TYPE_TRIAGE,
         INTENT_TYPE_SYNTHESIZE,
     }
 )
@@ -542,7 +515,8 @@ class AuditStage(BaseModel):
     updated_at: str
 
 
-class UpsertAuditStageRequest(BaseModel):
+class AuditStageRegistration(BaseModel):
+    stage_id: str = Field(min_length=1, max_length=120)
     label: str
     phase_order: int = Field(ge=0)
     required: bool = True
@@ -551,9 +525,35 @@ class UpsertAuditStageRequest(BaseModel):
     ] = "pending"
     capability: str | None = None
     detail: str | None = None
-    source_generation: int | None = Field(default=None, ge=1)
-    plan_revision: int | None = Field(default=None, ge=1)
+
+
+class ReconcileAuditStagesRequest(BaseModel):
+    stages: list[AuditStageRegistration] = Field(min_length=1)
+    source_generation: int = Field(ge=1)
+    plan_revision: int = Field(ge=1)
     actor: str = "dispatcher"
+
+    @model_validator(mode="after")
+    def unique_stage_ids(self) -> "ReconcileAuditStagesRequest":
+        ids = [stage.stage_id for stage in self.stages]
+        if len(ids) != len(set(ids)):
+            raise ValueError("stage IDs must be unique within a plan")
+        return self
+
+
+class ReplanAuditRequest(BaseModel):
+    source_generation: int = Field(ge=1)
+    plan_revision: int = Field(ge=1)
+    rationale: str = Field(min_length=1, max_length=2000)
+    actor: str = Field(default="human", min_length=1, max_length=120)
+
+    @field_validator("rationale", "actor")
+    @classmethod
+    def strip_replan_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
 
 
 class HumanDecision(BaseModel):
