@@ -158,7 +158,9 @@ class WorkerConfig(BaseModel):
     type: WorkerType
     task_types: list[TaskType]
     max_running: int = Field(gt=0)
-    priority: int = Field(ge=0)
+    # Accepted for compatibility with older dispatch.yaml files. Scheduling
+    # no longer uses priority; project preferences and live load decide.
+    priority: int | None = Field(default=None, ge=0)
     env: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("task_types")

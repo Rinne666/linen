@@ -448,6 +448,7 @@ class ProjectMeta(BaseModel):
     # client cannot bypass completion evidence checks merely by using a
     # different dispatcher configuration later.
     audit_mode: Literal["none", "hypothesis", "scope"] = "none"
+    worker_preference: Literal["auto", "pi", "codex", "claudecode"] = "auto"
     created_at: str
     reason: ProjectReason | None = None
     # Resolved source-tree path for the project. Set when the project is
@@ -688,6 +689,7 @@ class CreateProjectRequest(BaseModel):
     goal: str | None = None
     completion_policy: Literal["goal_based", "exhaustive"] = "goal_based"
     audit_mode: Literal["none", "hypothesis", "scope"] = "none"
+    worker_preference: Literal["auto", "pi", "codex", "claudecode"] = "auto"
     hints: list[CreateHintInline] | None = None
     # Mutually exclusive. `clone_url` triggers a synchronous `git clone` on
     # the server into a clones_root (default `~/.local/share/linen/clones/`),
@@ -1007,6 +1009,10 @@ class ConcludeResponse(BaseModel):
 
 class UpdateProjectStatusRequest(BaseModel):
     status: Literal["active", "stopped"]
+
+
+class UpdateProjectWorkerPreferenceRequest(BaseModel):
+    worker_preference: Literal["auto", "pi", "codex", "claudecode"]
 
 
 class UpdateProjectTitleRequest(BaseModel):

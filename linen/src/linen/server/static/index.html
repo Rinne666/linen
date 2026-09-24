@@ -1268,8 +1268,8 @@
                 class="flex w-full items-center justify-between gap-3 px-4 py-3 text-left hover:bg-slate-50"
                 :aria-expanded="technicalStatusOpen">
                 <div>
-                  <h3 class="text-xs font-bold uppercase tracking-wider text-slate-500">Execution details</h3>
-                  <p class="mt-1 text-[11px] text-slate-400">Reasoning engine, lock, audit mode and graph revision</p>
+                  <h3 class="text-xs font-bold uppercase tracking-wider text-slate-500">Execution &amp; CLI</h3>
+                  <p class="mt-1 text-[11px] text-slate-400">Choose a CLI or inspect the current reasoning engine</p>
                 </div>
                 <svg class="h-4 w-4 shrink-0 text-slate-400 transition-transform" :class="{ 'rotate-180': technicalStatusOpen }" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
               </button>
@@ -1279,6 +1279,18 @@
                 <dt class="text-slate-400">Mode</dt><dd class="text-right text-slate-600" x-text="auditModeLabel(project.project.audit_mode)"></dd>
                 <dt class="text-slate-400">Graph</dt><dd class="font-mono text-right text-slate-600" x-text="`r${project.project.graph_revision}`"></dd>
               </dl>
+              <div x-show="technicalStatusOpen" class="border-t border-slate-100 px-4 py-3">
+                <label class="flex flex-wrap items-center justify-between gap-3 text-[11px]">
+                  <span class="font-medium text-slate-600">CLI for this project</span>
+                  <select :value="project.project.worker_preference || 'auto'" @change="setWorkerPreference($event.target.value, $event.target)" :disabled="workerPreferenceSaving" class="min-w-40 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] text-slate-700 focus:border-brand-400 focus:outline-none focus:ring-2 focus:ring-brand-100 disabled:cursor-wait disabled:opacity-60">
+                    <option value="auto">Automatic · balance load</option>
+                    <option value="pi">Pi</option>
+                    <option value="codex">Codex CLI</option>
+                    <option value="claudecode">Claude Code</option>
+                  </select>
+                </label>
+                <p class="mt-2 text-[10px] leading-4 text-slate-400">Changes apply to tasks that have not started. Manual selection does not fall back to another CLI.</p>
+              </div>
             </section>
 
             <button type="button" @click="openCompleteProject()"
@@ -1950,6 +1962,17 @@
         </template>
       </div>
 
+      <label class="block space-y-2 text-sm font-medium text-slate-700">
+        <span>CLI worker</span>
+        <select x-model="newProject.worker_preference" class="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm focus:border-brand-400 focus:outline-none focus:ring-2 focus:ring-brand-100">
+          <option value="auto">Automatic · balance available CLIs</option>
+          <option value="pi">Pi</option>
+          <option value="codex">Codex CLI</option>
+          <option value="claudecode">Claude Code</option>
+        </select>
+        <span class="block text-[11px] font-normal leading-5 text-slate-500">Manual choice applies to new tasks. The selected CLI must be enabled for each task type in the dispatcher.</span>
+      </label>
+
       <template x-if="newProject.audit_mode !== 'none'">
         <section class="rounded-xl border border-brand-100 bg-brand-50/50 px-3.5 py-3" aria-label="Security Audit Charter">
           <div class="flex items-center justify-between gap-3">
@@ -2353,7 +2376,8 @@ function linenApp() {
     showDeleteModal: false,
 
     newProjectAdvancedOpen: false,
-    newProject: { title: '', origin: '', goal: '', audit_mode: 'scope', completion_policy: 'goal_based', source_mode: 'git', source_browse_name: '' },
+    newProject: { title: '', origin: '', goal: '', audit_mode: 'scope', completion_policy: 'goal_based', worker_preference: 'auto', source_mode: 'git', source_browse_name: '' },
+    workerPreferenceSaving: false,
     isCreatingProject: false,
     intentForm: { description: '' },
     concludeForm: { description: '', intentId: '' },
@@ -4516,6 +4540,38 @@ function linenApp() {
       if (reload) await this.loadProjects();
       if (toast) this.showToast(['stopped', 'paused'].includes(status) ? 'Project paused' : 'Project resumed');
       return updated;
+    },
+
+    async setWorkerPreference(workerPreference, control = null) {
+      if (!this.selectedProjectId || !this.project || this.workerPreferenceSaving) return;
+      if (!['auto', 'pi', 'codex', 'claudecode'].includes(workerPreference)) return;
+      const projectId = this.selectedProjectId;
+      const previousPreference = this.project.project.worker_preference || 'auto';
+      this.workerPreferenceSaving = true;
+      this.project.project.worker_preference = workerPreference;
+      try {
+        const updated = await this.api('PUT', `/projects/${projectId}/worker-preference`, {
+          worker_preference: workerPreference,
+        });
+        if (this.selectedProjectId === projectId && this.project) {
+          this.project.project.worker_preference = updated.worker_preference;
+        }
+        const summary = this.projects.find(item => item.id === projectId);
+        if (summary) summary.worker_preference = updated.worker_preference;
+        this.showToast(workerPreference === 'auto' ? 'CLI selection set to automatic' : `CLI selection set to ${this.cliLabel(workerPreference)}`);
+      } catch (e) {
+        if (this.selectedProjectId === projectId && this.project) {
+          this.project.project.worker_preference = previousPreference;
+        }
+        if (control) control.value = previousPreference;
+        this.showToast(e.message || 'Could not save CLI selection', 'error');
+      } finally {
+        this.workerPreferenceSaving = false;
+      }
+    },
+
+    cliLabel(workerPreference) {
+      return ({ pi: 'Pi', codex: 'Codex CLI', claudecode: 'Claude Code' })[workerPreference] || 'Automatic';
     },
 
     async stopAllActiveProjects() {
@@ -6827,6 +6883,7 @@ function linenApp() {
         goal: '',
         audit_mode: 'scope',
         completion_policy: 'goal_based',
+        worker_preference: 'auto',
         source_mode: 'git',
         source_browse_name: '',
       };
@@ -6858,6 +6915,7 @@ function linenApp() {
           origin: this.newProject.origin,
           audit_mode: this.newProject.audit_mode,
           completion_policy: this.newProject.completion_policy,
+          worker_preference: this.newProject.worker_preference,
         };
         if (this.newProject.audit_mode === 'none') {
           body.goal = this.newProject.goal;

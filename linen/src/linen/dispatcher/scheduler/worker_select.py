@@ -9,7 +9,6 @@ def choose_worker(candidates: list[WorkerConfig], running_counts: dict[str, int]
     grouped = sorted(
         candidates,
         key=lambda worker: (
-            worker.priority,
             running_counts.get(worker.name, 0),
             random.random(),
         ),

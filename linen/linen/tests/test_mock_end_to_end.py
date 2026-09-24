@@ -386,13 +386,12 @@ def test_task_healthcheck_failure_aborts_task_and_cools_down_worker(http_client:
 
 
 def _failover_config() -> DispatchConfig:
-    def worker(name: str, priority: int, healthcheck: str) -> dict:
+    def worker(name: str, healthcheck: str) -> dict:
         return {
             "name": name,
             "type": "mock",
             "task_types": ["reason", "explore"],
             "max_running": 1,
-            "priority": priority,
             "env": {
                 "MOCK_HEALTHCHECK": healthcheck,
                 "MOCK_REASON": _phase("complete", zero_outcomes=["intent"]),
@@ -417,21 +416,27 @@ def _failover_config() -> DispatchConfig:
                 "explore": {"timeout": 2, "conclude_timeout": 2},
             },
             "workers": [
-                worker("bad", 0, _phase("fail", zero_outcomes=["ok"])),
-                worker("good", 1, _phase("ok")),
+                worker("bad", _phase("fail", zero_outcomes=["ok"])),
+                worker("good", _phase("ok")),
             ],
         }
     )
 
 
-def test_unhealthy_worker_fails_over_to_healthy_worker(http_client: TestClient) -> None:
+def test_unhealthy_worker_fails_over_to_healthy_worker(
+    http_client: TestClient, monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "linen.dispatcher.scheduler.loop.choose_worker",
+        lambda candidates, _running: sorted(candidates, key=lambda worker: worker.name),
+    )
     client = InProcessClient(http_client)
     containers = LocalContainerManager()
     loop = _loop(_failover_config(), client, containers)
     project_id = _create_project(http_client)
 
     try:
-        # round 1: 'bad' (priority 0) is chosen first, its health check fails -> cooldown
+        # The controlled tie order picks 'bad' first; health check failure puts it on cooldown.
         _dispatch_and_wait(loop)
         assert "bad" in loop.worker_unhealthy_until
         assert client.get_project(project_id).project.status == "active"

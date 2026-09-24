@@ -157,11 +157,12 @@ Worker 选择规则：
 1. 先按任务类型筛选
 2. 再过滤掉已达到 `max_running` 的 Worker
 3. 再过滤掉处于短暂不可选窗口内的不健康 Worker
-4. 在剩余 Worker 中，优先选择 `priority` 更小的
-5. 如果 `priority` 相同，则优先选择当前运行中任务数更少的
-6. 如果仍然相同，则随机选择
-7. 如果是 `explore`，Dispatcher 先通过 `POST /projects/{project_id}/intents/{intent_id}/heartbeat` claim 成功，再真正启动任务
-8. 如果是 `reason`，claim 成功后由 `POST /projects/{project_id}/reason/heartbeat` 维持 lease；当 `runtime.worker_healthcheck=startup_and_task` 时，真正启动前再对选中的 Worker 执行一次健康检查；如果失败，则本次任务作废；该 Worker 会进入一个短暂不可选窗口，等待后续轮次再尝试
+4. 项目选择了具体 CLI 时，只保留该类型的 Worker；没有配置或不支持此任务类型时不会静默切换到其他 CLI
+5. `auto` 模式下，选择当前运行任务数最少的 Worker；并列时随机选择
+6. 如果是 `explore`，Dispatcher 先通过 `POST /projects/{project_id}/intents/{intent_id}/heartbeat` claim 成功，再真正启动任务
+7. 如果是 `reason`，claim 成功后由 `POST /projects/{project_id}/reason/heartbeat` 维持 lease；当 `runtime.worker_healthcheck=startup_and_task` 时，真正启动前再对选中的 Worker 执行一次健康检查；如果失败，则本次任务作废；该 Worker 会进入一个短暂不可选窗口，等待后续轮次再尝试
+
+项目的 `worker_preference` 可通过前端设置为 `auto`、`pi`、`codex` 或 `claudecode`，由 `PUT /projects/{project_id}/worker-preference` 保存；新建项目也可直接指定。变更只影响后续派发，不会中断正在运行的任务。旧配置仍可带 `priority` 字段，但它已被忽略。
 
 ---
 
@@ -622,16 +623,16 @@ Dispatcher 固定从 `stdout` 取全文作为模型正文输出。
 | 字段 | 含义 | 说明 |
 | --- | --- | --- |
 | `name` | Worker 静态标识 | 协议写回时作为 `creator` 或 `worker` |
-| `type` | Worker driver 名 | 支持 `claudecode`、`codex`、`mock` |
-| `task_types` | 支持的任务类型 | `bootstrap`、`reason`、`explore` |
+| `type` | Worker driver 名 | 支持 `claudecode`、`codex`、`pi`、`mock` |
+| `task_types` | 支持的任务类型 | `bootstrap`、`reason`、`explore`、`review` |
 | `max_running` | Worker 并发上限 | 达到上限后暂不派发 |
-| `priority` | 选择优先级 | 数字越小越优先 |
 | `env` | 运行时环境变量 | 由对应 driver 使用；`mock` 的 phase 耗时和结果概率也通过这里配置 |
 
-系统提供三类 Worker driver：
+系统提供四类 Worker driver：
 
 - `claudecode`
 - `codex`
+- `pi`
 - `mock`
 
 也就是说：
@@ -937,15 +938,14 @@ codex exec resume "{session}" --dangerously-bypass-approvals-and-sandbox --model
 | 字段 | 必填 | 含义 |
 | --- | --- | --- |
 | `name` | 是 | Worker 静态标识；协议写回时使用这个值作为 `creator` 或 `worker` |
-| `type` | 是 | Worker driver 名；支持 `claudecode`、`codex`、`mock` |
+| `type` | 是 | Worker driver 名；支持 `claudecode`、`codex`、`pi`、`mock` |
 | `task_types` | 是 | 该 Worker 支持的任务类型列表 |
 | `max_running` | 是 | 该 Worker 自身的并发上限 |
-| `priority` | 是 | 当前任务类型的候选 Worker 中，数字越小优先级越高 |
 | `env` | 是 | 该 Worker 的变量表；具体必需 key 由对应 driver 决定并在启动时校验 |
 
 补充：
 
-- Worker 选择顺序是：先过滤任务类型、`max_running` 和处于本地 `retry_after` 窗口内的 Worker，再按 `priority`，同优先级优先选当前运行数更少的，最后随机；`bootstrap` 和 `explore` 都会先 claim，再启动任务；当 `runtime.worker_healthcheck=startup_and_task` 时，真正启动前会做一次健康检查，失败的 Worker 会进入短暂不可选窗口；进入 `bootstrap_conclude` / `explore_conclude` fallback 时不再重复健康检查
+- Worker 选择顺序是：先过滤任务类型、项目选定的 CLI、`max_running` 和本地不可选窗口；自动模式优先选择当前运行数更少的 Worker，同负载随机选择；`bootstrap` 和 `explore` 都会先 claim，再启动任务；当 `runtime.worker_healthcheck=startup_and_task` 时，真正启动前会做一次健康检查，失败的 Worker 会进入短暂不可选窗口；进入 `bootstrap_conclude` / `explore_conclude` fallback 时不再重复健康检查
 - 健康检查、执行命令、session 提取、二阶段 `conclude` 都由对应 driver 代码负责
 - prompt 内容从代码工程里的 markdown 资源加载
 
@@ -993,7 +993,6 @@ workers:
     type: "claudecode"
     task_types: [bootstrap, reason]
     max_running: 1
-    priority: 0  # lower number wins; ties prefer fewer running tasks, then choose randomly
     env:
       ANTHROPIC_MODEL: "claude-sonnet-4-6"
       ANTHROPIC_BASE_URL: "https://api.example.com"
@@ -1003,7 +1002,6 @@ workers:
     type: "claudecode"
     task_types: [bootstrap, explore]
     max_running: 1
-    priority: 1
     env:
       ANTHROPIC_MODEL: "claude-sonnet-4-6"
       ANTHROPIC_BASE_URL: "https://api.example.com"
@@ -1013,7 +1011,6 @@ workers:
     type: "codex"
     task_types: [bootstrap, reason, explore]
     max_running: 1
-    priority: 3
     env:
       CODEX_MODEL: "gpt-5.4"
       CODEX_BASE_URL: "https://api.example.com/v1"
@@ -1023,7 +1020,6 @@ workers:
     type: "codex"
     task_types: [bootstrap, explore]
     max_running: 1
-    priority: 4
     env:
       CODEX_MODEL: "gpt-5.4"
       CODEX_BASE_URL: "https://api.example.com/v1"
@@ -1033,7 +1029,6 @@ workers:
     type: "mock"
     task_types: [bootstrap, reason, explore]
     max_running: 1
-    priority: 9
     env:
       MOCK_HEALTHCHECK: '{"delay":[0.05,0.15],"outcomes":{"ok":0.9,"fail":0.1}}'
       MOCK_BOOTSTRAP: '{"delay":[0.1,12.0],"outcomes":{"fact":0.6,"rejected":0.1,"invalid_json":0.1,"invalid_payload":0.1,"command_fail":0.1}}'

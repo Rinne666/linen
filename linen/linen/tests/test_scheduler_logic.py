@@ -100,18 +100,19 @@ def test_reap_cleanup_future_records_only_successful_inactive_cleanup() -> None:
     assert loop._inactive_cleanup_done == {"proj-success": "completed"}
 
 
-def test_choose_worker_prefers_priority_then_lower_running_count() -> None:
+def test_choose_worker_prefers_lower_running_count_without_priority() -> None:
     workers = make_config().workers
-    first = workers[0].model_copy(update={"name": "first", "priority": 0})
+    first = workers[0].model_copy(update={"name": "first", "priority": 1})
     busy = workers[0].model_copy(update={"name": "busy", "priority": 0})
-    lower_priority = workers[0].model_copy(update={"name": "lower", "priority": 1})
+    equally_loaded = workers[0].model_copy(update={"name": "equal", "priority": 9})
 
     ordered = choose_worker(
-        [lower_priority, busy, first],
-        {"busy": 2, "first": 0, "lower": 0},
+        [busy, equally_loaded, first],
+        {"busy": 2, "first": 0, "equal": 0},
     )
 
-    assert [worker.name for worker in ordered] == ["first", "busy", "lower"]
+    assert {worker.name for worker in ordered[:2]} == {"first", "equal"}
+    assert ordered[-1].name == "busy"
 
 
 def test_completion_sources_ignore_stale_generations_and_nonterminal_facts() -> None:

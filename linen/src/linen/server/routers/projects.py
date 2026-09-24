@@ -126,6 +126,7 @@ from linen.server.models import (
     ReasonHeartbeatRequest,
     UpdateProjectTitleRequest,
     UpdateProjectStatusRequest,
+    UpdateProjectWorkerPreferenceRequest,
 )
 from linen.server.uvpg import (
     PROOF_GATE_VERSION,
@@ -228,6 +229,9 @@ def list_projects():
                 reason_last_seen_event_seq=row["reason_last_seen_event_seq"] if "reason_last_seen_event_seq" in row.keys() else 0,
                 event_seq=row["latest_event_seq"] if "latest_event_seq" in row.keys() else 0,
                 audit_mode=row["audit_mode"] if "audit_mode" in row.keys() else "none",
+                worker_preference=(
+                    row["worker_preference"] if "worker_preference" in row.keys() else "auto"
+                ),
                 created_at=row["created_at"],
                 reason=project_reason_from_row(row),
                 fact_count=row["fact_count"],
@@ -279,9 +283,12 @@ def create_project(body: CreateProjectRequest):
 
             conn.execute(
                 "INSERT INTO projects (id, title, status, graph_revision, source_generation, plan_revision, "
-                "completion_policy, audit_mode, created_at, repo_root) "
-                "VALUES (?, ?, 'active', 1, 1, 1, ?, ?, ?, ?)",
-                (pid, body.title, body.completion_policy, body.audit_mode, now, resolved_repo_root),
+                "completion_policy, audit_mode, worker_preference, created_at, repo_root) "
+                "VALUES (?, ?, 'active', 1, 1, 1, ?, ?, ?, ?, ?)",
+                (
+                    pid, body.title, body.completion_policy, body.audit_mode,
+                    body.worker_preference, now, resolved_repo_root,
+                ),
             )
             conn.execute(
                 "INSERT INTO facts (id, project_id, description, display_title, semantic_type, source_generation) "
@@ -669,6 +676,21 @@ def update_project_status(project_id: str, body: UpdateProjectStatusRequest):
                 (project_id,),
             )
             clear_project_reason(conn, project_id)
+        return project_meta_from_row(get_project_or_404(conn, project_id))
+
+
+@router.put("/projects/{project_id}/worker-preference", response_model=ProjectMeta)
+def update_project_worker_preference(
+    project_id: str, body: UpdateProjectWorkerPreferenceRequest,
+):
+    with get_conn() as conn:
+        row = get_project_or_404(conn, project_id)
+        if row["worker_preference"] == body.worker_preference:
+            return project_meta_from_row(row)
+        conn.execute(
+            "UPDATE projects SET worker_preference = ? WHERE id = ?",
+            (body.worker_preference, project_id),
+        )
         return project_meta_from_row(get_project_or_404(conn, project_id))
 
 

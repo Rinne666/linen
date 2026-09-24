@@ -52,21 +52,19 @@ local:
 #   all_proxy: "http://127.0.0.1:7897"
 
 # No API keys needed — the host CLIs are used as-is. Per-worker `env:` overrides common_env.
+# Enable the CLIs users should be able to select and list their supported task types.
 workers:
   - name: "local-claude"
     type: "claudecode"
-    task_types: [reason, explore]
+    task_types: [reason, explore, review]
     max_running: 1
-    priority: 1
 
   # - name: "local-codex"
   #   type: "codex"
-  #   task_types: [explore]
+  #   task_types: [reason, explore, review]
   #   max_running: 1
-  #   priority: 1
 
   # - name: "local-pi"
   #   type: "pi"
-  #   task_types: [reason]
+  #   task_types: [reason, explore, review]
   #   max_running: 1
-  #   priority: 0

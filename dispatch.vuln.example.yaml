@@ -120,26 +120,20 @@ local:
   # the dispatcher from a different directory.
   agents_md: "linen/src/linen/dispatcher/prompts/vuln_audit/AGENTS.md"
 
-# No "bootstrap" task type on any worker — source-code audits are iterative
-# and the project should go directly to reason after creation.
+# CLI selection is stored per project. Automatic mode balances workers by live load.
 workers:
   - name: "audit-claude"
     type: "claudecode"
     task_types: [reason, explore, review]
     max_running: 1
-    priority: 1
 
   - name: "audit-codex"
     type: "codex"
-    task_types: [explore, review]
+    task_types: [reason, explore, review]
     max_running: 1
-    priority: 1
 
-  # Pi is good for focused reasoning AND for code reading (it has read, grep,
-  # find, bash tools). Its lower numeric priority makes it the preferred worker;
-  # Claude/Codex remain available when Pi is busy or unhealthy.
+  # If the project is set to Automatic, workers are selected by live load.
   - name: "audit-pi"
     type: "pi"
     task_types: [reason, explore, review]
     max_running: 1
-    priority: 0

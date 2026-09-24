@@ -858,7 +858,11 @@ class DispatcherLoop:
                 project.project.id,
             )
             return False
-        selection = self._select_worker(project.project.id, "reason")
+        selection = self._select_worker(
+            project.project.id,
+            "reason",
+            worker_preference=project.project.worker_preference,
+        )
         worker = selection.worker
         if worker is None:
             self._log_changed(
@@ -936,6 +940,7 @@ class DispatcherLoop:
         selection = self._select_worker(
             project.project.id,
             "explore",
+            worker_preference=project.project.worker_preference,
             provider_required=provider_required,
         )
         worker = selection.worker
@@ -1016,7 +1021,11 @@ class DispatcherLoop:
         prompt as a devil's advocate, and POSTs a Review. The fact's status
         is re-aggregated server-side on every review write.
         """
-        selection = self._select_worker(project.project.id, "review")
+        selection = self._select_worker(
+            project.project.id,
+            "review",
+            worker_preference=project.project.worker_preference,
+        )
         worker = selection.worker
         if worker is None:
             self._log_changed(
@@ -1085,6 +1094,7 @@ class DispatcherLoop:
         project_id: str,
         task_type: str,
         *,
+        worker_preference: str = "auto",
         provider_required: bool = True,
     ) -> WorkerSelection:
         now = time.time()
@@ -1094,7 +1104,22 @@ class DispatcherLoop:
         blocked_rejected: list[str] = []
         blocked_task_type: list[str] = []
         running_counts = self._worker_counts()
+        if worker_preference != "auto" and not any(
+            worker.type == worker_preference and task_type in worker.task_types
+            for worker in self.config.workers
+        ):
+            return WorkerSelection(
+                worker=None,
+                blocked_busy=[],
+                blocked_unhealthy=[],
+                blocked_rejected=[],
+                blocked_task_type=[
+                    f"preferred CLI {worker_preference} is not configured for {task_type}"
+                ],
+            )
         for worker in self.config.workers:
+            if worker_preference != "auto" and worker.type != worker_preference:
+                continue
             if task_type not in worker.task_types:
                 blocked_task_type.append(worker.name)
                 continue
@@ -1145,7 +1170,7 @@ class DispatcherLoop:
             "worker selection project=%s task=%s candidates=%s blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s blocked_task_type=%s chosen=%s",
             project_id,
             task_type,
-            [f"{worker.name}({running_counts.get(worker.name, 0)}/{worker.max_running},p{worker.priority})" for worker in candidates],
+            [f"{worker.name}({running_counts.get(worker.name, 0)}/{worker.max_running})" for worker in candidates],
             blocked_busy,
             blocked_unhealthy,
             blocked_rejected,

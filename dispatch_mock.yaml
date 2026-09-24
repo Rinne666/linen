@@ -29,7 +29,6 @@ workers:
     type: "mock"
     task_types: [reason, explore]
     max_running: 1
-    priority: 0
     env:
       MOCK_HEALTHCHECK: '{"delay":[0,2],"outcomes":{"ok":0.9,"fail":0.1}}'
       MOCK_REASON: '{"delay":[2,6],"outcomes":{"complete":0.1,"intent":0.4,"noop":0.1,"rejected":0.1,"invalid_json":0.1,"invalid_payload":0.1,"command_fail":0.1}}'
@@ -40,7 +39,6 @@ workers:
     type: "mock"
     task_types: [reason, explore]
     max_running: 1
-    priority: 0
     env:
       MOCK_HEALTHCHECK: '{"delay":[0,2],"outcomes":{"ok":0.9,"fail":0.1}}'
       MOCK_REASON: '{"delay":[2,6],"outcomes":{"complete":0.1,"intent":0.4,"noop":0.1,"rejected":0.1,"invalid_json":0.1,"invalid_payload":0.1,"command_fail":0.1}}'

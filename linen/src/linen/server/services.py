@@ -362,6 +362,9 @@ def project_meta_from_row(row: sqlite3.Row) -> ProjectMeta:
         ),
         event_seq=row["latest_event_seq"] if "latest_event_seq" in row.keys() else 0,
         audit_mode=row["audit_mode"] if "audit_mode" in row.keys() else "none",
+        worker_preference=(
+            row["worker_preference"] if "worker_preference" in row.keys() else "auto"
+        ),
         created_at=row["created_at"],
         reason=project_reason_from_row(row),
         repo_root=row["repo_root"] if "repo_root" in row.keys() else None,
