@@ -748,11 +748,17 @@ def outcome_fact(
 
 
 def result_for_intent(project: ProjectDetail, description: str) -> Fact | None:
-    intent = next(
-        (item for item in project.intents if item.description.strip() == description),
-        None,
-    )
-    return _fact(project, intent.to) if intent is not None and intent.to else None
+    matches = [
+        item for item in project.intents
+        if item.description.strip() == description
+        and item.source_generation == project.project.source_generation
+        and item.plan_revision == project.project.plan_revision
+    ]
+    intent = max(matches, key=lambda item: (item.created_at, item.id), default=None)
+    fact = _fact(project, intent.to) if intent is not None and intent.to else None
+    if fact is None or fact.source_generation != project.project.source_generation:
+        return None
+    return fact
 
 
 def adjudication_record(fact: Fact, workdir: Path) -> dict[str, Any]:

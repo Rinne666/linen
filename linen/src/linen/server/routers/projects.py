@@ -21,9 +21,10 @@ from linen.server.audit_state import (
     completion_gate_from_db,
     create_graph_edge,
     fact_display_title,
+    latest_finding_assessment,
     list_audit_stages,
     list_graph_edges,
-    list_human_decisions,
+    reportability_reason,
 )
 
 _DEFAULT_CLONES_ROOT = Path.home() / ".local" / "share" / "linen" / "clones"
@@ -385,7 +386,6 @@ def get_project(project_id: str):
             errors=list_intent_errors(conn, project_id),
             edges=list_graph_edges(conn, project_id),
             stages=list_audit_stages(conn, project_id),
-            decisions=list_human_decisions(conn, project_id),
         )
 
 
@@ -573,6 +573,18 @@ def confirm_technical_finding(project_id: str, fact_id: str):
             raise HTTPException(404, "Candidate fact not found")
         if candidate["semantic_type"] != "candidate_finding":
             raise HTTPException(409, "Technical confirmation requires a candidate_finding")
+        reportability_block = reportability_reason(conn, project_id, fact_id)
+        if reportability_block is not None:
+            assessment = latest_finding_assessment(conn, project_id, fact_id)
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "not_confirmed",
+                    "candidate_id": fact_id,
+                    "reason_codes": [reportability_block],
+                    "finding_assessment": assessment[2] if assessment else None,
+                },
+            )
         existing = conn.execute(
             "SELECT f.id FROM facts f JOIN graph_edges e ON e.project_id = f.project_id "
             "AND e.target_id = f.id WHERE f.project_id = ? AND e.source_id = ? "

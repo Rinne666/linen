@@ -610,6 +610,14 @@ if running_project_count < runtime.max_running_projects:
 - `workers[].max_running`：单个 Worker 自身的并发上限；达到上限后，这个 Worker 暂时不再参与派发
 - Worker CLI 即使以退出码 `0` 返回，若其 JSONL 明确错误字段报告限流或额度耗尽，Dispatcher 仍会打开 provider 熔断：普通 429 暂停模型任务 5 分钟，额度耗尽暂停 1 小时。只检查结构化错误字段，避免被提示词或目标源码中的 `429` 文本伪造；确定性的 coverage、summary 与托管扫描任务不受该熔断影响。
 
+### 阶段失败与项目活性
+
+- scope 证据或 adjudication 未完成时，Completion Gate 继续阻止最终报告和漏洞确认；Dispatcher 不再因此过滤独立的源代码探索任务。
+- 缺失结果 Fact 的已结束阶段任务可由图派生器创建有界替代 Intent。替代 Intent 使用不同 target 保持幂等，同时保留旧 Intent、执行产物和错误历史。
+- 单个阶段最多自动创建 3 个 Intent 尝试。预算用尽后停止自动重试，并允许独立阶段继续；Final report 仍需有效、经复审的 scope 结果。
+- 同一保留阶段存在多个 Intent 时，阶段投影和结果查询采用最新尝试，避免早期失败记录遮住后续成功结果。
+- 结果 JSON / Fact 契约校验失败时，持久错误包含具体校验异常摘要，便于修复或判断是否重试；普通进程失败仍沿用 Intent 错误的有界退避。
+
 ---
 
 ## Worker 配置

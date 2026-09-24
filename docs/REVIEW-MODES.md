@@ -9,6 +9,27 @@
 
 ---
 
+## Finding 判定方法
+
+不再通过 Human decision 手工确认、排除或豁免。Review 保存结构化
+`finding_assessment`，按以下证据给出 `vulnerability`、`design_weakness`、
+`hardening_advice`、`false_positive` 或 `inconclusive`：
+
+1. **威胁模型**：先检查冻结的 `SECURITY.md`、`SECURITY_THREAT_MODEL.md`、RFC，
+   以及可用的历史 CVE/GHSA/HackerOne 处置。明确排除或已承认的设计弱点不报作漏洞；
+   未收集到的来源保持 unknown。HackerOne 或其他远程规则可通过
+   `scope_adjudication.policy_urls` 配置并冻结到证据中。
+2. **端到端特权影响**：必须证明攻击者能从入口到达具体影响，无需管理员误操作/批准、
+   社会工程、范围外权限或攻击者设置的不安全配置；并直接破坏机密性、完整性、可用性，
+   或违反文档化信任边界。合法注册但被过度授权、能够跨边界操作的 Agent 仍可纳入威胁模型。
+3. **低影响行为**：仅创建待批准记录、污染列表、造成 UI 卡顿或审查疲劳，不构成漏洞；
+   真实但属于已接受设计/依赖排除前置条件的归为设计弱点，纯纵深防御改进归为加固建议。
+4. **事实与可报告性分开**：`VALID` 表示源码支持该代码行为，分类另行决定是否为漏洞；
+   `INVALID` 需要源码证明路径不成立或具体防护阻断，不得仅因政策排除/影响不足而否定代码事实。
+
+只有 in-scope 的 `vulnerability`，且前置条件和具体 C/I/A 或文档边界影响都通过服务端检查，
+才允许 Technical Confirmation。缺少结构化评估或证据不完整时保持待审，不接受手工覆盖。
+
 ## 本质
 
 `review` 任务是 linen **候选发现 → 复审 → 落定** 闭环的执行者。Phase 1a 之前它只有一种行为（"找反证"），现在按候选 fact 的特征拆成 **3 种 mode**：

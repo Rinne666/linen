@@ -37,16 +37,25 @@ audit:
   mode: scope
   # Mandatory pre-coverage gate. The dispatcher freezes local policy files and
   # optional maintainer/advisory material; an Explore worker then produces a
-  # quoted trust-boundary and pre-exclusion decision for independent review.
+  # quoted threat-model and policy assessment for independent review.
   scope_adjudication:
     enabled: true
     local_paths:
       - SECURITY.md
+      - SECURITY_THREAT_MODEL.md
       - .github/SECURITY.md
+      - .github/SECURITY_THREAT_MODEL.md
       - README.md
       - CONTRIBUTING.md
+      - "CHANGELOG*"
+      - "RFC*.md"
+      - "rfcs/**/*.md"
       - "docs/**/security*.md"
+      - "docs/**/SECURITY_THREAT_MODEL.md"
       - "docs/**/threat*.md"
+      - "docs/**/rfc*.md"
+      - "docs/**/CVE*.md"
+      - "docs/**/GHSA*.md"
       - "docs/**/architecture*.md"
       - "docs/**/deployment*.md"
     policy_urls: []  # Add official HTTPS VRP or trust-anchor pages here.

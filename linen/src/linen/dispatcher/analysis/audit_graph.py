@@ -19,6 +19,7 @@ from linen.server.uvpg import REQUIRED_ROLES
 
 CREATOR = "dispatcher.audit"
 AUDIT_SUMMARY_INTENT = "@analysis:audit-summary"
+MAX_STAGE_INTENT_ATTEMPTS = 3
 def managed_description(description: str) -> bool:
     value = description.strip()
     return (
@@ -31,6 +32,8 @@ def managed_description(description: str) -> bool:
 def _open(project: ProjectDetail, description: str) -> bool:
     return any(
         intent.description.strip() == description
+        and intent.source_generation == project.project.source_generation
+        and intent.plan_revision == project.project.plan_revision
         and intent.to is None
         and intent.concluded_at is None
         for intent in project.intents
@@ -38,7 +41,13 @@ def _open(project: ProjectDetail, description: str) -> bool:
 
 
 def _intent(project: ProjectDetail, description: str):
-    return next((intent for intent in project.intents if intent.description.strip() == description), None)
+    matches = [
+        intent for intent in project.intents
+        if intent.description.strip() == description
+        and intent.source_generation == project.project.source_generation
+        and intent.plan_revision == project.project.plan_revision
+    ]
+    return max(matches, key=lambda item: (item.created_at, item.id), default=None)
 
 
 def _result(project: ProjectDetail, description: str) -> Fact | None:
@@ -150,7 +159,48 @@ def _review_proposals(project: ProjectDetail) -> list[dict]:
 
 
 def _proposal_exists(project: ProjectDetail, description: str) -> bool:
-    return any(intent.description.strip() == description for intent in project.intents)
+    return _open(project, description)
+
+
+def _stage_intent_proposal(
+    project: ProjectDetail,
+    from_ids: list[str],
+    intent_type: str,
+    description: str,
+) -> dict | None:
+    """Return a bounded, idempotent retry for a stage with no result Fact.
+
+    A concluded intent without a result must not permanently satisfy the
+    existence check. Each replacement gets a distinct target, while an open
+    attempt remains the single owner of that stage obligation.
+    """
+    if _open(project, description):
+        return None
+    prior = [
+        item for item in project.intents
+        if item.description.strip() == description
+        and item.source_generation == project.project.source_generation
+        and item.plan_revision == project.project.plan_revision
+    ]
+    if len(prior) >= MAX_STAGE_INTENT_ATTEMPTS:
+        return None
+    attempt = len(prior) + 1
+    historical = any(
+        item.description.strip() == description for item in project.intents
+    )
+    if attempt == 1 and not historical:
+        target = description
+    else:
+        target = (
+            f"{description}:generation:{project.project.source_generation}"
+            f":plan:{project.project.plan_revision}:attempt:{attempt}"
+        )
+    return {
+        "from": from_ids,
+        "type": intent_type,
+        "description": description,
+        "target": target,
+    }
 
 
 def _coverage_summary_proposals(
@@ -274,53 +324,59 @@ def required_intents(
     if not config.enabled or project.project.audit_mode == "none":
         return []
     plan_anchor = "origin"
-    # Keep the entire gate ahead of unrelated legacy work. This is important
-    # when enabling the gate on an active board whose ready window is already
-    # full: collection, both attestations, and adjudication must still become
-    # visible instead of waiting behind coverage branches.
+    # Keep policy collection and adjudication high in the ready window, while
+    # allowing independent technical work to proceed if these bounded stages
+    # cannot produce a reviewed result. Final reporting remains scope-gated.
     if (
         project.project.audit_mode == "scope"
         and config.scope_adjudication.enabled
     ):
         evidence = scope_gate.result_for_intent(project, scope_gate.EVIDENCE_INTENT)
-        if evidence is None:
-            if _proposal_exists(project, scope_gate.EVIDENCE_INTENT):
-                return []
-            return [{
-                "from": ["origin"],
-                "type": "search",
-                "description": scope_gate.EVIDENCE_INTENT,
-            }]
-        if evidence.type != scope_gate.POLICY_EVIDENCE_TYPE:
-            return []
-        if not _reviewed(project, evidence.id):
-            return [
-                proposal for proposal in _review_proposals(project)
-                if proposal["from"] == [evidence.id]
-            ][:limit]
-        adjudication = scope_gate.result_for_intent(
-            project, scope_gate.ADJUDICATION_INTENT,
-        )
-        if adjudication is None:
-            if _proposal_exists(project, scope_gate.ADJUDICATION_INTENT):
-                return []
-            return [{
-                "from": [evidence.id],
-                "type": "verify",
-                "description": scope_gate.ADJUDICATION_INTENT,
-            }]
-        if adjudication.type != scope_gate.SCOPE_ADJUDICATION_TYPE:
-            return []
-        if not _reviewed(project, adjudication.id):
-            return [
-                proposal for proposal in _review_proposals(project)
-                if proposal["from"] == [adjudication.id]
-            ][:limit]
-        try:
-            scope_gate.adjudication_record(adjudication, workdir)
-        except (ValueError, OSError, KeyError, TypeError):
-            return []
-        plan_anchor = adjudication.id
+        if evidence is None or evidence.type != scope_gate.POLICY_EVIDENCE_TYPE:
+            proposal = _stage_intent_proposal(
+                project, ["origin"], "search", scope_gate.EVIDENCE_INTENT,
+            )
+            if proposal is not None:
+                return [proposal]
+            # Exhausted scope collection remains a final-report blocker, but
+            # it must not prevent source-grounded technical exploration.
+            plan_anchor = "origin"
+        else:
+            if not _reviewed(project, evidence.id):
+                review_proposals = [
+                    proposal for proposal in _review_proposals(project)
+                    if proposal["from"] == [evidence.id]
+                ][:limit]
+                if review_proposals:
+                    return review_proposals
+            adjudication = scope_gate.result_for_intent(
+                project, scope_gate.ADJUDICATION_INTENT,
+            )
+            if adjudication is None or adjudication.type != scope_gate.SCOPE_ADJUDICATION_TYPE:
+                proposal = _stage_intent_proposal(
+                    project, [evidence.id], "verify", scope_gate.ADJUDICATION_INTENT,
+                )
+                if proposal is not None:
+                    return [proposal]
+                # Keep policy uncertainty explicit and continue coverage.
+                plan_anchor = evidence.id
+            elif not _reviewed(project, adjudication.id):
+                review_proposals = [
+                    proposal for proposal in _review_proposals(project)
+                    if proposal["from"] == [adjudication.id]
+                ][:limit]
+                if review_proposals:
+                    return review_proposals
+                plan_anchor = evidence.id
+            else:
+                try:
+                    scope_gate.adjudication_record(adjudication, workdir)
+                except (ValueError, OSError, KeyError, TypeError):
+                    # Invalid adjudication is a reportability blocker, not a
+                    # reason to stop independent source analysis.
+                    plan_anchor = evidence.id
+                else:
+                    plan_anchor = adjudication.id
     reviews = _review_proposals(project)
     if reviews:
         return reviews[:limit]
@@ -332,8 +388,12 @@ def required_intents(
         return []
 
     proposals: list[dict] = []
-    if not any(fact.type == "coverage_plan" for fact in project.facts) and not _proposal_exists(project, coverage.PLAN_INTENT):
-        proposals.append({"from": [plan_anchor], "type": "search", "description": coverage.PLAN_INTENT})
+    if not any(fact.type == "coverage_plan" for fact in project.facts):
+        proposal = _stage_intent_proposal(
+            project, [plan_anchor], "search", coverage.PLAN_INTENT,
+        )
+        if proposal is not None:
+            proposals.append(proposal)
     if proposals:
         return proposals[:limit]
 
@@ -381,8 +441,12 @@ def required_intents(
     if proposals:
         return proposals[:limit]
     inputs = audit_summary_inputs(project, workdir, config)
-    if inputs is not None and not _proposal_exists(project, AUDIT_SUMMARY_INTENT):
-        return [{"from": inputs, "type": "synthesize", "description": AUDIT_SUMMARY_INTENT}]
+    if inputs is not None:
+        proposal = _stage_intent_proposal(
+            project, inputs, "synthesize", AUDIT_SUMMARY_INTENT,
+        )
+        if proposal is not None:
+            return [proposal]
     return []
 
 

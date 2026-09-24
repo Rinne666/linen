@@ -1054,7 +1054,7 @@ def _try_conclude_fallback(
             preview(result.stderr),
         )
         best_effort_release(client, project_id, intent.id, worker.name)
-        return "failed"
+        return f"invalid_result:{type(exc).__name__}: {str(exc)[:800]}"
     if kind == "rejected":
         LOG.warning(
             "conclude rejected project=%s intent=%s worker=%s conclude_ms=%s stdout_preview=%s",

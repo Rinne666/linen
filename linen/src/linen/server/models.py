@@ -309,6 +309,7 @@ REVIEW_DIAGNOSTIC_FIELDS = (
     "contradiction_analysis",
     "attestation_check",
     "summary_check",
+    "finding_assessment",
 )
 
 
@@ -319,6 +320,7 @@ class ReviewDiagnostics(BaseModel):
     contradiction_analysis: dict[str, Any] | None = None
     attestation_check: dict[str, Any] | None = None
     summary_check: dict[str, Any] | None = None
+    finding_assessment: dict[str, Any] | None = None
 
 
 class Review(ReviewDiagnostics):
@@ -485,7 +487,6 @@ class ProjectDetail(BaseModel):
     errors: list[IntentError] = Field(default_factory=list)
     edges: list[GraphEdge] = Field(default_factory=list)
     stages: list[AuditStage] = Field(default_factory=list)
-    decisions: list[HumanDecision] = Field(default_factory=list)
 
 
 class GraphEdge(BaseModel):
@@ -555,39 +556,6 @@ class ReplanAuditRequest(BaseModel):
         if not value:
             raise ValueError("must not be empty")
         return value
-
-
-class HumanDecision(BaseModel):
-    id: str
-    target_kind: str
-    target_id: str
-    decision: Literal["confirm", "reject", "waive", "exclude"]
-    rationale: str
-    basis_quote: str | None = None
-    revival_condition: str | None = None
-    actor: str
-    supersedes_id: str | None = None
-    source_generation: int = 1
-    created_at: str
-
-
-class CreateHumanDecisionRequest(BaseModel):
-    target_kind: str
-    target_id: str
-    decision: Literal["confirm", "reject", "waive", "exclude"]
-    rationale: str
-    basis_quote: str | None = None
-    revival_condition: str | None = None
-    actor: str
-    supersedes_id: str | None = None
-
-    @field_validator("target_kind", "target_id", "rationale", "actor")
-    @classmethod
-    def validate_decision_text(cls, value: str) -> str:
-        text = value.strip()
-        if not text:
-            raise ValueError("must not be empty")
-        return text
 
 
 class AuditEvent(BaseModel):

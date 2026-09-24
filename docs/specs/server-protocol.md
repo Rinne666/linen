@@ -190,13 +190,16 @@ Dispatcher 凭据维护的控制面投影，不构成第二任务队列：
 - `AuditStage` 保存当前 source generation / plan revision 的确定性阶段状态。
 - `SkillRun` 绑定 stage、skill id/version、artifact 路径和 SHA-256；完成后不可改写，
   服务端会重新校验本机 `.linen-analysis` 文件。
-- `HumanDecision` 追加记录 confirm/reject/waive/exclude、依据原文和复活条件；新决定通过
-  `supersedes_id` 取代旧决定但不删除历史。
+- Finding disposition is derived from a structured Review assessment: project
+  threat-model status, attacker preconditions, concrete C/I/A or documented
+  boundary impact, and classification as vulnerability, design weakness,
+  hardening advice, false positive, or inconclusive. There is no manual
+  decision override or stage waiver; legacy decision rows are ignored.
 - `AuditEvent` 是默认摘要、按需展开原始 metadata 的时间线。
 
 `status` 表示持久生命周期，`execution_status` 表示派生运行态，两者必须分开展示。
 `Completion Gate` 只有在无 open work、无未解决错误、所有必需阶段与 Skill receipt
-有效、候选完成独立裁决、终态证据链完整时才 `ready=true`。Dispatcher 随后通过原有
+有效、候选完成证据化分类、终态证据链完整时才 `ready=true`。Dispatcher 随后通过原有
 complete 接口原子完成项目并生成最终报告快照。
 
 相关控制面接口：
@@ -204,7 +207,6 @@ complete 接口原子完成项目并生成最终报告快照。
 - `GET /projects/{id}/completion-gate`
 - `GET/PUT /projects/{id}/stages/{stage_id}`
 - `GET/POST/PUT /projects/{id}/skill-runs`
-- `GET/POST /projects/{id}/decisions`
 - `GET /projects/{id}/events`
 - `GET /projects/{id}/export?format=report|yaml|timeline|json|sarif`
 

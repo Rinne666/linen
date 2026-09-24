@@ -101,10 +101,6 @@ def next_graph_edge_id(conn: sqlite3.Connection, project_id: str) -> str:
     return _next_scoped_id(conn, "graph_edge", "g", project_id)
 
 
-def next_human_decision_id(conn: sqlite3.Connection, project_id: str) -> str:
-    return _next_scoped_id(conn, "human_decision", "d", project_id)
-
-
 def next_report_snapshot_id(conn: sqlite3.Connection, project_id: str) -> str:
     return _next_scoped_id(conn, "report_snapshot", "rp", project_id)
 
@@ -605,20 +601,11 @@ def aggregate_fact_status_from_reviews(
 ) -> str:
     """Compute the new `facts.status` after a review is added/updated.
 
-    Aggregation rules (fail-fast on disproof, latest decisive review resolves
-    earlier uncertainty):
-    - Any review with verdict=INVALID                     -> 'false_positive'
-    - Latest review VALID with firm/certain confidence    -> 'triaged'
-    - Latest review NEEDS_REVIEW or tentative VALID       -> 'draft'
-    - No reviews                                           -> keep current_status
-
-    Manual states ('fixed', 'accepted_risk') are sticky — we never overwrite
-    a user-set terminal state.
+    Finding facts require a structured threat-model and impact assessment;
+    ordinary evidence facts retain the standard review lifecycle.
     """
-    if current_status in ("fixed", "accepted_risk"):
-        return current_status
     fact_row = conn.execute(
-        "SELECT type FROM facts WHERE project_id = ? AND id = ?",
+        "SELECT type, semantic_type FROM facts WHERE project_id = ? AND id = ?",
         (project_id, fact_id),
     ).fetchone()
     rows = conn.execute(
@@ -641,9 +628,27 @@ def aggregate_fact_status_from_reviews(
         rows = [row for row in rows if has_attestation(row)]
     if not rows:
         return current_status
-    if any(row["verdict"] == "INVALID" for row in rows):
-        return FACT_STATUS_FALSE_POSITIVE
     latest = rows[-1]
+    is_finding = fact_row is not None and (
+        fact_row["type"] == "vulnerability"
+        or fact_row["semantic_type"] in {"candidate_finding", "rejected_finding"}
+    )
+    if is_finding:
+        try:
+            diagnostics = json.loads(latest["diagnostics"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            diagnostics = {}
+        assessment = diagnostics.get("finding_assessment") if isinstance(diagnostics, dict) else None
+        classification = assessment.get("classification") if isinstance(assessment, dict) else None
+        if latest["verdict"] == "INVALID" and latest["confidence"] in {"firm", "certain"} and classification == "false_positive":
+            return FACT_STATUS_FALSE_POSITIVE
+        if latest["verdict"] == "VALID" and latest["confidence"] in {"firm", "certain"} and classification in {
+            "vulnerability", "design_weakness", "hardening_advice",
+        }:
+            return FACT_STATUS_TRIAGED
+        return FACT_STATUS_DRAFT
+    if latest["verdict"] == "INVALID":
+        return FACT_STATUS_FALSE_POSITIVE
     if latest["verdict"] == "VALID" and latest["confidence"] in {"firm", "certain"}:
         return FACT_STATUS_TRIAGED
     return FACT_STATUS_DRAFT

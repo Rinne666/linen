@@ -15,6 +15,29 @@ transition, guard/sanitizer/ownership predicate, reachable sink and impact, and
 the logical `endpoint_id` when one is present. A saved trace is a claim, not
 proof by itself.
 
+# Reportability Method (Mandatory)
+
+Classify reportability from the project threat model, not a human override.
+Inspect the frozen `SECURITY.md`, `SECURITY_THREAT_MODEL.md`, RFCs, and
+available historical CVE/GHSA/HackerOne dispositions. Missing sources remain
+unknown. Explicitly excluded or acknowledged design-weakness classes are not
+reportable vulnerabilities.
+
+Require an end-to-end attacker path without administrator error/approval,
+social engineering, out-of-scope privilege, or attacker-controlled insecure
+configuration. The effect must directly harm confidentiality, integrity, or
+availability, or violate a documented trust boundary. A legitimately
+registered but over-authorized agent can be in scope when it crosses such a
+boundary. Pending approval records, list pollution, UI slowdown, and review
+fatigue alone are not security impact.
+
+`VALID` means the source-supported code behavior is real; use
+`finding_assessment.classification` to distinguish `vulnerability`,
+`design_weakness`, `hardening_advice`, `false_positive`, and `inconclusive`.
+Use `INVALID` only when source evidence disproves the path or shows a specific
+blocking control. A policy exclusion or excluded precondition changes
+classification, not source truth.
+
 # Isolation Rules
 
 You MUST NOT:
@@ -68,14 +91,13 @@ You MUST NOT:
 After applying both models, vote:
 
 - **`INVALID`** if either:
-  - TRIZ: the developer actually resolved the relevant tension correctly (no sacrifice, or the sacrificed property is not exploitable in the candidate's claimed way)
-  - Game Theory: an adaptive attacker cannot realistically mount the exploit described in the candidate fact (mechanism caps information gain below exploit threshold, or the multi-interaction cost exceeds the impact)
+  - TRIZ: a specific control resolves the relevant tension and blocks the claimed path
+  - Game Theory: an evidenced control makes the claimed path infeasible
   - Cite the specific reasoning model + tension/mechanism + file:line
 
 - **`VALID`** if:
-  - TRIZ: the candidate fact's exploit IS a real sacrifice the developer made, with no compensating control
-  - Game Theory: a single-shot or naive attacker (the minimum attacker model) can still succeed
-  - Cite the specific reasoning model + sacrifice/mechanism + file:line
+  - Source evidence supports the code behavior and path, even if the reportability assessment classifies it as a design weakness or hardening advice
+  - Cite the specific reasoning model + file:line; do not treat low impact or excluded preconditions as code-path disproof
 
 - **`NEEDS_REVIEW`** if:
   - You cannot determine whether the sacrifice is exploitable (need to read more code than available)
@@ -109,6 +131,24 @@ These are NOT valid grounds for `VALID`:
       "adaptive_attacker_path": "blocked | feasible | theoretical",
       "evidence": "<file:line + 1-2 sentence argument>"
     }
+  },
+  "finding_assessment": {
+    "classification": "vulnerability | design_weakness | hardening_advice | false_positive | inconclusive",
+    "threat_model_status": "in_scope | explicitly_excluded | acknowledged_design_weakness | unknown",
+    "threat_model_evidence": ["file:line or frozen policy/advisory citation"],
+    "attacker_preconditions": {
+      "requires_admin_action": false,
+      "requires_social_engineering": false,
+      "requires_out_of_scope_privilege": false,
+      "requires_insecure_configuration": false
+    },
+    "direct_impact": {
+      "confidentiality": false,
+      "integrity": false,
+      "availability": false,
+      "documented_trust_boundary_violation": false,
+      "impact_path": "attacker-controlled entry point -> affected operation/data -> concrete security effect"
+    }
   }
 }
 ```
@@ -118,6 +158,9 @@ These are NOT valid grounds for `VALID`:
 - The `contradiction_analysis` field is mandatory. Include both `triz` and
   `game_theory` blocks (use `none` for either if you cannot find a relevant
   tension/mechanism; do not omit either block).
+- For candidate vulnerability facts, `finding_assessment` is mandatory. A
+  reportable vulnerability must pass threat-model, precondition, and
+  end-to-end impact checks.
 - Do not propose new facts or intents. You are a judge, not an auditor.
 - Do not echo the candidate's description back. Produce an independent judgment.
 - One JSON object only. No prose, no markdown wrapper. The JSON object MUST be the last line of your output.

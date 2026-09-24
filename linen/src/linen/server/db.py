@@ -231,27 +231,8 @@ CREATE TABLE IF NOT EXISTS skill_runs (
 CREATE INDEX IF NOT EXISTS skill_runs_project_idx
     ON skill_runs (project_id, source_generation, plan_revision, stage_id, started_at);
 
--- Human scope/finding decisions are append-only. Reversal creates a newer
--- decision linked through supersedes_id; history is never overwritten.
-CREATE TABLE IF NOT EXISTS human_decisions (
-    id TEXT NOT NULL,
-    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    target_kind TEXT NOT NULL,
-    target_id TEXT NOT NULL,
-    decision TEXT NOT NULL
-        CHECK (decision IN ('confirm', 'reject', 'waive', 'exclude')),
-    rationale TEXT NOT NULL,
-    basis_quote TEXT,
-    revival_condition TEXT,
-    actor TEXT NOT NULL,
-    supersedes_id TEXT,
-    source_generation INTEGER NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (id, project_id)
-);
-CREATE INDEX IF NOT EXISTS human_decisions_target_idx
-    ON human_decisions (project_id, source_generation, target_kind, target_id, created_at);
-
+-- Existing databases may retain the retired human_decisions table as inert
+-- history. New databases do not create it; runtime logic never reads or writes it.
 -- Append-only trace of semantic and control-plane mutations. Current state
 -- remains in relational tables; this ledger powers Activities and forensics.
 CREATE TABLE IF NOT EXISTS audit_events (

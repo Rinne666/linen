@@ -221,7 +221,7 @@ def snapshot_from_db(conn: sqlite3.Connection, project_id: str) -> BlackboardSna
     for column in ("reason_trigger", "reason_started_at", "reason_last_heartbeat_at", "reason_lease_id"):
         project_payload.pop(column, None)
     nodes: list[NodeEnvelope] = [NodeEnvelope(kind="project", id=project_id, payload=project_payload)]
-    for table, kind, key in (("facts", "fact", "id"), ("intents", "intent", "id"), ("hints", "hint", "id"), ("reviews", "review", "id"), ("intent_errors", "intent_error", "id"), ("audit_stages", "stage", "stage_id"), ("human_decisions", "decision", "id")):
+    for table, kind, key in (("facts", "fact", "id"), ("intents", "intent", "id"), ("hints", "hint", "id"), ("reviews", "review", "id"), ("intent_errors", "intent_error", "id"), ("audit_stages", "stage", "stage_id")):
         rows = conn.execute(f"SELECT * FROM {table} WHERE project_id = ?", (project_id,)).fetchall()
         for row in rows:
             payload = {column: row[column] for column in row.keys() if column != "project_id"}
@@ -239,7 +239,11 @@ def snapshot_from_db(conn: sqlite3.Connection, project_id: str) -> BlackboardSna
             nodes.append(NodeEnvelope(kind=kind, id=row[key], payload=payload))
     nodes.sort(key=lambda node: (node.kind, node.id))
     edges: list[EdgeEnvelope] = []
-    for edge in conn.execute("SELECT * FROM graph_edges WHERE project_id = ?", (project_id,)).fetchall():
+    for edge in conn.execute(
+        "SELECT * FROM graph_edges WHERE project_id = ? "
+        "AND source_kind != 'decision' AND target_kind != 'decision'",
+        (project_id,),
+    ).fetchall():
         edges.append(EdgeEnvelope(id=edge["id"], source_kind=edge["source_kind"], source_id=edge["source_id"], target_kind=edge["target_kind"], target_id=edge["target_id"], relation_type=edge["relation_type"], payload={"source_generation": edge["source_generation"], "created_at": edge["created_at"], "created_by": edge["created_by"], "metadata": _loads(edge["metadata"], {})}))
     edges.sort(key=lambda edge: (edge.source_kind, edge.source_id, edge.target_kind, edge.target_id, edge.relation_type, edge.id))
     snapshot = BlackboardSnapshot(project_id=project_id, graph_revision=project["graph_revision"], source_generation=project["source_generation"], plan_revision=project["plan_revision"], nodes=nodes, edges=edges, created_at=utcnow())

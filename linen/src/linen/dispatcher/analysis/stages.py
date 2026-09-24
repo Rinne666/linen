@@ -48,7 +48,13 @@ def stage_definitions(config: AuditConfig, audit_mode: str) -> list[StageDefinit
 
 
 def _intent(project: ProjectDetail, description: str) -> Intent | None:
-    return next((item for item in project.intents if item.description.strip() == description), None)
+    matches = [
+        item for item in project.intents
+        if item.description.strip() == description
+        and item.source_generation == project.project.source_generation
+        and item.plan_revision == project.project.plan_revision
+    ]
+    return max(matches, key=lambda item: (item.created_at, item.id), default=None)
 
 
 def _fact(project: ProjectDetail, intent: Intent | None) -> Fact | None:

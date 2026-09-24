@@ -18,13 +18,11 @@ from linen.server.models import (
     CompletionCheck,
     CompletionGate,
     GraphEdge,
-    HumanDecision,
 )
 from linen.server.services import (
     audit_completion_blockers_from_db,
     get_project_or_404,
     next_graph_edge_id,
-    next_human_decision_id,
     utcnow,
 )
 
@@ -258,7 +256,9 @@ def _edge_from_row(row: sqlite3.Row) -> GraphEdge:
 
 def list_graph_edges(conn: sqlite3.Connection, project_id: str) -> list[GraphEdge]:
     rows = conn.execute(
-        "SELECT * FROM graph_edges WHERE project_id = ? ORDER BY created_at, id",
+        "SELECT * FROM graph_edges WHERE project_id = ? "
+        "AND source_kind != 'decision' AND target_kind != 'decision' "
+        "ORDER BY created_at, id",
         (project_id,),
     ).fetchall()
     return [_edge_from_row(row) for row in rows]
@@ -287,14 +287,6 @@ def list_audit_stages(conn: sqlite3.Connection, project_id: str) -> list[AuditSt
         (project_id, project["source_generation"], project["plan_revision"]),
     ).fetchall()
     return [_stage_from_row(row) for row in rows]
-
-
-def list_human_decisions(conn: sqlite3.Connection, project_id: str) -> list[HumanDecision]:
-    rows = conn.execute(
-        "SELECT * FROM human_decisions WHERE project_id = ? ORDER BY created_at, id",
-        (project_id,),
-    ).fetchall()
-    return [HumanDecision(**dict(row)) for row in rows]
 
 
 def list_audit_events(
@@ -326,71 +318,102 @@ def list_audit_events(
     ]
 
 
-def effective_human_decisions(
-    conn: sqlite3.Connection, project_id: str,
-) -> dict[tuple[str, str], HumanDecision]:
-    project = get_project_or_404(conn, project_id)
-    generation = project["source_generation"] if "source_generation" in project.keys() else 1
-    # Decisions are attestations of one source/plan generation.  Historical
-    # decisions remain in the API, but must not waive or confirm a new graph.
-    decisions = [
-        decision for decision in list_human_decisions(conn, project_id)
-        if decision.source_generation == generation
-    ]
-    superseded = {decision.supersedes_id for decision in decisions if decision.supersedes_id}
-    return {
-        (decision.target_kind, decision.target_id): decision
-        for decision in decisions
-        if decision.id not in superseded
-    }
+def latest_finding_assessment(
+    conn: sqlite3.Connection, project_id: str, fact_id: str,
+) -> tuple[str, str | None, dict[str, Any]] | None:
+    row = conn.execute(
+        "SELECT verdict, confidence, diagnostics FROM reviews "
+        "WHERE project_id = ? AND fact_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+        (project_id, fact_id),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        diagnostics = json.loads(row["diagnostics"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        diagnostics = {}
+    assessment = diagnostics.get("finding_assessment") if isinstance(diagnostics, dict) else None
+    return (
+        row["verdict"], row["confidence"], assessment
+        if isinstance(assessment, dict) else {},
+    )
+
+
+def reportability_reason(
+    conn: sqlite3.Connection, project_id: str, fact_id: str,
+) -> str | None:
+    """Return None only when a reviewed candidate meets the reportability bar."""
+    review = latest_finding_assessment(conn, project_id, fact_id)
+    if review is None:
+        return "REPORTABILITY_ASSESSMENT_REQUIRED"
+    verdict, confidence, assessment = review
+    if verdict != "VALID" or confidence not in {"firm", "certain"}:
+        return "DECISIVE_REVIEW_REQUIRED"
+    if assessment.get("classification") != "vulnerability":
+        return "NOT_REPORTABLE_VULNERABILITY"
+    if assessment.get("threat_model_status") != "in_scope":
+        return "THREAT_MODEL_SCOPE_NOT_ESTABLISHED"
+    threat_model_evidence = assessment.get("threat_model_evidence")
+    if not isinstance(threat_model_evidence, list) or not any(
+        isinstance(item, str) and item.strip() for item in threat_model_evidence
+    ):
+        return "THREAT_MODEL_EVIDENCE_REQUIRED"
+    preconditions = assessment.get("attacker_preconditions")
+    if not isinstance(preconditions, dict):
+        return "ATTACKER_PRECONDITIONS_REQUIRED"
+    precondition_keys = (
+        "requires_admin_action", "requires_social_engineering",
+        "requires_out_of_scope_privilege", "requires_insecure_configuration",
+    )
+    if any(type(preconditions.get(key)) is not bool for key in precondition_keys):
+        return "ATTACKER_PRECONDITIONS_REQUIRED"
+    if any(preconditions[key] for key in precondition_keys):
+        return "OUT_OF_SCOPE_PRECONDITION"
+    impact = assessment.get("direct_impact")
+    if not isinstance(impact, dict):
+        return "END_TO_END_IMPACT_REQUIRED"
+    impact_keys = (
+        "confidentiality", "integrity", "availability",
+        "documented_trust_boundary_violation",
+    )
+    if any(type(impact.get(key)) is not bool for key in impact_keys):
+        return "END_TO_END_IMPACT_REQUIRED"
+    if not any(impact[key] for key in impact_keys) or not str(impact.get("impact_path") or "").strip():
+        return "END_TO_END_IMPACT_REQUIRED"
+    return None
 
 
 def _strongly_reviewed(conn: sqlite3.Connection, project_id: str, fact_id: str) -> bool:
-    confirmed = conn.execute(
-        "SELECT semantic_type, proof FROM facts WHERE project_id = ? AND id = ?",
-        (project_id, fact_id),
-    ).fetchone()
-    if confirmed is not None and confirmed["semantic_type"] == "confirmed_finding":
-        proof = json.loads(confirmed["proof"] or "{}")
-        if proof.get("attributes", {}).get("gate_version") == "uvpg-proof-v1":
-            return True
-    rows = conn.execute(
-        "SELECT verdict, confidence FROM reviews WHERE project_id = ? AND fact_id = ? "
-        "ORDER BY created_at, id",
-        (project_id, fact_id),
-    ).fetchall()
-    if not rows:
-        return False
-    latest = rows[-1]
-    return latest["verdict"] == "VALID" and latest["confidence"] in {"firm", "certain"}
+    review = latest_finding_assessment(conn, project_id, fact_id)
+    return bool(
+        review is not None
+        and review[0] == "VALID"
+        and review[1] in {"firm", "certain"}
+        and reportability_reason(conn, project_id, fact_id) is None
+    )
 
 
 def _decisively_reviewed(conn: sqlite3.Connection, project_id: str, fact_id: str) -> bool:
-    """Whether a candidate has a terminal review decision.
+    """Whether a candidate has a terminal evidence-based assessment.
 
-    INVALID is itself a decisive disposition; requiring VALID for every
-    candidate would make correctly rejected findings permanently block an
-    audit.  Confirmed evidence still uses ``_strongly_reviewed`` below.
+    Technical proof alone cannot replace the threat-model and impact assessment.
     """
-    confirmed = conn.execute(
-        "SELECT semantic_type, proof FROM facts WHERE project_id = ? AND id = ?",
-        (project_id, fact_id),
-    ).fetchone()
-    if confirmed is not None and confirmed["semantic_type"] == "confirmed_finding":
-        proof = json.loads(confirmed["proof"] or "{}")
-        if proof.get("attributes", {}).get("gate_version") == "uvpg-proof-v1":
-            return True
-    rows = conn.execute(
-        "SELECT verdict, confidence FROM reviews WHERE project_id = ? AND fact_id = ? "
-        "ORDER BY created_at, id",
-        (project_id, fact_id),
-    ).fetchall()
-    if not rows:
+    review = latest_finding_assessment(conn, project_id, fact_id)
+    if review is None:
         return False
-    latest = rows[-1]
-    if latest["verdict"] == "INVALID":
+    verdict, confidence, assessment = review
+    if confidence not in {"firm", "certain"}:
+        return False
+    if verdict == "INVALID":
+        return assessment.get("classification") == "false_positive"
+    if verdict != "VALID":
+        return False
+    classification = assessment.get("classification")
+    if classification in {"design_weakness", "hardening_advice"}:
         return True
-    return latest["verdict"] == "VALID" and latest["confidence"] in {"firm", "certain"}
+    return classification == "vulnerability" and reportability_reason(
+        conn, project_id, fact_id
+    ) is None
 
 
 def completion_gate_from_db(
@@ -477,16 +500,12 @@ def completion_gate_from_db(
         status="fail" if error_rows else "pass",
     )
 
-    decisions = effective_human_decisions(conn, project_id)
     stages = list_audit_stages(conn, project_id)
     if stages:
         required_stages: list[AuditStage] = []
         incomplete_stages: list[AuditStage] = []
         for stage in stages:
             if not stage.required:
-                continue
-            decision = decisions.get(("stage", stage.stage_id))
-            if decision is not None and decision.decision == "waive":
                 continue
             required_stages.append(stage)
             if stage.status in {"satisfied", "not_applicable"}:
@@ -525,15 +544,9 @@ def completion_gate_from_db(
         if row["type"] == "vulnerability"
         or row["semantic_type"] in {"candidate_finding", "confirmed_finding", "rejected_finding"}
     ]
-    human_excluded_candidate_ids = {
-        target_id
-        for (target_kind, target_id), decision in decisions.items()
-        if target_kind == "fact" and decision.decision in {"reject", "exclude"}
-    }
     unresolved_candidates = [
         row for row in candidate_rows
-        if row["id"] not in human_excluded_candidate_ids
-        and (row["status"] == "draft" or not _decisively_reviewed(conn, project_id, row["id"]))
+        if row["status"] == "draft" or not _decisively_reviewed(conn, project_id, row["id"])
     ]
     technically_confirmed_candidate_ids = {
         row["source_id"]
@@ -551,16 +564,15 @@ def completion_gate_from_db(
         row for row in candidate_rows
         if row["semantic_type"] == "candidate_finding"
         and row["status"] == "triaged"
-        and row["id"] not in human_excluded_candidate_ids
         and row["id"] not in technically_confirmed_candidate_ids
         and _strongly_reviewed(conn, project_id, row["id"])
     ]
     add(
         "finding_reviews",
-        "Every candidate has an independent decision",
+        "Every candidate has an evidence-based assessment",
         not unresolved_candidates,
-        "All candidates have decisive independent review." if not unresolved_candidates
-        else f"{len(unresolved_candidates)} candidate finding(s) still require decisive review.",
+        "All candidates have decisive threat-model and impact assessments." if not unresolved_candidates
+        else f"{len(unresolved_candidates)} candidate finding(s) still require a decisive evidence-based assessment.",
         evidence_ids=[row["id"] for row in unresolved_candidates],
         # Generic blackboards retain candidate facts but have no adversarial
         # finding gate; this preserves the legacy completion contract.
@@ -607,8 +619,8 @@ def completion_gate_from_db(
             "No reviewed positive candidate is awaiting Technical Confirmation."
             if not reviewed_candidates
             else (
-                f"{len(reviewed_candidates)} reviewed positive candidate finding(s) "
-                "still require Technical Confirmation or explicit exclusion."
+                f"{len(reviewed_candidates)} reportable positive candidate finding(s) "
+                "still require Technical Confirmation."
             ),
             evidence_ids=[row["id"] for row in reviewed_candidates],
         )

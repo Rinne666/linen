@@ -260,11 +260,20 @@ class ScopeAdjudicationConfig(BaseModel):
     enabled: bool = False
     local_paths: list[str] = Field(default_factory=lambda: [
         "SECURITY.md",
+        "SECURITY_THREAT_MODEL.md",
         ".github/SECURITY.md",
+        ".github/SECURITY_THREAT_MODEL.md",
         "README.md",
         "CONTRIBUTING.md",
+        "CHANGELOG*",
+        "RFC*.md",
+        "rfcs/**/*.md",
         "docs/**/security*.md",
+        "docs/**/SECURITY_THREAT_MODEL.md",
         "docs/**/threat*.md",
+        "docs/**/rfc*.md",
+        "docs/**/CVE*.md",
+        "docs/**/GHSA*.md",
         "docs/**/architecture*.md",
         "docs/**/deployment*.md",
     ])

@@ -52,9 +52,45 @@ For EVERY hypothesis, explicitly check against these 8 known Claude FP patterns.
 
 After the 5-layer search AND the 8-pattern check, vote on a verdict:
 
-- **`VALID`** only if you read the actual code and found no defense across ALL 5 layers AND none of the 8 FP patterns match. Do not validate by analogy.
-- **`INVALID`** only if you can point to a SPECIFIC guard (file:line or specific doc citation) that blocks the chain. State the guard in the summary. Cite the layer.
+- **`VALID`** means the claimed code behavior and trace are supported by source. It does not by itself mean the issue is a reportable vulnerability; `finding_assessment.classification` makes that determination.
+- **`INVALID`** means source evidence disproves the claimed path or identifies a specific guard that blocks it. State the guard in the summary and cite the layer. Do not use `INVALID` solely because policy excludes the class or the impact is only a design weakness.
 - **`NEEDS_REVIEW`** if you couldn't determine (e.g. need to read a config file you can't access, test the runtime, or check a dependency version). Be specific about what is missing.
+
+# Reportability Method (Mandatory)
+
+Do not ask for, wait for, or infer a human decision. Classify the candidate from
+the project evidence and the end-to-end attack path. First inspect the frozen
+`SECURITY.md`, `SECURITY_THREAT_MODEL.md`, RFCs, and available historical
+CVE/GHSA/HackerOne dispositions. Missing or unavailable sources are unknown,
+not evidence of exclusion. An explicit project exclusion or a documented and
+accepted design weakness is not a reportable vulnerability.
+
+A candidate is a `vulnerability` only when all of these are evidenced:
+
+1. The attacker and preconditions fit the project's threat model. A registered
+   agent or other legitimate identity may still be in scope if it is
+   over-authorized across a documented trust boundary.
+2. The attacker can reach the effect end to end without an administrator's
+   mistaken approval/action, social engineering, out-of-scope privileges, or
+   attacker-controlled insecure configuration.
+3. The path directly harms confidentiality, integrity, or availability, or
+   violates a documented security trust boundary. Name the concrete data,
+   operation, privilege, or artifact affected and cite the path.
+
+Creating a pending approval record, polluting a list, UI slowdown, or review
+fatigue alone does not satisfy the impact requirement. Classify those as
+`design_weakness` when the behavior is real but depends on an excluded
+precondition or accepted design, or `hardening_advice` when it is only a
+defense-in-depth improvement. Use `false_positive` only when source evidence
+disproves the claimed path/effect; use `inconclusive` when evidence is missing.
+
+Every candidate review must return `finding_assessment` with `classification`,
+`threat_model_status` (`in_scope`, `explicitly_excluded`,
+`acknowledged_design_weakness`, or `unknown`), cited `threat_model_evidence`,
+attacker precondition booleans, concrete impact booleans, a documented-boundary
+violation boolean, and an end-to-end `impact_path`. Only an in-scope
+`vulnerability` with no excluded preconditions and a concrete C/I/A impact or
+documented-boundary violation can proceed to Technical Confirmation.
 
 # Output (raw JSON, no markdown, no prose, last line of output)
 
@@ -80,6 +116,24 @@ After the 5-layer search AND the 8-pattern check, vote on a verdict:
     "6_config_as_vuln": "not applicable | MATCH: <evidence> | partial: <evidence>",
     "7_test_code": "not applicable | MATCH: <evidence> | partial: <evidence>",
     "8_double_counting": "not applicable | MATCH: <evidence> | partial: <evidence>"
+  },
+  "finding_assessment": {
+    "classification": "vulnerability | design_weakness | hardening_advice | false_positive | inconclusive",
+    "threat_model_status": "in_scope | explicitly_excluded | acknowledged_design_weakness | unknown",
+    "threat_model_evidence": ["file:line or frozen policy/advisory citation"],
+    "attacker_preconditions": {
+      "requires_admin_action": false,
+      "requires_social_engineering": false,
+      "requires_out_of_scope_privilege": false,
+      "requires_insecure_configuration": false
+    },
+    "direct_impact": {
+      "confidentiality": false,
+      "integrity": false,
+      "availability": false,
+      "documented_trust_boundary_violation": false,
+      "impact_path": "attacker-controlled entry point -> affected operation/data -> concrete security effect"
+    }
   }
 }
 ```
@@ -92,6 +146,9 @@ After the 5-layer search AND the 8-pattern check, vote on a verdict:
 - The `protection_search` and `fp_pattern_check` fields are mandatory. Include
   every documented key. If the candidate is too thin to evaluate, fill the
   checks with the missing evidence and return NEEDS_REVIEW.
+- For candidate vulnerability facts, `finding_assessment` is mandatory. Do not
+  promote a human override, confidence score, or policy eligibility alone into
+  a vulnerability verdict.
 - Do NOT propose new facts or intents. You are a judge, not an auditor.
 - Do NOT echo the candidate's description back; produce an independent judgment.
 - One JSON object only. No prose, no markdown wrapper.

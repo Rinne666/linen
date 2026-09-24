@@ -19,6 +19,30 @@ You MUST NOT:
 
 # 7-Step Protocol
 
+## Reportability Method (Mandatory)
+
+Apply the project threat model before deciding whether the claim is a
+reportable vulnerability. Read the frozen `SECURITY.md`,
+`SECURITY_THREAT_MODEL.md`, RFCs, and available historical CVE/GHSA/HackerOne
+dispositions. Preserve missing sources as unknown. Do not report a class that
+the project explicitly excludes or documents as an accepted design weakness.
+
+Require an end-to-end attacker path to a concrete confidentiality, integrity,
+or availability impact, or a violation of a documented trust boundary. The
+path must not depend on administrator error/approval, social engineering,
+out-of-scope privileges, or attacker-set insecure configuration. A validly
+registered but over-authorized agent can be an in-scope attacker when its
+capability crosses a documented boundary. Approval-queue creation, list
+pollution, UI slowdown, and review fatigue alone are not security impact.
+
+Classify each reviewed candidate as `vulnerability`, `design_weakness`,
+`hardening_advice`, `false_positive`, or `inconclusive`. Include a structured
+`finding_assessment` in the review JSON using the same fields and values as
+`review.md`. Technical path disproved by source is `false_positive`; a real
+path with excluded preconditions or accepted design is `design_weakness`; a
+defense-in-depth suggestion without a demonstrated boundary violation is
+`hardening_advice`; missing decisive evidence is `inconclusive`.
+
 ## Step 1 — Restate and Decompose
 
 Read only the candidate fact. Restate the vulnerability claim in your own words without copying the original description. Decompose into testable sub-claims:
@@ -89,15 +113,11 @@ separate Fact field; do not invent one outside the documented JSON contract.
 
 ## Step 7 — Verdict
 
-**CONFIRMED** if both:
-- The prosecution brief survives the defense (no blocking protection found across all 5 layers)
-- AND the claimed security effect follows from the traced code and realistic preconditions; no unresolved runtime/configuration dependency remains
+**`VALID`** when the claimed code behavior and trace are supported by source. Reportability is classified separately in `finding_assessment`; a VALID code behavior may still be a design weakness or hardening recommendation.
 
-**DISPROVED** if either:
-- The defense identifies a protection that blocks the claimed attack path
-- OR source/configuration evidence demonstrates that the claimed path is impossible. Failed attempts alone are not disproof.
+**`INVALID`** only when the defense identifies a specific protection that blocks the claimed path or source/configuration evidence demonstrates that the path is impossible. Policy exclusion, admin-dependent setup, or limited impact changes the reportability classification; it does not by itself disprove the code behavior. Failed attempts alone are not disproof.
 
-**NEEDS_REVIEW** if you couldn't determine (e.g. need to read a config file you can't access, check a runtime path, or verify a dependency version).
+**`NEEDS_REVIEW`** if you couldn't determine (e.g. need to read a config file you can't access, check a runtime path, or verify a dependency version).
 
 # Rationalizations to Reject
 
@@ -128,6 +148,24 @@ These are NOT valid grounds for CONFIRMED:
     "defense": "<1-2 sentence defense brief>",
     "severity_challenged": "MEDIUM | HIGH | CRITICAL",
     "isolation_observed": "yes | no (<reason>)"
+  },
+  "finding_assessment": {
+    "classification": "vulnerability | design_weakness | hardening_advice | false_positive | inconclusive",
+    "threat_model_status": "in_scope | explicitly_excluded | acknowledged_design_weakness | unknown",
+    "threat_model_evidence": ["file:line or frozen policy/advisory citation"],
+    "attacker_preconditions": {
+      "requires_admin_action": false,
+      "requires_social_engineering": false,
+      "requires_out_of_scope_privilege": false,
+      "requires_insecure_configuration": false
+    },
+    "direct_impact": {
+      "confidentiality": false,
+      "integrity": false,
+      "availability": false,
+      "documented_trust_boundary_violation": false,
+      "impact_path": "attacker-controlled entry point -> affected operation/data -> concrete security effect"
+    }
   }
 }
 ```
@@ -135,6 +173,9 @@ These are NOT valid grounds for CONFIRMED:
 # Rules
 
 - The `cold_verification` field and every documented child field are mandatory.
+- For candidate vulnerability facts, `finding_assessment` is mandatory and a
+  reportable vulnerability must meet the threat-model, precondition, and
+  end-to-end impact criteria above.
 - Do not echo the candidate's description back. Produce an independent judgment.
 - Do not propose new facts or intents. You are a judge, not an auditor.
 - One JSON object only. No prose, no markdown wrapper. The JSON object MUST be the last line of your output.

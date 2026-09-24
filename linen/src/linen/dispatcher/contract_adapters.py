@@ -47,7 +47,6 @@ def project_detail_to_snapshot(
         *(_node("review", item.id, item) for item in project.reviews),
         *(_node("intent_error", item.id, item) for item in project.errors),
         *(_node("stage", item.stage_id, item) for item in project.stages),
-        *(_node("decision", item.id, item) for item in project.decisions),
     ]
     node_ids = [node.id for node in nodes]
     if len(node_ids) != len(set(node_ids)):

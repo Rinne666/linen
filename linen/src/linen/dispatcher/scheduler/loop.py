@@ -516,19 +516,13 @@ class DispatcherLoop:
                 summary.id,
                 [intent.id for intent in deferred_by_error],
             )
-        if self._scope_gate_pending(project):
-            withheld = len(unclaimed_intents)
-            unclaimed_intents = [
-                intent for intent in unclaimed_intents
-                if self._scope_gate_intent_allowed(project, intent)
-            ]
+        if self._scope_gate_pending(project) and unclaimed_intents:
             self._log_changed(
                 f"{skip_scope}:scope_gate",
                 logging.INFO,
-                "scope adjudication gate withholding technical work project=%s visible_gate_intents=%s withheld=%s",
+                "scope adjudication incomplete; dispatching exploratory work while final reporting remains gated project=%s queued_intents=%s",
                 summary.id,
                 [intent.id for intent in unclaimed_intents],
-                withheld - len(unclaimed_intents),
             )
         if running_intent_ids and not unclaimed_intents:
             self._log_changed(
@@ -717,13 +711,32 @@ class DispatcherLoop:
         created = 0
         known_intent_ids = {intent.id for intent in project.intents}
         for proposal in proposals:
+            target = proposal.get("target")
+            if target is None:
+                prior = [
+                    intent for intent in project.intents
+                    if intent.description.strip() == proposal["description"].strip()
+                    and intent.source_generation == project.project.source_generation
+                    and intent.plan_revision == project.project.plan_revision
+                ]
+                any_historical = any(
+                    intent.description.strip() == proposal["description"].strip()
+                    for intent in project.intents
+                )
+                if prior or any_historical:
+                    target = (
+                        f"{proposal['description']}:generation:{project.project.source_generation}"
+                        f":plan:{project.project.plan_revision}:attempt:{len(prior) + 1}"
+                    )
+                else:
+                    target = proposal["description"]
             response = self.client.create_intent(
                 project.project.id,
                 proposal["from"],
                 proposal["description"],
                 audit_graph.CREATOR,
                 action=proposal.get("action") or proposal.get("type"),
-                target=proposal.get("target") or proposal["description"],
+                target=target,
                 intent_type=proposal.get("type"),
             )
             if response.status_code in {403, 409}:
@@ -1225,24 +1238,6 @@ class DispatcherLoop:
             or not coverage.reviewed(project, adjudication.id)
         )
 
-    def _scope_gate_intent_allowed(
-        self, project: ProjectDetail, intent: Intent,
-    ) -> bool:
-        if not self._scope_gate_pending(project):
-            return True
-        if scope_gate.is_evidence_intent(intent) or scope_gate.is_adjudication_intent(intent):
-            return True
-        if not (intent.type or "").startswith("review") or len(intent.from_) != 1:
-            return False
-        source = next(
-            (fact for fact in project.facts if fact.id == intent.from_[0]),
-            None,
-        )
-        return source is not None and source.type in {
-            scope_gate.POLICY_EVIDENCE_TYPE,
-            scope_gate.SCOPE_ADJUDICATION_TYPE,
-        }
-
     @staticmethod
     def _intent_error_allows_dispatch(
         project: ProjectDetail, intent: Intent,
@@ -1575,6 +1570,13 @@ class DispatcherLoop:
         if reporter is None:
             return
         profiles = {
+            "invalid_result": (
+                "invalid_blackboard_result",
+                "Worker output could not be validated into the required result fact.",
+                10,
+                120,
+                2,
+            ),
             "failed": (
                 "task_failed",
                 "The task failed before it could produce a valid blackboard result.",
@@ -1628,6 +1630,9 @@ class DispatcherLoop:
                 2,
             ),
         )
+        if outcome.startswith("invalid_result:"):
+            detail = outcome.partition(":")[2]
+            code, message, base_retry, max_retry, max_attempts = profiles["invalid_result"]
         if detail:
             message = f"{message} {detail}"[:4000]
         try:

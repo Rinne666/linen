@@ -11,7 +11,6 @@ from linen.server.audit_state import (
     list_audit_events,
     list_audit_stages,
     list_graph_edges,
-    list_human_decisions,
 )
 from linen.server.db import get_conn
 from linen.server.services import (
@@ -191,10 +190,6 @@ def _export_yaml(conn, project_id: str) -> str:
     ]
     data["audit_stages"] = [
         stage.model_dump(exclude_none=True) for stage in list_audit_stages(conn, project_id)
-    ]
-    data["human_decisions"] = [
-        decision.model_dump(exclude_none=True)
-        for decision in list_human_decisions(conn, project_id)
     ]
     data["completion_gate"] = completion_gate_from_db(
         conn, project_id
@@ -409,29 +404,16 @@ def _fact_title(fact) -> str:
 
 
 def _export_summary(conn, project_id: str) -> str:
-    """Render a short, decision-focused audit report.
+    """Render a short, assessment-focused audit report.
 
-    Confirmed findings are created only by Technical Confirmation. Rejected
-    candidates require a decisive Review or human decision. Everything else
-    remains visibly pending instead of being silently promoted or discarded.
+    Confirmed findings are created only by Technical Confirmation. Candidate
+    outcomes follow the structured threat-model and impact assessment; anything
+    without decisive evidence remains pending.
     """
     proj, facts, _hints, _intents, _sources_by_intent = _load_project_data(
         conn, project_id
     )
     reviews = list_reviews_for_project(conn, project_id)
-    decisions = [
-        decision
-        for decision in list_human_decisions(conn, project_id)
-        if decision.source_generation == proj["source_generation"]
-    ]
-    superseded_decisions = {
-        decision.supersedes_id for decision in decisions if decision.supersedes_id
-    }
-    effective_decisions = {
-        (decision.target_kind, decision.target_id): decision
-        for decision in decisions
-        if decision.id not in superseded_decisions
-    }
     reviews_by_fact: dict[str, list] = {}
     for review in reviews:
         reviews_by_fact.setdefault(review.fact_id, []).append(review)
@@ -468,26 +450,27 @@ def _export_summary(conn, project_id: str) -> str:
     ]
 
     excluded: list[tuple[object, str, str]] = []
+    design_weaknesses: list[tuple[object, str]] = []
+    hardening_advice: list[tuple[object, str]] = []
     pending = []
     for fact in candidates:
         fact_reviews = reviews_by_fact.get(fact["id"], [])
         latest_review = fact_reviews[-1] if fact_reviews else None
-        decision = effective_decisions.get(("fact", fact["id"]))
+        assessment = latest_review.finding_assessment if latest_review else None
+        classification = assessment.get("classification") if assessment else None
         exclusion_label = ""
         exclusion_reason = ""
-        if decision is not None and decision.decision in {"reject", "exclude"}:
-            exclusion_label = "Rejected" if decision.decision == "reject" else "Excluded from scope"
-            exclusion_reason = decision.rationale
-        elif latest_review is not None and latest_review.verdict == "INVALID":
+        decisive_review = latest_review is not None and latest_review.confidence in {"firm", "certain"}
+        if decisive_review and latest_review.verdict == "INVALID" and classification == "false_positive":
             confidence = latest_review.confidence or "unspecified confidence"
             exclusion_label = f"Independent Review: INVALID / {confidence}"
             exclusion_reason = latest_review.summary
-        elif fact["semantic_type"] == "rejected_finding" or fact["status"] == "false_positive":
-            exclusion_label = "Rejected finding"
-            exclusion_reason = "The candidate is recorded as a false positive; no decisive Review summary is available."
-
         if exclusion_reason:
             excluded.append((fact, exclusion_label, exclusion_reason))
+        elif decisive_review and latest_review.verdict == "VALID" and classification == "design_weakness":
+            design_weaknesses.append((fact, latest_review.summary if latest_review else ""))
+        elif decisive_review and latest_review.verdict == "VALID" and classification == "hardening_advice":
+            hardening_advice.append((fact, latest_review.summary if latest_review else ""))
         else:
             pending.append(fact)
 
@@ -506,7 +489,9 @@ def _export_summary(conn, project_id: str) -> str:
         "## Result",
         "",
         f"**{len(confirmed)} confirmed vulnerabilit{'y' if len(confirmed) == 1 else 'ies'} · "
-        f"{len(excluded)} excluded candidate{'s' if len(excluded) != 1 else ''} · "
+        f"{len(excluded)} false positive{'s' if len(excluded) != 1 else ''} · "
+        f"{len(design_weaknesses)} design weakness{'es' if len(design_weaknesses) != 1 else ''} · "
+        f"{len(hardening_advice)} hardening recommendation{'s' if len(hardening_advice) != 1 else ''} · "
         f"{len(pending)} pending candidate{'s' if len(pending) != 1 else ''}.**",
         "",
         f"**Audit status:** {_markdown_text(status_label)}  ",
@@ -578,7 +563,7 @@ def _export_summary(conn, project_id: str) -> str:
                     lines.extend(f"- `{_markdown_text(location)}`" for location in citations)
                     lines.append("")
 
-    lines.extend(["## Excluded candidates", ""])
+    lines.extend(["## False positives", ""])
     if not excluded:
         lines.extend(["No candidates have a decisive exclusion record.", ""])
     else:
@@ -588,12 +573,27 @@ def _export_summary(conn, project_id: str) -> str:
                     f"### {index}. {_markdown_text(_fact_title(fact))}",
                     "",
                     f"**Candidate:** `{_markdown_text(fact['id'])}`  ",
-                    f"**Decision:** {_markdown_text(label)}",
+                    f"**Assessment:** {_markdown_text(label)}",
                     "",
                     "**Reason:** " + _markdown_text(_compact_text(reason, 900)),
                     "",
                 ]
             )
+
+    for heading, items in (
+        ("Design weaknesses", design_weaknesses),
+        ("Hardening recommendations", hardening_advice),
+    ):
+        lines.extend([f"## {heading}", ""])
+        if not items:
+            lines.extend([f"No {heading.lower()} were recorded.", ""])
+            continue
+        for fact, rationale in items:
+            lines.extend([
+                f"- `{_markdown_text(fact['id'])}` — {_markdown_text(_fact_title(fact))}",
+                f"  - {_markdown_text(_compact_text(rationale, 900))}",
+            ])
+        lines.append("")
 
     if pending:
         lines.extend(
@@ -608,7 +608,11 @@ def _export_summary(conn, project_id: str) -> str:
             fact_reviews = reviews_by_fact.get(fact["id"], [])
             latest_review = fact_reviews[-1] if fact_reviews else None
             if latest_review is not None and latest_review.verdict == "VALID":
-                state = "Independent Review passed; Technical Confirmation is still required."
+                assessment = latest_review.finding_assessment or {}
+                state = (
+                    f"Assessment: {assessment.get('classification', 'missing')}; "
+                    "Technical Confirmation is still required."
+                )
             elif latest_review is not None:
                 state = f"Latest Review: {latest_review.verdict}."
             else:
@@ -622,7 +626,7 @@ def _export_summary(conn, project_id: str) -> str:
         [
             "## Scope and limitations",
             "",
-            "This brief report contains terminal finding decisions only. A candidate is listed as confirmed only after Technical Confirmation, and an exclusion requires a decisive Review or human decision. It does not prove that unexamined code or vulnerability classes are safe.",
+            "This brief report contains evidence-based finding assessments only. A candidate is listed as confirmed only after its threat-model and end-to-end impact criteria pass Review and Technical Confirmation. It does not prove that unexamined code or vulnerability classes are safe.",
             "",
         ]
     )
