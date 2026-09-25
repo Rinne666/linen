@@ -72,6 +72,11 @@ class PiDriver(WorkerDriver):
             "--session-dir",
             self._session_dir(worker),
         ]
+        if self._read_only_recon(prompt):
+            argv.extend([
+                "--no-extensions", "--no-skills", "--no-prompt-templates",
+                "--no-themes", "--no-context-files", "--tools", "read,grep,find,ls",
+            ])
         if session:
             argv.extend(["--session", session])
         argv.extend(["-p", prompt])
@@ -92,9 +97,13 @@ class PiDriver(WorkerDriver):
             self._session_dir(worker),
             "--session",
             session,
-            "-p",
-            prompt,
         ]
+        if self._read_only_recon(prompt):
+            argv.extend([
+                "--no-extensions", "--no-skills", "--no-prompt-templates",
+                "--no-themes", "--no-context-files", "--tools", "read,grep,find,ls",
+            ])
+        argv.extend(["-p", prompt])
         return self._wrap_with_models(worker, argv)
 
     def _local_argv(self, worker: WorkerConfig, prompt: str, session: str | None) -> list[str]:
@@ -104,6 +113,7 @@ class PiDriver(WorkerDriver):
         # and rejects fresh UUIDs, while --session-id creates the session on first use, which
         # is what the dispatcher needs (it generates a fresh UUID per task).
         session_dir = self._session_dir(worker)
+        readonly = self._read_only_recon(prompt)
         pi_argv = [
             "--mode",
             "json",
@@ -115,13 +125,17 @@ class PiDriver(WorkerDriver):
             "--no-themes",
             "--no-context-files",
             "--tools",
-            "read,write,edit,bash,grep,find,ls",
+            "read,grep,find,ls" if readonly else "read,write,edit,bash,grep,find,ls",
         ]
         if session:
             pi_argv.extend(["--session-id", session])
         pi_argv.extend(["-p", prompt])
         script = 'sdir="$1"\nshift\nmkdir -p "$sdir"\nexec pi "$@"\n'
         return ["/bin/sh", "-lc", script, "--", session_dir, *pi_argv]
+
+    @staticmethod
+    def _read_only_recon(prompt: str) -> bool:
+        return prompt.lstrip().startswith("# READ-ONLY RECON TASK")
 
     def extract_session(self, session: str | None, stdout: str, stderr: str) -> str | None:
         if session:

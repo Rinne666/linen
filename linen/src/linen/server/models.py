@@ -32,6 +32,7 @@ FACT_TYPE_VALIDATION = "validation"
 FACT_TYPE_REACHABILITY = "reachability"
 FACT_TYPE_VULNERABILITY = "vulnerability"
 FACT_TYPE_RECON = "recon"
+FACT_TYPE_RECON_SNAPSHOT = "recon_snapshot"
 FACT_TYPE_COVERAGE_PLAN = "coverage_plan"
 FACT_TYPE_COVERAGE_RESULT = "coverage_result"
 FACT_TYPE_CANDIDATE_DISPOSITION = "candidate_disposition"
@@ -55,7 +56,7 @@ FACT_TYPE_SECURITY_INVARIANT = "security_invariant"
 FACT_TYPE_SECURITY_BOUNDARY = "security_boundary"
 
 REVIEWLESS_INTERMEDIATE_FACT_TYPES = frozenset({
-    FACT_TYPE_COVERAGE_PLAN, FACT_TYPE_ARCHITECTURE_MAP,
+    FACT_TYPE_RECON, FACT_TYPE_RECON_SNAPSHOT, FACT_TYPE_COVERAGE_PLAN, FACT_TYPE_ARCHITECTURE_MAP,
     FACT_TYPE_AUTHZ_MATRIX, FACT_TYPE_STATE_MODEL, FACT_TYPE_CROSS_SERVICE_MAP,
     FACT_TYPE_CONTRACT_MAP, FACT_TYPE_HYPOTHESIS_BATCH, FACT_TYPE_VARIANT_BATCH,
     FACT_TYPE_MODULE_SUMMARY, FACT_TYPE_SEMANTIC_SUMMARY, FACT_TYPE_AUDIT_SUMMARY,
@@ -436,6 +437,16 @@ class ProjectReason(BaseModel):
     last_heartbeat_at: str
 
 
+class ProjectWorkerIssue(BaseModel):
+    worker: str
+    task_type: str
+    code: str
+    message: str
+    remediation: str
+    intent_id: str | None = None
+    created_at: str
+
+
 class ProjectMeta(BaseModel):
     id: str
     title: str
@@ -451,6 +462,7 @@ class ProjectMeta(BaseModel):
     # different dispatcher configuration later.
     audit_mode: Literal["none", "hypothesis", "scope"] = "none"
     worker_preference: Literal["auto", "pi", "codex", "claudecode"] = "auto"
+    worker_issues: list[ProjectWorkerIssue] = Field(default_factory=list)
     created_at: str
     reason: ProjectReason | None = None
     # Resolved source-tree path for the project. Set when the project is
@@ -977,6 +989,15 @@ class ConcludeResponse(BaseModel):
 
 class UpdateProjectStatusRequest(BaseModel):
     status: Literal["active", "stopped"]
+
+
+class ReportProjectWorkerIssueRequest(BaseModel):
+    worker: str = Field(min_length=1, max_length=120)
+    task_type: Literal["reason", "explore", "review"]
+    code: str = Field(min_length=1, max_length=120)
+    message: str = Field(min_length=1, max_length=4000)
+    remediation: str = Field(min_length=1, max_length=2000)
+    intent_id: str | None = Field(default=None, max_length=120)
 
 
 class UpdateProjectWorkerPreferenceRequest(BaseModel):

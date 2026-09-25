@@ -32,11 +32,20 @@ Agent 不直接认领 Intent，不直接 heartbeat，不直接调用 linen API�
     Fact/Intent/Review 与哈希 artifact 重新推导缺失边，以
     `creator=dispatcher.audit` 写回普通 Intent；重启只会重算，不会丢步骤，也不会
     形成第二真相源。单次 fan-out 最多 8 条，仍受全局和项目 Worker 配额约束。
-14. scope 审计先固定 source snapshot 与 coverage plan。Reason 可选择语义分析方法，
-    但这些方法不构成强制阶段顺序；发现通过普通 Intent、Fact、证据与统一 proof
-    review 推进到 `audit_summary`。这些是自由的 Intent.type 模式，不是固定 Worker
-    角色。
-15. `poc:isolated` Intent 只有在 `audit.poc_sandbox.enabled=true` 时可运行；源码以
+14. `audit.recon.enabled` 时，scope 流程冻结一次完整源码快照，然后为每个配置的
+    漏洞类别派发一个仓库级 Recon Intent；不会创建 coverage plan、文件格子或模块
+    汇总。类别任务强制选择 Pi，且 Pi CLI 只开放读取/搜索工具。Pi 返回带快照行号
+    引用的 source-to-sink 候选与明确缺口；Reason 读取 artifact、归并跨类别证据并
+    决定是否发起有上限的类别跟进或普通验证任务。Recon Fact 是只读侦察材料，不是
+    漏洞结论，也不能单独通过完成门槛。未启用 Recon 时仍使用原 coverage 流程。
+    已在当前 source generation / plan revision 创建 coverage plan 的旧项目继续履行
+    已冻结的 coverage 阶段；更换模式只作用于尚未开始计划的新项目或重新规划后的版本。
+15. Reason 只由安全相关的新证据、用户确认/放弃动作，或所有 open Intent 均已阻塞时
+    唤醒。普通 coverage 结果由确定性调度器继续推进；只有 `needs_followup`、`blocked`
+    或带 lead 的结果才额外触发 Reason，避免每个覆盖单元都支付一次策略推理调用。
+    Reason 失败时确认本轮已读取的事件游标，但不确认执行期间新到的事件，防止同一
+    失败触发无限重试，同时保留并发产生的新证据唤醒后续分析。
+16. `poc:isolated` Intent 只有在 `audit.poc_sandbox.enabled=true` 时可运行；源码以
     只读冻结快照挂载到一次性容器，不挂载 host HOME、图历史或 Docker socket，且
     失败后禁止切回 host conclude fallback。
 
@@ -693,6 +702,9 @@ driver 按各自 provider 的协议构造请求：`claudecode` 打 `{base}/v1/me
 - 非 2xx / 连接失败 / 超时（`requests` 超时由 `runtime.healthcheck_timeout` 控制）视为不健康
 - 如果这次失败，Dispatcher 把失败写成附着于 Intent 的持久化 Error；临时错误进入
   有界指数退避，永久前置条件错误进入 blocked，不允许立即循环
+- 确定性的 CLI 模型不兼容、未知模型、鉴权失败、可执行文件缺失或 provider quota 耗尽
+  不应作为普通 Intent 重试：Dispatcher 写入项目级 CLI Issue 并自动切为 `stopped`；
+  Issues 面板显示原因和修复建议。用户修复后点击 Resume，open Intent 重新排队
 - 窗口结束后，后续轮次再次选择到这个 Worker 时重新检查
 - provider/健康检查仍保留 Worker 级本地 circuit；Intent 级 `retry_at` 同时持久化在
   Server，dispatcher 重启后也不会丢失。连续失败达到预算后必须人工修复并 Retry

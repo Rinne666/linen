@@ -10,7 +10,7 @@ import json
 import uuid
 from pathlib import Path
 
-from linen.dispatcher.analysis import audit_recipes, coverage, scope_gate
+from linen.dispatcher.analysis import audit_recipes, coverage, recon, scope_gate
 from linen.dispatcher.analysis.artifacts import ancestor_ids, digest, write_json
 from linen.dispatcher.config import AuditConfig
 from linen.server.models import Fact, ProjectDetail, REVIEWLESS_INTERMEDIATE_FACT_TYPES
@@ -225,16 +225,43 @@ def audit_summary_inputs(
     config: AuditConfig,
 ) -> list[str] | None:
     try:
-        plan_fact, _, plan = coverage.get_plan(project, workdir)
-        expected_modules = {cell["module"] for cell in plan["cells"]}
-        module_ids = []
-        for group in coverage.module_summary_groups(project, workdir, config.coverage):
-            fact = _result(project, group["description"])
-            if fact is None or fact.type != "module_summary" or not _reviewed(project, fact.id):
+        recon_mode = recon.active_for_project(project, config.recon)
+        if recon_mode:
+            unresolved_work = [
+                intent for intent in project.intents
+                if intent.source_generation == project.project.source_generation
+                and intent.plan_revision == project.project.plan_revision
+                and intent.to is None
+                and intent.concluded_at is None
+                and intent.description.strip() != AUDIT_SUMMARY_INTENT
+            ]
+            if unresolved_work:
                 return None
-            module_ids.append(fact.id)
-        if len(module_ids) != len(expected_modules) or not _reviewed(project, plan_fact.id):
-            return None
+            plan_fact = recon.snapshot_fact(project)
+            if plan_fact is None:
+                return None
+            snapshot_record = recon.result_record(plan_fact, workdir)
+            if snapshot_record.get("kind") != "recon_snapshot":
+                return None
+            category_facts = recon.expected_category_facts(project, config.recon)
+            if category_facts is None:
+                return None
+            for fact in category_facts:
+                record = recon.result_record(fact, workdir)
+                if record.get("kind") != "category_reconnaissance" or record.get("status") != "complete":
+                    return None
+            module_ids = [plan_fact.id, *(fact.id for fact in category_facts)]
+        else:
+            plan_fact, _, plan = coverage.get_plan(project, workdir)
+            expected_modules = {cell["module"] for cell in plan["cells"]}
+            module_ids = []
+            for group in coverage.module_summary_groups(project, workdir, config.coverage):
+                fact = _result(project, group["description"])
+                if fact is None or fact.type != "module_summary" or not _reviewed(project, fact.id):
+                    return None
+                module_ids.append(fact.id)
+            if len(module_ids) != len(expected_modules) or not _reviewed(project, plan_fact.id):
+                return None
         gate_ids = []
         if config.scope_adjudication.enabled:
             adjudication = scope_gate.result_for_intent(
@@ -250,7 +277,9 @@ def audit_summary_inputs(
             gate_ids.append(adjudication.id)
         required_ids = set(gate_ids + module_ids)
         for fact in project.facts:
-            if fact.id in {"origin", "goal"} or fact.type in {"recon", "audit_summary"}:
+            if fact.id in {"origin", "goal"} or fact.type == "audit_summary":
+                continue
+            if recon_mode and fact.id in module_ids:
                 continue
             if fact.status in {"false_positive", "fixed", "accepted_risk"}:
                 continue
@@ -277,8 +306,8 @@ def audit_summary_fact(
 ) -> dict[str, str]:
     inputs = audit_summary_inputs(project, workdir, config)
     if (intent.description.strip() != AUDIT_SUMMARY_INTENT or (intent.type or "") != "synthesize"
-            or inputs is None or set(intent.from_) != set(inputs)):
-        raise ValueError("Audit summary requires every validated coverage module summary")
+        or inputs is None or set(intent.from_) != set(inputs)):
+        raise ValueError("Audit summary requires every validated reconnaissance or coverage result")
     vulnerabilities = [
         fact.id for fact in project.facts
         if fact.type == "vulnerability" and fact.status == "triaged" and _reviewed(project, fact.id)
@@ -290,9 +319,9 @@ def audit_summary_fact(
         "input_fact_ids": inputs,
         "confirmed_vulnerability_ids": sorted(vulnerabilities),
         "statement": (
-        "The scope gate and required coverage branches completed on "
-            "frozen evidence. Policy eligibility "
-            "remains separate from technical exploitability."
+            ("The scope gate and configured category reconnaissance branches completed on "
+             if recon.active_for_project(project, config.recon) else "The scope gate and required coverage branches completed on ")
+            + "frozen evidence. Policy eligibility remains separate from technical exploitability."
         ),
     }
     directory = workdir / ".linen-analysis" / ("audit-summary-" + uuid.uuid4().hex)
@@ -303,8 +332,9 @@ def audit_summary_fact(
         "type": "audit_summary",
         "description": (
             f"Scope audit synthesis completed with {len(vulnerabilities)} confirmed vulnerabilities. "
-            "All required coverage branches reached validated summaries. "
-            "This does not prove the repository universally safe."
+            + ("All configured category reconnaissance branches completed. "
+               if recon.active_for_project(project, config.recon) else "All required coverage branches reached validated summaries. ")
+            + "This does not prove the repository universally safe."
         ),
         "evidence": (
             f"artifact: {path}\nmanifest_sha256: {digest(path.read_bytes())}\n"
@@ -387,6 +417,39 @@ def required_intents(
         # configured stage and a validated receipt.
         return []
 
+    if recon.active_for_project(project, config.recon):
+        snapshot = recon.snapshot_fact(project)
+        if snapshot is None:
+            proposal = _stage_intent_proposal(
+                project, [plan_anchor], "search", recon.SNAPSHOT_INTENT,
+            )
+            return [proposal] if proposal is not None else []
+        for category in config.recon.categories:
+            if recon.latest_category_fact(project, category) is not None:
+                continue
+            description = recon.category_description(category)
+            category_attempted = any(
+                intent.description.strip() == description
+                and intent.source_generation == project.project.source_generation
+                and intent.plan_revision == project.project.plan_revision
+                for intent in project.intents
+            )
+            if not category_attempted:
+                return [{
+                    "from": [snapshot.id],
+                    "type": "search",
+                    "description": description,
+                }]
+        # The high-level Reason worker owns decisions about partial searches
+        # and targeted follow-ups. Never expand them into per-file cells.
+        inputs = audit_summary_inputs(project, workdir, config)
+        if inputs is not None:
+            proposal = _stage_intent_proposal(
+                project, inputs, "synthesize", AUDIT_SUMMARY_INTENT,
+            )
+            return [proposal] if proposal is not None else []
+        return []
+
     proposals: list[dict] = []
     if not any(fact.type == "coverage_plan" for fact in project.facts):
         proposal = _stage_intent_proposal(
@@ -456,7 +519,10 @@ def scope_blockers(
     config: AuditConfig,
     from_ids: list[str],
 ) -> list[str]:
-    blockers = coverage.scope_blockers(project, workdir, config.coverage, from_ids)
+    recon_mode = recon.active_for_project(project, config.recon)
+    blockers = [] if recon_mode else coverage.scope_blockers(
+        project, workdir, config.coverage, from_ids,
+    )
     if config.scope_adjudication.enabled:
         evidence = scope_gate.result_for_intent(project, scope_gate.EVIDENCE_INTENT)
         adjudication = scope_gate.result_for_intent(
@@ -481,5 +547,8 @@ def scope_blockers(
     elif not _reviewed(project, summary.id):
         blockers.append(f"{summary.id} requires a firm/certain VALID review.")
     if audit_summary_inputs(project, workdir, config) is None:
-        blockers.append("Coverage branches have not reached validated module summaries.")
+        blockers.append(
+            "Configured reconnaissance branches have not produced complete validated results."
+            if recon_mode else "Coverage branches have not reached validated module summaries."
+        )
     return list(dict.fromkeys(blockers))

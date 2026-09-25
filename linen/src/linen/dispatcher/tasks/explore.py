@@ -5,7 +5,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Any
-from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, scope_gate
+from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, recon, scope_gate
 from linen.dispatcher.analysis.artifacts import review_inputs, select_snapshot
 
 from linen.dispatcher.analysis.policy import SOURCE_DATA_BOUNDARY
@@ -229,6 +229,22 @@ def run_explore_task(
             )
 
         if (scope_audit and intent.type == "search"
+                and config.audit.recon.enabled
+                and intent.description.strip() == recon.SNAPSHOT_INTENT):
+            fact = recon.create_snapshot(
+                Path(container_name) / "repo", Path(container_name),
+                project.project.source_generation, config.audit.recon,
+            )
+            if cancellation.is_cancelled or lease.failure is not None:
+                best_effort_release(client, project.project.id, intent.id, worker.name)
+                return "cancelled" if cancellation.is_cancelled else "failed"
+            return write_conclude_result(
+                client, project.project.id, intent.id, worker.name, fact["description"],
+                source="recon_source_snapshot", phase_ms=int((time.perf_counter() - task_started) * 1000),
+                fact_type=fact["type"], evidence=fact["evidence"], fact_status="triaged",
+            )
+
+        if (scope_audit and intent.type == "search"
                 and intent.description.strip() == coverage.PLAN_INTENT):
             fresh = client.get_project(project.project.id)
             if any(f.type == "coverage_plan" for f in fresh.facts):
@@ -340,6 +356,14 @@ def run_explore_task(
             graph_context = "Withheld for isolated proof-of-concept validation."
 
         coverage_task = scope_audit and intent.description.startswith(coverage.CELL_PREFIX)
+        recon_task = (
+            scope_audit
+            and config.audit.recon.enabled
+            and intent.description.startswith(recon.CATEGORY_PREFIX)
+        )
+        task_timeout = (
+            config.audit.recon.timeout if recon_task else config.tasks.explore.timeout
+        )
         scope_adjudication_task = (
             scope_audit
             and config.audit.scope_adjudication.enabled
@@ -351,6 +375,7 @@ def run_explore_task(
         )
         continuation_allowed = not (
             coverage_task
+            or recon_task
             or scope_adjudication_task
             or semantic_recipe is not None
             or poc_isolated
@@ -378,6 +403,10 @@ def run_explore_task(
             recipe_version = recipe_definition.version
         elif coverage_task:
             prompt = coverage.execution_prompt(project, intent, Path(container_name))
+        elif recon_task:
+            prompt = recon.execution_prompt(
+                project, intent, Path(container_name), config.audit.recon,
+            )
         else:
             prompt = render_prompt(
                 load_prompt(config.runtime.prompt_group, "explore.md"),
@@ -402,15 +431,19 @@ def run_explore_task(
             )
         if not poc_isolated:
             prompt = append_context_projection_reference(prompt, context_reference)
-        recipe_id = recipe_id or "explore"
+        recipe_id = recipe_id or (
+            f"recon:{recon.parse_category_intent(intent, config.audit.recon)[0]}"
+            if recon_task else "explore"
+        )
         worker_manifest, run_envelope = build_context_execution_contracts(
             project,
             worker,
             projection,
             phase="scope_adjudication" if scope_adjudication_task else (
-                "semantic_recipe" if semantic_recipe is not None else "explore_execute"
+                "semantic_recipe" if semantic_recipe is not None else
+                "recon_category" if recon_task else "explore_execute"
             ),
-            timeout_seconds=config.tasks.explore.timeout,
+            timeout_seconds=task_timeout,
             prompt=prompt,
             logical_scope=(
                 f"explore:{intent.id}:graph-{projection.graph_revision}:"
@@ -433,6 +466,8 @@ def run_explore_task(
             if scope_adjudication_task
             else "semantic_recipe"
             if semantic_recipe is not None
+            else "recon_category"
+            if recon_task
             else "explore_execute"
         )
         first = _run_process(
@@ -441,7 +476,7 @@ def run_explore_task(
             worker,
             execute.argv,
             phase=execute_phase,
-            timeout=config.tasks.explore.timeout,
+            timeout=task_timeout,
             lease=lease,
             cancellation=cancellation,
             recipe_id=recipe_id,
@@ -882,6 +917,11 @@ def _try_conclude_fallback(
         return "failed"
 
     coverage_task = scope_audit and intent.description.startswith(coverage.CELL_PREFIX)
+    recon_task = (
+        scope_audit
+        and config.audit.recon.enabled
+        and intent.description.startswith(recon.CATEGORY_PREFIX)
+    )
     scope_adjudication_task = (
         scope_audit
         and config.audit.scope_adjudication.enabled
@@ -918,6 +958,11 @@ def _try_conclude_fallback(
         prompt = coverage.conclusion_prompt(
             fresh_project, intent, Path(container_name), validation_error=failure_detail,
         )
+    elif recon_task:
+        prompt = recon.execution_prompt(
+            fresh_project, intent, Path(container_name), config.audit.recon,
+            validation_error=failure_detail,
+        )
     else:
         prompt = render_prompt(
             load_prompt(config.runtime.prompt_group, "explore_conclude.md"),
@@ -937,17 +982,22 @@ def _try_conclude_fallback(
         if scope_adjudication_task
         else "semantic_recipe_conclude"
         if semantic_recipe is not None
+        else "recon_conclude"
+        if recon_task
         else "explore_conclude"
     )
     # A semantic recipe may need to re-read and repair many frozen-source
     # citations.  The generic short conclude window is intended for concise
     # response cleanup and repeatedly killed otherwise valid recipe repairs.
     conclude_timeout = (
+        config.audit.recon.conclude_timeout if recon_task else
         max(config.tasks.explore.conclude_timeout, config.tasks.explore.timeout)
-        if semantic_recipe is not None
-        else config.tasks.explore.conclude_timeout
+        if semantic_recipe is not None else config.tasks.explore.conclude_timeout
     )
-    recipe_id = recipe_id or "explore_conclude"
+    recipe_id = recipe_id or (
+        f"recon:{recon.parse_category_intent(intent, config.audit.recon)[0]}:conclude"
+        if recon_task else "explore_conclude"
+    )
     worker_manifest, run_envelope = build_context_execution_contracts(
         fresh_project,
         worker,
@@ -1107,12 +1157,20 @@ def _managed_result(config, project, intent, container_name, payload, fact):
                 config.audit.semantic,
                 config.runtime.prompt_group,
             )
+        if (
+            config.audit.recon.enabled
+            and intent.description.startswith(recon.CATEGORY_PREFIX)
+        ):
+            return recon.outcome_fact(
+                payload, project, intent, Path(container_name), config.audit.recon,
+            )
         if intent.description.startswith(coverage.CELL_PREFIX):
             return coverage.outcome_fact(payload, project, intent, Path(container_name))
         if fact["type"] in {
             "coverage_plan", "coverage_result",
             "module_summary", "audit_summary", *audit_recipes.SEMANTIC_ARTIFACT_FACT_TYPES,
             "policy_evidence", "scope_adjudication",
+            "recon",
         }:
             raise ValueError("Managed audit fact type requires its exact graph-derived intent")
     return fact

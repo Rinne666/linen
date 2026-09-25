@@ -125,6 +125,7 @@ from linen.server.models import (
     ReopenResponse,
     ReasonClaimRequest,
     ReasonHeartbeatRequest,
+    ReportProjectWorkerIssueRequest,
     UpdateProjectTitleRequest,
     UpdateProjectStatusRequest,
     UpdateProjectWorkerPreferenceRequest,
@@ -233,6 +234,7 @@ def list_projects():
                 worker_preference=(
                     row["worker_preference"] if "worker_preference" in row.keys() else "auto"
                 ),
+                worker_issues=project_meta_from_row(row).worker_issues,
                 created_at=row["created_at"],
                 reason=project_reason_from_row(row),
                 fact_count=row["fact_count"],
@@ -535,6 +537,25 @@ def plan_proof_gap(project_id: str, fact_id: str):
     with get_conn() as conn:
         project = check_project_active(conn, project_id)
         status = _proof_status_payload(conn, project_id, fact_id)
+        assessment = latest_finding_assessment(conn, project_id, fact_id)
+        if assessment is not None:
+            verdict, confidence, details = assessment
+            if (
+                verdict == "VALID"
+                and confidence in {"firm", "certain"}
+                and details.get("classification")
+                in {"false_positive", "design_weakness", "hardening_advice"}
+            ):
+                # The proof package is a vulnerability-evidence workflow. A
+                # decisive review that classifies a candidate outside the
+                # vulnerability category is terminal for this planner; keep
+                # the proof-status diagnostics visible without creating an
+                # unbounded chain of exploitability obligations.
+                return {
+                    "created": False,
+                    "reason": "candidate_assessed_as_non_vulnerability",
+                    **status,
+                }
         selected = next((gap for gap in derive_proof_gaps(conn, project_id, fact_id) if gap.code not in NON_INVESTIGATIVE_GAPS and gap.code not in NON_AUTOMATIC_REPAIR_GAPS), None)
         if selected is None:
             return {"created": False, "reason": "no_investigative_gap", **status}
@@ -677,9 +698,15 @@ def update_project_status(project_id: str, body: UpdateProjectStatusRequest):
         if current_status == body.status:
             return project_meta_from_row(row)
 
+        open_worker_issues = []
+        if body.status == "active" and "worker_issues" in row.keys():
+            try:
+                open_worker_issues = json.loads(row["worker_issues"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                open_worker_issues = []
         conn.execute(
-            "UPDATE projects SET status = ? WHERE id = ?",
-            (body.status, project_id),
+            "UPDATE projects SET status = ?, worker_issues = ? WHERE id = ?",
+            (body.status, "[]" if body.status == "active" else row["worker_issues"], project_id),
         )
         bump_graph_revision(conn, project_id)
         if body.status == "stopped":
@@ -688,6 +715,80 @@ def update_project_status(project_id: str, body: UpdateProjectStatusRequest):
                 (project_id,),
             )
             clear_project_reason(conn, project_id)
+        elif open_worker_issues:
+            append_event(
+                conn,
+                project_id,
+                "project_worker_issue_resumed",
+                "Human",
+                entity_kind="project",
+                entity_id=project_id,
+                payload={"issue_count": len(open_worker_issues)},
+            )
+        return project_meta_from_row(get_project_or_404(conn, project_id))
+
+
+@router.post("/projects/{project_id}/worker-issue", response_model=ProjectMeta)
+def pause_project_for_worker_issue(
+    project_id: str, body: ReportProjectWorkerIssueRequest,
+):
+    """Persist a deterministic CLI failure and pause the project for recovery."""
+    with get_conn() as conn:
+        row = get_project_or_404(conn, project_id)
+        if row["status"] == "completed":
+            raise HTTPException(409, "Completed projects cannot be paused for a worker issue")
+        try:
+            issues = json.loads(row["worker_issues"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            issues = []
+        issue = {
+            **body.model_dump(),
+            "created_at": utcnow(),
+        }
+        duplicate = any(
+            isinstance(existing, dict)
+            and existing.get("worker") == issue["worker"]
+            and existing.get("code") == issue["code"]
+            and existing.get("task_type") == issue["task_type"]
+            and existing.get("intent_id") == issue["intent_id"]
+            for existing in issues
+        )
+        if duplicate:
+            return project_meta_from_row(row)
+        issues.append(issue)
+        was_active = row["status"] == "active"
+        if body.intent_id:
+            conn.execute(
+                "UPDATE intent_errors SET resolved_at = ?, resolution = ? "
+                "WHERE project_id = ? AND intent_id = ? AND resolved_at IS NULL",
+                (issue["created_at"], f"superseded by {body.code}; resume after CLI repair", project_id, body.intent_id),
+            )
+        conn.execute(
+            "UPDATE projects SET status = 'stopped', worker_issues = ? WHERE id = ?",
+            (json.dumps(issues, ensure_ascii=False), project_id),
+        )
+        if was_active:
+            conn.execute(
+                "UPDATE intents SET worker = NULL WHERE project_id = ? AND concluded_at IS NULL",
+                (project_id,),
+            )
+            clear_project_reason(conn, project_id)
+            bump_graph_revision(conn, project_id)
+        append_event(
+            conn,
+            project_id,
+            "project_worker_issue_blocked",
+            "dispatcher",
+            entity_kind="intent" if body.intent_id else "project",
+            entity_id=body.intent_id or project_id,
+            payload={
+                "worker": body.worker,
+                "task_type": body.task_type,
+                "code": body.code,
+                "message": body.message,
+                "remediation": body.remediation,
+            },
+        )
         return project_meta_from_row(get_project_or_404(conn, project_id))
 
 

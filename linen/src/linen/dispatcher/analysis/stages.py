@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from linen.dispatcher.analysis.artifacts import load_artifact
-from linen.dispatcher.analysis import audit_recipes, coverage, scope_gate
+from linen.dispatcher.analysis import audit_recipes, coverage, recon, scope_gate
 from linen.dispatcher.config import AuditConfig
 from linen.server.models import AuditStage, Fact, Intent, ProjectDetail
 
@@ -38,7 +38,16 @@ def stage_definitions(config: AuditConfig, audit_mode: str) -> list[StageDefinit
             StageDefinition("scope-evidence", "Scope evidence", 10, "scope.evidence", config.scope_adjudication.enabled, config.scope_adjudication.enabled),
             StageDefinition("scope-adjudication", "Scope adjudication", 20, "scope.adjudication", config.scope_adjudication.enabled, config.scope_adjudication.enabled),
         ])
-    if audit_mode == "scope":
+    if audit_mode == "scope" and config.recon.enabled:
+        result.append(StageDefinition("recon-snapshot", "Frozen source snapshot", 30, "recon.snapshot", True))
+        result.extend(
+            StageDefinition(
+                f"recon-{category}", f"Recon: {category}", 40 + index,
+                f"recon.{category}", True,
+            )
+            for index, category in enumerate(config.recon.categories)
+        )
+    elif audit_mode == "scope":
         result.append(StageDefinition("coverage-plan", "Coverage plan", 30, "coverage.plan", True))
     if audit_mode == "scope":
         result.append(StageDefinition("semantic-analysis", "Semantic analysis", 100, "semantic.analysis", config.semantic.enabled, config.semantic.enabled))
@@ -110,12 +119,38 @@ def _definition_status(
         "coverage-plan": coverage.PLAN_INTENT,
         "audit-summary": "@analysis:audit-summary",
         "semantic-analysis": "@analysis:audit-summary",
+        "recon-snapshot": recon.SNAPSHOT_INTENT,
     }.get(definition.stage_id, None)
+    if definition.stage_id.startswith("recon-") and definition.stage_id != "recon-snapshot":
+        description = recon.category_description(definition.stage_id.removeprefix("recon-"))
     if description is None:
         description = f"@analysis:{definition.stage_id}"
     intent = _intent(project, description)
     fact = _fact(project, intent)
     status, _unused_run_id, detail = _result_status(intent, fact, workdir)
+    if definition.stage_id.startswith("recon-") and definition.stage_id != "recon-snapshot":
+        matches = [
+            item for item in project.intents
+            if recon.category_from_description(item.description) == definition.stage_id.removeprefix("recon-")
+            and item.source_generation == project.project.source_generation
+            and item.plan_revision == project.project.plan_revision
+        ]
+        latest = max(matches, key=lambda item: (item.created_at, item.id), default=None)
+        intent = latest
+        fact = _fact(project, latest)
+        if fact is None:
+            status = (
+                "running" if latest and latest.worker else
+                "failed" if latest and latest.concluded_at else "pending"
+            )
+            detail = "Latest reconnaissance attempt has no result Fact." if status == "failed" else None
+        else:
+            try:
+                record = recon.result_record(fact, workdir)
+                status = "satisfied" if record.get("status") == "complete" else "blocked"
+                detail = record.get("summary") or "Recon coverage is partial."
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                status, detail = "failed", f"Invalid recon artifact: {exc}"
     if intent is not None:
         errors = [
             error for error in project.errors
@@ -146,9 +181,34 @@ def reconcile(config: AuditConfig, project: ProjectDetail, workdir: Path) -> lis
     """
     if not config.enabled or project.project.audit_mode == "none":
         return []
+    effective_config = config
+    current_plan_fact_ids = {
+        fact.id for fact in project.facts
+        if fact.type == "coverage_plan"
+        and fact.source_generation == project.project.source_generation
+    }
+    if config.recon.enabled and (
+        any(
+            intent.to in current_plan_fact_ids
+            and intent.source_generation == project.project.source_generation
+            and intent.plan_revision == project.project.plan_revision
+            for intent in project.intents
+        )
+        or any(
+            intent.description.strip() == coverage.PLAN_INTENT
+            and intent.source_generation == project.project.source_generation
+            and intent.plan_revision == project.project.plan_revision
+            for intent in project.intents
+        )
+    ):
+        # A project's first registered stage set is frozen. Keep legacy
+        # coverage projects on that contract when a dispatcher is upgraded.
+        effective_config = config.model_copy(update={
+            "recon": config.recon.model_copy(update={"enabled": False}),
+        })
     derived = [
-        _definition_status(definition, config, project, workdir)
-        for definition in stage_definitions(config, project.project.audit_mode)
+        _definition_status(definition, effective_config, project, workdir)
+        for definition in stage_definitions(effective_config, project.project.audit_mode)
     ]
     if not project.stages:
         return derived
@@ -158,7 +218,7 @@ def reconcile(config: AuditConfig, project: ProjectDetail, workdir: Path) -> lis
     # persisted stages removed from config remain in the frozen set.
     definitions = {
         definition.stage_id: definition
-        for definition in stage_definitions(config, project.project.audit_mode)
+        for definition in stage_definitions(effective_config, project.project.audit_mode)
     }
     by_id = {row["stage_id"]: row for row in derived}
     rows = []
@@ -169,7 +229,7 @@ def reconcile(config: AuditConfig, project: ProjectDetail, workdir: Path) -> lis
             # plan, continue observing its frozen stage even if the matching
             # capability is now disabled in dispatcher config.
             definition = replace(definition, required=stage.required, enabled=True)
-            row = _definition_status(definition, config, project, workdir)
+            row = _definition_status(definition, effective_config, project, workdir)
         else:
             row = by_id.get(stage.stage_id)
             if row is None and not stage.required:

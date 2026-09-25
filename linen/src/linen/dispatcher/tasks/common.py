@@ -570,6 +570,23 @@ def classify_provider_failure(result: ProcessResult) -> str | None:
     )
     if any(marker in normalized for marker in rate_limit_markers):
         return "rate_limited"
+    if (
+        "model is not supported when using codex with a chatgpt account" in normalized
+        or "model is not supported for this account" in normalized
+        or "unsupported model" in normalized
+    ):
+        return "cli_model_unsupported"
+    if "unrecognized_model" in normalized or "unknown model" in normalized:
+        return "cli_model_unrecognized"
+    if any(marker in normalized for marker in (
+        "authentication_error", "unauthorized", "invalid api key",
+        "not logged in", "authentication required", "token expired",
+    )):
+        return "cli_auth_failed"
+    if any(marker in normalized for marker in (
+        "executable file not found", "command not found",
+    )):
+        return "cli_executable_missing"
     return None
 
 

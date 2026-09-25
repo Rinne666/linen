@@ -451,6 +451,8 @@ Body：
 
 当项目切到 `stopped` 时，Server 会立即把所有尚无结论的 Intent 的 `worker` 清空为 `null`，并把 `project.reason` 清空，使这些 claim 立刻失效。这样项目恢复后可以马上重新认领，不必等待超时。`stopped` 的语义是硬停止：Server 负责拒绝后续探索写操作并清空 open intent claim / reason lease；消费者拿到这个信号后应立刻取消本地仍在运行的任务，并停止对应项目容器。
 
+若 `worker_issues` 非空，用户将项目从 `stopped` 恢复为 `active` 时，Server 会清空当前 CLI Issue 列表并追加恢复事件。失败 Intent 保持 open，可在修复 CLI 配置、凭证或额度后重新认领。
+
 已知问题：当前协议里，Intent 级只保存“当前 claim 持有者”这一份信息，也就是 `intent.worker`。因此项目一旦被切到 `stopped`，这些 open intent 的 `worker` 会被立即清空；停止后从项目详情里将无法直接看出“该 intent 在停止前最后是由哪个 worker 在推进”。后续可以考虑增加类似 `worker_history` 的 Intent 级历史字段来保留这部分可见性，但当前版本尚未实现。
 
 Body：
@@ -458,6 +460,25 @@ Body：
 ```json
 {
   "status": "stopped"
+}
+```
+
+#### POST /projects/{project_id}/worker-issue
+
+Dispatcher 在检测到确定性的 CLI 配置、鉴权、模型或 provider quota 故障时调用此接口。Server 将 Issue 持久化到项目元数据、把项目切到 `stopped`、释放 open Intent 和 reason lease，并追加 `project_worker_issue_blocked` 事件。Issue 包含 worker、任务类型、错误码、原因、修复建议和可选的 intent id，可在项目详情及 Issues 侧栏查看。
+
+普通任务失败、短暂断流及 rate limit 仍按原有有界退避处理，不触发项目级暂停。用户修复问题后点击 Resume，Server 清空这些未解决 CLI issues；仍 open 的工作随后重新排队。
+
+Body：
+
+```json
+{
+  "worker": "local-codex",
+  "task_type": "explore",
+  "code": "cli_model_unsupported",
+  "message": "The selected CLI rejected its configured model.",
+  "remediation": "Configure a supported model or choose another CLI, then resume the project.",
+  "intent_id": "i123"
 }
 ```
 

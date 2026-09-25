@@ -586,8 +586,8 @@
           <div class="flex items-start justify-between mb-3">
             <span class="text-[11px] font-mono text-slate-400 tracking-wide" x-text="p.id"></span>
             <span class="px-1.5 py-0.5 rounded-full text-[9px] font-semibold uppercase tracking-[0.12em]"
-              :class="projectStatusBadgeClass(p.status, p.activity_status)"
-              x-text="p.execution_status ? executionStatusDisplay(p.execution_status) : (p.status === 'active' ? `Active · ${p.activity_status || 'idle'}` : projectStatusLabel(p.status))"></span>
+              :class="(p.worker_issues || []).length ? 'bg-rose-100 text-rose-700' : projectStatusBadgeClass(p.status, p.activity_status)"
+              x-text="(p.worker_issues || []).length ? `CLI issue · ${p.worker_issues.length}` : (p.execution_status ? executionStatusDisplay(p.execution_status) : (p.status === 'active' ? `Active · ${p.activity_status || 'idle'}` : projectStatusLabel(p.status)))"></span>
           </div>
           <div class="mb-3 flex-1">
             <div class="title-action-trigger flex items-start gap-2">
@@ -1150,12 +1150,14 @@
               <p class="break-words text-xs leading-relaxed text-slate-700" x-text="error.message || 'The work item failed.'"></p>
               <p class="break-words text-[11px] leading-relaxed text-slate-500" x-text="projectErrorRecovery(error)"></p>
               <div class="flex items-center justify-between gap-2 border-t border-slate-100 pt-2">
-                <button type="button" @click="selectIntent(error.intent_id); sideTab = 'detail'"
+                <button type="button" x-show="!error.project_worker_issue && error.intent_id" @click="selectIntent(error.intent_id); sideTab = 'detail'"
                   class="text-[11px] font-semibold text-brand-600 hover:text-brand-800">View work</button>
                 <button type="button" x-show="canRetryIntentError(error)" @click="retryIntentError(error)"
                   :disabled="retryingIntentId === error.intent_id"
                   class="rounded-lg bg-slate-900 px-2.5 py-1.5 text-[10px] font-semibold text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-45"
                   x-text="retryingIntentId === error.intent_id ? 'Retrying…' : 'Retry now'"></button>
+                <button type="button" x-show="error.project_worker_issue && project.project.status === 'stopped'" @click="setProjectStatus(selectedProjectId, 'active')"
+                  class="rounded-lg bg-slate-900 px-2.5 py-1.5 text-[10px] font-semibold text-white hover:bg-slate-700">Resume project</button>
                 <span class="text-[10px] text-slate-400" x-text="formatTime(error.last_failed_at)"></span>
               </div>
             </div>
@@ -4042,9 +4044,20 @@ function linenApp() {
         const graphChanged = currentProject?.project?.graph_revision !== nextProject?.project?.graph_revision;
         const eventStreamChanged = currentProject?.project?.event_seq !== nextProject?.project?.event_seq;
         const embeddedReviewsChanged = !this.dataMatches(currentProject?.reviews, nextProject?.reviews);
+        const previousWorkerIssueKeys = new Set((currentProject?.project?.worker_issues || []).map(issue =>
+          `${issue.worker}:${issue.code}:${issue.created_at}`
+        ));
+        const newWorkerIssues = (nextProject?.project?.worker_issues || []).filter(issue =>
+          !previousWorkerIssueKeys.has(`${issue.worker}:${issue.code}:${issue.created_at}`)
+        );
         const changed = this.reconcileProjectSnapshot(nextProject);
 
         if (background && !changed) return false;
+
+        if (background && newWorkerIssues.length && this.selectedProjectId === id) {
+          this.sideTab = 'blocked';
+          this.showToast(`Project paused: ${newWorkerIssues[0].message}`, 'error');
+        }
 
         const refreshes = [this.loadCompletionGate(id, { background })];
         if (!background || graphChanged || embeddedReviewsChanged) {
@@ -4448,10 +4461,12 @@ function linenApp() {
       if (projectSummary) {
         projectSummary.status = updated.status;
         projectSummary.reason = updated.reason;
+        projectSummary.worker_issues = updated.worker_issues || [];
       }
       if (this.selectedProjectId === projectId && this.project) {
         this.project.project.status = updated.status;
         this.project.project.reason = updated.reason;
+        this.project.project.worker_issues = updated.worker_issues || [];
         if (!this.projectIsActive()) {
           this.showIntentModal = false;
           this.showConcludeModal = false;
@@ -6030,9 +6045,17 @@ function linenApp() {
 
     unresolvedProjectErrors() {
       if (!this.project) return [];
-      return (this.project.errors || [])
+      const taskErrors = (this.project.errors || [])
         .filter(error => !error.resolved_at)
-        .slice()
+        .slice();
+      const workerIssues = (this.project.project.worker_issues || []).map(issue => ({
+        ...issue,
+        intent_id: issue.intent_id || 'Project CLI',
+        classification: 'blocked',
+        last_failed_at: issue.created_at,
+        project_worker_issue: true,
+      }));
+      return [...taskErrors, ...workerIssues]
         .sort((a, b) => String(b.last_failed_at || '').localeCompare(String(a.last_failed_at || '')));
     },
 
@@ -6050,6 +6073,10 @@ function linenApp() {
       const titles = {
         provider_quota_exhausted: 'Model provider quota exhausted',
         provider_rate_limited: 'Model provider rate limit reached',
+        cli_model_unsupported: 'CLI model is unsupported',
+        cli_model_unrecognized: 'CLI model is unrecognized',
+        cli_auth_failed: 'CLI authentication failed',
+        cli_executable_missing: 'CLI executable is unavailable',
         source_repository_missing: 'Repository source is unavailable',
         invalid_blackboard_result: 'Invalid blackboard result',
         blackboard_result_invalid: 'Invalid blackboard result',

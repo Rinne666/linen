@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from pathlib import Path
 
@@ -96,8 +97,9 @@ Return exactly one raw JSON object, with no markdown fences or commentary:
 data.coverage must contain:
   outcome: checked | not_applicable | needs_followup | blocked
   inspected_files: list of assigned relative file paths actually read
-  citations: list of {file, line, code}, with a one-based line and an exact,
-             preferably single-line excerpt copied from that source line
+  citations: for text files, {file, line, code} with an exact source excerpt;
+             for binary files, {file, byte_offset, bytes_hex} with an exact
+             4-64 byte range copied from that file
   leads: list of {file, line, summary, next_step}; mandatory and non-empty for
          needs_followup, otherwise an empty list
   rationale: non-empty explanation of checks, protections, findings, or blockers
@@ -132,9 +134,10 @@ Do not restart the audit. Use the analysis already completed in this conversatio
 and return the final JSON now. The previous response failed validation for this reason:
 """ + json.dumps(error[:2000], ensure_ascii=False) + """
 
-Before answering, verify each citation against the frozen source with a line-numbered
-read such as `nl -ba`. The `line` must identify the copied excerpt exactly. Include one
-citation for every assigned non-empty file when outcome is checked or not_applicable.
+Before answering, verify each text citation against the frozen source with a
+line-numbered read such as `nl -ba`. For binary files, inspect the bytes and cite
+an exact 4-64 byte range with a zero-based byte_offset. Include a citation for
+every assigned non-empty file when outcome is checked or not_applicable.
 Return only the raw JSON object.
 """
 
@@ -148,10 +151,55 @@ def normalize_payload(payload: dict) -> dict:
     return payload
 
 
-def _canonical_citation(citation: dict, inspected: list[str], contents: dict[str, str]) -> dict:
+def _canonical_citation(
+    citation: dict,
+    inspected: list[str],
+    contents: dict[str, str],
+    raw_contents: dict[str, bytes],
+) -> dict:
     if not isinstance(citation, dict) or citation.get("file") not in inspected:
         raise ValueError("Citation must reference an inspected file")
     filename = citation["file"]
+    raw = raw_contents[filename]
+    try:
+        raw.decode("utf-8")
+        is_text = b"\x00" not in raw
+    except UnicodeDecodeError:
+        is_text = False
+
+    if not is_text:
+        # Binary assets have no meaningful source line. Accept exact byte
+        # ranges and normalize them with the frozen digest. Also accept the
+        # earlier prompt's line=1 signature representation during migration.
+        offset = citation.get("byte_offset")
+        bytes_hex = citation.get("bytes_hex")
+        if offset is None and citation.get("line") == 1:
+            code = citation.get("code")
+            if isinstance(code, str):
+                if code.lower().startswith("signature bytes:"):
+                    encoded = code.split(":", 1)[1]
+                    bytes_hex = "".join(re.findall(r"[0-9a-fA-F]{2}", encoded))
+                elif re.fullmatch(r"(?:[0-9a-fA-F]{2}[\s:]*)+", code):
+                    bytes_hex = "".join(re.findall(r"[0-9a-fA-F]{2}", code))
+                offset = 0
+        if (
+            type(offset) is not int
+            or offset < 0
+            or not isinstance(bytes_hex, str)
+            or not re.fullmatch(r"(?:[0-9a-fA-F]{2}){4,64}", bytes_hex)
+        ):
+            raise ValueError("Binary citation requires an exact byte range of 4-64 bytes")
+        cited_bytes = bytes.fromhex(bytes_hex)
+        if raw[offset:offset + len(cited_bytes)] != cited_bytes:
+            raise ValueError("Binary citation does not match the frozen source")
+        return {
+            "file": filename,
+            "kind": "binary",
+            "sha256": digest(raw),
+            "byte_offset": offset,
+            "bytes_hex": cited_bytes.hex(),
+        }
+
     lines = contents[filename].splitlines()
     line = citation.get("line")
     code = citation.get("code")
@@ -212,10 +260,14 @@ def outcome_fact(payload: dict, project: ProjectDetail, intent: Intent, workdir:
         raise ValueError("Invalid inspected_files, citations, or leads")
     cited = set()
     normalized_citations = []
-    contents = {name: source_bytes(source, name, plan["snapshot"]["files"][name]).decode("utf-8", errors="replace")
-                for name in cell["files"]}
+    raw_contents = {
+        name: source_bytes(source, name, plan["snapshot"]["files"][name])
+        for name in cell["files"]
+    }
+    contents = {name: raw.decode("utf-8", errors="replace")
+                for name, raw in raw_contents.items()}
     for citation in citations:
-        normalized = _canonical_citation(citation, inspected, contents)
+        normalized = _canonical_citation(citation, inspected, contents, raw_contents)
         normalized_citations.append(normalized)
         cited.add(normalized["file"])
     leads = []
@@ -243,7 +295,18 @@ def outcome_fact(payload: dict, project: ProjectDetail, intent: Intent, workdir:
             "next_step": next_step.strip(),
         })
     if outcome["outcome"] in TERMINAL_OUTCOMES:
-        required = {name for name, content in contents.items() if content.strip()}
+        required = set()
+        for name, content in contents.items():
+            raw = raw_contents[name]
+            try:
+                raw.decode("utf-8")
+                is_text = b"\x00" not in raw
+            except UnicodeDecodeError:
+                is_text = False
+            if content.strip() and is_text:
+                required.add(name)
+            elif raw and not is_text:
+                required.add(name)
         if set(inspected) != set(cell["files"]) or not required.issubset(cited):
             raise ValueError("Terminal coverage must inspect and cite all non-empty files")
         if leads:
@@ -419,7 +482,47 @@ def reason_instructions(project: ProjectDetail, workdir: Path, config: CoverageC
     if not any(f.type == "coverage_plan" for f in project.facts):
         state = {"next": f"Emit search from origin with description exactly {PLAN_INTENT}"}
     else:
-        state = coverage_state(project, workdir, config)
+        coverage = coverage_state(project, workdir, config)
+        # The dispatcher derives coverage Intents from this state and only
+        # materializes a small ready window.  Putting every cell in Reason's
+        # prompt duplicates hundreds of rows (and file lists) without helping
+        # it choose work; on large repositories that made Reason time out
+        # before it could resolve unrelated graph obligations.
+        ready_cells = [
+            cell for cell in coverage["cells"]
+            if cell["status"] not in TERMINAL_OUTCOMES | {
+                "queued", "running", "awaiting_review",
+            }
+            and not cell["retry_exhausted"]
+        ]
+        pending_sample = [
+            {
+                "cell_id": cell["cell_id"],
+                "module": cell["module"],
+                "topic": cell["topic"],
+                "attempts": cell["attempts"],
+            }
+            for cell in ready_cells[:5]
+        ]
+        state = {
+            "plan_id": coverage["plan_id"],
+            "plan_fact_id": coverage["plan_fact_id"],
+            "snapshot": coverage["snapshot"],
+            "summary": coverage["summary"],
+            "retry_exhausted_cells": sum(
+                cell["retry_exhausted"] for cell in coverage["cells"]
+            ),
+            "unresolved_skips": [
+                skipped for skipped in coverage["skipped"]
+                if skipped["reason"] not in {"excluded", "analysis_artifacts"}
+            ][:5],
+            "ready_cell_sample": pending_sample,
+            "ready_cell_sample_truncated": len(ready_cells) > len(pending_sample),
+            "dispatcher_materialization_window": (
+                "The dispatcher materializes coverage work in a bounded window; "
+                "do not emit or enumerate reserved @coverage intents."
+            ),
+        }
     return """
 Scope audit policy (overrides hypothesis completion): Finding one vulnerability does
 NOT finish this project. Reserved @analysis and @coverage intents are derived from
@@ -484,6 +587,8 @@ Verification rules:
   even when the cited source lines themselves are genuine.
 - For checked/not_applicable, confirm that all non-empty files were cited and
   that no unresolved lead contradicts the terminal outcome.
+- For binary citations, independently verify the cited byte range and SHA-256
+  against the frozen file; do not treat a binary signature as proof of behavior.
 - For needs_followup, verify every structured lead's file/line and next step.
   For blocked, confirm that the rationale precisely identifies the blocker.
   Neither outcome establishes coverage.

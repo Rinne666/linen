@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS projects (
         CHECK (audit_mode IN ('none', 'hypothesis', 'scope')),
     worker_preference TEXT NOT NULL DEFAULT 'auto'
         CHECK (worker_preference IN ('auto', 'pi', 'codex', 'claudecode')),
+    worker_issues TEXT NOT NULL DEFAULT '[]',
     -- Source and plan revisions are separate from graph_revision. A new
     -- checkout invalidates prior evidence without deleting it; replanning the
     -- same checkout advances only plan_revision.
@@ -410,6 +411,10 @@ def _ensure_project_columns(conn: sqlite3.Connection) -> None:
     if "worker_preference" not in columns:
         conn.execute(
             "ALTER TABLE projects ADD COLUMN worker_preference TEXT NOT NULL DEFAULT 'auto'"
+        )
+    if "worker_issues" not in columns:
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN worker_issues TEXT NOT NULL DEFAULT '[]'"
         )
     if "graph_revision" not in columns:
         conn.execute("ALTER TABLE projects ADD COLUMN graph_revision INTEGER NOT NULL DEFAULT 0")

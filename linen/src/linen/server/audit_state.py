@@ -28,6 +28,8 @@ from linen.server.services import (
 
 
 FACT_SEMANTIC_TYPES: dict[str, str] = {
+    "recon": "recon",
+    "recon_snapshot": "observation",
     "policy_evidence": "scope",
     "scope_adjudication": "scope",
     "coverage_plan": "coverage",
@@ -57,6 +59,7 @@ FACT_TITLES: dict[str, str] = {
     "policy_evidence": "Scope evidence",
     "scope_adjudication": "Scope decision",
     "coverage_plan": "Coverage plan",
+    "recon_snapshot": "Frozen source snapshot",
     "coverage_result": "Coverage result",
     "architecture_map": "Architecture map",
     "authz_matrix": "Authorization map",
@@ -425,6 +428,11 @@ def completion_gate_from_db(
     project = get_project_or_404(conn, project_id)
     generation = project["source_generation"] if "source_generation" in project.keys() else 1
     plan_revision = project["plan_revision"] if "plan_revision" in project.keys() else 1
+    recon_profile = conn.execute(
+        "SELECT 1 FROM facts WHERE project_id = ? AND source_generation = ? "
+        "AND type = 'recon_snapshot' LIMIT 1",
+        (project_id, generation),
+    ).fetchone() is not None
     checks: list[CompletionCheck] = []
     blockers: list[str] = []
 
@@ -460,16 +468,16 @@ def completion_gate_from_db(
     add(
         "open_work",
         "All audit tasks reached a terminal state",
-        not blocking_open_rows if exhaustive else True,
+        not blocking_open_rows if exhaustive or recon_profile else True,
         "No open audit tasks remain." if not open_rows else (
             f"No required audit tasks remain; {len(on_demand_open_rows)} on-demand tool run(s) remain open."
-            if exhaustive and not blocking_open_rows
-            else f"{len(blocking_open_rows)} required audit task(s) remain open." if exhaustive
+            if (exhaustive or recon_profile) and not blocking_open_rows
+            else f"{len(blocking_open_rows)} required audit task(s) remain open." if exhaustive or recon_profile
             else "Open work is allowed after the goal is satisfied."
         ),
         evidence_ids=[row["id"] for row in blocking_open_rows],
-        blocking=exhaustive,
-        status="pass" if not blocking_open_rows or not exhaustive else "fail",
+        blocking=exhaustive or recon_profile,
+        status="pass" if not blocking_open_rows or not (exhaustive or recon_profile) else "fail",
     )
 
     error_rows = conn.execute(
@@ -482,16 +490,16 @@ def completion_gate_from_db(
     on_demand_error_rows = [row for row in error_rows if row["phase"] == "baseline_scan"]
     # In goal-based mode execution errors are visible diagnostics, not a
     # completion invariant. Keep execution_status aligned with that contract.
-    blocking_errors = exhaustive and bool(blocking_error_rows)
+    blocking_errors = (exhaustive or recon_profile) and bool(blocking_error_rows)
     add(
         "operational_errors",
         "No unresolved blocking execution errors",
         not blocking_errors,
         (
             f"{len(on_demand_error_rows)} on-demand tool error(s) remain visible but do not block completion."
-            if exhaustive and on_demand_error_rows and not blocking_error_rows
+            if (exhaustive or recon_profile) and on_demand_error_rows and not blocking_error_rows
             else f"{len(error_rows)} unresolved execution error(s) remain visible but do not block goal-based completion."
-            if error_rows and not exhaustive
+            if error_rows and not exhaustive and not recon_profile
             else "No unresolved execution errors." if not error_rows
             else f"{len(blocking_error_rows)} unresolved execution error(s) block completion."
         ),
@@ -687,7 +695,7 @@ def completion_gate_from_db(
     claimed_rows = [row for row in open_rows if row["worker"] is not None]
     execution_status = "complete" if project["status"] == "completed" else (
         "paused" if project["status"] in {"paused", "stopped"} else
-        "blocked" if exhaustive and blocking_error_rows else
+        "blocked" if (exhaustive or recon_profile) and blocking_error_rows else
         "reasoning" if project["reason_worker"] else
         "working" if claimed_rows else
         "idle_attention_required" if on_demand_error_rows else

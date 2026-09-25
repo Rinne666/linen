@@ -235,16 +235,32 @@ class ReviewSandboxConfig(BaseModel):
 
 
 class ReconConfig(BaseModel):
-    """Optional, non-authoritative reconnaissance before scope coverage.
-
-    Recon is deliberately opt-in.  It may prioritize the first coverage cells,
-    but it never contributes evidence to a vulnerability proof and can never
-    complete an audit project.
-    """
+    """Category-driven, read-only source reconnaissance for scope audits."""
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
+    categories: list[str] = Field(default_factory=lambda: [
+        "input-validation", "authorization", "dangerous-api",
+    ])
+    timeout: int = Field(default=1800, gt=0, le=7200)
+    conclude_timeout: int = Field(default=300, gt=0, le=1800)
+    max_runs_per_category: int = Field(default=2, gt=0, le=5)
+    max_leads: int = Field(default=40, gt=0, le=200)
+    max_target_bytes: int = Field(default=10_000_000, gt=0)
+    exclude: list[str] = Field(default_factory=lambda: [
+        ".git", ".venv", "node_modules", "__pycache__",
+    ])
+
+    @field_validator("categories")
+    @classmethod
+    def valid_categories(cls, value: list[str]) -> list[str]:
+        import re
+        if not value or len(value) != len(set(value)) or any(
+            not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", item) for item in value
+        ):
+            raise ValueError("recon.categories must contain unique lowercase category IDs")
+        return value
 
 
 class ScopeAdjudicationConfig(BaseModel):
@@ -423,10 +439,22 @@ class DispatchConfig(BaseModel):
         if not self.workers:
             raise ValueError("workers must not be empty")
         if self.audit.enabled:
-            if self.audit.recon.enabled and self.audit.mode != "scope":
-                raise ValueError("audit recon requires scope mode")
             if not any("review" in worker.task_types for worker in self.workers):
                 raise ValueError("audit mode requires at least one review worker")
+        if self.audit.recon.enabled and not self.audit.enabled:
+            raise ValueError("audit recon requires audit.enabled")
+        if self.audit.recon.enabled and self.audit.mode != "scope":
+            raise ValueError("audit recon requires scope mode")
+        if self.audit.recon.enabled and self.audit.semantic.enabled:
+            raise ValueError(
+                "audit.recon and audit.semantic cannot both be enabled; semantic recipes "
+                "currently require a coverage snapshot"
+            )
+        if self.audit.recon.enabled and not any(
+            worker.type == "pi" and "explore" in worker.task_types
+            for worker in self.workers
+        ):
+            raise ValueError("audit.recon requires a Pi worker configured for explore tasks")
         if self.audit.scope_adjudication.enabled and not self.audit.enabled:
             raise ValueError("scope adjudication requires audit.enabled")
         if self.audit.scope_adjudication.enabled and self.audit.mode != "scope":

@@ -30,12 +30,13 @@
 
 server: "http://127.0.0.1:9000"
 
-# Coverage-driven audit: the plan covers every included file × topic on a
-# frozen snapshot. A finding alone cannot complete the project.
+# Category-driven audit: Pi searches the complete frozen source tree per
+# vulnerability class; no per-file coverage cells are created. Recon leads
+# are hypotheses and still require graph-level verification and review.
 audit:
   enabled: true
   mode: scope
-  # Mandatory pre-coverage gate. The dispatcher freezes local policy files and
+  # Mandatory scope gate. The dispatcher freezes local policy files and
   # optional maintainer/advisory material; an Explore worker then produces a
   # quoted threat-model and policy assessment for independent review.
   scope_adjudication:
@@ -63,11 +64,19 @@ audit:
     fetch_timeout: 15
     max_documents: 64
     max_document_bytes: 1000000
-  # Existing Explore workers run these as isolated conversations. The
-  # dispatcher selects one recipe per graph-derived Intent and validates its
-  # cited result before it may become a Fact.
-  semantic:
+  # Pi receives one repository-wide read-only investigation per category.
+  # Each run reads the same frozen snapshot and returns cited source-to-sink
+  # leads; Reason interprets the graph and may request a bounded follow-up.
+  recon:
     enabled: true
+    categories: [input-validation, authorization, dangerous-api]
+    max_runs_per_category: 2
+    max_leads: 40
+  # Semantic recipes currently consume a coverage snapshot, so leave them off
+  # in category-recon mode. Coverage configuration below remains available for
+  # deployments that choose the deterministic file-coverage workflow instead.
+  semantic:
+    enabled: false
     architecture: true
     authorization: true
     state_concurrency: true

@@ -18,6 +18,7 @@ from linen.server.models import (
     IntentError,
     ProjectMeta,
     ProjectReason,
+    ProjectWorkerIssue,
     Review,
     REVIEWLESS_INTERMEDIATE_FACT_TYPES,
 )
@@ -344,6 +345,11 @@ def project_reason_from_row(row: sqlite3.Row) -> ProjectReason | None:
 
 
 def project_meta_from_row(row: sqlite3.Row) -> ProjectMeta:
+    try:
+        worker_issue_data = json.loads(row["worker_issues"] or "[]") if "worker_issues" in row.keys() else []
+        worker_issues = [ProjectWorkerIssue.model_validate(item) for item in worker_issue_data]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        worker_issues = []
     return ProjectMeta(
         id=row["id"],
         title=row["title"],
@@ -361,6 +367,7 @@ def project_meta_from_row(row: sqlite3.Row) -> ProjectMeta:
         worker_preference=(
             row["worker_preference"] if "worker_preference" in row.keys() else "auto"
         ),
+        worker_issues=worker_issues,
         created_at=row["created_at"],
         reason=project_reason_from_row(row),
         repo_root=row["repo_root"] if "repo_root" in row.keys() else None,

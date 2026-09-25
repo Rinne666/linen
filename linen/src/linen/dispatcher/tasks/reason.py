@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage
+from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, recon
 
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.analysis.policy import (
@@ -52,6 +52,7 @@ HIGH_VALUE_FACT_TYPES = (
     "negative_assurance", "coverage", "coverage_plan", "coverage_result",
     "candidate_disposition", "audit_summary",
     "source", "sink", "dataflow", "sanitizer", "validation", "reachability",
+    "recon",
 )
 
 
@@ -527,7 +528,14 @@ def run_reason_task(
 
         if audit_enabled:
             if scope_audit:
-                prompt += coverage.reason_instructions(project, Path(container_name), config.audit.coverage)
+                if recon.active_for_project(project, config.audit.recon):
+                    prompt += recon.reason_instructions(
+                        project, Path(container_name), config.audit.recon,
+                    )
+                else:
+                    prompt += coverage.reason_instructions(
+                        project, Path(container_name), config.audit.coverage,
+                    )
                 if config.audit.semantic.enabled:
                     bundle = audit_recipes.load_bundle(config.runtime.prompt_group)
                     method_lines = []
@@ -820,6 +828,23 @@ def run_reason_task(
                                 client.create_hint(project.project.id, message, "audit-policy")
                             continue
                     semantic_method = False
+                    recon_method = False
+                    if (
+                        scope_audit
+                        and recon.active_for_project(fresh, config.audit.recon)
+                        and isinstance(intent_data.get("description"), str)
+                        and intent_data["description"].startswith(recon.CATEGORY_PREFIX)
+                    ):
+                        try:
+                            recon.validate_intent(fresh, config.audit.recon, intent_data)
+                            source_ids = intent_data.get("from", [])
+                            recon_sources = {fact.id for fact in fresh.facts if fact.type == "recon"}
+                            recon_method = (
+                                isinstance(source_ids, list)
+                                and any(source_id in recon_sources for source_id in source_ids)
+                            )
+                        except (ValueError, TypeError):
+                            recon_method = False
                     if (
                         scope_audit
                         and config.audit.semantic.enabled
@@ -845,7 +870,8 @@ def run_reason_task(
                             )
                         except ValueError:
                             semantic_method = False
-                    if audit_graph.managed_description(intent_data["description"]) and not semantic_method:
+                    if (audit_graph.managed_description(intent_data["description"])
+                            and not semantic_method and not recon_method):
                         message = (
                             "Audit intent blocked: reserved managed intents are materialized "
                             f"from graph state by the dispatcher ({intent_data['description']})"
@@ -924,7 +950,13 @@ def run_reason_task(
         return "success"
     finally:
         lease.stop()
+        if ack_event_seq is None:
+            # A failed strategy pass must not be retriggered forever by the
+            # same stale events (especially audit_task_failed/review_created).
+            # Acknowledge only the snapshot this pass actually saw; meaningful
+            # evidence arriving while it ran remains available to wake Reason.
+            ack_event_seq = project.project.event_seq
         best_effort_release_reason(
             client, project.project.id, worker.name, lease_id, ack_event_seq,
-            ack=ack_event_seq is not None,
+            ack=True,
         )

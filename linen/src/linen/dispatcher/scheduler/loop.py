@@ -35,6 +35,13 @@ UNHEALTHY_RETRY_AFTER_SECONDS = 5
 REJECTED_RETRY_AFTER_SECONDS = 5
 RATE_LIMIT_RETRY_AFTER_SECONDS = 300
 QUOTA_EXHAUSTED_RETRY_AFTER_SECONDS = 3600
+PROJECT_PAUSING_CLI_ISSUES = {
+    "quota_exhausted",
+    "cli_model_unsupported",
+    "cli_model_unrecognized",
+    "cli_auth_failed",
+    "cli_executable_missing",
+}
 
 
 @dataclass(slots=True)
@@ -950,10 +957,27 @@ class DispatcherLoop:
 
     def _dispatch_explore(self, project: ProjectDetail, export_yaml: str, intent: Intent) -> bool:
         provider_required = self._explore_requires_provider(project, intent)
+        recon_scout = (
+            self.config.audit.enabled
+            and self.config.audit.recon.enabled
+            and project.project.audit_mode == "scope"
+            and intent.description.strip().startswith("@analysis:recon:")
+            and intent.description.strip() != "@analysis:recon-snapshot"
+        )
+        recon_snapshot = (
+            self.config.audit.enabled
+            and self.config.audit.recon.enabled
+            and intent.description.strip() == "@analysis:recon-snapshot"
+        )
         selection = self._select_worker(
             project.project.id,
             "explore",
-            worker_preference=project.project.worker_preference,
+            # Recon runs use Pi by explicit audit configuration; other tasks
+            # still honor the project's selected CLI.
+            worker_preference=(
+                "pi" if recon_scout else
+                "auto" if recon_snapshot else project.project.worker_preference
+            ),
             provider_required=provider_required,
         )
         worker = selection.worker
@@ -1211,6 +1235,8 @@ class DispatcherLoop:
             return False
         if intent.type == "search" and description == coverage.PLAN_INTENT:
             return False
+        if self.config.audit.recon.enabled and description == "@analysis:recon-snapshot":
+            return False
         return not (
             description.startswith(coverage.MODULE_SUMMARY_PREFIX)
             or description == audit_graph.AUDIT_SUMMARY_INTENT
@@ -1431,19 +1457,43 @@ class DispatcherLoop:
     def _reason_may_run(
         self, project: ProjectDetail, trigger_events: list[AuditEvent] | None = None,
     ) -> bool:
-        """Allow fresh evidence to wake strategy while unrelated work remains open."""
+        """Wake strategy for security-significant evidence, not routine coverage churn."""
         open_intents = [
             intent for intent in project.intents
             if intent.to is None and intent.concluded_at is None
         ]
-        if not open_intents:
-            return True
-        wake_events = {
-            "audit_task_concluded", "audit_task_failed", "review_created",
-            "audit_task_abandoned", "technical_confirmation", "dynamic_verification_pass",
+        no_open_intents = not open_intents
+        facts_by_id = {fact.id: fact for fact in project.facts}
+        strategy_fact_types = {
+            "candidate_finding", "confirmed_finding", "negative_assurance",
+            "candidate_disposition", "source", "sink", "dataflow",
+            "sanitizer", "validation", "reachability", "recon",
         }
-        if any(event.event_type in wake_events for event in (trigger_events or [])):
-            return True
+        for event in trigger_events or []:
+            if event.event_type in {
+                "audit_task_abandoned", "technical_confirmation",
+                "dynamic_verification_pass",
+            }:
+                return True
+            if event.event_type not in {"audit_task_concluded", "review_created"}:
+                continue
+            fact_id = event.payload.get("fact_id")
+            fact = facts_by_id.get(fact_id) if isinstance(fact_id, str) else None
+            if fact is None:
+                continue
+            if fact.semantic_type in strategy_fact_types:
+                return True
+            if event.event_type == "audit_task_concluded" and fact.type == "coverage_result":
+                try:
+                    evidence = json.loads(fact.evidence or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if evidence.get("outcome") in {"needs_followup", "blocked"} or evidence.get("leads"):
+                    return True
+        if no_open_intents:
+            # The first Reason pass seeds a new project. Later, run lifecycle
+            # events from a failed Reason attempt alone must not create a loop.
+            return project.project.reason_last_seen_event_seq == 0
         for intent in open_intents:
             blocked = any(
                 error.intent_id == intent.id
@@ -1539,7 +1589,9 @@ class DispatcherLoop:
                     )
                 else:
                     self.worker_rejected_until.pop(rejection_key, None)
-                if outcome not in {"success", "cancelled", "blocked"}:
+                if outcome in PROJECT_PAUSING_CLI_ISSUES:
+                    self._pause_project_for_cli_issue(task, outcome)
+                elif outcome not in {"success", "cancelled", "blocked"}:
                     self._record_intent_error(task, outcome)
             except Exception as exc:
                 LOG.exception("task crashed project=%s task=%s worker=%s", task.project_id, task.task_type, task.worker_name)
@@ -1668,6 +1720,79 @@ class DispatcherLoop:
                 task.intent_id,
                 outcome,
             )
+
+    def _pause_project_for_cli_issue(self, task: RunningTask, outcome: str) -> None:
+        profiles = {
+            "quota_exhausted": (
+                "provider_quota_exhausted",
+                f"{task.worker_name} reported that its model provider quota is exhausted.",
+                "Restore provider quota or choose another available CLI, then resume the project.",
+            ),
+            "cli_model_unsupported": (
+                "cli_model_unsupported",
+                f"{task.worker_name} rejected its configured model for the signed-in account.",
+                "Configure a model supported by this CLI account or choose another CLI, then resume the project.",
+            ),
+            "cli_model_unrecognized": (
+                "cli_model_unrecognized",
+                f"{task.worker_name}'s provider does not recognize its configured model.",
+                "Correct the model/provider settings for this CLI or choose another CLI, then resume the project.",
+            ),
+            "cli_auth_failed": (
+                "cli_auth_failed",
+                f"{task.worker_name} could not authenticate with its configured provider.",
+                "Sign in again or repair the CLI credentials, then resume the project.",
+            ),
+            "cli_executable_missing": (
+                "cli_executable_missing",
+                f"The configured executable for {task.worker_name} could not be started.",
+                "Install the CLI or correct its executable path, then resume the project.",
+            ),
+        }
+        code, message, remediation = profiles[outcome]
+        reporter = getattr(
+            getattr(self, "client", None), "report_project_worker_issue", None,
+        )
+        if reporter is None:
+            self._record_intent_error(task, outcome, detail=message)
+            return
+        try:
+            response = reporter(
+                task.project_id,
+                task.worker_name,
+                task.task_type,
+                code,
+                message,
+                remediation,
+                task.intent_id,
+            )
+            if not response.ok:
+                LOG.warning(
+                    "project CLI issue write failed project=%s task=%s worker=%s status=%s body=%s",
+                    task.project_id,
+                    task.task_type,
+                    task.worker_name,
+                    response.status_code,
+                    response.text,
+                )
+                self._record_intent_error(task, outcome, detail=message)
+                return
+            LOG.error(
+                "paused project after CLI issue project=%s task=%s worker=%s code=%s intent=%s",
+                task.project_id,
+                task.task_type,
+                task.worker_name,
+                code,
+                task.intent_id,
+            )
+        except Exception:
+            LOG.exception(
+                "project CLI issue persistence crashed project=%s task=%s worker=%s",
+                task.project_id,
+                task.task_type,
+                task.worker_name,
+            )
+            self._record_intent_error(task, outcome, detail=message)
 
     def _cleanup_completed_containers(self, summaries: list[ProjectSummary]) -> None:
         for summary in summaries:

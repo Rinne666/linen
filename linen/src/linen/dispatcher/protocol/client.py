@@ -305,6 +305,29 @@ class LinenClient:
             json=body,
         )
 
+    def report_project_worker_issue(
+        self,
+        project_id: str,
+        worker: str,
+        task_type: str,
+        code: str,
+        message: str,
+        remediation: str,
+        intent_id: str | None = None,
+    ) -> ApiResult:
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/worker-issue",
+            json={
+                "worker": worker,
+                "task_type": task_type,
+                "code": code,
+                "message": message,
+                "remediation": remediation,
+                "intent_id": intent_id,
+            },
+        )
+
     def retry_intent(
         self, project_id: str, intent_id: str, actor: str,
     ) -> ApiResult:
