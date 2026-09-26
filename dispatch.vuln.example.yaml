@@ -72,9 +72,43 @@ audit:
     categories: [input-validation, authorization, dangerous-api]
     max_runs_per_category: 2
     max_leads: 40
-  # Semantic recipes currently consume a coverage snapshot, so leave them off
-  # in category-recon mode. Coverage configuration below remains available for
-  # deployments that choose the deterministic file-coverage workflow instead.
+  # Optional CodeQL path candidates. Build a trusted Linux analysis image with
+  # the CLI and query packs already installed; Linen never pulls or downloads
+  # tools during a scan. Only no-build languages are accepted. Confirm the
+  # applicable CodeQL terms before setting terms_acknowledged to true.
+  codeql:
+    enabled: false
+    terms_acknowledged: false
+    image: null
+    cli_path: /opt/codeql/codeql
+    # Required for every enabled language; each reviewed .qls suite is baked
+    # into the trusted image (never downloaded or supplied by a worker).
+    # query_suites:
+    #   python:
+    #     - codeql/python-queries:codeql-suites/python-security-extended.qls
+    #   javascript:
+    #     - codeql/javascript-queries:codeql-suites/javascript-security-extended.qls
+    # Optional named query suites baked into the same trusted image.
+    # Reason (using the project's selected CLI) may request one by category;
+    # the dispatcher, not the model, runs the configured suite in isolation.
+    # query_profiles:
+    #   authorization:
+    #     python:
+    #       - /opt/codeql/queries/python/authz.qls
+    #   input-validation:
+    #     javascript:
+    #       - /opt/codeql/queries/javascript/input-validation.qls
+    languages: [python, javascript]
+    timeout: 1800
+    threads: 2
+    max_candidates: 100
+    max_sarif_bytes: 20000000
+    max_work_bytes: 4000000000
+    network: none
+    memory: 4g
+    cpus: 2
+  # Semantic recipes are optional; leave them off unless their configured
+  # evidence prerequisites are available for this project.
   semantic:
     enabled: false
     architecture: true
@@ -85,11 +119,6 @@ audit:
     hypothesis_profiles: [backward, contradiction, attack-composition]
     variant_search: true
     max_verify_attempts: 2
-  coverage:
-    topics: [input-validation, authorization, dangerous-operations]
-    files_per_cell: 40
-    max_cells: 1000
-    max_attempts_per_cell: 3
   review_sandbox:
     enabled: false
     # Prepare a trusted local image containing the configured reviewer CLI.

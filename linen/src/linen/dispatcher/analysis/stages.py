@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from linen.dispatcher.analysis.artifacts import load_artifact
-from linen.dispatcher.analysis import audit_recipes, coverage, recon, scope_gate
+from linen.dispatcher.analysis import codeql, recon, scope_gate
 from linen.dispatcher.config import AuditConfig
 from linen.server.models import AuditStage, Fact, Intent, ProjectDetail
 
@@ -40,6 +40,11 @@ def stage_definitions(config: AuditConfig, audit_mode: str) -> list[StageDefinit
         ])
     if audit_mode == "scope" and config.recon.enabled:
         result.append(StageDefinition("recon-snapshot", "Frozen source snapshot", 30, "recon.snapshot", True))
+        if config.codeql.enabled:
+            result.append(StageDefinition(
+                "codeql-candidates", "CodeQL path candidates", 35,
+                "codeql.paths", True,
+            ))
         result.extend(
             StageDefinition(
                 f"recon-{category}", f"Recon: {category}", 40 + index,
@@ -47,10 +52,6 @@ def stage_definitions(config: AuditConfig, audit_mode: str) -> list[StageDefinit
             )
             for index, category in enumerate(config.recon.categories)
         )
-    elif audit_mode == "scope":
-        result.append(StageDefinition("coverage-plan", "Coverage plan", 30, "coverage.plan", True))
-    if audit_mode == "scope":
-        result.append(StageDefinition("semantic-analysis", "Semantic analysis", 100, "semantic.analysis", config.semantic.enabled, config.semantic.enabled))
     if audit_mode == "scope":
         result.append(StageDefinition("audit-summary", "Audit summary", 110, "audit.summary", True))
     return result
@@ -116,10 +117,9 @@ def _definition_status(
     description = {
         "scope-evidence": scope_gate.EVIDENCE_INTENT,
         "scope-adjudication": scope_gate.ADJUDICATION_INTENT,
-        "coverage-plan": coverage.PLAN_INTENT,
         "audit-summary": "@analysis:audit-summary",
-        "semantic-analysis": "@analysis:audit-summary",
         "recon-snapshot": recon.SNAPSHOT_INTENT,
+        "codeql-candidates": codeql.INTENT,
     }.get(definition.stage_id, None)
     if definition.stage_id.startswith("recon-") and definition.stage_id != "recon-snapshot":
         description = recon.category_description(definition.stage_id.removeprefix("recon-"))
@@ -151,6 +151,18 @@ def _definition_status(
                 detail = record.get("summary") or "Recon coverage is partial."
             except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
                 status, detail = "failed", f"Invalid recon artifact: {exc}"
+    if definition.stage_id == "codeql-candidates" and definition.enabled:
+        latest = codeql.latest_fact(project)
+        if latest is not None:
+            try:
+                record = codeql.result_record(latest, workdir)
+                status = "satisfied" if record.get("status") == "complete" else "failed"
+                detail = (
+                    f"{record.get('candidate_count', 0)} machine path candidate(s); "
+                    "all require graph-level verification."
+                )
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                status, detail = "failed", f"Invalid CodeQL artifact: {exc}"
     if intent is not None:
         errors = [
             error for error in project.errors
@@ -182,30 +194,6 @@ def reconcile(config: AuditConfig, project: ProjectDetail, workdir: Path) -> lis
     if not config.enabled or project.project.audit_mode == "none":
         return []
     effective_config = config
-    current_plan_fact_ids = {
-        fact.id for fact in project.facts
-        if fact.type == "coverage_plan"
-        and fact.source_generation == project.project.source_generation
-    }
-    if config.recon.enabled and (
-        any(
-            intent.to in current_plan_fact_ids
-            and intent.source_generation == project.project.source_generation
-            and intent.plan_revision == project.project.plan_revision
-            for intent in project.intents
-        )
-        or any(
-            intent.description.strip() == coverage.PLAN_INTENT
-            and intent.source_generation == project.project.source_generation
-            and intent.plan_revision == project.project.plan_revision
-            for intent in project.intents
-        )
-    ):
-        # A project's first registered stage set is frozen. Keep legacy
-        # coverage projects on that contract when a dispatcher is upgraded.
-        effective_config = config.model_copy(update={
-            "recon": config.recon.model_copy(update={"enabled": False}),
-        })
     derived = [
         _definition_status(definition, effective_config, project, workdir)
         for definition in stage_definitions(effective_config, project.project.audit_mode)
@@ -232,7 +220,15 @@ def reconcile(config: AuditConfig, project: ProjectDetail, workdir: Path) -> lis
             row = _definition_status(definition, effective_config, project, workdir)
         else:
             row = by_id.get(stage.stage_id)
-            if row is None and not stage.required:
+            if row is None and stage.stage_id in {"semantic-analysis", "coverage-plan"}:
+                # Older dispatchers persisted this derived capability as a
+                # required stage. Retire it so the old per-file workflow
+                # cannot keep a project blocked after upgrade.
+                row = {
+                    "status": "not_applicable",
+                    "detail": "Retired: repository-wide reconnaissance replaces this legacy stage.",
+                }
+            elif row is None and not stage.required:
                 row = {
                     "status": "not_applicable",
                     "detail": "Retired stage is no longer implemented by this dispatcher.",
@@ -241,7 +237,7 @@ def reconcile(config: AuditConfig, project: ProjectDetail, workdir: Path) -> lis
             "stage_id": stage.stage_id,
             "label": stage.label,
             "phase_order": stage.phase_order,
-            "required": stage.required,
+            "required": False if stage.stage_id in {"semantic-analysis", "coverage-plan"} else stage.required,
             "status": row["status"] if row is not None else stage.status,
             "capability": stage.capability,
             "detail": row["detail"] if row is not None else stage.detail,

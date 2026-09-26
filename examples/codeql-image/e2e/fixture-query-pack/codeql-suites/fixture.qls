@@ -1,0 +1,2 @@
+- description: LLM-authored SQLite input flow fixture query
+- query: SqliteInputToExecute.ql

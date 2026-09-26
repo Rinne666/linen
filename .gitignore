@@ -21,8 +21,11 @@ dist/
 .playwright-cli/
 .impeccable/
 .linen-analysis/
+.linen-recon/
+.linen-codeql/
 .linen-executions/
 .linen-runtime/
+static_analysis_codeql_*/
 datas/
 .tools/
 .workbuddy/

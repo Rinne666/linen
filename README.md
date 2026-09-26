@@ -154,7 +154,10 @@ are stored in the ignored `.linen-runtime/` directory.
 
 ## Source-code audit mode
 
-Linen includes a coverage-driven audit mode for authorized source trees:
+Linen includes a category-driven audit mode for authorized source trees. The
+vulnerability example config freezes the source once and lets Pi dynamically
+search the repository per configured category, without creating per-file
+coverage cells:
 
 ```bash
 cp dispatch.vuln.example.yaml dispatch.yaml
@@ -185,7 +188,10 @@ mutually exclusive. If neither is supplied, the Dispatcher uses
 Audit mode can provide:
 
 - frozen scope and policy evidence;
-- coverage plans over included files and configured topics;
+- repository-wide, read-only Recon leads over a frozen snapshot;
+- optional isolated CodeQL path candidates, kept as machine evidence for Reason
+  to interpret rather than vulnerability verdicts;
+- optional Reason-selected CodeQL query profiles reusing the frozen-snapshot database;
 - deterministic source inventory and reproducible execution records;
 - evidence-bearing vulnerability candidates;
 - independent review, proof-closure, and technical-confirmation gates;
@@ -194,6 +200,36 @@ Audit mode can provide:
 - preserved worker output and artifacts under the project work directory.
 
 Use this only against systems and source code you are authorized to test.
+
+CodeQL is disabled by default. Enabling it requires a locally available Linux
+analysis image containing the CodeQL CLI and query packs; the image is never
+pulled during an audit. The audit runs it with `network: none`, a read-only
+frozen source mount, and `--build-mode=none`, so target build commands do not
+run. Set `audit.codeql.terms_acknowledged: true` only after confirming that
+your intended use complies with the applicable CodeQL terms. The CLI installed
+on a developer host is not automatically mounted into this container.
+Configure an explicit `.qls` in `audit.codeql.query_suites` for each enabled
+language; named `query_profiles` add bounded follow-up analyses.
+Optional `audit.codeql.query_profiles` map category IDs and languages to query
+suites already inside the trusted image. Reason, using the project's selected
+CLI, can request a profile to answer a concrete unresolved question; the
+dispatcher runs that suite in isolation and returns canonicalized path
+candidates. Model output cannot supply shell commands or arbitrary query paths.
+To build a local image from an official, platform-matching Linux CodeQL bundle,
+run `scripts/build_codeql_image.sh /path/to/codeql-bundle-linux-*.tar.zst
+linen-codeql:local`. For example, a Python suite can use
+`codeql/python-queries:codeql-suites/python-security-extended.qls`; include only
+languages for which the bundle contains the corresponding query pack. The
+script does not download the bundle or install a host CodeQL CLI.
+The opt-in real-Docker plumbing test can use its tiny QL fixture pack:
+
+```bash
+docker build --build-arg BASE_IMAGE=linen-codeql:local \
+  -f examples/codeql-image/e2e/Dockerfile -t linen-codeql:e2e .
+LINEN_CODEQL_TEST_IMAGE=linen-codeql:e2e \
+LINEN_CODEQL_TEST_SUITE=/opt/codeql/qlpacks/linen/fixture-sqlite-input/0.0.1/codeql-suites/fixture.qls \
+uv run --project linen --group dev pytest linen/linen/tests/test_codeql_docker_e2e.py -q
+```
 
 ### Audit inspection commands
 

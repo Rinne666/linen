@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, recon
+from linen.dispatcher.analysis import audit_graph, audit_recipes, codeql, recon
 
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.analysis.policy import (
@@ -49,7 +49,7 @@ REASON_SEED_BUDGET = 32
 REASON_HINT_SEED_LIMIT = 4
 HIGH_VALUE_FACT_TYPES = (
     "scope", "summary", "candidate_finding", "confirmed_finding",
-    "negative_assurance", "coverage", "coverage_plan", "coverage_result",
+    "negative_assurance",
     "candidate_disposition", "audit_summary",
     "source", "sink", "dataflow", "sanitizer", "validation", "reachability",
     "recon",
@@ -532,9 +532,8 @@ def run_reason_task(
                     prompt += recon.reason_instructions(
                         project, Path(container_name), config.audit.recon,
                     )
-                else:
-                    prompt += coverage.reason_instructions(
-                        project, Path(container_name), config.audit.coverage,
+                    prompt += codeql.reason_instructions(
+                        project, Path(container_name), config.audit.codeql,
                     )
                 if config.audit.semantic.enabled:
                     bundle = audit_recipes.load_bundle(config.runtime.prompt_group)
@@ -817,18 +816,9 @@ def run_reason_task(
                 intent_type = intent_data.get("type")
                 if audit_enabled:
                     fresh = client.get_project(project.project.id)
-                    if scope_audit:
-                        try:
-                            coverage.validate_intent(
-                                fresh, Path(container_name), config.audit.coverage, intent_data,
-                            )
-                        except ValueError as exc:
-                            message = f"Coverage intent blocked: {exc} ({intent_data['description']})"
-                            if not any(h.content == message for h in fresh.hints):
-                                client.create_hint(project.project.id, message, "audit-policy")
-                            continue
                     semantic_method = False
                     recon_method = False
+                    codeql_method = False
                     if (
                         scope_audit
                         and recon.active_for_project(fresh, config.audit.recon)
@@ -845,6 +835,18 @@ def run_reason_task(
                             )
                         except (ValueError, TypeError):
                             recon_method = False
+                    if (
+                        scope_audit
+                        and isinstance(intent_data.get("description"), str)
+                        and intent_data["description"].startswith(codeql.QUERY_PREFIX)
+                    ):
+                        try:
+                            codeql.validate_query_intent(
+                                fresh, config.audit.codeql, intent_data,
+                            )
+                            codeql_method = True
+                        except (ValueError, TypeError):
+                            codeql_method = False
                     if (
                         scope_audit
                         and config.audit.semantic.enabled
@@ -871,7 +873,7 @@ def run_reason_task(
                         except ValueError:
                             semantic_method = False
                     if (audit_graph.managed_description(intent_data["description"])
-                            and not semantic_method and not recon_method):
+                            and not semantic_method and not recon_method and not codeql_method):
                         message = (
                             "Audit intent blocked: reserved managed intents are materialized "
                             f"from graph state by the dispatcher ({intent_data['description']})"

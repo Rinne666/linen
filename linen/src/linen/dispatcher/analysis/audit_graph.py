@@ -10,7 +10,7 @@ import json
 import uuid
 from pathlib import Path
 
-from linen.dispatcher.analysis import audit_recipes, coverage, recon, scope_gate
+from linen.dispatcher.analysis import codeql, coverage, recon, scope_gate
 from linen.dispatcher.analysis.artifacts import ancestor_ids, digest, write_json
 from linen.dispatcher.config import AuditConfig
 from linen.server.models import Fact, ProjectDetail, REVIEWLESS_INTERMEDIATE_FACT_TYPES
@@ -25,7 +25,6 @@ def managed_description(description: str) -> bool:
     return (
         value.startswith("@analysis:")
         or value.startswith("@uvpg:proof:")
-        or value.startswith(coverage.CELL_PREFIX)
     )
 
 
@@ -48,13 +47,6 @@ def _intent(project: ProjectDetail, description: str):
         and intent.plan_revision == project.project.plan_revision
     ]
     return max(matches, key=lambda item: (item.created_at, item.id), default=None)
-
-
-def _result(project: ProjectDetail, description: str) -> Fact | None:
-    intent = _intent(project, description)
-    if intent is None or not intent.to:
-        return None
-    return next((fact for fact in project.facts if fact.id == intent.to), None)
 
 
 def _reviewed(project: ProjectDetail, fact_id: str) -> bool:
@@ -203,22 +195,6 @@ def _stage_intent_proposal(
     }
 
 
-def _coverage_summary_proposals(
-    project: ProjectDetail,
-    workdir: Path,
-    config: AuditConfig,
-) -> list[dict]:
-    proposals = []
-    for group in coverage.module_summary_groups(project, workdir, config.coverage):
-        if not _proposal_exists(project, group["description"]):
-            proposals.append({
-                "from": [group["plan_fact_id"], *group["result_ids"]],
-                "type": "synthesize",
-                "description": group["description"],
-            })
-    return proposals
-
-
 def audit_summary_inputs(
     project: ProjectDetail,
     workdir: Path,
@@ -251,17 +227,20 @@ def audit_summary_inputs(
                 if record.get("kind") != "category_reconnaissance" or record.get("status") != "complete":
                     return None
             module_ids = [plan_fact.id, *(fact.id for fact in category_facts)]
-        else:
-            plan_fact, _, plan = coverage.get_plan(project, workdir)
-            expected_modules = {cell["module"] for cell in plan["cells"]}
-            module_ids = []
-            for group in coverage.module_summary_groups(project, workdir, config.coverage):
-                fact = _result(project, group["description"])
-                if fact is None or fact.type != "module_summary" or not _reviewed(project, fact.id):
+            if codeql.active_for_project(project, config.codeql):
+                machine_fact = codeql.latest_fact(project)
+                if machine_fact is None:
                     return None
-                module_ids.append(fact.id)
-            if len(module_ids) != len(expected_modules) or not _reviewed(project, plan_fact.id):
-                return None
+                machine_record = codeql.result_record(machine_fact, workdir)
+                if (
+                    machine_record.get("status") != "complete"
+                    or machine_record.get("snapshot_id") != snapshot_record["snapshot"]["id"]
+                ):
+                    return None
+                module_ids.append(machine_fact.id)
+                module_ids.extend(fact.id for _category, fact in codeql.query_results(project))
+        else:
+            return None
         gate_ids = []
         if config.scope_adjudication.enabled:
             adjudication = scope_gate.result_for_intent(
@@ -307,7 +286,7 @@ def audit_summary_fact(
     inputs = audit_summary_inputs(project, workdir, config)
     if (intent.description.strip() != AUDIT_SUMMARY_INTENT or (intent.type or "") != "synthesize"
         or inputs is None or set(intent.from_) != set(inputs)):
-        raise ValueError("Audit summary requires every validated reconnaissance or coverage result")
+        raise ValueError("Audit summary requires every validated reconnaissance result")
     vulnerabilities = [
         fact.id for fact in project.facts
         if fact.type == "vulnerability" and fact.status == "triaged" and _reviewed(project, fact.id)
@@ -319,9 +298,9 @@ def audit_summary_fact(
         "input_fact_ids": inputs,
         "confirmed_vulnerability_ids": sorted(vulnerabilities),
         "statement": (
-            ("The scope gate and configured category reconnaissance branches completed on "
-             if recon.active_for_project(project, config.recon) else "The scope gate and required coverage branches completed on ")
-            + "frozen evidence. Policy eligibility remains separate from technical exploitability."
+            "The scope gate and configured category reconnaissance branches"
+            + (", plus CodeQL machine-path collection" if codeql.active_for_project(project, config.codeql) else "")
+            + " completed on frozen evidence. Policy eligibility remains separate from technical exploitability."
         ),
     }
     directory = workdir / ".linen-analysis" / ("audit-summary-" + uuid.uuid4().hex)
@@ -332,8 +311,9 @@ def audit_summary_fact(
         "type": "audit_summary",
         "description": (
             f"Scope audit synthesis completed with {len(vulnerabilities)} confirmed vulnerabilities. "
-            + ("All configured category reconnaissance branches completed. "
-               if recon.active_for_project(project, config.recon) else "All required coverage branches reached validated summaries. ")
+            + ("All configured category reconnaissance branches"
+               + (" and CodeQL machine-path collection" if codeql.active_for_project(project, config.codeql) else "")
+               + " completed. ")
             + "This does not prove the repository universally safe."
         ),
         "evidence": (
@@ -388,7 +368,7 @@ def required_intents(
                 )
                 if proposal is not None:
                     return [proposal]
-                # Keep policy uncertainty explicit and continue coverage.
+                # Keep policy uncertainty explicit while source recon proceeds.
                 plan_anchor = evidence.id
             elif not _reviewed(project, adjudication.id):
                 review_proposals = [
@@ -424,6 +404,19 @@ def required_intents(
                 project, [plan_anchor], "search", recon.SNAPSHOT_INTENT,
             )
             return [proposal] if proposal is not None else []
+        if codeql.active_for_project(project, config.codeql) and codeql.latest_fact(project) is None:
+            attempted = any(
+                intent.description.strip() == codeql.INTENT
+                and intent.source_generation == project.project.source_generation
+                and intent.plan_revision == project.project.plan_revision
+                for intent in project.intents
+            )
+            if not attempted:
+                return [{
+                    "from": [snapshot.id],
+                    "type": "search",
+                    "description": codeql.INTENT,
+                }]
         for category in config.recon.categories:
             if recon.latest_category_fact(project, category) is not None:
                 continue
@@ -450,59 +443,8 @@ def required_intents(
             return [proposal] if proposal is not None else []
         return []
 
-    proposals: list[dict] = []
-    if not any(fact.type == "coverage_plan" for fact in project.facts):
-        proposal = _stage_intent_proposal(
-            project, [plan_anchor], "search", coverage.PLAN_INTENT,
-        )
-        if proposal is not None:
-            proposals.append(proposal)
-    if proposals:
-        return proposals[:limit]
-
-    plan_fact = next((fact for fact in project.facts if fact.type == "coverage_plan"), None)
-    if plan_fact is None or not _reviewed(project, plan_fact.id):
+    if not recon.active_for_project(project, config.recon):
         return []
-
-    try:
-        semantic_verifications = audit_recipes.verification_proposals(
-            project, workdir, config.semantic,
-        )
-    except (ValueError, OSError, KeyError, TypeError):
-        semantic_verifications = []
-
-    proposals.extend(semantic_verifications)
-    if proposals:
-        return proposals[:limit]
-
-    plan = plan_fact
-    if plan is not None and _reviewed(project, plan.id):
-        try:
-            state = coverage.coverage_state(project, workdir, config.coverage)
-            for row in state["cells"]:
-                if row["status"] in {"pending", "blocked", "invalid", "needs_followup"} and not row["retry_exhausted"]:
-                    from_ids = [state["plan_fact_id"]]
-                    if row["result_id"]:
-                        result = next((fact for fact in project.facts if fact.id == row["result_id"]), None)
-                        if result is None or not coverage.review_resolved(project, result.id):
-                            continue
-                        from_ids.append(result.id)
-                    if not _open(project, row["description"]):
-                        attempt_anchor = row["result_id"] or "initial"
-                        proposals.append({
-                            "from": from_ids,
-                            "type": "verify",
-                            "description": row["description"],
-                            "target": f"{row['description']}:attempt:{attempt_anchor}",
-                        })
-        except (ValueError, OSError, KeyError, TypeError):
-            pass
-
-    if proposals:
-        return proposals[:limit]
-    proposals.extend(_coverage_summary_proposals(project, workdir, config))
-    if proposals:
-        return proposals[:limit]
     inputs = audit_summary_inputs(project, workdir, config)
     if inputs is not None:
         proposal = _stage_intent_proposal(
@@ -519,10 +461,7 @@ def scope_blockers(
     config: AuditConfig,
     from_ids: list[str],
 ) -> list[str]:
-    recon_mode = recon.active_for_project(project, config.recon)
-    blockers = [] if recon_mode else coverage.scope_blockers(
-        project, workdir, config.coverage, from_ids,
-    )
+    blockers = []
     if config.scope_adjudication.enabled:
         evidence = scope_gate.result_for_intent(project, scope_gate.EVIDENCE_INTENT)
         adjudication = scope_gate.result_for_intent(
@@ -541,6 +480,45 @@ def scope_blockers(
                 scope_gate.adjudication_record(adjudication, workdir)
             except (ValueError, OSError, KeyError, TypeError) as exc:
                 blockers.append(f"Invalid scope adjudication evidence {adjudication.id}: {exc}")
+    if recon.active_for_project(project, config.recon) and codeql.active_for_project(project, config.codeql):
+        machine_fact = codeql.latest_fact(project)
+        if machine_fact is None:
+            blockers.append("CodeQL machine-path analysis has no completed result Fact.")
+        else:
+            try:
+                machine_record = codeql.result_record(machine_fact, workdir)
+                if machine_record.get("status") != "complete":
+                    blockers.append("CodeQL machine-path analysis did not complete successfully.")
+            except (ValueError, OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                blockers.append(f"Invalid CodeQL machine-path evidence {machine_fact.id}: {exc}")
+        snapshot = recon.snapshot_fact(project)
+        for intent in project.intents:
+            category = codeql.query_category(intent.description)
+            if (
+                category is None
+                or intent.source_generation != project.project.source_generation
+                or intent.plan_revision != project.project.plan_revision
+            ):
+                continue
+            fact = next((item for item in project.facts if item.id == intent.to), None)
+            if fact is None:
+                blockers.append(
+                    f"Requested CodeQL query profile {category} did not produce a result Fact; "
+                    "inspect its execution error and retry within the configured attempt limit."
+                )
+                continue
+            try:
+                query_record = codeql.result_record(fact, workdir)
+                if (
+                    query_record.get("status") != "complete"
+                    or snapshot is None
+                    or query_record.get("snapshot_fact_id") != snapshot.id
+                ):
+                    blockers.append(
+                        f"CodeQL query profile {category} did not complete against the current frozen snapshot."
+                    )
+            except (ValueError, OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                blockers.append(f"Invalid CodeQL query evidence {fact.id}: {exc}")
     summary = next((fact for fact in project.facts if fact.id in from_ids and fact.type == "audit_summary"), None)
     if summary is None:
         blockers.append("Scope completion must reference a validated audit_summary fact.")
@@ -549,6 +527,5 @@ def scope_blockers(
     if audit_summary_inputs(project, workdir, config) is None:
         blockers.append(
             "Configured reconnaissance branches have not produced complete validated results."
-            if recon_mode else "Coverage branches have not reached validated module summaries."
         )
     return list(dict.fromkeys(blockers))

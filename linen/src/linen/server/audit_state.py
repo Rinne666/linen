@@ -80,6 +80,7 @@ INTENT_METADATA: tuple[tuple[str, str, str, str], ...] = (
     ("@analysis:scope-evidence", "Collect scope evidence", "scope", "defines"),
     ("@analysis:scope-adjudication", "Decide audit scope", "scope", "defines"),
     ("@analysis:coverage-plan", "Plan coverage", "coverage", "defines"),
+    ("@analysis:codeql-path-candidates", "Collect CodeQL path candidates", "recon", "produces"),
     ("@analysis:audit-summary", "Build audit summary", "report", "produces"),
 )
 
@@ -135,6 +136,8 @@ def intent_metadata(description: str, intent_type: str | None) -> tuple[str, str
         return "Verify coverage unit", "audit_task", "coverage", "produces"
     if value.startswith("@analysis:review:") or (intent_type or "").startswith("review"):
         return "Review finding", "review_task", "review", "reviews"
+    if value.startswith("@analysis:codeql-query:"):
+        return "Query CodeQL profile", "audit_task", "machine_analysis", "produces"
     if value.startswith("@analysis:semantic:variant_search"):
         return "Search for variants", "audit_task", "variants", "variant_of"
     if value.startswith("@analysis:semantic-verify:"):

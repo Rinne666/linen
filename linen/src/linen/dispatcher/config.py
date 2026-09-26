@@ -239,7 +239,7 @@ class ReconConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = False
+    enabled: bool = True
     categories: list[str] = Field(default_factory=lambda: [
         "input-validation", "authorization", "dangerous-api",
     ])
@@ -261,6 +261,94 @@ class ReconConfig(BaseModel):
         ):
             raise ValueError("recon.categories must contain unique lowercase category IDs")
         return value
+
+
+CodeQLLanguage = Literal["csharp", "java", "javascript", "python", "ruby"]
+
+
+class CodeQLConfig(ReviewSandboxConfig):
+    """Opt-in CodeQL path-candidate generation in an isolated Docker image."""
+
+    languages: list[CodeQLLanguage] = Field(default_factory=lambda: ["python", "javascript"])
+    cli_path: str = "/opt/codeql/codeql"
+    timeout: int = Field(default=1800, gt=0, le=7200)
+    threads: int = Field(default=2, gt=0, le=8)
+    max_candidates: int = Field(default=100, gt=0, le=1000)
+    max_query_attempts_per_profile: int = Field(default=2, gt=0, le=5)
+    max_sarif_bytes: int = Field(default=20_000_000, gt=0, le=100_000_000)
+    max_work_bytes: int = Field(default=4_000_000_000, gt=0, le=50_000_000_000)
+    terms_acknowledged: bool = False
+    # Every enabled language needs an explicit initial suite. The model may
+    # later choose a named, bounded query profile, but cannot replace the
+    # initial deterministic collection stage with arbitrary queries.
+    query_suites: dict[CodeQLLanguage, list[str]] = Field(default_factory=dict)
+    # Optional per-category query suites baked into the trusted image. Reason
+    # may request one by category; it cannot supply shell commands or paths.
+    query_profiles: dict[str, dict[CodeQLLanguage, list[str]]] = Field(default_factory=dict)
+
+    @field_validator("languages")
+    @classmethod
+    def unique_languages(cls, value: list[str]) -> list[str]:
+        if not value or len(value) != len(set(value)):
+            raise ValueError("codeql.languages must be non-empty and unique")
+        return value
+
+    @model_validator(mode="after")
+    def validate_codeql(self) -> "CodeQLConfig":
+        import re
+        if "\x00" in self.cli_path or "\n" in self.cli_path or not self.cli_path.startswith("/"):
+            raise ValueError("codeql.cli_path must be an absolute path inside the analysis image")
+        if any(
+            self.cli_path == root or self.cli_path.startswith(root + "/")
+            for root in ("/repo", "/input", "/work", "/tmp")
+        ):
+            raise ValueError("codeql.cli_path must be part of the trusted, read-only analysis image")
+        if self.enabled:
+            if not self.image:
+                raise ValueError("codeql.image is required when CodeQL is enabled")
+            if not self.terms_acknowledged:
+                raise ValueError("codeql.terms_acknowledged must be true before enabling CodeQL")
+            if self.network != "none":
+                raise ValueError("CodeQL analysis must run with network=none")
+            if self.env_allowlist:
+                raise ValueError("CodeQL analysis must not receive host or worker environment variables")
+            missing_suites = set(self.languages) - set(self.query_suites)
+            if missing_suites:
+                raise ValueError(
+                    "codeql.query_suites must provide an explicit suite for each enabled "
+                    f"language; missing: {', '.join(sorted(missing_suites))}"
+                )
+        for language, queries in self.query_suites.items():
+            if language not in self.languages:
+                raise ValueError(f"CodeQL query suite uses an unconfigured language: {language}")
+            _validate_codeql_query_refs(queries)
+        for category, language_queries in self.query_profiles.items():
+            if not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", category):
+                raise ValueError("codeql.query_profiles keys must be lowercase category IDs")
+            if not language_queries:
+                raise ValueError("each CodeQL query profile must configure at least one language")
+            for language, queries in language_queries.items():
+                if language not in self.languages:
+                    raise ValueError(f"CodeQL profile {category} uses an unconfigured language: {language}")
+                _validate_codeql_query_refs(queries)
+        return self
+
+
+def _validate_codeql_query_refs(queries: list[str]) -> None:
+    if not queries or len(queries) != len(set(queries)):
+        raise ValueError("CodeQL query suites must contain unique query references")
+    for query in queries:
+        if (
+            not isinstance(query, str) or not query or "\x00" in query
+            or "\n" in query or query.startswith("-")
+            or ".." in query.replace("\\", "/").split("/")
+        ):
+            raise ValueError("CodeQL query references must be safe paths or pack specifiers")
+        if query.startswith("/") and any(
+            query == root or query.startswith(root + "/")
+            for root in ("/repo", "/input", "/work", "/cache", "/tmp")
+        ):
+            raise ValueError("CodeQL query suites must come from the trusted analysis image")
 
 
 class ScopeAdjudicationConfig(BaseModel):
@@ -380,14 +468,26 @@ class AuditConfig(BaseModel):
     # defaults to scope coverage rather than stopping after one hypothesis.
     enabled: bool = False
     mode: Literal["hypothesis", "scope"] = "scope"
+    # Read-only migration support for projects created with the retired
+    # coverage-cell pipeline. New scope projects use Recon.
     coverage: CoverageConfig = Field(default_factory=CoverageConfig)
     review_sandbox: ReviewSandboxConfig = Field(default_factory=ReviewSandboxConfig)
     poc_sandbox: PocSandboxConfig = Field(default_factory=PocSandboxConfig)
     recon: ReconConfig = Field(default_factory=ReconConfig)
+    codeql: CodeQLConfig = Field(default_factory=CodeQLConfig)
     scope_adjudication: ScopeAdjudicationConfig = Field(
         default_factory=ScopeAdjudicationConfig
     )
     semantic: SemanticAuditConfig = Field(default_factory=SemanticAuditConfig)
+
+    @model_validator(mode="after")
+    def require_repository_recon_for_scope(self) -> "AuditConfig":
+        if self.enabled and self.mode == "scope" and not self.recon.enabled:
+            raise ValueError(
+                "scope audits require audit.recon.enabled; the coverage-cell pipeline is retired"
+            )
+        return self
+
 
 
 class DispatchConfig(BaseModel):
@@ -455,6 +555,16 @@ class DispatchConfig(BaseModel):
             for worker in self.workers
         ):
             raise ValueError("audit.recon requires a Pi worker configured for explore tasks")
+        if self.audit.codeql.enabled and not self.audit.enabled:
+            raise ValueError("audit.codeql requires audit.enabled")
+        if self.audit.codeql.enabled and self.audit.mode != "scope":
+            raise ValueError("audit.codeql requires scope mode")
+        if self.audit.codeql.enabled and not self.audit.recon.enabled:
+            raise ValueError("audit.codeql requires a frozen reconnaissance snapshot")
+        if self.audit.codeql.enabled and not any(
+            "explore" in worker.task_types for worker in self.workers
+        ):
+            raise ValueError("audit.codeql requires an explore worker for graph scheduling")
         if self.audit.scope_adjudication.enabled and not self.audit.enabled:
             raise ValueError("scope adjudication requires audit.enabled")
         if self.audit.scope_adjudication.enabled and self.audit.mode != "scope":

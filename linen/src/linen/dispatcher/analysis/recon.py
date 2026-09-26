@@ -16,7 +16,7 @@ from linen.dispatcher.analysis.artifacts import (
     snapshot_source,
     write_json,
 )
-from linen.dispatcher.config import CoverageConfig, ReconConfig
+from linen.dispatcher.config import ReconConfig
 from linen.server.models import Fact, Intent, ProjectDetail, FACT_TYPE_RECON_SNAPSHOT
 
 SNAPSHOT_INTENT = "@analysis:recon-snapshot"
@@ -38,24 +38,12 @@ def category_from_description(description: str) -> str | None:
 
 
 def active_for_project(project: ProjectDetail, config: ReconConfig) -> bool:
-    """Do not retrofit a frozen coverage plan into a different audit contract."""
-    current_plan_fact_ids = {
-        fact.id for fact in project.facts
-        if fact.type == "coverage_plan"
-        and fact.source_generation == project.project.source_generation
-    }
-    has_coverage_plan = any(
-        intent.to in current_plan_fact_ids
-        and intent.plan_revision == project.project.plan_revision
-        and intent.source_generation == project.project.source_generation
-        for intent in project.intents
-    ) or any(
-        intent.description.strip() == "@analysis:coverage-plan"
-        and intent.source_generation == project.project.source_generation
-        and intent.plan_revision == project.project.plan_revision
-        for intent in project.intents
-    )
-    return config.enabled and not has_coverage_plan
+    """Use repository-wide recon as the only scope-audit execution mode.
+
+    Historical coverage-plan Facts remain readable in old blackboards, but
+    they no longer select or reactivate the retired per-file scheduler.
+    """
+    return config.enabled
 
 
 def parse_category_intent(intent: Intent, config: ReconConfig) -> tuple[str, str | None] | None:
@@ -145,12 +133,8 @@ def create_snapshot(
                 pass
         shutil.rmtree(root)
     root.mkdir(parents=True)
-    snapshot_config = CoverageConfig(
-        max_target_bytes=config.max_target_bytes,
-        exclude=config.exclude,
-    )
     snapshot = snapshot_source(
-        repo.resolve(), root / "source", snapshot_config, workdir.resolve(),
+        repo.resolve(), root / "source", config, workdir.resolve(),
     )
     if not snapshot["files"]:
         raise ValueError("Recon snapshot contains no readable files")
@@ -423,7 +407,9 @@ def latest_category_fact(project: ProjectDetail, category: str) -> Fact | None:
 
 def result_record(fact: Fact, workdir: Path) -> dict[str, Any]:
     _path, record = load_artifact(fact, workdir)
-    if record.get("kind") not in {"recon_snapshot", "category_reconnaissance"}:
+    if record.get("kind") not in {
+        "recon_snapshot", "category_reconnaissance", "codeql_path_candidates",
+    }:
         raise ValueError("Unexpected reconnaissance artifact kind")
     return record
 

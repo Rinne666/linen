@@ -16,7 +16,7 @@ from pathlib import Path
 
 import requests
 
-from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, scope_gate, stages
+from linen.dispatcher.analysis import audit_graph, audit_recipes, codeql, coverage, scope_gate, stages
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.models import RunningTask
 from linen.dispatcher.protocol.client import LinenClient
@@ -397,8 +397,8 @@ class DispatcherLoop:
             return False
         self._honor_manual_provider_retries(project)
         # Managed audit mechanics are derived exclusively from the exported
-        # graph and immutable project artifacts. Scope mode derives the full
-        # coverage DAG; hypothesis mode derives only configured baseline scan
+        # graph and immutable project artifacts. Scope mode derives the Recon DAG;
+        # hypothesis mode derives only configured baseline scan
         # and review edges. Materializing a missing edge here preserves the
         # blackboard as the only task ledger and makes restarts deterministic.
         if project.project.reason is None and self._materialize_audit_intents(project):
@@ -562,15 +562,11 @@ class DispatcherLoop:
                 return False
             # Pick the least-recently attempted intent. A released intent keeps
             # its heartbeat timestamp, so failures rotate to the back of the
-            # persisted blackboard queue instead of starving older work. For
-            # never-attempted intents this is ordinary FIFO ordering. Every
-            # explore intent shares this ordering; coverage cells retain their
-            # existing penalty so bulk coverage cannot starve other work.
+            # persisted blackboard queue instead of starving older work.
             next_intent = min(
                 explore_intents,
                 key=lambda i: (
                     int(self._explore_requires_provider(project, i)),
-                    int(i.description.strip().startswith(coverage.CELL_PREFIX)),
                     i.last_heartbeat_at or i.created_at,
                     i.created_at,
                     i.id,
@@ -659,9 +655,7 @@ class DispatcherLoop:
             return False
         workdir = Path(self.container_manager.ensure_running(project.project.id))
         # Keep only a small ready window on the blackboard. The complete audit
-        # DAG remains derivable from facts, intents, and reviews, but thousands
-        # of future coverage cells no longer hide triage work or make
-        # the UI look as if every cell is already running.
+        # DAG remains derivable from facts, intents, and reviews.
         limit = min(8, max(1, self.config.runtime.max_project_workers * 2))
         open_managed = sum(
             audit_graph.managed_description(intent.description)
@@ -670,7 +664,6 @@ class DispatcherLoop:
             for intent in project.intents
         )
         proposal_limit = limit - open_managed
-        legacy_overflow = open_managed > limit
         priority_scope_gate = (
             self.config.audit.scope_adjudication.enabled
             and project.project.audit_mode == "scope"
@@ -685,7 +678,7 @@ class DispatcherLoop:
                 or not coverage.reviewed(project, scope_adjudication.id)
             )
         )
-        if proposal_limit <= 0 and not legacy_overflow and not priority_scope_gate:
+        if proposal_limit <= 0 and not priority_scope_gate:
             proposal_limit = 0
 
         # Proof mode is candidate-centric and bounded: the server derives one
@@ -705,16 +698,8 @@ class DispatcherLoop:
                 return False
         proposals = audit_graph.required_intents(
             project, workdir, self.config.audit,
-            limit=1 if legacy_overflow or priority_scope_gate else proposal_limit,
+            limit=1 if priority_scope_gate else proposal_limit,
         )
-        if legacy_overflow:
-            # Existing projects may already contain hundreds of eagerly
-            # materialized coverage cells. Permit only a higher-priority graph
-            # edge through that legacy backlog; never add another coverage cell.
-            proposals = [
-                proposal for proposal in proposals
-                if not proposal["description"].strip().startswith(coverage.CELL_PREFIX)
-            ][:1]
         created = 0
         known_intent_ids = {intent.id for intent in project.intents}
         for proposal in proposals:
@@ -969,6 +954,12 @@ class DispatcherLoop:
             and self.config.audit.recon.enabled
             and intent.description.strip() == "@analysis:recon-snapshot"
         )
+        codeql_scan = (
+            self.config.audit.enabled
+            and codeql.active_for_project(project, self.config.audit.codeql)
+            and project.project.audit_mode == "scope"
+            and codeql.is_intent(intent)
+        )
         selection = self._select_worker(
             project.project.id,
             "explore",
@@ -976,9 +967,10 @@ class DispatcherLoop:
             # still honor the project's selected CLI.
             worker_preference=(
                 "pi" if recon_scout else
-                "auto" if recon_snapshot else project.project.worker_preference
+                "auto" if recon_snapshot or codeql_scan else project.project.worker_preference
             ),
             provider_required=provider_required,
+            worker_health_required=not codeql_scan,
         )
         worker = selection.worker
         if worker is None:
@@ -1133,6 +1125,7 @@ class DispatcherLoop:
         *,
         worker_preference: str = "auto",
         provider_required: bool = True,
+        worker_health_required: bool = True,
     ) -> WorkerSelection:
         now = time.time()
         candidates: list[WorkerConfig] = []
@@ -1165,7 +1158,7 @@ class DispatcherLoop:
                 blocked_busy.append(f"{worker.name}({running}/{worker.max_running})")
                 continue
             unhealthy_until = self.worker_unhealthy_until.get(worker.name, 0)
-            if unhealthy_until > now:
+            if worker_health_required and unhealthy_until > now:
                 blocked_unhealthy.append(f"{worker.name}({unhealthy_until - now:.1f}s)")
                 continue
             provider_until = getattr(self, "worker_provider_until", {}).get(worker.name, 0)
@@ -1181,7 +1174,7 @@ class DispatcherLoop:
                 self.worker_provider_reason.pop(worker.name, None)
                 self._persist_provider_circuits()
             rejected_until = self.worker_rejected_until.get((project_id, task_type, worker.name), 0)
-            if rejected_until > now:
+            if worker_health_required and rejected_until > now:
                 blocked_rejected.append(f"{worker.name}({rejected_until - now:.1f}s)")
                 continue
             candidates.append(worker)
@@ -1233,14 +1226,11 @@ class DispatcherLoop:
             and scope_gate.is_evidence_intent(intent)
         ):
             return False
-        if intent.type == "search" and description == coverage.PLAN_INTENT:
-            return False
         if self.config.audit.recon.enabled and description == "@analysis:recon-snapshot":
             return False
-        return not (
-            description.startswith(coverage.MODULE_SUMMARY_PREFIX)
-            or description == audit_graph.AUDIT_SUMMARY_INTENT
-        )
+        if codeql.active_for_project(project, self.config.audit.codeql) and codeql.is_intent(intent):
+            return False
+        return description != audit_graph.AUDIT_SUMMARY_INTENT
 
     def _scope_gate_pending(self, project: ProjectDetail) -> bool:
         if not (

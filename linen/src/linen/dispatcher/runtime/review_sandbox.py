@@ -17,7 +17,8 @@ class DockerReviewProcess:
 
     def __init__(self, config: ReviewSandboxConfig, source: Path, snapshot: dict,
                  run_dir: Path, argv: list[str], env: dict[str, str], timeout: int,
-                 inputs: dict[str, bytes] | None = None):
+                 inputs: dict[str, bytes] | None = None, *, writable_workdir: bool = False,
+                 persistent_workdir: Path | None = None):
         self.config = config
         self.source = source
         self.snapshot = snapshot
@@ -26,6 +27,8 @@ class DockerReviewProcess:
         self.worker_env = env
         self.timeout = timeout
         self.inputs = inputs or {}
+        self.writable_workdir = writable_workdir
+        self.persistent_workdir = persistent_workdir
         self.name = "linen-review-" + uuid.uuid4().hex
         self.process: LocalProcess | None = None
         self.executable = shutil.which(config.executable)
@@ -89,10 +92,37 @@ class DockerReviewProcess:
             "--security-opt=no-new-privileges", "--pids-limit", str(self.config.pids_limit),
             "--memory", self.config.memory, "--cpus", str(self.config.cpus),
             "--workdir", "/work", "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
-            "--tmpfs", "/work:rw,nosuid,nodev,size=256m,mode=1777",
             "--mount", f"type=bind,source={staged},target=/repo,readonly,bind-recursive=disabled",
             "--mount", f"type=bind,source={input_dir},target=/input,readonly,bind-recursive=disabled",
         ]
+        if self.writable_workdir:
+            output_dir = self.run_dir / "work"
+            output_dir.mkdir(mode=0o700)
+            # The analysis container gets one fresh, dispatcher-owned writable
+            # directory so CodeQL databases can exceed tmpfs limits. Source and
+            # input remain separate read-only mounts.
+            output_dir.chmod(0o777)
+            if "," in str(output_dir):
+                raise ValueError("Docker bind source paths cannot contain commas")
+            command.extend([
+                "--mount",
+                # Bind mounts are writable by default. Docker's --mount parser
+                # accepts `readonly`, but not the `rw` shorthand used by -v.
+                f"type=bind,source={output_dir},target=/work,bind-recursive=disabled",
+            ])
+        else:
+            command.extend(["--tmpfs", "/work:rw,nosuid,nodev,size=256m,mode=1777"])
+        if self.persistent_workdir is not None:
+            persistent = self.persistent_workdir.resolve()
+            persistent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # Prepared analysis databases survive disposable query containers.
+            persistent.chmod(0o777)
+            if "," in str(persistent):
+                raise ValueError("Docker bind source paths cannot contain commas")
+            command.extend([
+                "--mount",
+                f"type=bind,source={persistent},target=/cache,bind-recursive=disabled",
+            ])
         for name, value in container_env.items():
             command.extend(["--env", name if name in self.config.env_allowlist else f"{name}={value}"])
         # Override image entrypoints; no image startup script is needed to
@@ -153,9 +183,12 @@ class ReviewSandboxBackend:
     """Minimal process factory used by run_worker_process and its lease hooks."""
 
     def __init__(self, config: ReviewSandboxConfig, source: Path, snapshot: dict, root: Path,
-                 inputs: dict[str, bytes] | None = None):
+                 inputs: dict[str, bytes] | None = None, *, writable_workdir: bool = False,
+                 persistent_workdir: Path | None = None):
         self.config, self.source, self.snapshot, self.root = config, source, snapshot, root
         self.inputs = inputs or {}
+        self.writable_workdir = writable_workdir
+        self.persistent_workdir = persistent_workdir
         self.last_process: DockerReviewProcess | None = None
 
     def build_exec_process(self, container_name: str, env: dict[str, str], command: list[str],
@@ -163,5 +196,7 @@ class ReviewSandboxBackend:
         self.last_process = DockerReviewProcess(
             self.config, self.source, self.snapshot, self.root / uuid.uuid4().hex,
             command, env, timeout_seconds or 300, self.inputs,
+            writable_workdir=self.writable_workdir,
+            persistent_workdir=self.persistent_workdir,
         )
         return self.last_process

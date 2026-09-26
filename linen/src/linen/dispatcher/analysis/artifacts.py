@@ -338,7 +338,10 @@ def evidence_fields(evidence: str | None) -> dict[str, str]:
 def load_artifact(fact: Fact, workdir: Path) -> tuple[Path, dict]:
     fields = evidence_fields(fact.evidence)
     path = Path(fields.get("artifact", "")).resolve()
-    roots = [(workdir / name).resolve() for name in (".linen-analysis", ".linen-coverage")]
+    roots = [
+        (workdir / name).resolve()
+        for name in (".linen-analysis", ".linen-coverage", ".linen-recon", ".linen-codeql")
+    ]
     if not any(path.is_relative_to(root) for root in roots):
         raise ValueError("Artifact must be inside this project's analysis directories")
     data = path.read_bytes()
@@ -389,7 +392,7 @@ def select_snapshot(project: ProjectDetail, fact_id: str, workdir: Path) -> tupl
         allowed_types = (
             {"policy_evidence"}
             if policy_review
-            else {"coverage_plan"}
+            else {"coverage_plan", "recon_snapshot"}
         )
         if fact.id in ancestors and fact.type in allowed_types:
             path, artifact = load_artifact(fact, workdir)
@@ -407,7 +410,7 @@ def review_inputs(project: ProjectDetail, fact: Fact, workdir: Path) -> dict[str
     """Selected execution records, never other reviews or graph history."""
     inputs: dict[str, bytes] = {}
     artifact_fact_types = {
-        "coverage_plan", "module_summary", "audit_summary",
+        "coverage_plan", "recon_snapshot", "recon", "module_summary", "audit_summary",
         "architecture_map", "authz_matrix", "state_model", "cross_service_map",
         "contract_map", "hypothesis_batch", "variant_batch", "semantic_summary",
         "policy_evidence", "scope_adjudication",
@@ -422,6 +425,7 @@ def review_inputs(project: ProjectDetail, fact: Fact, workdir: Path) -> dict[str
             "statement", "repository", "sources", "gaps", "trust_boundaries",
             "pre_exclusions", "conflicts", "decision_scope",
             "technical_exploitability_unchanged", "evidence_gaps",
+            "leads", "snapshot_id", "snapshot_fact_id", "languages",
         ) if key in artifact}
         inputs["record.json"] = json.dumps(record, ensure_ascii=False).encode()
     elif fact.type == "coverage_result":

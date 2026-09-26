@@ -38,8 +38,16 @@ Agent 不直接认领 Intent，不直接 heartbeat，不直接调用 linen API�
     引用的 source-to-sink 候选与明确缺口；Reason 读取 artifact、归并跨类别证据并
     决定是否发起有上限的类别跟进或普通验证任务。Recon Fact 是只读侦察材料，不是
     漏洞结论，也不能单独通过完成门槛。未启用 Recon 时仍使用原 coverage 流程。
-    已在当前 source generation / plan revision 创建 coverage plan 的旧项目继续履行
-    已冻结的 coverage 阶段；更换模式只作用于尚未开始计划的新项目或重新规划后的版本。
+    已有 coverage-plan stage 在升级后会被标记为 retired；新调度只创建仓库级 Recon
+    Intent，不再派发 coverage plan 或 per-file cell。
+    `audit.codeql.enabled` 可在该流程中额外创建一个确定性 CodeQL 候选任务。它使用
+    独立 Docker 镜像、无网络、只读快照挂载和独立可写分析目录；仅允许配置无需构建
+    的语言。SARIF path location 会按快照内容重新生成并验证精确引用，再归一化为
+    带 `source_type=codeql` / `source_ref` 的 Recon lead。该任务不执行仓库构建脚本，
+    结果不直接成为 vulnerability；Reason 仍负责授权、信任边界、可达性和影响判断。
+    CodeQL 默认关闭，启用时要求显式声明已确认适用的使用条款，并由部署提供预装
+    CodeQL CLI 和 query packs 的本地分析镜像。语义分析能力仍可选，但不再单列为
+    required stage。
 15. Reason 只由安全相关的新证据、用户确认/放弃动作，或所有 open Intent 均已阻塞时
     唤醒。普通 coverage 结果由确定性调度器继续推进；只有 `needs_followup`、`blocked`
     或带 lead 的结果才额外触发 Reason，避免每个覆盖单元都支付一次策略推理调用。
