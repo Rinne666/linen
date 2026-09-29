@@ -46,7 +46,7 @@ class ClaudeCodeDriver(SeedSessionDriver):
                 "claude",
                 "--session-id",
                 session,
-                "--dangerously-skip-permissions",
+                *self._permission_args(worker, prompt),
                 "-p",
                 "--",
                 prompt,
@@ -59,8 +59,27 @@ class ClaudeCodeDriver(SeedSessionDriver):
             "claude",
             "-r",
             session,
-            "--dangerously-skip-permissions",
+            *self._permission_args(worker, prompt),
             "-p",
             "--",
             prompt,
+        ]
+
+    @staticmethod
+    def _permission_args(worker: WorkerConfig, prompt: str) -> list[str]:
+        read_only = worker.sandbox_mode == "read-only" or prompt.lstrip().startswith((
+            "# READ-ONLY RECON TASK",
+            "# READ-ONLY RECON COVERAGE REVIEW",
+        ))
+        if not read_only:
+            return ["--dangerously-skip-permissions"]
+        return [
+            "--safe-mode",
+            "--restricted",
+            "--tools",
+            "Read,Grep,Glob",
+            "--permission-mode",
+            "plan",
+            "--permission-prompts",
+            "none",
         ]

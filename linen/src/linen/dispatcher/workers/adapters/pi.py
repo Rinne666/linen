@@ -72,7 +72,7 @@ class PiDriver(WorkerDriver):
             "--session-dir",
             self._session_dir(worker),
         ]
-        if self._read_only_recon(prompt):
+        if self._read_only(worker, prompt):
             argv.extend([
                 "--no-extensions", "--no-skills", "--no-prompt-templates",
                 "--no-themes", "--no-context-files", "--tools", "read,grep,find,ls",
@@ -98,7 +98,7 @@ class PiDriver(WorkerDriver):
             "--session",
             session,
         ]
-        if self._read_only_recon(prompt):
+        if self._read_only(worker, prompt):
             argv.extend([
                 "--no-extensions", "--no-skills", "--no-prompt-templates",
                 "--no-themes", "--no-context-files", "--tools", "read,grep,find,ls",
@@ -113,7 +113,7 @@ class PiDriver(WorkerDriver):
         # and rejects fresh UUIDs, while --session-id creates the session on first use, which
         # is what the dispatcher needs (it generates a fresh UUID per task).
         session_dir = self._session_dir(worker)
-        readonly = self._read_only_recon(prompt)
+        readonly = self._read_only(worker, prompt)
         pi_argv = [
             "--mode",
             "json",
@@ -127,6 +127,15 @@ class PiDriver(WorkerDriver):
             "--tools",
             "read,grep,find,ls" if readonly else "read,write,edit,bash,grep,find,ls",
         ]
+        # Local Pi normally follows the user's global default model. Allow a
+        # worker to select an already-configured provider/model explicitly so
+        # one exhausted provider does not block the project's other CLI routes.
+        provider = worker.env.get("PI_PROVIDER")
+        model = worker.env.get("PI_MODEL")
+        if provider:
+            pi_argv.extend(["--provider", provider])
+        if model:
+            pi_argv.extend(["--model", model])
         if session:
             pi_argv.extend(["--session-id", session])
         pi_argv.extend(["-p", prompt])
@@ -135,7 +144,14 @@ class PiDriver(WorkerDriver):
 
     @staticmethod
     def _read_only_recon(prompt: str) -> bool:
-        return prompt.lstrip().startswith("# READ-ONLY RECON TASK")
+        return prompt.lstrip().startswith((
+            "# READ-ONLY RECON TASK",
+            "# READ-ONLY RECON COVERAGE REVIEW",
+        ))
+
+    @classmethod
+    def _read_only(cls, worker: WorkerConfig, prompt: str) -> bool:
+        return worker.sandbox_mode == "read-only" or cls._read_only_recon(prompt)
 
     def extract_session(self, session: str | None, stdout: str, stderr: str) -> str | None:
         if session:

@@ -477,12 +477,21 @@ def audit_completion_blockers_from_db(
             fact["status"] == "triaged"
             and fact["type"] in REVIEWLESS_INTERMEDIATE_FACT_TYPES
         )
-        if not technical_confirmation and not deterministic_intermediate and (
-            latest_review is None
-            or latest_review["verdict"] != "VALID"
-            or latest_review["confidence"] not in {"firm", "certain"}
-        ):
-            blockers.append(f"{fact_id} needs VALID review(s) with firm/certain confidence.")
+        terminal_review_valid = (
+            latest_review is not None
+            and latest_review["confidence"] in {"firm", "certain"}
+            and (
+                latest_review["verdict"] == "VALID"
+                or (
+                    fact["status"] == "false_positive"
+                    and latest_review["verdict"] == "INVALID"
+                )
+            )
+        )
+        if not technical_confirmation and not deterministic_intermediate and not terminal_review_valid:
+            blockers.append(
+                f"{fact_id} needs a firm/certain review supporting its terminal disposition."
+            )
         if not parents.get(fact_id):
             blockers.append(f"{fact_id} has no incoming evidence chain.")
         active.add(fact_id)

@@ -162,6 +162,9 @@ class WorkerConfig(BaseModel):
     # no longer uses priority; project preferences and live load decide.
     priority: int | None = Field(default=None, ge=0)
     env: dict[str, str] = Field(default_factory=dict)
+    # Optional CLI sandbox/tool restriction. Codex audit tasks are dispatched
+    # read-only automatically; Pi can be configured read-only for all tasks.
+    sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] | None = None
 
     @field_validator("task_types")
     @classmethod
@@ -243,6 +246,7 @@ class ReconConfig(BaseModel):
     categories: list[str] = Field(default_factory=lambda: [
         "input-validation", "authorization", "dangerous-api",
     ])
+    max_discovered_categories: int = Field(default=2, ge=0, le=8)
     timeout: int = Field(default=1800, gt=0, le=7200)
     conclude_timeout: int = Field(default=300, gt=0, le=1800)
     max_runs_per_category: int = Field(default=2, gt=0, le=5)
@@ -551,10 +555,9 @@ class DispatchConfig(BaseModel):
                 "currently require a coverage snapshot"
             )
         if self.audit.recon.enabled and not any(
-            worker.type == "pi" and "explore" in worker.task_types
-            for worker in self.workers
+            "explore" in worker.task_types for worker in self.workers
         ):
-            raise ValueError("audit.recon requires a Pi worker configured for explore tasks")
+            raise ValueError("audit.recon requires an explore worker")
         if self.audit.codeql.enabled and not self.audit.enabled:
             raise ValueError("audit.codeql requires audit.enabled")
         if self.audit.codeql.enabled and self.audit.mode != "scope":

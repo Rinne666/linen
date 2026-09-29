@@ -537,6 +537,184 @@ def verification_target(
     return batch, candidate
 
 
+def _security_check_refs(raw: Any, citation_ids: set[str], label: str) -> list[str]:
+    if (
+        not isinstance(raw, list)
+        or not raw
+        or len(raw) > 16
+        or any(not isinstance(item, str) or item not in citation_ids for item in raw)
+    ):
+        raise ValueError(f"{label} must reference one or more frozen-source citations")
+    return list(dict.fromkeys(raw))
+
+
+def _normalize_security_checks(
+    raw: Any, citation_ids: set[str], outcome: str,
+) -> dict[str, Any]:
+    if not isinstance(raw, dict) or set(raw) != {
+        "attacker_cases", "protection_checks", "configuration_analysis",
+    }:
+        raise ValueError(
+            "Security checks require attacker_cases, protection_checks, and configuration_analysis"
+        )
+    cases = raw["attacker_cases"]
+    if not isinstance(cases, list) or not cases or len(cases) > 16:
+        raise ValueError("Security checks require a bounded non-empty attacker_cases list")
+    normalized_cases = []
+    case_ids: set[str] = set()
+    for case in cases:
+        if not isinstance(case, dict) or set(case) != {
+            "case_id", "input_class", "representative_value", "attacker_control",
+            "sink_reachable", "security_effect", "citation_ids",
+        }:
+            raise ValueError(
+                "Each attacker case requires an ID, concrete input, control, sink, effect, and citations"
+            )
+        if (
+            not isinstance(case["case_id"], str)
+            or not _ID.fullmatch(case["case_id"])
+            or case["case_id"] in case_ids
+            or any(not isinstance(case[key], str) or not case[key].strip() or len(case[key]) > 1200
+                   for key in ("input_class", "representative_value", "security_effect"))
+            or not isinstance(case["attacker_control"], str)
+            or case["attacker_control"] not in {"yes", "no", "unknown"}
+            or not isinstance(case["sink_reachable"], str)
+            or case["sink_reachable"] not in {"yes", "no", "unknown"}
+        ):
+            raise ValueError("Attacker case has an invalid value or sink outcome")
+        case_ids.add(case["case_id"])
+        normalized_cases.append({
+            "case_id": case["case_id"],
+            "input_class": case["input_class"].strip(),
+            "representative_value": case["representative_value"].strip(),
+            "attacker_control": case["attacker_control"],
+            "sink_reachable": case["sink_reachable"],
+            "security_effect": case["security_effect"].strip(),
+            "citation_ids": _security_check_refs(case["citation_ids"], citation_ids, "Attacker case"),
+        })
+
+    protection_checks = raw["protection_checks"]
+    if not isinstance(protection_checks, list) or not protection_checks or len(protection_checks) > 24:
+        raise ValueError("protection_checks must explicitly assess at least one relevant guard or its absence")
+    normalized_protections = []
+    for check in protection_checks:
+        if not isinstance(check, dict) or set(check) != {
+            "protection", "predicate", "attacker_case_id", "predicate_result",
+            "resulting_value", "result", "sink_reachable", "citation_ids",
+        }:
+            raise ValueError("Each protection check requires a predicate, test case, result, and citations")
+        text_fields = ("protection", "predicate", "attacker_case_id", "resulting_value")
+        if (
+            any(not isinstance(check[key], str) or not check[key].strip() or len(check[key]) > 1200
+                for key in text_fields)
+            or check["attacker_case_id"] not in case_ids
+            or not isinstance(check["predicate_result"], str)
+            or check["predicate_result"] not in {"accepts", "rejects", "transforms", "not_applicable", "unknown"}
+            or not isinstance(check["result"], str)
+            or check["result"] not in {"blocks", "bypassable", "not_on_path", "none_found", "unknown"}
+            or not isinstance(check["sink_reachable"], str)
+            or check["sink_reachable"] not in {"yes", "no", "unknown"}
+        ):
+            raise ValueError("Protection check has an invalid assessment")
+        normalized_protections.append({
+            **{key: check[key].strip() for key in text_fields},
+            "result": check["result"],
+            "sink_reachable": check["sink_reachable"],
+            "citation_ids": _security_check_refs(check["citation_ids"], citation_ids, "Protection check"),
+        })
+
+    configuration = raw["configuration_analysis"]
+    if not isinstance(configuration, dict) or set(configuration) != {
+        "default_mode", "ordinary_enabled_mode", "requires_admin_misconfiguration", "summary", "citation_ids",
+    }:
+        raise ValueError("configuration_analysis does not match the required contract")
+    modes = {
+        "default_mode": {"enabled", "disabled", "conditional", "unknown", "not_applicable"},
+        "ordinary_enabled_mode": {"analyzed", "not_applicable", "unknown"},
+        "requires_admin_misconfiguration": {"yes", "no", "unknown", "not_applicable"},
+    }
+    if (
+        any(not isinstance(configuration[key], str) or configuration[key] not in allowed
+            for key, allowed in modes.items())
+        or not isinstance(configuration["summary"], str)
+        or not configuration["summary"].strip()
+        or len(configuration["summary"]) > 2000
+    ):
+        raise ValueError("configuration_analysis has an invalid mode or summary")
+    normalized_configuration = {
+        **{key: configuration[key] for key in modes},
+        "summary": configuration["summary"].strip(),
+        "citation_ids": _security_check_refs(
+            configuration["citation_ids"], citation_ids, "Configuration analysis",
+        ),
+    }
+
+    for check in normalized_protections:
+        if check["result"] == "blocks" and (
+            check["predicate_result"] != "rejects" or check["sink_reachable"] != "no"
+        ):
+            raise ValueError("A protection only blocks when its tested predicate rejects before the sink")
+        case = next(
+            item for item in normalized_cases if item["case_id"] == check["attacker_case_id"]
+        )
+        if check["result"] == "blocks" and case["sink_reachable"] == "yes":
+            raise ValueError("A blocked protection cannot also leave its linked attacker case reaching the sink")
+        if check["result"] == "none_found" and check["predicate_result"] != "not_applicable":
+            raise ValueError("A no-protection result must mark the predicate not_applicable")
+
+    if normalized_configuration["default_mode"] in {"enabled", "disabled", "conditional"}:
+        if normalized_configuration["ordinary_enabled_mode"] == "not_applicable":
+            raise ValueError("A configurable feature cannot mark its ordinary enabled mode not_applicable")
+        if normalized_configuration["requires_admin_misconfiguration"] == "not_applicable":
+            raise ValueError("A configurable feature must state whether admin misconfiguration is required")
+    elif normalized_configuration["default_mode"] == "unknown":
+        if normalized_configuration["ordinary_enabled_mode"] != "unknown":
+            raise ValueError("Unknown configuration defaults must retain enabled-mode uncertainty")
+    elif normalized_configuration["default_mode"] == "not_applicable":
+        if normalized_configuration["ordinary_enabled_mode"] != "not_applicable":
+            raise ValueError("A configuration-independent path cannot claim an enabled mode was analyzed")
+        if normalized_configuration["requires_admin_misconfiguration"] not in {"no", "not_applicable"}:
+            raise ValueError("A configuration-independent path cannot require admin misconfiguration")
+
+    if outcome in {"confirmed", "refuted"}:
+        if any(
+            case["attacker_control"] == "unknown" or case["sink_reachable"] == "unknown"
+            for case in normalized_cases
+        ):
+            raise ValueError("Unresolved attacker control or sink reachability must remain blocked")
+        if any(check["result"] == "unknown" for check in normalized_protections):
+            raise ValueError("Unresolved protection effects must remain blocked")
+        if (
+            normalized_configuration["default_mode"] == "unknown"
+            or normalized_configuration["ordinary_enabled_mode"] == "unknown"
+            or normalized_configuration["requires_admin_misconfiguration"] == "unknown"
+        ):
+            raise ValueError("Unresolved configuration facts must remain blocked")
+
+    if outcome == "confirmed":
+        if normalized_configuration["requires_admin_misconfiguration"] == "yes":
+            raise ValueError("An admin-misconfiguration prerequisite cannot establish a confirmed vulnerability")
+        if not any(
+            case["attacker_control"] == "yes" and case["sink_reachable"] == "yes"
+            for case in normalized_cases
+        ):
+            raise ValueError("Confirmed outcome needs a cited attacker-controlled case that reaches the sink")
+    elif (
+        outcome == "refuted"
+        and normalized_configuration["requires_admin_misconfiguration"] != "yes"
+        and any(
+            case["attacker_control"] == "yes" and case["sink_reachable"] == "yes"
+            for case in normalized_cases
+        )
+    ):
+        raise ValueError("A refuted result cannot retain an attacker-controlled path to the sink")
+    return {
+        "attacker_cases": normalized_cases,
+        "protection_checks": normalized_protections,
+        "configuration_analysis": normalized_configuration,
+    }
+
+
 def verification_outcome_fact(
     payload: dict[str, Any], project: ProjectDetail, intent: Intent, workdir: Path,
 ) -> dict[str, object]:
@@ -544,13 +722,13 @@ def verification_outcome_fact(
     data = payload.get("data", payload)
     expected_keys = {
         "description", "type", "evidence", "citations", "candidate_disposition",
-        "endpoint_id", "trace",
+        "endpoint_id", "trace", "security_checks",
     }
     optional_keys = {"provenance", "root_cause", "variants_checked"}
     if not isinstance(data, dict) or not expected_keys <= set(data) or set(data) - expected_keys - optional_keys:
         raise ValueError(
             "Semantic verification requires exactly description, type, evidence, "
-            "citations, endpoint_id, trace, and candidate_disposition; provenance, "
+            "citations, endpoint_id, trace, security_checks, and candidate_disposition; provenance, "
             "root_cause, and variants_checked are optional"
         )
     disposition = data.get("candidate_disposition")
@@ -567,7 +745,12 @@ def verification_outcome_fact(
     fact_type = data.get("type")
     evidence = data.get("evidence")
     description = data.get("description")
-    if outcome not in VERIFY_OUTCOMES or not isinstance(rationale, str) or not rationale.strip():
+    if (
+        not isinstance(outcome, str)
+        or outcome not in VERIFY_OUTCOMES
+        or not isinstance(rationale, str)
+        or not rationale.strip()
+    ):
         raise ValueError("Semantic disposition requires a valid outcome and rationale")
     if outcome == "confirmed" and fact_type != "vulnerability":
         raise ValueError("A confirmed hypothesis result must produce a vulnerability candidate")
@@ -581,6 +764,9 @@ def verification_outcome_fact(
     citations = _canonical_citations(data.get("citations"), source, plan["snapshot"])
     if not citations:
         raise ValueError("Semantic verification requires at least one frozen-source citation")
+    security_checks = _normalize_security_checks(
+        data.get("security_checks"), {item["id"] for item in citations}, outcome,
+    )
     endpoint_id = canonical_endpoint_id(data.get("endpoint_id"))
     trace = canonical_vulnerability_trace(
         data.get("trace"), citations, source, plan["snapshot"], outcome=outcome,
@@ -595,6 +781,7 @@ def verification_outcome_fact(
         "candidate": candidate,
         "endpoint_id": endpoint_id,
         "citations": citations,
+        "security_checks": security_checks,
         "worker_evidence": evidence.strip(),
     }
     return {
@@ -606,6 +793,7 @@ def verification_outcome_fact(
             provenance=data.get("provenance"),
             root_cause=data.get("root_cause"),
             variants_checked=data.get("variants_checked"),
+            security_checks=security_checks,
         ),
     }
 

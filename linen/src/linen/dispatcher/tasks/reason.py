@@ -826,7 +826,9 @@ def run_reason_task(
                         and intent_data["description"].startswith(recon.CATEGORY_PREFIX)
                     ):
                         try:
-                            recon.validate_intent(fresh, config.audit.recon, intent_data)
+                            recon.validate_intent(
+                                fresh, config.audit.recon, intent_data, Path(container_name),
+                            )
                             source_ids = intent_data.get("from", [])
                             recon_sources = {fact.id for fact in fresh.facts if fact.type == "recon"}
                             recon_method = (

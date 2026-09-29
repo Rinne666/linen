@@ -564,10 +564,21 @@ def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_
     """Derive bounded investigative obligations from the shared proof result."""
     result = evaluate_proof_gate(conn, project_id, candidate_fact_id)
     view = collect_candidate_proof_subgraph(conn, project_id, candidate_fact_id)
+    _, unified_review_reason, _ = candidate_proof_review(
+        conn, project_id, candidate_fact_id,
+    )
+    reason_codes = set(result.reason_codes)
+    stale_unified_review = unified_review_reason == "PROOF_GRAPH_CHANGED"
+    if stale_unified_review:
+        # A changed proof graph is not an unrepairable provenance defect. The
+        # existing cold review simply attests to an older graph, so request a
+        # fresh candidate-local review before technical confirmation.
+        reason_codes.discard("PROOF_GRAPH_CHANGED")
+        reason_codes.add("UNREVIEWED_EVIDENCE")
     generation_row = conn.execute("SELECT source_generation FROM projects WHERE id = ?", (project_id,)).fetchone()
     generation = generation_row["source_generation"] if generation_row else 0
     gaps: list[ProofGap] = []
-    for code in sorted(set(result.reason_codes), key=lambda value: (GAP_PRIORITY.get(value, 99), value)):
+    for code in sorted(reason_codes, key=lambda value: (GAP_PRIORITY.get(value, 99), value)):
         if code in NON_INVESTIGATIVE_GAPS:
             role, intent_type, relation, description, expected = None, "blocked", None, "Repair the proof graph integrity before further investigation.", None
         elif code == "UNREVIEWED_EVIDENCE":
@@ -576,6 +587,14 @@ def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_
             # that already have a candidate review retain their old targeted
             # obligations until the unified review is recorded.
             has_candidate_review = bool(view.reviews_by_fact.get(candidate_fact_id))
+            if stale_unified_review:
+                gaps.append(ProofGap(
+                    candidate_fact_id, code, "candidate", GAP_PRIORITY.get(code, 99),
+                    (candidate_fact_id,), "review:cold-verifier", "reviews", None,
+                    "Independently falsify or validate the complete current candidate-local vulnerability proof.",
+                    "missing", generation, candidate_fact_id,
+                ))
+                continue
             targets = unreviewed_required_facts(view) if has_candidate_review else [candidate_fact_id]
             if not has_candidate_review:
                 gaps.append(ProofGap(

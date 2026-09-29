@@ -64,6 +64,17 @@ Document:
 - Whether each control is bypassable given realistic attacker input
 - Framework-level protections active on this path (ORM, auto-escaping, CSRF tokens, etc.)
 
+For every apparent protection, evaluate its effect rather than its presence:
+state the actual predicate or policy decision, test representative attacker
+values/encodings, note the branch and resulting value/state, and determine
+whether the claimed sink remains reachable. A source citation for an `if`,
+role check, sanitizer, or permission helper alone is not disproof. When a feature
+is off by default, inspect a normal supported configuration where it is enabled
+and trace that execution path; only an attacker-controlled insecure setting or
+administrator error may be treated as an excluded precondition when the threat
+model supports that exclusion. If the needed runtime/deployment fact is
+unavailable, preserve it as uncertainty and return NEEDS_REVIEW where decisive.
+
 If the code path cannot be traced, record the discrepancy. Return NEEDS_REVIEW unless a concrete code/configuration blocker disproves the claim.
 
 ## Step 3 — 5-Layer Protection Search
