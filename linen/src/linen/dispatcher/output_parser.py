@@ -21,7 +21,9 @@ def extract_json_object(text: str) -> dict[str, Any]:
         try:
             parsed = json.loads(segment)
         except json.JSONDecodeError:
-            pass
+            recovered = _close_truncated_json(segment)
+            if recovered is not None:
+                return recovered
         else:
             if isinstance(parsed, dict):
                 return parsed
@@ -30,7 +32,10 @@ def extract_json_object(text: str) -> dict[str, Any]:
             try:
                 parsed, _end = decoder.raw_decode(segment[start:])
             except json.JSONDecodeError:
-                continue
+                recovered = _close_truncated_json(segment[start:])
+                if recovered is None:
+                    continue
+                parsed = recovered
             if isinstance(parsed, dict):
                 return parsed
 
@@ -45,3 +50,41 @@ def _candidate_segments(text: str) -> list[str]:
 
 def _object_start_positions(text: str) -> list[int]:
     return [index for index, char in enumerate(text) if char == "{"]
+
+
+def _close_truncated_json(text: str) -> dict[str, Any] | None:
+    """Recover a JSON object cut off only after a complete value.
+
+    Worker CLIs can truncate otherwise valid JSON at an output-size boundary.
+    Close only unmatched containers; never repair strings, scalar tokens, or
+    missing separators, so malformed model output still fails closed.
+    """
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            stack.append("}")
+        elif char == "[":
+            stack.append("]")
+        elif char in "}]":
+            if not stack or stack.pop() != char:
+                return None
+
+    if in_string or not stack or not text.rstrip().endswith(("}", "]", '"')):
+        return None
+    try:
+        parsed = json.loads(text.rstrip() + "".join(reversed(stack)))
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None

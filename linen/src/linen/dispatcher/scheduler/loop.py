@@ -869,6 +869,12 @@ class DispatcherLoop:
             worker_preference=project.project.worker_preference,
         )
         worker = selection.worker
+        if (
+            worker is not None
+            and project.project.audit_mode != "none"
+            and worker.type == "codex"
+        ):
+            worker = worker.model_copy(update={"sandbox_mode": "read-only"})
         if worker is None:
             self._log_changed(
                 f"project:{project.project.id}:worker:reason",
@@ -942,18 +948,6 @@ class DispatcherLoop:
 
     def _dispatch_explore(self, project: ProjectDetail, export_yaml: str, intent: Intent) -> bool:
         provider_required = self._explore_requires_provider(project, intent)
-        recon_scout = (
-            self.config.audit.enabled
-            and self.config.audit.recon.enabled
-            and project.project.audit_mode == "scope"
-            and intent.description.strip().startswith("@analysis:recon:")
-            and intent.description.strip() != "@analysis:recon-snapshot"
-        )
-        recon_snapshot = (
-            self.config.audit.enabled
-            and self.config.audit.recon.enabled
-            and intent.description.strip() == "@analysis:recon-snapshot"
-        )
         codeql_scan = (
             self.config.audit.enabled
             and codeql.active_for_project(project, self.config.audit.codeql)
@@ -963,16 +957,20 @@ class DispatcherLoop:
         selection = self._select_worker(
             project.project.id,
             "explore",
-            # Recon runs use Pi by explicit audit configuration; other tasks
-            # still honor the project's selected CLI.
-            worker_preference=(
-                "pi" if recon_scout else
-                "auto" if recon_snapshot or codeql_scan else project.project.worker_preference
-            ),
+            # Deterministic snapshot collection does not call an LLM. All
+            # provider-backed work honors the project's explicit CLI choice,
+            # including repository-wide reconnaissance.
+            worker_preference=project.project.worker_preference,
             provider_required=provider_required,
             worker_health_required=not codeql_scan,
         )
         worker = selection.worker
+        if (
+            worker is not None
+            and project.project.audit_mode != "none"
+            and worker.type == "codex"
+        ):
+            worker = worker.model_copy(update={"sandbox_mode": "read-only"})
         if worker is None:
             self._log_changed(
                 f"project:{project.project.id}:worker:explore",
@@ -1056,6 +1054,12 @@ class DispatcherLoop:
             worker_preference=project.project.worker_preference,
         )
         worker = selection.worker
+        if (
+            worker is not None
+            and project.project.audit_mode != "none"
+            and worker.type == "codex"
+        ):
+            worker = worker.model_copy(update={"sandbox_mode": "read-only"})
         if worker is None:
             self._log_changed(
                 f"project:{project.project.id}:worker:review",
@@ -1471,7 +1475,15 @@ class DispatcherLoop:
             fact = facts_by_id.get(fact_id) if isinstance(fact_id, str) else None
             if fact is None:
                 continue
-            if fact.semantic_type in strategy_fact_types:
+            # Generic explore facts carry their typed evidence in `type`
+            # (for example `reachability` or `dataflow`) while their
+            # `semantic_type` is commonly the broader value `observation`.
+            # Check both fields so newly concluded evidence wakes Reason and
+            # can advance the audit instead of leaving the project idle.
+            if (
+                fact.semantic_type in strategy_fact_types
+                or fact.type in strategy_fact_types
+            ):
                 return True
             if event.event_type == "audit_task_concluded" and fact.type == "coverage_result":
                 try:

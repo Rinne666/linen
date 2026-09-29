@@ -34,12 +34,32 @@ Agent 不直接认领 Intent，不直接 heartbeat，不直接调用 linen API�
     形成第二真相源。单次 fan-out 最多 8 条，仍受全局和项目 Worker 配额约束。
 14. `audit.recon.enabled` 时，scope 流程冻结一次完整源码快照，然后为每个配置的
     漏洞类别派发一个仓库级 Recon Intent；不会创建 coverage plan、文件格子或模块
-    汇总。类别任务强制选择 Pi，且 Pi CLI 只开放读取/搜索工具。Pi 返回带快照行号
+    汇总。Recon 与覆盖盲点评审都是独立的只读 Explore Intent；Codex worker 使用
+    `read-only` sandbox，Pi worker 只开放读取/搜索工具。类别 Recon 返回带快照行号
     引用的 source-to-sink 候选与明确缺口；Reason 读取 artifact、归并跨类别证据并
-    决定是否发起有上限的类别跟进或普通验证任务。Recon Fact 是只读侦察材料，不是
-    漏洞结论，也不能单独通过完成门槛。未启用 Recon 时仍使用原 coverage 流程。
+    决定是否发起有上限的类别跟进或普通验证任务。完成当前类别分支后、创建最终摘要前，
+    Dispatcher 先创建一次独立的 `@analysis:recon-coverage-review` Intent。该任务重新
+    检查冻结源码与 Recon 结果，特别比较并行路径、对象/配置生命周期、未覆盖项和排除
+    理由；它只产出有引用的遗漏，不确认漏洞。可处理的遗漏由图派生器转成普通 Recon
+    Intent；预算耗尽或源码无法判定的遗漏作为 residual gap 写入摘要 artifact。
+    对应的 Recon Fact 必须引用并明确 disposition 复核项；没有明确记为 `addressed` 的项目
+    不会从 residual gap 中清除。
+    完成初始类别后，Reason 可根据
+    证据发现未建模的威胁类别并追加少量类别级 Recon（由
+    `audit.recon.max_discovered_categories` 限制）；动态分支作为摘要的前置证据，
+    不改变已冻结的基础阶段集合。保护条件必须针对攻击者输入与到达 sink 的结果验证；默认关闭不能代替
+    对受支持启用配置的分析。每条 Recon lead 都携带结构化攻击样例、保护条件分支、
+    sink 可达性及管理员误配置前提；每个类别结果还必须分别记录并行路径、生命周期、
+    未覆盖项和排除理由，引用只读快照中的精确行；Fact 摘要展示其中首个检查，其余保存在 artifact。
+    读取/引用文件、类别结果完整或达到运行上限，都不能单独证明假设空间完整。
+    Recon Fact 是只读侦察材料，不是漏洞结论，也不能单独
+    通过完成门槛。未启用 Recon 时仍使用原 coverage 流程。
     已有 coverage-plan stage 在升级后会被标记为 retired；新调度只创建仓库级 Recon
     Intent，不再派发 coverage plan 或 per-file cell。
+    审计摘要包含 independent coverage review 的结论、行动项和残余缺口。
+    `coverage_complete` 只表示已配置和证据发现的镜头没有记录到未完成
+    或残余缺口；`assumption_space_exhaustiveness` 固定为 `not_proven`。有限的类别集合
+    收敛不能证明威胁类别假设空间完整，结果页会持续展示这一限制。
     `audit.codeql.enabled` 可在该流程中额外创建一个确定性 CodeQL 候选任务。它使用
     独立 Docker 镜像、无网络、只读快照挂载和独立可写分析目录；仅允许配置无需构建
     的语言。SARIF path location 会按快照内容重新生成并验证精确引用，再归一化为

@@ -70,6 +70,9 @@ audit:
   recon:
     enabled: true
     categories: [input-validation, authorization, dangerous-api]
+    # Reason may discover a small number of additional in-scope threat lenses
+    # after comparing the initial repository-wide results.
+    max_discovered_categories: 2
     max_runs_per_category: 2
     max_leads: 40
   # Optional CodeQL path candidates. Build a trusted Linux analysis image with

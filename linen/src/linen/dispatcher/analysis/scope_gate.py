@@ -446,7 +446,14 @@ def execution_prompt(
     "type": "scope_adjudication",
     "evidence": "what policy material was evaluated",
     "scope_adjudication": {
-      "coverage": {"status": "complete | partial", "summary": "...", "gaps": ["..."]},
+      "coverage": {
+        "status": "complete | partial", "summary": "...", "gaps": ["..."],
+        "source_assessments": [
+          {"source_id": "policy-001", "disposition": "policy_relevant | no_scope_policy | uncertain | not_reviewed",
+           "summary": "what this document contributes to the threat model or scope",
+           "citations": ["c1"]}
+        ]
+      },
       "citations": [
         {"id": "c1", "source_id": "policy-001", "file": "local/SECURITY.md",
          "line": 10, "quote": "exact quotation from the frozen document"}
@@ -473,7 +480,22 @@ Every trust boundary and pre-exclusion needs at least one citation. Every
 excluded, conditional, or unknown item needs a non-empty revival_conditions
 array. collection_gaps must remain visible in coverage; do not turn an absent
 document into an exclusion. Policy eligibility and technical exploitability
-are separate axes. Use accepted=false only for a genuine policy refusal."""
+are separate axes. Use accepted=false only for a genuine policy refusal.
+
+Provide exactly one source_assessments entry for every source whose manifest
+status is collected. Explicitly evaluate each file, including documents that
+contain no relevant policy; use disposition no_scope_policy only after reading
+that file. If any collected file cannot be evaluated, use not_reviewed, make
+coverage partial, and explain the gap. Use only citations that belong to that
+same source file. This is required so reviewers can verify each source rather
+than infer evaluation from a document count.
+
+For every citation, copy the source text verbatim from the cited line(s),
+including Markdown link labels and destinations, backticks, punctuation, and
+capitalization. Do not paraphrase or render Markdown when filling `quote`.
+Do not cite a source statement unless at least one trust boundary,
+pre-exclusion, or conflict references that citation ID. Omit unrelated
+statements rather than adding unused citations."""
     sections = [
         f"# Audit recipe: {recipe.label} (scope_adjudication v{recipe.version})",
         audit_recipes.load_bundle(prompt_group).common.source_policy,
@@ -591,8 +613,12 @@ def _normalize_adjudication(
             "pre_exclusions, and conflicts"
         )
     coverage = raw["coverage"]
-    if not isinstance(coverage, dict) or set(coverage) != {"status", "summary", "gaps"}:
-        raise ValueError("Scope adjudication coverage requires status, summary, and gaps")
+    if not isinstance(coverage, dict) or set(coverage) != {
+        "status", "summary", "gaps", "source_assessments",
+    }:
+        raise ValueError(
+            "Scope adjudication coverage requires status, summary, gaps, and source_assessments"
+        )
     if coverage.get("status") not in {"complete", "partial"}:
         raise ValueError("Scope adjudication coverage status must be complete or partial")
     gaps = _text_list(coverage.get("gaps"), "Scope adjudication gaps")
@@ -600,6 +626,53 @@ def _normalize_adjudication(
         raise ValueError("Collected policy evidence gaps require partial adjudication coverage")
     citations = _canonical_citations(raw["citations"], source, manifest)
     citation_ids = {citation["id"] for citation in citations}
+    collected_sources = {
+        item["id"]: item["snapshot_file"]
+        for item in manifest.get("sources", [])
+        if isinstance(item, dict)
+        and item.get("status") == "collected"
+        and isinstance(item.get("id"), str)
+        and isinstance(item.get("snapshot_file"), str)
+    }
+    assessments = coverage["source_assessments"]
+    if not isinstance(assessments, list) or len(assessments) != len(collected_sources):
+        raise ValueError("Every collected policy source needs exactly one source assessment")
+    normalized_assessments = []
+    assessed_ids: set[str] = set()
+    citation_sources = {item["id"]: item["source_id"] for item in citations}
+    for item in assessments:
+        if not isinstance(item, dict) or set(item) != {
+            "source_id", "disposition", "summary", "citations",
+        }:
+            raise ValueError("Invalid policy source assessment fields")
+        source_id = item.get("source_id")
+        if (
+            not isinstance(source_id, str)
+            or source_id not in collected_sources
+            or source_id in assessed_ids
+        ):
+            raise ValueError("Policy source assessments must identify each collected source once")
+        disposition = item.get("disposition")
+        if disposition not in {"policy_relevant", "no_scope_policy", "uncertain", "not_reviewed"}:
+            raise ValueError("Invalid policy source assessment disposition")
+        if disposition == "not_reviewed" and (coverage["status"] != "partial" or not gaps):
+            raise ValueError("An unreviewed policy source requires partial coverage and a recorded gap")
+        assessment_citations = _references(
+            item.get("citations"), citation_ids,
+            f"source assessment {source_id} citations", minimum=0,
+        )
+        if any(citation_sources[citation_id] != source_id for citation_id in assessment_citations):
+            raise ValueError("Source assessment citations must come from that frozen source")
+        normalized_assessments.append({
+            "source_id": source_id,
+            "file": collected_sources[source_id],
+            "disposition": disposition,
+            "summary": _text(item.get("summary"), "policy source assessment summary"),
+            "citations": assessment_citations,
+        })
+        assessed_ids.add(source_id)
+    if assessed_ids != set(collected_sources):
+        raise ValueError("Policy source assessments omit a collected source")
 
     boundaries = raw["trust_boundaries"]
     if not isinstance(boundaries, list) or len(boundaries) > 240:
@@ -672,6 +745,11 @@ def _normalize_adjudication(
         for item in [*normalized_boundaries, *normalized_exclusions, *normalized_conflicts]
         for citation_id in item["citations"]
     }
+    used.update(
+        citation_id
+        for item in normalized_assessments
+        for citation_id in item["citations"]
+    )
     if used != citation_ids:
         raise ValueError("Every policy citation must support a trust boundary, exclusion, or conflict")
     return {
@@ -679,6 +757,7 @@ def _normalize_adjudication(
             "status": coverage["status"],
             "summary": _text(coverage.get("summary"), "Scope adjudication coverage summary"),
             "gaps": gaps,
+            "source_assessments": normalized_assessments,
         },
         "citations": citations,
         "trust_boundaries": normalized_boundaries,
@@ -735,8 +814,10 @@ def outcome_fact(
         "description": (
             f"Scope adjudicated from {len(manifest.get('sources', []))} frozen policy documents: "
             f"{len(record['trust_boundaries'])} trust boundaries, "
-            f"{len(record['pre_exclusions'])} pre-exclusion decisions, "
-            f"{len(record['evidence_gaps']) + len(record['coverage']['gaps'])} recorded gaps. "
+        f"{len(record['pre_exclusions'])} pre-exclusion decisions, "
+        f"{len(record['coverage']['source_assessments'])} collected sources assessed, "
+        f"{len(record['evidence_gaps'])} policy-source collection gaps; "
+            f"adjudication coverage is {record['coverage']['status']}. "
             "Decisions affect policy eligibility only, not technical exploitability."
         ),
         "evidence": (

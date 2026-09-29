@@ -41,7 +41,13 @@ that do not have a conventional taint sink.
 Return `complete` when the graph contains a validated `audit_summary`, it represents
 every required terminal branch, and there are no
 unresolved findings. Completion must reference that summary and describe the
-frozen snapshot and exclusions. Never claim the repository is safe.
+frozen snapshot and exclusions. The finite configured/discovered lens set is
+not proof that the threat-class assumption space is exhaustive. If the
+independent read-only coverage review has not returned, do not complete. The
+dispatcher routes its actionable omissions through ordinary Recon Intents and
+retains omissions that cannot be resolved within the bounded graph as residual
+gaps in the summary. Never claim the repository is safe or all threat classes
+are covered.
 
 # Output contract
 

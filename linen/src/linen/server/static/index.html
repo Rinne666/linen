@@ -324,6 +324,15 @@
     background: rgba(255, 255, 255, 0.94);
     box-shadow: 0 4px 14px rgba(16, 24, 40, 0.06);
   }
+  .audit-map-panel {
+    border: 1px solid #d0d5dd;
+    border-radius: 9px;
+    background: rgba(255, 255, 255, 0.975);
+    box-shadow: 0 8px 22px rgba(16, 24, 40, 0.08);
+    scrollbar-color: #cbd5e1 transparent;
+    scrollbar-width: thin;
+  }
+  .audit-scope-row { overflow-wrap: anywhere; }
   .outline-row {
     border: 1px solid #e4e7ec;
     border-radius: 8px;
@@ -819,7 +828,7 @@
     <div class="graph-canvas flex-1 relative min-w-0 min-h-0">
       <div class="workbench-toolbar absolute top-3 left-3 z-10 flex max-w-[calc(100%-24px)] items-center gap-1 p-1 overflow-x-auto">
         <button type="button" @click="setGraphView('findings')" class="workbench-tab" :aria-selected="graphView === 'findings'" aria-label="Show finding chains">Findings</button>
-        <button type="button" @click="setGraphView('current')" class="workbench-tab" :aria-selected="graphView === 'current'" aria-label="Show current execution focus">Current</button>
+        <button type="button" @click="setGraphView('current')" class="workbench-tab" :aria-selected="graphView === 'current'" aria-label="Show audit coverage and worker progress">Audit map</button>
         <button type="button" @click="setGraphView('full')" class="workbench-tab" :aria-selected="graphView === 'full'" aria-label="Show graph">Graph</button>
         <button type="button" @click="setGraphView('list')" class="workbench-tab" :aria-selected="graphView === 'list'" aria-label="Show blackboard list">List</button>
         <span class="mx-1 h-5 w-px bg-slate-200 shrink-0"></span>
@@ -845,39 +854,117 @@
           <option value="invalid">Invalid</option>
         </select>
         <span class="mx-1 h-5 w-px bg-slate-200 shrink-0"></span>
-        <button x-show="graphView === 'full'" type="button" @click.stop="nodeLegendOpen = !nodeLegendOpen"
+        <button x-show="graphView === 'full' || (graphView === 'current' && project?.project?.audit_mode === 'scope')" type="button" @click.stop="nodeLegendOpen = !nodeLegendOpen"
           class="workbench-tab shrink-0" :aria-selected="nodeLegendOpen" :aria-expanded="nodeLegendOpen">
-          Legend
+          <span x-text="graphView === 'current' ? 'Map key' : 'Legend'"></span>
         </button>
         <button x-show="graphView !== 'list' && !(graphView === 'findings' && findingsMode === 'list')" type="button" @click.stop="viewOptionsOpen = !viewOptionsOpen"
           class="workbench-tab shrink-0" :aria-selected="viewOptionsOpen" :aria-expanded="viewOptionsOpen">View</button>
       </div>
 
       <section x-show="graphView === 'current'" x-cloak
-        class="graph-view-status absolute left-3 top-[10.25rem] z-10 w-[min(430px,calc(100%-24px))] px-3 py-2.5"
+        class="audit-map-panel absolute left-3 right-3 z-10 max-h-[min(43vh,390px)] overflow-y-auto px-4 py-3"
+        :class="project?.project?.audit_mode === 'scope' && (!projectPrimaryStatus() || projectPrimaryStatus().tone === 'success') ? 'top-[4.25rem]' : 'top-[10.25rem]'"
         role="status" aria-live="polite">
-        <div>
-          <p class="text-[9px] font-bold uppercase tracking-[0.13em] text-slate-400">Now</p>
-          <p class="mt-0.5 text-xs font-semibold leading-relaxed text-slate-700" x-text="currentSummary().now"></p>
-        </div>
-        <div x-show="currentSummary().next" class="mt-2 border-t border-slate-100 pt-2">
-          <span class="text-[9px] font-bold uppercase tracking-[0.13em]"
-            :class="currentSummary().nextMode === 'user_action' ? 'text-amber-600' : currentSummary().nextMode === 'automatic' ? 'text-sky-600' : 'text-slate-400'"
-            x-text="currentSummary().nextMode === 'user_action' ? 'Action required' : currentSummary().nextMode === 'automatic' ? 'Next · automatic' : 'Waiting'"></span>
-          <span class="ml-2 text-[11px] text-slate-600" x-text="currentSummary().next"></span>
-          <button x-show="currentSummary().nextMode === 'user_action' && currentSummary().actionTarget" type="button"
-            @click="openFindingFact(currentSummary().actionTarget)"
-            class="ml-2 text-[10px] font-semibold text-amber-700 hover:text-amber-900"
-            x-text="currentSummary().actionLabel"></button>
-        </div>
+        <template x-if="project?.project?.audit_mode === 'scope'">
+          <div>
+            <button type="button" @click="auditCoverageOpen = !auditCoverageOpen"
+              class="flex w-full flex-wrap items-center justify-between gap-x-6 gap-y-2 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-200"
+              :aria-expanded="auditCoverageOpen" aria-controls="audit-coverage-details">
+              <span class="min-w-0">
+                <span class="block text-sm font-semibold tracking-tight text-slate-800">Audit coverage</span>
+                <span class="mt-0.5 block text-[10px] text-slate-500">Recorded audit lenses and live assignments · refreshed every 5 seconds</span>
+              </span>
+              <span class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] tabular-nums text-slate-600">
+                <span><b class="text-emerald-700" x-text="currentCoverageCounts().satisfied"></b> closed</span>
+                <span><b class="text-sky-700" x-text="currentCoverageCounts().running"></b> running</span>
+                <span><b class="text-slate-700" x-text="currentCoverageCounts().pending"></b> pending</span>
+                <span x-show="currentCoverageCounts().partial"><b class="text-amber-800" x-text="currentCoverageCounts().partial"></b> partial</span>
+                <span x-show="currentCoverageCounts().blocked"><b class="text-rose-700" x-text="currentCoverageCounts().blocked"></b> blocked</span>
+                <span><b :class="auditResidualGapCount() ? 'text-amber-700' : 'text-slate-700'" x-text="auditResidualGapCount()"></b> residual gaps</span>
+              </span>
+              <svg class="h-4 w-4 shrink-0 text-slate-400 transition-transform" :class="auditCoverageOpen ? 'rotate-180' : ''" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                <path fill-rule="evenodd" d="M5.22 7.47a.75.75 0 0 1 1.06 0L10 11.19l3.72-3.72a.75.75 0 1 1 1.06 1.06l-4.25 4.25a.75.75 0 0 1-1.06 0L5.22 8.53a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
+              </svg>
+            </button>
+            <div id="audit-coverage-details" x-show="auditCoverageOpen" x-cloak
+              class="mt-3 grid gap-4 border-t border-slate-100 pt-3 xl:grid-cols-[minmax(0,1.55fr)_minmax(250px,1fr)]">
+              <section aria-label="Tracked audit coverage">
+                <div class="mb-2 flex items-center justify-between gap-3">
+                  <h3 class="text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Scope and required stages</h3>
+                  <span class="text-[10px] text-slate-500" x-text="`${currentCoverageCounts().satisfied} / ${currentCoverageRows().length} stages closed`"></span>
+                </div>
+                <div class="grid gap-1.5 sm:grid-cols-2">
+                  <template x-for="row in currentCoverageRows()" :key="row.key">
+                    <button type="button" @click="row.intent ? focusOutlineIntent(row.intent.id) : null"
+                      class="audit-scope-row flex min-h-10 min-w-0 items-center gap-2 rounded-md border border-slate-200 bg-white/95 px-2.5 py-2 text-left transition hover:border-slate-300 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-200"
+                      :class="row.status === 'blocked' || row.status === 'failed' ? 'border-rose-200 bg-rose-50/80' : row.status === 'running' ? 'border-sky-200 bg-sky-50/80' : ''"
+                      :title="row.detail || row.label">
+                      <span class="h-2 w-2 shrink-0 rounded-full" :class="stageStatusDotClass(row.status)"></span>
+                      <span class="min-w-0 flex-1">
+                        <span class="block truncate text-[11px] font-medium text-slate-700" x-text="row.label"></span>
+                        <span class="block truncate text-[9px] text-slate-500" x-text="row.worker ? `${row.worker} · ${row.heartbeat || 'active'}` : (row.detail || row.statusLabel)"></span>
+                      </span>
+                      <span class="shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold"
+                        :class="auditStageBadgeClass(row.status)" x-text="row.statusLabel"></span>
+                    </button>
+                  </template>
+                  <p x-show="!currentCoverageRows().length" class="col-span-full rounded-md border border-dashed border-slate-200 px-3 py-4 text-center text-[10px] text-slate-500">
+                    No recorded scope-audit stages. Check the selected audit mode and dispatcher configuration.
+                  </p>
+                </div>
+                <p class="mt-2 text-[9px] leading-relaxed text-slate-500">This map reports configured and discovered lenses. It does not claim that every possible threat class or source path has been covered.</p>
+              </section>
+
+              <section aria-label="Worker activity" class="min-w-0 xl:border-l xl:border-slate-100 xl:pl-4">
+                <div class="mb-2 flex items-center justify-between gap-3">
+                  <h3 class="text-[10px] font-semibold uppercase tracking-[0.1em] text-slate-500">Worker activity</h3>
+                  <span class="text-[10px] text-slate-500" x-text="`${currentActivityRows().filter(row => row.worker).length} assigned`"></span>
+                </div>
+                <div class="space-y-1.5">
+                  <template x-for="row in currentActivityRows().slice(0, 4)" :key="row.id">
+                    <button type="button" @click="row.id !== 'reason' && focusOutlineIntent(row.id)"
+                      class="flex w-full min-w-0 items-start gap-2 rounded-md px-2 py-1.5 text-left transition hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-200">
+                      <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full" :class="row.status === 'Running' ? 'bg-sky-500 animate-pulse' : row.status === 'Blocked' ? 'bg-rose-500' : row.status === 'Retrying' ? 'bg-amber-500' : 'bg-slate-300'"></span>
+                      <span class="min-w-0 flex-1">
+                        <span class="flex items-center justify-between gap-2">
+                          <span class="truncate text-[10px] font-semibold text-slate-700" x-text="row.worker || 'Waiting for worker'"></span>
+                          <span class="shrink-0 text-[9px] text-slate-500" x-text="row.status"></span>
+                        </span>
+                        <span class="mt-0.5 block truncate text-[10px] text-slate-600" x-text="row.title"></span>
+                        <span class="mt-0.5 block truncate font-mono text-[9px] text-slate-400" x-text="row.heartbeat ? `Heartbeat · ${row.heartbeat}` : `Intent · ${row.id}`"></span>
+                      </span>
+                    </button>
+                  </template>
+                  <div x-show="!currentActivityRows().length" class="rounded-md border border-dashed border-slate-200 px-3 py-4 text-center">
+                    <p class="text-[10px] font-medium text-slate-600" x-text="project?.project?.reason ? `${project.project.reason.worker} is planning the next audit step` : 'No open worker assignments'"></p>
+                    <p class="mt-1 text-[9px] text-slate-500" x-text="project?.project?.reason ? 'New work will appear here after Reason updates the graph.' : 'Completed work remains visible in the coverage map.'"></p>
+                  </div>
+                  <p x-show="currentActivityRows().length > 4" class="px-2 text-[9px] text-slate-500" x-text="`${currentActivityRows().length - 4} more assignments · open Graph for the full record`"></p>
+                </div>
+              </section>
+            </div>
+          </div>
+        </template>
+        <template x-if="project?.project?.audit_mode !== 'scope'">
+          <div class="flex items-center justify-between gap-3">
+            <div class="min-w-0">
+              <h2 class="text-sm font-semibold text-slate-800">Current work</h2>
+              <p class="mt-0.5 text-xs text-slate-600" x-text="currentSummary().now"></p>
+              <p class="mt-1 text-[10px] text-slate-500" x-text="currentContextSummary()"></p>
+            </div>
+            <button type="button" @click="setGraphView('full')"
+              class="shrink-0 text-[10px] font-semibold text-brand-700 hover:text-brand-900">Open full graph</button>
+          </div>
+        </template>
         <div class="mt-2 flex items-center justify-between gap-3 border-t border-slate-100 pt-2">
-          <span class="text-[10px] text-slate-500" x-text="currentContextSummary()"></span>
+          <span class="min-w-0 truncate text-[10px] text-slate-500" x-text="currentSummary().next ? `${currentSummary().nextMode === 'user_action' ? 'Action required' : 'Next'} · ${currentSummary().next}` : lastActivityLabel()"></span>
           <button type="button" @click="setGraphView('full')"
-            class="shrink-0 text-[10px] font-semibold text-brand-600 hover:text-brand-800">Open full map</button>
+            class="shrink-0 text-[10px] font-semibold text-brand-700 hover:text-brand-900">Full graph</button>
         </div>
       </section>
 
-      <section x-show="projectPrimaryStatus()" x-cloak
+      <section x-show="projectPrimaryStatus() && !(graphView === 'current' && project?.project?.audit_mode === 'scope' && projectPrimaryStatus().tone === 'success')" x-cloak
         class="absolute left-3 right-3 top-[4.35rem] z-10 rounded-xl border px-4 py-3 shadow-sm"
         :class="projectPrimaryStatus().tone === 'attention' ? 'border-amber-200 bg-amber-50/95' : projectPrimaryStatus().tone === 'blocked' ? 'border-rose-200 bg-rose-50/95' : projectPrimaryStatus().tone === 'success' ? 'border-emerald-200 bg-emerald-50/95' : 'border-slate-200 bg-white/95'"
         role="status" aria-live="polite">
@@ -937,21 +1024,51 @@
             <option value="confirmed">Confirmed</option>
             <option value="invalid">Invalid</option>
           </select>
+          <label class="flex items-start gap-2 text-[11px] leading-relaxed text-slate-600">
+            <input type="checkbox" x-model="showClosedWork" @change="applyGraphFilters(); layoutVisibleGraph(false)"
+              class="mt-0.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500">
+            <span x-text="`Show ${closedNoResultIntentCount()} completed task node${closedNoResultIntentCount() === 1 ? '' : 's'} without a result fact`"></span>
+          </label>
         </div>
-        <label class="block text-[10px] font-bold uppercase tracking-wider text-slate-400">Layout engine</label>
-        <select x-model="layoutMode" @change="applySelectedLayout()"
-          class="h-8 w-full rounded-lg border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-600 focus:ring-2 focus:ring-brand-100">
-          <option value="dagre_tb">Dagre · top to bottom</option>
-          <option value="dagre_lr">Dagre · left to right</option>
-          <option value="klay_tb">Klay · top to bottom</option>
-          <option value="klay_lr">Klay · left to right</option>
-          <option value="elk_tb">ELK · top to bottom</option>
-          <option value="elk_lr">ELK · left to right</option>
-        </select>
+        <div x-show="graphView === 'current' && project?.project?.audit_mode === 'scope'"
+          class="rounded-lg border border-slate-100 bg-slate-50 px-3 py-2 text-[11px] leading-relaxed text-slate-600">
+          Audit map is arranged top to bottom with orthogonal edges and wider node spacing.
+        </div>
+        <div x-show="graphView !== 'current' || project?.project?.audit_mode !== 'scope'">
+          <label class="block text-[10px] font-bold uppercase tracking-wider text-slate-400">Layout engine</label>
+          <select x-model="layoutMode" @change="applySelectedLayout()"
+            class="h-8 w-full rounded-lg border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-600 focus:ring-2 focus:ring-brand-100">
+            <option value="dagre_tb">Dagre · top to bottom</option>
+            <option value="dagre_lr">Dagre · left to right</option>
+            <option value="klay_tb">Klay · top to bottom</option>
+            <option value="klay_lr">Klay · left to right</option>
+            <option value="elk_tb">ELK · top to bottom</option>
+            <option value="elk_lr">ELK · left to right</option>
+          </select>
+        </div>
       </div>
 
       <div x-show="nodeLegendOpen && workspaceMode === 'graph'" x-cloak @click.outside="nodeLegendOpen = false"
-        class="node-legend absolute z-20 p-3" aria-label="Node type color legend">
+        class="node-legend absolute z-20 p-3" aria-label="Graph legend">
+        <div x-show="graphView === 'current' && project?.project?.audit_mode === 'scope'">
+          <div class="mb-2 flex items-center justify-between">
+            <span class="text-xs font-bold text-slate-700">Audit process nodes</span>
+            <span class="text-[10px] text-slate-400">ranked by dependencies</span>
+          </div>
+          <div class="grid grid-cols-1 gap-y-2 text-[11px] text-slate-600 sm:grid-cols-2 sm:gap-x-4">
+            <span class="flex items-center gap-2"><i class="h-3 w-4 rounded-[4px] border border-sky-300 bg-sky-50"></i><b>Worker action</b> · status, worker, heartbeat</span>
+            <span class="flex items-center gap-2"><i class="h-3 w-3 rotate-45 border border-violet-400 bg-violet-50"></i><b>Scope gate</b></span>
+            <span class="flex items-center gap-2"><i class="h-3 w-4 rounded-[5px] border border-teal-300 bg-teal-50"></i><b>Evidence</b> · observation or result</span>
+            <span class="flex items-center gap-2"><i class="h-3 w-4 rounded-[5px] border border-indigo-300 bg-indigo-50"></i><b>Shared artifact</b> · plan, policy, map</span>
+            <span class="flex items-center gap-2"><i class="h-3 w-4 rounded-[4px] border border-amber-300 bg-amber-50"></i><b>Reasoning</b> · hypothesis or candidate</span>
+            <span class="flex items-center gap-2"><i class="h-3 w-3 rounded-[2px] border border-rose-400 bg-rose-50" style="clip-path:polygon(25% 0,75% 0,100% 50%,75% 100%,25% 100%,0 50%)"></i><b>Decision</b> · disposition or conclusion</span>
+          </div>
+          <div class="mt-3 space-y-1 border-t border-slate-100 pt-2 text-[10px] leading-relaxed text-slate-500">
+            <p><b>Arrow</b> reads input → action → output; source edges retain their recorded relation and output edges mean the intent produced that fact.</p>
+            <p><b>Status</b> is attached to the action node; a live worker includes its latest heartbeat. This map shows the current plan focus.</p>
+          </div>
+        </div>
+        <div x-show="graphView !== 'current' || project?.project?.audit_mode !== 'scope'">
         <div class="mb-2 flex items-center justify-between">
           <span class="text-xs font-bold text-slate-700">Blackboard semantics</span>
           <span class="text-[10px] text-slate-400">Fill = family</span>
@@ -966,6 +1083,7 @@
         <div class="mt-3 space-y-1 border-t border-slate-100 pt-2 text-[10px] leading-relaxed text-slate-500">
           <p><b>Arrow</b> reads source → target; its short verb names the relationship, such as <i>supports</i>, <i>confirms</i>, or <i>rejects</i>.</p>
           <p><b>Border</b>: dashed = queued, dotted = invalidated, solid = established; every node also prints its semantic type and status.</p>
+        </div>
         </div>
       </div>
 
@@ -1000,8 +1118,8 @@
         <div class="mx-auto max-w-4xl">
           <div class="mb-5 flex items-start justify-between gap-4">
             <div>
-              <h2 class="text-lg font-bold tracking-tight text-slate-900">Findings</h2>
-              <p class="mt-1 text-xs leading-relaxed text-slate-500">Candidate and confirmed finding records from the current project.</p>
+              <h2 class="text-lg font-bold tracking-tight text-slate-900">Audit results</h2>
+              <p class="mt-1 text-xs leading-relaxed text-slate-500">Confirmed outcomes, unresolved review, and reconnaissance gaps are separate. Closing recorded categories does not prove every threat class was included.</p>
             </div>
             <button type="button" @click="showFindingsGraph()"
               class="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 transition hover:border-brand-200 hover:text-brand-700">
@@ -1010,7 +1128,56 @@
             </button>
           </div>
 
-          <div x-show="primaryFindingFacts().length" class="space-y-2">
+          <div class="mb-5 flex flex-wrap items-center gap-x-5 gap-y-2 border-y border-slate-200 py-3 text-xs">
+            <span class="text-slate-600"><b class="tabular-nums text-emerald-700" x-text="confirmedFindingCount()"></b> confirmed</span>
+            <span class="text-slate-600"><b class="tabular-nums text-amber-700" x-text="reviewPendingFacts().length"></b> need review</span>
+            <span class="text-slate-600"><b class="tabular-nums text-slate-700" x-text="reconResidualCategories().length"></b> recon categories with leads or gaps</span>
+            <span class="text-slate-600"><b class="tabular-nums text-slate-700" x-text="reconLeadCount()"></b> leads retained as hypotheses</span>
+            <span class="text-slate-600"><b class="tabular-nums text-amber-700" x-text="auditResidualGapCount()"></b> explicit residual gaps</span>
+          </div>
+
+          <section x-show="latestAuditSummaryFact()" class="mb-7 border-b border-slate-200 pb-5">
+            <div class="flex items-start justify-between gap-4">
+              <div class="min-w-0">
+                <h3 class="text-sm font-semibold text-slate-800">Audit conclusion</h3>
+                <p class="mt-1 text-[10px] font-semibold"
+                  :class="auditSummaryFreshnessLabel() === 'Latest synthesis' ? 'text-emerald-700' : 'text-amber-700'"
+                  x-text="auditSummaryFreshnessLabel()"></p>
+                <p class="mt-1 text-xs leading-relaxed text-slate-600" x-text="latestAuditSummaryFact()?.description"></p>
+                <p x-show="project?.project?.audit_mode === 'scope'" class="mt-2 inline-flex items-center gap-1.5 rounded-md bg-amber-50 px-2 py-1 text-[10px] font-semibold text-amber-800">
+                  Threat-class completeness is not proven; this summary closes only the recorded lenses.
+                </p>
+              </div>
+              <button type="button" @click="openFindingFact(latestAuditSummaryFact()?.id)"
+                class="shrink-0 text-[11px] font-semibold text-brand-700 hover:text-brand-900">Inspect</button>
+            </div>
+          </section>
+
+          <section x-show="reviewPendingFacts().length" class="mb-7">
+            <div class="mb-2 flex items-baseline justify-between gap-3">
+              <h3 class="text-sm font-semibold text-slate-800">Needs further review</h3>
+              <span class="text-[10px] text-amber-700">Not confirmed findings</span>
+            </div>
+            <div class="space-y-2">
+              <template x-for="fact in reviewPendingFacts()" :key="fact.id">
+                <button type="button" @click="openFindingFact(fact.id)"
+                  class="block w-full rounded-lg border border-amber-200 bg-amber-50/60 p-3 text-left transition hover:border-amber-400 hover:bg-amber-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-200">
+                  <div class="flex items-start justify-between gap-4">
+                    <div class="min-w-0 flex-1">
+                      <p class="mb-1 text-[10px] font-semibold text-amber-800" x-text="fact.id + ' · ' + semanticTypeLabel(fact.semantic_type || fact.type || 'observation')"></p>
+                      <h4 class="break-words text-xs font-semibold leading-relaxed text-slate-800" x-text="factDisplayTitle(fact)"></h4>
+                      <p class="mt-1 line-clamp-3 break-words text-[11px] leading-relaxed text-slate-600" x-text="latestFactReview(fact)?.summary || fact.description"></p>
+                    </div>
+                    <span class="shrink-0 rounded-md bg-amber-100 px-2 py-1 text-[10px] font-semibold text-amber-800">Needs review</span>
+                  </div>
+                </button>
+              </template>
+            </div>
+          </section>
+
+          <section x-show="primaryFindingFacts().length" class="mb-7">
+            <h3 class="mb-2 text-sm font-semibold text-slate-800">Finding records</h3>
+            <div class="space-y-2">
             <template x-for="fact in primaryFindingFacts()" :key="fact.id">
               <button type="button" @click="openFindingFact(fact.id)"
                 class="block w-full rounded-xl border bg-white p-4 text-left transition hover:border-brand-300 hover:bg-brand-50/20 focus-visible:outline-none"
@@ -1027,12 +1194,32 @@
                 <p class="mt-3 text-[10px] font-medium text-slate-400" x-text="findingListMeta(fact)"></p>
               </button>
             </template>
-          </div>
+            </div>
+          </section>
 
-          <div x-show="!primaryFindingFacts().length" class="rounded-xl border border-dashed border-slate-300 bg-white px-6 py-12 text-center">
-            <p class="text-sm font-semibold text-slate-600">No findings yet</p>
-            <p class="mt-1 text-xs text-slate-400">Architecture, source, sink, and coverage evidence remain available in the full map.</p>
-          </div>
+          <section x-show="reconResidualCategories().length" class="mb-7 border-t border-slate-200 pt-5">
+            <div class="mb-2 flex items-baseline justify-between gap-3">
+              <h3 class="text-sm font-semibold text-slate-800">Recon leads and gaps</h3>
+              <span class="text-[10px] text-amber-700">Leads are hypotheses; category completion is not exhaustive</span>
+            </div>
+            <div class="divide-y divide-slate-200">
+              <template x-for="item in reconResidualCategories()" :key="item.category">
+                <button type="button" @click="openFindingFact(item.fact.id)"
+                  class="flex w-full items-center justify-between gap-4 py-3 text-left hover:bg-white/70">
+                  <span class="min-w-0">
+                    <span class="block text-xs font-semibold text-slate-700" x-text="item.category"></span>
+                    <span class="mt-0.5 block text-[10px] text-slate-500" x-text="`${item.status} · ${item.leads} lead${item.leads === 1 ? '' : 's'} retained · ${item.gaps} explicit gap${item.gaps === 1 ? '' : 's'} · ${item.fact.id}`"></span>
+                  </span>
+                  <span class="shrink-0 rounded-md bg-amber-100 px-2 py-1 text-[10px] font-semibold text-amber-800">Inspect</span>
+                </button>
+              </template>
+            </div>
+          </section>
+
+          <section x-show="!primaryFindingFacts().length && !reviewPendingFacts().length" class="border-t border-slate-200 py-5">
+            <p class="text-xs font-semibold text-slate-700">No candidate or confirmed finding record</p>
+            <p class="mt-1 text-[11px] leading-relaxed text-slate-500">This does not mean the target is vulnerability-free. Check the conclusion and any reconnaissance coverage gaps above.</p>
+          </section>
         </div>
       </div>
 
@@ -1430,6 +1617,37 @@
                         </li>
                       </template>
                     </ol>
+                  </section>
+
+                  <section x-show="findingSecurityChecks(selectedFactRecord())" class="rounded-lg border border-slate-200 bg-white px-3 py-3">
+                    <div class="flex items-baseline justify-between gap-3">
+                      <h4 class="text-xs font-bold text-slate-800">Input and protection analysis</h4>
+                      <span class="text-[9px] font-semibold uppercase tracking-wide text-slate-400">Source-level · no code execution</span>
+                    </div>
+                    <div class="mt-3 space-y-3">
+                      <template x-for="item in findingSecurityChecks(selectedFactRecord())?.attacker_cases || []" :key="item.case_id">
+                        <article class="rounded-md bg-slate-50 p-2.5">
+                          <p class="text-[10px] font-semibold text-slate-700" x-text="`${item.input_class}: ${item.representative_value}`"></p>
+                          <p class="mt-1 text-[10px] text-slate-600" x-text="`Attacker control: ${item.attacker_control} · sink reachable: ${item.sink_reachable} · effect: ${item.security_effect}`"></p>
+                        </article>
+                      </template>
+                      <template x-for="(item, index) in findingSecurityChecks(selectedFactRecord())?.protection_checks || []" :key="`${item.attacker_case_id}-${index}`">
+                        <article class="rounded-md border border-slate-200 p-2.5">
+                          <p class="text-[10px] font-semibold text-slate-700" x-text="`${item.protection} · ${item.result}`"></p>
+                          <p class="mt-1 break-words font-mono text-[10px] text-slate-600" x-text="item.predicate"></p>
+                          <p class="mt-1 text-[10px] text-slate-600" x-text="`Input ${item.attacker_case_id}: ${item.predicate_result} → ${item.resulting_value} · sink reachable: ${item.sink_reachable}`"></p>
+                          <div class="mt-1 flex flex-wrap gap-1">
+                            <template x-for="citationId in item.citation_ids || []" :key="citationId">
+                              <button type="button" @click="focusTraceCitation(citationId)" class="rounded bg-brand-50 px-1.5 py-0.5 text-[9px] font-semibold text-brand-700" x-text="citationId"></button>
+                            </template>
+                          </div>
+                        </article>
+                      </template>
+                      <div class="rounded-md border border-amber-100 bg-amber-50/60 p-2.5">
+                        <p class="text-[10px] font-semibold text-amber-900" x-text="`Configuration · default ${findingSecurityChecks(selectedFactRecord())?.configuration_analysis?.default_mode || 'unknown'} · enabled mode ${findingSecurityChecks(selectedFactRecord())?.configuration_analysis?.ordinary_enabled_mode || 'unknown'} · admin misconfiguration required ${findingSecurityChecks(selectedFactRecord())?.configuration_analysis?.requires_admin_misconfiguration || 'unknown'}`"></p>
+                        <p class="mt-1 text-[10px] leading-relaxed text-amber-800" x-text="findingSecurityChecks(selectedFactRecord())?.configuration_analysis?.summary || 'Configuration behavior not established.'"></p>
+                      </div>
+                    </div>
                   </section>
 
                   <section aria-labelledby="finding-evidence-heading">
@@ -2288,9 +2506,11 @@ function linenApp() {
     sideTab: 'detail',
     workspaceMode: 'graph',
     graphView: 'current',
+    auditCoverageOpen: false,
     findingsMode: 'list',
     graphKindFilter: 'all',
     graphStateFilter: 'all',
+    showClosedWork: false,
     nodeLegendOpen: false,
     viewOptionsOpen: false,
     headerMoreOpen: false,
@@ -2582,7 +2802,15 @@ function linenApp() {
         };
       }
       if (this.project.project.status === 'completed') {
-        return { eyebrow: 'Complete', title: 'Audit completed', detail: 'The completion checks passed and the audit is closed.', tone: 'success' };
+        if (this.project.project.audit_mode !== 'scope') {
+          return { eyebrow: 'Complete', title: 'Audit completed', detail: 'The completion checks passed and the audit is closed.', tone: 'success' };
+        }
+        return {
+          eyebrow: 'Complete',
+          title: 'Recorded audit branches completed',
+          detail: 'Completion checks passed for the recorded lenses. The threat-class assumption space is not proven exhaustive.',
+          tone: 'success',
+        };
       }
       if (this.project.project.reason || this.workingIntentCount()) {
         const intent = this.currentFocusIntents()[0];
@@ -2735,7 +2963,7 @@ function linenApp() {
       const candidates = this.project.facts.filter(fact =>
         fact.semantic_type === 'candidate_finding' && !promoted.has(fact.id)
       ).length;
-      return `${candidates} candidate${candidates === 1 ? '' : 's'} · ${this.confirmedFindingCount()} confirmed`;
+      return `${candidates} candidate${candidates === 1 ? '' : 's'} · ${this.confirmedFindingCount()} confirmed · ${this.reviewPendingFacts().length} need review`;
     },
 
     completionEvidenceCheck() {
@@ -2826,7 +3054,7 @@ function linenApp() {
     },
 
     stageStatusDotClass(status) {
-      return ({ pending: 'bg-slate-300', running: 'bg-sky-500', satisfied: 'bg-emerald-500', blocked: 'bg-rose-500', failed: 'bg-rose-500', not_applicable: 'bg-slate-300' })[status] || 'bg-slate-300';
+      return ({ pending: 'bg-slate-300', running: 'bg-sky-500', satisfied: 'bg-emerald-500', partial: 'bg-amber-500', blocked: 'bg-rose-500', failed: 'bg-rose-500', not_applicable: 'bg-slate-300' })[status] || 'bg-slate-300';
     },
 
     reasonBadgeText(reason, compact = false) {
@@ -2893,13 +3121,29 @@ function linenApp() {
     },
 
     graphViewLabel() {
-      return ({ current: 'Current focus', findings: 'Finding chain', full: 'Graph', list: 'Blackboard list' })[this.graphView] || 'Graph';
+      return ({ current: this.project?.project?.audit_mode === 'scope' ? 'Audit map' : 'Current focus', findings: 'Finding chain', full: 'Graph', list: 'Blackboard list' })[this.graphView] || 'Graph';
     },
 
     graphViewSummary() {
       if (!this.project) return 'Loading blackboard…';
-      if (this.graphView === 'findings') return `${this.findingFactCount()} finding-related facts`;
+      if (this.graphView === 'findings') {
+        const focus = this.findingsGraphFocus();
+        const outcomeCount = focus.seedCount;
+        const edgeCount = focus.edgeIds.size;
+        const gaps = this.auditResidualGapCount();
+        const outcomeLabel = `${outcomeCount} key result${outcomeCount === 1 ? '' : 's'}`;
+        const edgeLabel = `${edgeCount} causal link${edgeCount === 1 ? '' : 's'}`;
+        const gapLabel = gaps ? ` · ${gaps} coverage gap${gaps === 1 ? '' : 's'}` : '';
+        const scopeNote = this.project.project.audit_mode === 'scope'
+          ? ' · threat classes not proven exhaustive'
+          : '';
+        return `${outcomeLabel} · ${edgeLabel}${gapLabel}${scopeNote} · limited lineage; Graph shows all evidence`;
+      }
       if (this.graphView === 'current') {
+        if (this.project.project.audit_mode === 'scope') {
+          const counts = this.currentCoverageCounts();
+          return `${counts.satisfied}/${this.currentCoverageRows().length} tracked stages closed · ${counts.running} active · ${this.auditResidualGapCount()} residual gaps · recorded lenses only`;
+        }
         const focus = this.currentGraphFocus();
         const intents = this.currentFocusIntents();
         const runningCount = intents.filter(intent => Boolean(intent.worker)).length;
@@ -2912,6 +3156,186 @@ function linenApp() {
         return focus.primaryNodeIds.size ? `${focus.primaryNodeIds.size} recent evidence item${focus.primaryNodeIds.size === 1 ? '' : 's'}` : 'Origin and goal context';
       }
       return 'All facts, work and assessments';
+    },
+
+    auditResidualGapCount() {
+      const summary = this.latestAuditSummaryFact();
+      const count = Number(String(summary?.description || '').match(/(\d+) explicit residual gap/)?.[1] || 0);
+      return Math.max(count, this.reconResidualCategories().reduce((total, item) => total + item.gaps, 0));
+    },
+
+    auditStageIntentDescription(stage) {
+      const id = stage?.stage_id || '';
+      if (id === 'scope-evidence') return '@analysis:scope-evidence';
+      if (id === 'scope-adjudication') return '@analysis:scope-adjudication';
+      if (id === 'recon-snapshot') return '@analysis:recon-snapshot';
+      if (id === 'recon-coverage-review') return '@analysis:recon-coverage-review';
+      if (id === 'codeql-candidates') return '@analysis:codeql-path-candidates';
+      if (id === 'audit-summary') return '@analysis:audit-summary';
+      if (id.startsWith('recon-')) return `@analysis:recon:${id.slice('recon-'.length)}`;
+      return '';
+    },
+
+    currentIntentsForDescription(description, { prefix = false } = {}) {
+      if (!this.project || !description) return [];
+      return this.project.intents.filter(intent => {
+        if (intent.source_generation !== this.project.project.source_generation
+          || intent.plan_revision !== this.project.project.plan_revision) return false;
+        const value = String(intent.description || '').trim();
+        return prefix ? value === description || value.startsWith(`${description}:`) : value === description;
+      }).sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || ''))
+        || String(a.id || '').localeCompare(String(b.id || '')));
+    },
+
+    currentCoverageRows() {
+      if (!this.project || this.project.project.audit_mode !== 'scope') return [];
+      const stages = this.visibleAuditStages().filter(stage => stage.required && stage.status !== 'not_applicable');
+      const rows = stages.map(stage => {
+        const description = this.auditStageIntentDescription(stage);
+        const categoryStage = stage.stage_id.startsWith('recon-')
+          && !['recon-snapshot', 'recon-coverage-review'].includes(stage.stage_id);
+        const matches = categoryStage
+          ? this.project.intents.filter(intent => {
+            if (intent.source_generation !== this.project.project.source_generation
+              || intent.plan_revision !== this.project.project.plan_revision) return false;
+            return this.reconCategoryFromDescription(intent.description) === stage.stage_id.slice('recon-'.length);
+          }).sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || ''))
+            || String(a.id || '').localeCompare(String(b.id || '')))
+          : this.currentIntentsForDescription(description);
+        const intent = matches[matches.length - 1] || null;
+        const error = intent ? this.intentError(intent.id) : null;
+        const artifactStatus = categoryStage && intent?.to
+          ? String(this.getFactRecord(intent.to)?.evidence || '').match(/^status:\s*(complete|partial)$/mi)?.[1]
+          : '';
+        const activeWorker = this.isOpenIntent(intent) ? intent?.worker || '' : '';
+        const status = error?.classification === 'blocked' ? 'blocked'
+          : error?.classification === 'transient' ? 'failed'
+          : activeWorker ? 'running'
+          : categoryStage && artifactStatus === 'partial' ? 'partial'
+          : stage.status;
+        return {
+          key: stage.stage_id,
+          label: stage.label,
+          status,
+          statusLabel: status === 'partial' ? 'Partial' : this.stageStatusLabel(status),
+          detail: stage.detail || '',
+          intent,
+          worker: activeWorker,
+          heartbeat: activeWorker && intent?.last_heartbeat_at ? this.formatTime(intent.last_heartbeat_at) : '',
+        };
+      });
+
+      const knownCategories = new Set(stages
+        .filter(stage => stage.stage_id.startsWith('recon-')
+          && !['recon-snapshot', 'recon-coverage-review'].includes(stage.stage_id))
+        .map(stage => stage.stage_id.slice('recon-'.length)));
+      const discoveredCategories = new Set();
+      for (const intent of this.project.intents) {
+        if (intent.source_generation !== this.project.project.source_generation
+          || intent.plan_revision !== this.project.project.plan_revision) continue;
+        const category = this.reconCategoryFromDescription(intent.description);
+        if (category && !knownCategories.has(category)) discoveredCategories.add(category);
+      }
+      for (const category of Array.from(discoveredCategories).sort()) {
+        const matches = this.project.intents.filter(intent =>
+          intent.source_generation === this.project.project.source_generation
+          && intent.plan_revision === this.project.project.plan_revision
+          && this.reconCategoryFromDescription(intent.description) === category,
+        ).sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || ''))
+          || String(a.id || '').localeCompare(String(b.id || '')));
+        const intent = matches[matches.length - 1] || null;
+        const fact = intent?.to ? this.getFactRecord(intent.to) : null;
+        const artifactStatus = String(fact?.evidence || '').match(/^status:\s*(complete|partial)$/mi)?.[1];
+        const error = intent ? this.intentError(intent.id) : null;
+        const activeWorker = this.isOpenIntent(intent) ? intent?.worker || '' : '';
+        const status = error?.classification === 'blocked' ? 'blocked'
+          : error?.classification === 'transient' ? 'failed'
+          : activeWorker ? 'running'
+          : artifactStatus === 'partial' ? 'partial'
+          : artifactStatus === 'complete' ? 'satisfied'
+          : intent?.concluded_at ? 'failed' : 'pending';
+        rows.push({
+          key: `discovered-${category}`,
+          label: `Recon · ${category}`,
+          status,
+          statusLabel: status === 'partial' ? 'Partial' : this.stageStatusLabel(status),
+          detail: fact ? this.factDisplayTitle(fact) : 'Evidence-discovered lens',
+          intent,
+          worker: activeWorker,
+          heartbeat: activeWorker && intent?.last_heartbeat_at ? this.formatTime(intent.last_heartbeat_at) : '',
+        });
+      }
+      return rows;
+    },
+
+    reconCategoryFromDescription(description) {
+      const match = String(description || '').trim().match(/^@analysis:recon:([a-z][a-z0-9-]{0,63})(?::[a-z0-9][a-z0-9-]{0,63})?$/);
+      return match?.[1] || '';
+    },
+
+    currentCoverageCounts() {
+      const rows = this.currentCoverageRows();
+      return {
+        satisfied: rows.filter(row => row.status === 'satisfied').length,
+        running: rows.filter(row => row.status === 'running').length,
+        pending: rows.filter(row => row.status === 'pending').length,
+        partial: rows.filter(row => row.status === 'partial').length,
+        blocked: rows.filter(row => ['blocked', 'failed'].includes(row.status)).length,
+      };
+    },
+
+    auditStageBadgeClass(status) {
+      return ({
+        satisfied: 'bg-emerald-50 text-emerald-700',
+        running: 'bg-sky-50 text-sky-700',
+        blocked: 'bg-rose-50 text-rose-700',
+        failed: 'bg-rose-50 text-rose-700',
+        partial: 'bg-amber-50 text-amber-800',
+        pending: 'bg-slate-100 text-slate-600',
+        not_applicable: 'bg-slate-100 text-slate-500',
+      })[status] || 'bg-slate-100 text-slate-600';
+    },
+
+    currentActivityRows() {
+      if (!this.project) return [];
+      const intents = this.project.intents.filter(intent =>
+        intent.source_generation === this.project.project.source_generation
+        && intent.plan_revision === this.project.project.plan_revision
+        && this.isOpenIntent(intent),
+      ).map(intent => {
+        const error = this.intentError(intent.id);
+        const status = error?.classification === 'blocked' ? 'Blocked'
+          : error?.classification === 'transient' ? 'Retrying'
+          : intent.worker ? 'Running' : 'Queued';
+        return {
+          id: intent.id,
+          worker: intent.worker || '',
+          title: this.intentDisplayTitle(intent),
+          status,
+          heartbeat: intent.last_heartbeat_at ? this.formatTime(intent.last_heartbeat_at) : '',
+          created_at: intent.created_at || '',
+        };
+      });
+      intents.sort((a, b) => {
+        const rank = row => row.status === 'Running' ? 0 : row.status === 'Blocked' ? 1 : row.status === 'Retrying' ? 2 : 3;
+        return rank(a) - rank(b)
+          || String(b.heartbeat || b.created_at).localeCompare(String(a.heartbeat || a.created_at));
+      });
+      const reason = this.project.project.reason;
+      if (reason?.worker) {
+        intents.unshift({
+          id: 'reason', worker: reason.worker,
+          title: reason.trigger ? `Reason · ${reason.trigger}` : 'Reason · planning the next audit step',
+          status: 'Reasoning', heartbeat: '', created_at: '',
+        });
+      }
+      return intents;
+    },
+
+    reconLeadCount() {
+      return this.latestReconResultFacts().reduce((total, fact) => {
+        return total + Number(String(fact.evidence || '').match(/^leads:\s*(\d+)$/m)?.[1] || 0);
+      }, 0);
     },
 
     setGraphView(view) {
@@ -2991,6 +3415,63 @@ function linenApp() {
         .filter(fact => this.isPrimaryFindingFact(fact))
         .slice()
         .reverse();
+    },
+
+    latestFactReview(fact) {
+      const reviews = this.reviewsByFactId?.[fact?.id] || [];
+      return reviews.reduce((latest, review) => {
+        if (!latest) return review;
+        const currentTime = Date.parse(review.created_at || '') || 0;
+        const latestTime = Date.parse(latest.created_at || '') || 0;
+        if (currentTime !== latestTime) return currentTime > latestTime ? review : latest;
+        return String(review.id || '') > String(latest.id || '') ? review : latest;
+      }, null);
+    },
+
+    reviewPendingFacts() {
+      return (this.project?.facts || [])
+        .filter(fact => this.isFindingContextFact(fact) && this.latestFactReview(fact)?.verdict === 'NEEDS_REVIEW')
+        .slice()
+        .reverse();
+    },
+
+    latestAuditSummaryFact() {
+      return (this.project?.facts || [])
+        .filter(fact => fact.type === 'audit_summary')
+        .reduce((latest, fact) => {
+          if (!latest) return fact;
+          const factTime = Date.parse(this.getProducingIntent(fact.id)?.concluded_at || '') || 0;
+          const latestTime = Date.parse(this.getProducingIntent(latest.id)?.concluded_at || '') || 0;
+          return factTime >= latestTime ? fact : latest;
+        }, null);
+    },
+
+    auditSummaryFreshnessLabel() {
+      const summary = this.latestAuditSummaryFact();
+      if (!summary) return '';
+      const summaryTime = Date.parse(this.getProducingIntent(summary.id)?.concluded_at || '');
+      if (!summaryTime) return 'Synthesis status unavailable';
+      const hasNewerFacts = (this.project?.facts || []).some(fact => {
+        if (fact.id === summary.id) return false;
+        const producedAt = Date.parse(this.getProducingIntent(fact.id)?.concluded_at || '');
+        return producedAt > summaryTime;
+      });
+      return hasNewerFacts ? 'Earlier synthesis · newer evidence is included in the counts below' : 'Latest synthesis';
+    },
+
+    reconResidualCategories() {
+      return this.latestReconResultFacts().map(fact => {
+        const evidence = String(fact.evidence || '');
+        const category = evidence.match(/^category:\s*(.+)$/m)?.[1]?.trim();
+        const status = evidence.match(/^status:\s*(.+)$/m)?.[1]?.trim().toLowerCase() || 'unknown';
+        const leads = Number(evidence.match(/^leads:\s*(\d+)$/m)?.[1] || 0);
+        const gaps = Number(evidence.match(/^gaps:\s*(\d+)$/m)?.[1] || (status === 'partial' ? 1 : 0));
+        return { category: category || 'unknown', status, leads, gaps, fact };
+      }).filter(item => item.status === 'partial' || item.gaps > 0 || item.leads > 0);
+    },
+
+    closedNoResultIntentCount() {
+      return (this.project?.intents || []).filter(intent => this.isClosedNoResultIntent(intent)).length;
     },
 
     findingVerificationLabel(fact) {
@@ -3113,6 +3594,7 @@ function linenApp() {
     },
 
     currentGraphFocus() {
+      if (this.project?.project?.audit_mode === 'scope') return this.auditCoverageGraphFocus();
       const compactGraph = window.innerWidth <= 820;
       const maxNodes = compactGraph ? 6 : 10;
       const maxEdges = compactGraph ? 8 : 14;
@@ -3155,6 +3637,7 @@ function linenApp() {
         nodeIds.add(placeholderId);
         primaryNodeIds.add(placeholderId);
         for (const sourceId of intent.from || []) {
+          if (edgeIds.size >= maxEdges || (nodeIds.size >= maxNodes && !nodeIds.has(sourceId))) break;
           nodeIds.add(sourceId);
           primaryNodeIds.add(sourceId);
           edgeIds.add(`${intent.id}_${sourceId}`);
@@ -3193,29 +3676,167 @@ function linenApp() {
       return { nodeIds, primaryNodeIds, contextNodeIds, edgeIds, intentIds, signature };
     },
 
+    auditCoverageGraphFocus() {
+      const compactGraph = window.innerWidth <= 820;
+      const maxNodes = compactGraph ? 40 : 72;
+      const maxEdges = compactGraph ? 48 : 88;
+      const nodeIds = new Set();
+      const primaryNodeIds = new Set();
+      const contextNodeIds = new Set();
+      const edgeIds = new Set();
+      const intentIds = new Set();
+      const lineageSeeds = [];
+      const project = this.project;
+      if (!project) return { nodeIds, primaryNodeIds, contextNodeIds, edgeIds, intentIds, signature: '' };
+      const factsById = new Map(project.facts.map(fact => [fact.id, fact]));
+      const producerByFact = new Map(project.intents.filter(intent => intent.to).map(intent => [intent.to, intent]));
+      const currentPlanIntent = intent => intent.source_generation === project.project.source_generation
+        && intent.plan_revision === project.project.plan_revision;
+      const addIntent = intent => {
+        if (!intent || !currentPlanIntent(intent) || intentIds.has(intent.id)) return;
+        const taskNodeId = `_ph_${intent.id}`;
+        const neededNodes = Number(!nodeIds.has(taskNodeId)) + Number(Boolean(intent.to && !nodeIds.has(intent.to)));
+        if (nodeIds.size + neededNodes > maxNodes) return;
+        nodeIds.add(taskNodeId);
+        primaryNodeIds.add(taskNodeId);
+        intentIds.add(intent.id);
+        if (intent.to && factsById.has(intent.to)) {
+          nodeIds.add(intent.to);
+          primaryNodeIds.add(intent.to);
+          if (edgeIds.size < maxEdges) edgeIds.add(`${intent.id}__output`);
+          lineageSeeds.push(intent.to);
+        }
+        for (const sourceId of intent.from || []) {
+          if (!factsById.has(sourceId) || edgeIds.size >= maxEdges) continue;
+          if (!nodeIds.has(sourceId) && nodeIds.size >= maxNodes) continue;
+          nodeIds.add(sourceId);
+          contextNodeIds.add(sourceId);
+          edgeIds.add(`${intent.id}_${sourceId}`);
+          lineageSeeds.push(sourceId);
+        }
+      };
+
+      // Keep one current attempt per managed lens in view as its placeholder
+      // becomes a result Fact, then add all open investigations beside it.
+      for (const row of this.currentCoverageRows()) addIntent(row.intent);
+      for (const intent of project.intents.filter(item => currentPlanIntent(item) && this.isOpenIntent(item))) {
+        addIntent(intent);
+      }
+      for (const fact of this.primaryFindingFacts().slice(-4)) {
+        const producer = producerByFact.get(fact.id);
+        if (producer) addIntent(producer);
+      }
+
+      const queue = lineageSeeds.map(factId => ({ factId, depth: 0 }));
+      const visited = new Set();
+      while (queue.length && nodeIds.size < maxNodes && edgeIds.size < maxEdges) {
+        const { factId, depth } = queue.shift();
+        if (visited.has(factId) || depth >= 2) continue;
+        visited.add(factId);
+        const producer = producerByFact.get(factId);
+        if (!producer || !currentPlanIntent(producer)) continue;
+        addIntent(producer);
+        for (const sourceId of producer.from || []) {
+          if (!factsById.has(sourceId) || edgeIds.size >= maxEdges) continue;
+          if (!nodeIds.has(sourceId) && nodeIds.size >= maxNodes) break;
+          nodeIds.add(sourceId);
+          contextNodeIds.add(sourceId);
+          edgeIds.add(`${producer.id}_${sourceId}`);
+          queue.push({ factId: sourceId, depth: depth + 1 });
+        }
+      }
+      if (!nodeIds.size && factsById.has('origin')) {
+        nodeIds.add('origin');
+        primaryNodeIds.add('origin');
+      }
+      const signature = [this.graphView, ...Array.from(nodeIds).sort(), ...Array.from(edgeIds).sort()].join('|');
+      return { nodeIds, primaryNodeIds, contextNodeIds, edgeIds, intentIds: Array.from(intentIds), signature };
+    },
+
     currentContextSummary() {
       const focus = this.currentGraphFocus();
       const evidenceCount = Array.from(focus.nodeIds).filter(id => !id.startsWith('_ph_')).length;
       const workCount = focus.intentIds.length;
-      return `${focus.nodeIds.size} linked nodes · ${evidenceCount} evidence item${evidenceCount === 1 ? '' : 's'} · ${workCount} active task${workCount === 1 ? '' : 's'}`;
+      const workLabel = this.project?.project?.audit_mode === 'scope' ? 'audit action' : 'active task';
+      return `${focus.nodeIds.size} linked nodes · ${evidenceCount} evidence item${evidenceCount === 1 ? '' : 's'} · ${workCount} ${workLabel}${workCount === 1 ? '' : 's'} · focused subset; Graph shows all evidence`;
     },
 
     findingsGraphFocus() {
-      const nodeIds = new Set(['origin', 'goal']);
+      const nodeIds = new Set();
       const edgeIds = new Set();
-      if (!this.project) return { nodeIds, edgeIds };
-      const findingIds = new Set(this.project.facts.filter(fact => this.isFindingContextFact(fact)).map(fact => fact.id));
-      for (const intent of this.project.intents) {
-        const related = findingIds.has(intent.to) || (intent.from || []).some(id => findingIds.has(id));
-        if (!related) continue;
-        if (intent.to) nodeIds.add(intent.to);
-        else nodeIds.add(`_ph_${intent.id}`);
-        for (const sourceId of intent.from || []) {
+      if (!this.project) return { nodeIds, edgeIds, seedCount: 0 };
+
+      const factsById = new Map(this.project.facts.map(fact => [fact.id, fact]));
+      const producerByFact = new Map(
+        this.project.intents.filter(intent => intent.to).map(intent => [intent.to, intent]),
+      );
+      const findingSeeds = new Set([
+        ...this.primaryFindingFacts().map(fact => fact.id),
+        ...this.reviewPendingFacts().map(fact => fact.id),
+      ]);
+      const reconAnchors = this.latestReconResultFacts()
+        .filter(fact => String(fact.evidence || '').match(/^status:\s*partial$/mi)
+          || Number(fact.evidence?.match(/^leads:\s*(\d+)$/m)?.[1] || 0) > 0
+          || Number(fact.evidence?.match(/^gaps:\s*(\d+)$/m)?.[1] || 0) > 0);
+      const summary = this.latestAuditSummaryFact();
+      const displayedAnchors = [...reconAnchors, ...(summary ? [summary] : [])];
+      const maxLineageDepth = 3;
+      const maxLineageEdges = window.innerWidth <= 820 ? 8 : 16;
+      const maxLineageNodes = window.innerWidth <= 820 ? 12 : 22;
+
+      // Show only current finding outcomes and a short producer chain. Keep
+      // the synthesis and latest recon results as compact, separately clickable
+      // outcome anchors instead of expanding their large fan-in dependencies.
+      for (const factId of findingSeeds) nodeIds.add(factId);
+      for (const fact of displayedAnchors) nodeIds.add(fact.id);
+
+      const queue = Array.from(findingSeeds, factId => ({ factId, depth: 0 }));
+      const visited = new Set();
+      while (queue.length) {
+        if (edgeIds.size >= maxLineageEdges) break;
+        const { factId, depth } = queue.shift();
+        if (visited.has(factId) || depth >= maxLineageDepth) continue;
+        visited.add(factId);
+        const producer = producerByFact.get(factId);
+        if (!producer) continue;
+        for (const sourceId of producer.from || []) {
+          if (edgeIds.size >= maxLineageEdges) break;
+          if (!factsById.has(sourceId)) continue;
+          if (!nodeIds.has(sourceId) && nodeIds.size >= maxLineageNodes) break;
           nodeIds.add(sourceId);
-          edgeIds.add(`${intent.id}_${sourceId}`);
+          edgeIds.add(`${producer.id}_${sourceId}`);
+          queue.push({ factId: sourceId, depth: depth + 1 });
         }
       }
-      return { nodeIds, edgeIds };
+
+      // Preserve the small, direct link from recon outcomes into the latest
+      // synthesis, without rendering every fact consumed by that synthesis.
+      if (summary) {
+        const producer = producerByFact.get(summary.id);
+        for (const fact of reconAnchors) {
+          if (edgeIds.size >= maxLineageEdges) break;
+          if (producer?.from?.includes(fact.id)) {
+            edgeIds.add(`${producer.id}_${fact.id}`);
+          }
+        }
+      }
+      return { nodeIds, edgeIds, seedCount: findingSeeds.size };
+    },
+
+    latestReconResultFacts() {
+      const byCategory = new Map();
+      for (const fact of this.project?.facts || []) {
+        if (fact.type !== 'recon') continue;
+        const category = String(fact.evidence || '').match(/^category:\s*(.+)$/m)?.[1]?.trim();
+        if (!category) continue;
+        const current = byCategory.get(category);
+        const producedAt = Date.parse(this.getProducingIntent(fact.id)?.concluded_at || '') || 0;
+        const currentAt = current
+          ? Date.parse(this.getProducingIntent(current.id)?.concluded_at || '') || 0
+          : -1;
+        if (!current || producedAt >= currentAt) byCategory.set(category, fact);
+      }
+      return Array.from(byCategory.values());
     },
 
     graphFactMatchesKind(fact) {
@@ -3248,7 +3869,11 @@ function linenApp() {
         ));
       }
       if (fact.id === 'origin' || fact.id === 'goal') return true;
-      if (this.graphStateFilter === 'confirmed') return ['triaged', 'fixed'].includes(fact.status || 'triaged');
+      if (this.graphStateFilter === 'confirmed') {
+        return fact.semantic_type === 'confirmed_finding'
+          || fact.status === 'confirmed'
+          || (fact.type === 'vulnerability' && ['triaged', 'fixed'].includes(fact.status || 'triaged'));
+      }
       if (this.graphStateFilter === 'invalid') return fact.status === 'false_positive';
       return (fact.status || 'triaged') === this.graphStateFilter;
     },
@@ -3276,6 +3901,19 @@ function linenApp() {
       }
       if (this.graphKindFilter === 'findings') return !this.auditIntentLabel(intent);
       return true;
+    },
+
+    isClosedNoResultIntent(intent) {
+      return Boolean(intent && !intent.to && intent.concluded_at);
+    },
+
+    graphIntentVisible(intent) {
+      const currentAuditMapIntent = this.graphView === 'current'
+        && this.project?.project?.audit_mode === 'scope'
+        && intent?.source_generation === this.project.project.source_generation
+        && intent?.plan_revision === this.project.project.plan_revision;
+      return Boolean(intent && (this.showClosedWork || currentAuditMapIntent || !this.isClosedNoResultIntent(intent))
+        && (this.graphView !== 'full' || this.graphIntentMatchesFilters(intent)));
     },
 
     outlineFacts() {
@@ -3309,9 +3947,9 @@ function linenApp() {
           ? this.project.intents.find(intent => intent.id === intentId)
           : this.project.facts.find(fact => fact.id === node.id());
         const filterVisible = this.graphView !== 'full'
-          ? Boolean(record)
+          ? Boolean(intentId ? this.graphIntentVisible(record) : record)
           : intentId
-          ? Boolean(record && this.graphIntentMatchesFilters(record))
+          ? this.graphIntentVisible(record)
           : Boolean(record && this.graphFactMatchesKind(record) && this.graphFactMatchesState(record));
         const viewVisible = this.graphView === 'current'
           ? Boolean(currentFocus?.nodeIds.has(node.id()))
@@ -3320,6 +3958,8 @@ function linenApp() {
           : true;
         const visible = filterVisible && viewVisible;
         node.toggleClass('filtered-out', !visible);
+        node.toggleClass('audit-map-node', this.graphView === 'current'
+          && this.project?.project?.audit_mode === 'scope' && visible);
         node.removeClass('current-focus current-primary current-context');
         if (visible && currentFocus?.primaryNodeIds.has(node.id())) node.addClass('current-primary');
         if (visible && currentFocus?.primaryNodeIds.has(node.id()) && intentId && record?.worker) node.addClass('current-focus');
@@ -3330,16 +3970,19 @@ function linenApp() {
         const intent = intentId ? this.project.intents.find(item => item.id === intentId) : null;
         const endpointsVisible = !edge.source().hasClass('filtered-out') && !edge.target().hasClass('filtered-out');
         const filterVisible = this.graphView !== 'full'
-          ? Boolean(intentId ? intent : true)
+          ? Boolean(intentId ? this.graphIntentVisible(intent) : true)
           : intentId
-          ? Boolean(intent && this.graphIntentMatchesFilters(intent))
+          ? this.graphIntentVisible(intent)
           : true;
         const viewVisible = this.graphView === 'current'
           ? Boolean(currentFocus?.edgeIds.has(edge.id()))
           : this.graphView === 'findings'
           ? Boolean(findingsFocus?.edgeIds.has(edge.id()))
           : true;
-        edge.toggleClass('filtered-out', !(filterVisible && viewVisible && endpointsVisible));
+        const visibleInGraph = filterVisible && viewVisible && endpointsVisible;
+        edge.toggleClass('filtered-out', !visibleInGraph);
+        edge.toggleClass('audit-map-edge', this.graphView === 'current'
+          && this.project?.project?.audit_mode === 'scope' && visibleInGraph);
         const showEdgeLabel = this.graphView === 'current'
           ? filterVisible && viewVisible && endpointsVisible
           : this.graphView === 'findings'
@@ -3390,16 +4033,76 @@ function linenApp() {
       return `${title}\n${semantic} · ${status}`;
     },
 
-    openIntentNodeSize(intent) {
+    openIntentNodeSize(intent, wide = false) {
       const label = this.openIntentNodeLabel(intent);
-      const measured = this.measureWrappedText(label, 158, 10);
-      return { width: Math.max(142, Math.ceil(measured.width + 26)), height: Math.max(54, Math.ceil(measured.height + 20)) };
+      const maxTextWidth = wide ? 210 : 158;
+      const minWidth = wide ? 194 : 142;
+      const measured = this.measureWrappedText(label, maxTextWidth, 10);
+      return { width: Math.max(minWidth, Math.ceil(measured.width + 26)), height: Math.max(54, Math.ceil(measured.height + 20)) };
+    },
+
+    auditIntentGraphStatus(intent) {
+      const error = this.intentError(intent?.id);
+      if (error?.classification === 'blocked') return 'Blocked';
+      if (error?.classification === 'transient') return 'Retrying';
+      if (this.isOpenIntent(intent)) return intent?.worker ? 'Running' : 'Queued';
+      return intent?.to ? 'Completed' : 'Closed · no result';
+    },
+
+    auditIntentGraphNodeType(intent) {
+      const error = this.intentError(intent?.id);
+      if (error?.classification === 'blocked') return 'intent_blocked';
+      if (error?.classification === 'transient') return 'intent_retrying';
+      if (this.isOpenIntent(intent)) return intent?.worker ? 'audit_running' : 'audit_pending';
+      return intent?.to ? 'audit_complete' : 'audit_closed';
+    },
+
+    auditIntentGraphRole(intent) {
+      return intent?.description === '@analysis:scope-adjudication' ? 'gate' : 'worker';
+    },
+
+    auditFactGraphRole(fact) {
+      if (fact?.type === 'scope_adjudication') return 'gate';
+      if (['candidate_disposition', 'audit_summary', 'vulnerability'].includes(fact?.type)
+        || ['confirmed_finding', 'rejected_finding', 'negative_assurance', 'summary', 'vulnerability'].includes(fact?.semantic_type)) return 'decision';
+      if (['policy_evidence', 'coverage_plan', 'coverage_result', 'architecture_map', 'authz_matrix', 'state_model', 'cross_service_map', 'contract_map'].includes(fact?.type)) return 'state';
+      if (['hypothesis', 'candidate_finding'].includes(fact?.semantic_type) || ['hypothesis_batch', 'variant_batch'].includes(fact?.type)) return 'reasoning';
+      if (['origin', 'goal'].includes(fact?.id) || ['audit_target', 'audit_objective', 'scope'].includes(fact?.semantic_type)) return '';
+      return 'evidence';
+    },
+
+    auditIntentGraphLabel(intent) {
+      const role = this.auditIntentGraphRole(intent) === 'gate' ? 'SCOPE GATE' : 'AUDIT ACTION';
+      const worker = intent?.worker ? this.compactDisplayTitle(intent.worker, 'worker') : 'Worker not recorded';
+      const heartbeat = this.isOpenIntent(intent) && intent?.last_heartbeat_at
+        ? `Heartbeat · ${this.formatTime(intent.last_heartbeat_at)}`
+        : '';
+      return [
+        this.intentDisplayTitle(intent),
+        `${role} · ${this.auditIntentGraphStatus(intent)}`,
+        worker,
+        heartbeat,
+      ].filter(Boolean).join('\n');
+    },
+
+    auditIntentGraphSize(label, wide = false) {
+      const maxTextWidth = wide ? 210 : 158;
+      const minWidth = wide ? 194 : 158;
+      const measured = this.measureWrappedText(label, maxTextWidth, 10);
+      return { width: Math.max(minWidth, Math.ceil(measured.width + 24)), height: Math.max(70, Math.ceil(measured.height + 22)) };
     },
 
     auditIntentLabel(intent) {
       const description = intent?.description || '';
       if (description === '@analysis:scope-evidence') return 'Policy evidence';
       if (description === '@analysis:scope-adjudication') return 'Scope gate';
+      if (description === '@analysis:recon-snapshot') return 'Frozen source snapshot';
+      if (description === '@analysis:recon-coverage-review') return 'Coverage blind-spot review';
+      if (description === '@analysis:codeql-path-candidates') return 'CodeQL path candidates';
+      if (description.startsWith('@analysis:recon:')) {
+        const category = this.reconCategoryFromDescription(description);
+        return category ? `Recon · ${category}` : 'Recon follow-up';
+      }
       if (description === '@analysis:coverage-plan') return 'Plan';
       if (description === '@analysis:audit-summary') return 'Audit summary';
       if (description === '@analysis:semantic-summary') return 'Semantic summary';
@@ -4992,6 +5695,7 @@ function linenApp() {
       this._currentFocusSignature = '';
       this.graphKindFilter = 'all';
       this.graphStateFilter = 'all';
+      this.showClosedWork = false;
       this.nodeLegendOpen = false;
       this.viewOptionsOpen = false;
       this.headerMoreOpen = false;
@@ -5078,10 +5782,12 @@ function linenApp() {
     buildElements() {
       const nodes = [];
       const edges = [];
+      const scopeAudit = this.project.project.audit_mode === 'scope';
       for (const f of this.project.facts) {
         const nodeType = this.factNodeType(f);
         const label = this.summarizeFactLabel(f);
         const size = this.factNodeSize(label, nodeType);
+        const auditMapSize = scopeAudit ? this.factNodeSize(label, nodeType, true) : size;
         nodes.push({ data: {
           id: f.id,
           label,
@@ -5090,12 +5796,54 @@ function linenApp() {
           nodeType,
           semanticType: f.semantic_type || f.type || 'observation',
           semanticFamily: this.semanticFamily(f, 'fact'),
+          auditRole: scopeAudit ? this.auditFactGraphRole(f) : '',
           lifecycle: f.status || 'triaged',
           width: size.width,
           height: size.height,
+          auditMapWidth: auditMapSize.width,
+          auditMapHeight: auditMapSize.height,
         }});
       }
       for (const intent of this.project.intents) {
+        const currentScopeAuditIntent = scopeAudit
+          && intent.source_generation === this.project.project.source_generation
+          && intent.plan_revision === this.project.project.plan_revision;
+        if (currentScopeAuditIntent || !intent.to) {
+          const phId = `_ph_${intent.id}`;
+          const label = currentScopeAuditIntent ? this.auditIntentGraphLabel(intent) : this.openIntentNodeLabel(intent);
+          const nodeSize = currentScopeAuditIntent ? this.auditIntentGraphSize(label) : this.openIntentNodeSize(intent);
+          const auditMapSize = scopeAudit
+            ? currentScopeAuditIntent ? this.auditIntentGraphSize(label, true) : this.openIntentNodeSize(intent, true)
+            : nodeSize;
+          const nodeType = currentScopeAuditIntent ? this.auditIntentGraphNodeType(intent) : this.openIntentNodeType(intent);
+          nodes.push({ data: {
+            id: phId,
+            label,
+            displayTitle: this.intentDisplayTitle(intent),
+            description: intent.description,
+            nodeType,
+            semanticType: intent.semantic_type || 'audit_task',
+            semanticFamily: 'work',
+            auditRole: currentScopeAuditIntent ? this.auditIntentGraphRole(intent) : '',
+            lifecycle: currentScopeAuditIntent
+              ? (this.isOpenIntent(intent) ? (intent.worker ? 'running' : 'open') : 'closed')
+              : (intent.worker ? 'running' : 'open'),
+            intentId: intent.id,
+            width: nodeSize.width,
+            height: nodeSize.height,
+            auditMapWidth: auditMapSize.width,
+            auditMapHeight: auditMapSize.height,
+          }});
+          for (const src of intent.from) {
+            const relationType = this.edgeRelationForIntent(intent, src);
+            edges.push({ data: { id: `${intent.id}_${src}`, source: src, target: phId, intentId: intent.id, relationType, label: this.relationLabel(relationType), status: currentScopeAuditIntent && !this.isOpenIntent(intent) ? 'concluded' : nodeType }});
+          }
+          if (intent.to) edges.push({ data: {
+            id: `${intent.id}__output`, source: phId, target: intent.to, intentId: intent.id,
+            relationType: 'produces', label: 'produces', status: 'concluded',
+          }});
+          continue;
+        }
         if (intent.to) {
           for (const src of intent.from) {
             const relationType = this.edgeRelationForIntent(intent, src, intent.to);
@@ -5108,27 +5856,6 @@ function linenApp() {
               label: this.relationLabel(relationType),
               status: 'concluded',
             }});
-          }
-        } else {
-          const phId = `_ph_${intent.id}`;
-          const nodeSize = this.openIntentNodeSize(intent);
-          const nodeType = this.openIntentNodeType(intent);
-          nodes.push({ data: {
-            id: phId,
-            label: this.openIntentNodeLabel(intent),
-            displayTitle: this.intentDisplayTitle(intent),
-            description: intent.description,
-            nodeType,
-            semanticType: intent.semantic_type || 'audit_task',
-            semanticFamily: 'work',
-            lifecycle: intent.worker ? 'running' : 'open',
-            intentId: intent.id,
-            width: nodeSize.width,
-            height: nodeSize.height,
-          }});
-          for (const src of intent.from) {
-            const relationType = this.edgeRelationForIntent(intent, src);
-            edges.push({ data: { id: `${intent.id}_${src}`, source: src, target: phId, intentId: intent.id, relationType, label: this.relationLabel(relationType), status: nodeType }});
           }
         }
       }
@@ -5219,6 +5946,24 @@ function linenApp() {
         { selector: 'node[semanticFamily="work"][lifecycle="open"]', style: { 'border-style':'dashed' }},
         { selector: 'node[semanticFamily="work"][lifecycle="running"]', style: { 'background-color':'#fef3c7',color:'#92400e','border-color':'#f59e0b','border-style':'solid' }},
         { selector: 'node[lifecycle="false_positive"]', style: { 'background-color':'#f8fafc',color:'#64748b','border-color':'#94a3b8','border-style':'dotted' }},
+        { selector: 'node[nodeType="audit_complete"]', style: { 'background-color':'#ecfdf5',color:'#047857','border-color':'#34d399','border-style':'solid' }},
+        { selector: 'node[nodeType="audit_closed"]', style: { 'background-color':'#f8fafc',color:'#64748b','border-color':'#94a3b8','border-style':'dotted' }},
+        { selector: 'node[nodeType="audit_running"]', style: { 'background-color':'#eff6ff',color:'#1d4ed8','border-color':'#60a5fa','border-style':'solid' }},
+        { selector: 'node[nodeType="audit_pending"]', style: { 'background-color':'#f8fafc',color:'#475569','border-color':'#94a3b8','border-style':'dashed' }},
+        { selector: 'node[nodeType="intent_blocked"]', style: { 'background-color':'#fff1f2',color:'#be123c','border-color':'#f43f5e','border-style':'solid' }},
+        { selector: 'node[nodeType="intent_retrying"]', style: { 'background-color':'#fff7ed',color:'#c2410c','border-color':'#fb923c','border-style':'dashed' }},
+        { selector: 'node[auditRole="worker"]', style: { shape:'round-rectangle','background-color':'#eff6ff',color:'#1d4ed8','border-color':'#60a5fa','border-width':1.8 }},
+        { selector: 'node[auditRole="evidence"]', style: { shape:'round-rectangle','background-color':'#ecfdf5',color:'#065f46','border-color':'#5eead4','border-width':1.8 }},
+        { selector: 'node[auditRole="state"]', style: { shape:'barrel','background-color':'#eef2ff',color:'#3730a3','border-color':'#818cf8','border-width':1.8 }},
+        { selector: 'node[auditRole="gate"]', style: { shape:'diamond','background-color':'#f5f3ff',color:'#6d28d9','border-color':'#a78bfa','border-width':2.2 }},
+        { selector: 'node[auditRole="reasoning"]', style: { shape:'round-rectangle','background-color':'#fffbeb',color:'#92400e','border-color':'#fbbf24','border-width':1.8 }},
+        { selector: 'node[auditRole="decision"]', style: { shape:'hexagon','background-color':'#fff1f2',color:'#9f1239','border-color':'#fb7185','border-width':2.2 }},
+        { selector: 'node[auditRole][nodeType="audit_pending"]', style: { 'border-style':'dashed' }},
+        { selector: 'node[auditRole][nodeType="audit_complete"]', style: { 'border-style':'solid' }},
+        { selector: 'node[auditRole][nodeType="audit_closed"]', style: { 'border-style':'dotted' }},
+        { selector: 'node[auditRole][nodeType="intent_blocked"]', style: { 'border-color':'#e11d48','border-width':2.6 }},
+        { selector: 'node[auditRole][nodeType="intent_retrying"]', style: { 'border-color':'#f59e0b','border-width':2.4,'border-style':'dashed' }},
+        { selector: 'node.audit-map-node', style: { width:'data(auditMapWidth)',height:'data(auditMapHeight)','text-max-width':'210px' }},
 
         { selector: 'edge[status="concluded"]', style: { width:1.6,'line-color':'#98a2b3','target-arrow-color':'#98a2b3','target-arrow-shape':'triangle','curve-style':'bezier',label:'data(label)','font-size':'9px',color:'#667085','text-rotation':'autorotate','text-margin-y':-10,'text-max-width':'140px','text-wrap':'ellipsis','text-background-color':'#ffffff','text-background-opacity':0.94,'text-background-padding':'3px','text-events':'yes','arrow-scale':0.8 }},
         { selector: 'edge[status="in_progress"]', style: { width:2,'line-color':'#fbbf24','line-style':'dashed','line-dash-pattern':[8,4],'line-dash-offset':0,'target-arrow-color':'#fbbf24','target-arrow-shape':'triangle','curve-style':'bezier',label:'data(label)','font-size':'7px',color:'#b45309','text-rotation':'autorotate','text-margin-y':-9,'text-max-width':'80px','text-wrap':'ellipsis','text-background-color':'#fffbeb','text-background-opacity':0.85,'text-background-padding':'2px','text-events':'yes','arrow-scale':0.9 }},
@@ -5230,12 +5975,14 @@ function linenApp() {
         { selector: 'edge', style: { label:'data(label)','font-size':'9px','font-weight':'600',color:'#475569','text-rotation':'none','text-margin-y':-9,'text-max-width':'92px','text-wrap':'wrap','text-background-color':'#ffffff','text-background-opacity':0.94,'text-background-padding':'3px','text-events':'yes' }},
         { selector: 'edge:not(.current-edge):not(.focus)', style: { label:'' }},
         { selector: 'edge.current-edge, edge.focus', style: { label:'data(label)' }},
+        { selector: 'edge.audit-map-edge', style: { 'curve-style':'taxi','taxi-direction':'vertical','taxi-turn':'50%','taxi-radius':0,'taxi-turn-min-distance':24,'text-rotation':'none','font-size':'8px','text-margin-y':0 }},
 
         { selector: '.highlight', style: { 'z-index':999 }},
         { selector: 'edge.highlight', style: { 'z-index':999 }},
         { selector: 'node.focus', style: { 'border-width':3,'border-color':'#312e81','border-opacity':0.95,'z-index':1000 }},
         { selector: 'node.current-primary', style: { 'underlay-color':'#a5b4fc','underlay-padding':6,'underlay-opacity':0.3,'z-index':850 }},
-        { selector: 'node.current-focus', style: { 'background-color':'#4f46e5','color':'#ffffff','border-width':3,'border-color':'#312e81','border-style':'solid','z-index':900 }},
+        { selector: 'node.current-focus', style: { 'border-width':3,'border-color':'#312e81','border-style':'solid','z-index':900 }},
+        { selector: 'node.current-focus[auditRole=""]', style: { 'background-color':'#4f46e5','color':'#ffffff' }},
         { selector: 'node.current-context', style: { 'border-color':'#cbd5e1','border-width':1.2,'opacity':0.78,'z-index':700 }},
         { selector: 'edge.focus', style: { 'z-index':1000,'overlay-color':'#93c5fd','overlay-opacity':0.22,'overlay-padding':5 }},
         { selector: 'node.selected-fact', style: { 'border-width':0,'underlay-color':'#93c5fd','underlay-padding':8,'underlay-opacity':0.28,'z-index':1001 }},
@@ -5246,6 +5993,33 @@ function linenApp() {
     },
 
     layoutOpts(animate = true) {
+      if (this.graphView === 'current' && this.project?.project?.audit_mode === 'scope') {
+        const compact = window.innerWidth <= 820;
+        return {
+          name: 'klay',
+          fit: true,
+          padding: compact ? 56 : 68,
+          animate,
+          animationDuration: 400,
+          animationEasing: 'ease-in-out-cubic',
+          nodeDimensionsIncludeLabels: true,
+          klay: {
+            direction: 'DOWN',
+            edgeRouting: 'ORTHOGONAL',
+            crossingMinimization: 'LAYER_SWEEP',
+            cycleBreaking: 'GREEDY',
+            nodeLayering: 'NETWORK_SIMPLEX',
+            nodePlacement: 'BRANDES_KOEPF',
+            separateConnectedComponents: true,
+            feedbackEdges: true,
+            spacing: compact ? 52 : 64,
+            inLayerSpacingFactor: compact ? 1.4 : 1.6,
+            edgeSpacingFactor: 0.8,
+            thoroughness: 12,
+            randomizationSeed: 1,
+          },
+        };
+      }
       const direction = this.layoutDirection();
       if (this.layoutEngine() === 'elk') {
         const elkDirection = direction === 'TB' ? 'DOWN' : 'RIGHT';
@@ -5540,10 +6314,10 @@ function linenApp() {
       return `${title}\n${semantic} · ${this.semanticTypeLabel(status)}`;
     },
 
-    factNodeSize(label, nodeType) {
+    factNodeSize(label, nodeType, wide = false) {
       const preset = !['origin', 'goal'].includes(nodeType)
-        ? { fontSize: 10, maxTextWidth: 158, minWidth: 142, minHeight: 54, paddingX: 13, paddingY: 11 }
-        : { fontSize: 10, maxTextWidth: 158, minWidth: 142, minHeight: 54, paddingX: 13, paddingY: 11 };
+        ? { fontSize: 10, maxTextWidth: wide ? 210 : 158, minWidth: wide ? 194 : 142, minHeight: 54, paddingX: 13, paddingY: 11 }
+        : { fontSize: 10, maxTextWidth: wide ? 210 : 158, minWidth: wide ? 194 : 142, minHeight: 54, paddingX: 13, paddingY: 11 };
 
       const measured = this.measureWrappedText(label, preset.maxTextWidth, preset.fontSize);
       return {
@@ -5710,7 +6484,7 @@ function linenApp() {
       const nt = node.data('nodeType');
       const keepLogFocus = this.sideTab === 'log';
 
-      if (['in_progress', 'unclaimed', 'audit_pending', 'audit_running'].includes(nt)) {
+      if (node.data('intentId')) {
         this.selectIntent(node.data('intentId'));
         if (keepLogFocus) this.scrollTimelineToSelection();
         else this.sideTab = 'detail';
@@ -5895,6 +6669,11 @@ function linenApp() {
     vulnerabilityTrace(fact) {
       const trace = this.findingEvidenceFact(fact)?.proof?.attributes?.trace;
       return Array.isArray(trace) ? trace : [];
+    },
+
+    findingSecurityChecks(fact) {
+      const checks = this.findingEvidenceFact(fact)?.proof?.attributes?.security_checks;
+      return checks && typeof checks === 'object' && !Array.isArray(checks) ? checks : null;
     },
 
     vulnerabilityEndpoint(fact) {

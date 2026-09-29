@@ -39,22 +39,32 @@ class CodexDriver(RegexSessionDriver):
         return f"POST {worker.env['CODEX_BASE_URL']}/responses (model={worker.env['CODEX_MODEL']})"
 
     def build_execute(self, worker: WorkerConfig, prompt: str, session: str | None) -> DriverResult:
+        prefix = ["codex"]
+        if worker.sandbox_mode:
+            # Approval policy is a root option and must precede `exec`.
+            prefix.extend(["--ask-for-approval", "never"])
+            # Audit calls are read-only and should leave enough CLI capacity
+            # for repository-wide reconnaissance; `high` reasoning made
+            # scheduler Reason calls routinely consume their full timeout.
+            sandbox_args = [
+                "--sandbox", worker.sandbox_mode,
+                "--skip-git-repo-check",
+                "-c", 'model_reasoning_effort="medium"',
+            ]
+        else:
+            sandbox_args = ["--dangerously-bypass-approvals-and-sandbox"]
         if self.local:
+            model = worker.env.get("CODEX_MODEL")
+            model_args = ["--model", model] if model else []
             return DriverResult(
-                argv=[
-                    "codex",
-                    "exec",
-                    "--dangerously-bypass-approvals-and-sandbox",
-                    "--",
-                    prompt,
-                ]
+                argv=[*prefix, "exec", *sandbox_args, *model_args, "--", prompt]
             )
         env = worker.env
         return DriverResult(
             argv=[
-                "codex",
+                *prefix,
                 "exec",
-                "--dangerously-bypass-approvals-and-sandbox",
+                *sandbox_args,
                 "--model",
                 env["CODEX_MODEL"],
                 "-c",
@@ -75,23 +85,38 @@ class CodexDriver(RegexSessionDriver):
         )
 
     def build_conclude(self, worker: WorkerConfig, prompt: str, session: str) -> list[str]:
+        prefix = ["codex"]
+        if worker.sandbox_mode:
+            prefix.extend(["--ask-for-approval", "never"])
+            # `exec resume` has no --sandbox option; carry the sandbox policy
+            # through the same Codex config override used by the resumed CLI.
+            sandbox_args = [
+                "--skip-git-repo-check",
+                "-c", f'sandbox_mode="{worker.sandbox_mode}"',
+                "-c", 'model_reasoning_effort="medium"',
+            ]
+        else:
+            sandbox_args = ["--dangerously-bypass-approvals-and-sandbox"]
         if self.local:
+            model = worker.env.get("CODEX_MODEL")
+            model_args = ["--model", model] if model else []
             return [
-                "codex",
+                *prefix,
                 "exec",
                 "resume",
                 session,
-                "--dangerously-bypass-approvals-and-sandbox",
+                *sandbox_args,
+                *model_args,
                 "--",
                 prompt,
             ]
         env = worker.env
         return [
-            "codex",
+            *prefix,
             "exec",
             "resume",
             session,
-            "--dangerously-bypass-approvals-and-sandbox",
+            *sandbox_args,
             "--model",
             env["CODEX_MODEL"],
             "-c",
@@ -101,7 +126,7 @@ class CodexDriver(RegexSessionDriver):
             "-c",
             'model_providers.linen.wire_api="responses"',
             "-c",
-            'model_reasoning_effort="high"',
+            'model_reasoning_effort="medium"' if worker.sandbox_mode else 'model_reasoning_effort="high"',
             "-c",
             f'model_providers.linen.base_url="{env["CODEX_BASE_URL"]}"',
             "-c",

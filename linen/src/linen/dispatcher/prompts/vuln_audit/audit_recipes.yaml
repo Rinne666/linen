@@ -26,6 +26,17 @@ common:
     sanitizer, tenant predicate, transaction, or validation is a hypothesis
     until a dedicated verification task traces the complete reachable path.
 
+    Reading a file or citing a guard is not a security review. Test each
+    material protection against the attacker's concrete input class and path:
+    state the predicate, representative accepted/rejected forms, transformed
+    value or state, and whether the sensitive operation remains reachable. A
+    protection only disproves a path when source evidence shows its effective
+    condition blocks that attacker-controlled case before the operation.
+    When a feature is disabled by default, inspect a normal supported enabled
+    configuration and trace that branch; disabled-by-default is a precondition,
+    not a safety proof. Distinguish ordinary documented deployments from an
+    attacker or administrator deliberately setting an insecure option.
+
   output_contract: |-
     Return exactly one raw JSON object and no prose or markdown:
     {
@@ -75,9 +86,22 @@ recipes:
       classes the evidence explicitly excludes, accepts, or conditions. Every
       exclusion must retain the exact supporting quote and a concrete revival
       condition describing what new technical or deployment evidence would put
-      the class back in scope.
+      the class back in scope. Copy citation quotes byte-for-byte from the
+      supplied source, preserving Markdown link syntax, backticks, and
+      punctuation; do not paraphrase or render the text. Every citation must be
+      referenced by a trust boundary, pre-exclusion, or conflict. Omit unrelated
+      policy statements instead of producing unused citations.
 
-      Preserve disagreements between sources as conflicts. An unavailable URL,
+      Evaluate every collected policy document separately. Provide one
+      source_assessments entry per collected source ID, state whether it adds
+      policy relevant to this scope, and cite only lines from that same source.
+      If a collected document cannot be assessed, mark it not_reviewed, set
+      coverage to partial, and record the reason as a gap; never imply that the
+      full document set was evaluated from SECURITY.md alone.
+
+      Preserve disagreements between sources as conflicts. Each conflict must
+      cite at least two distinct citation IDs from the top-level citations list;
+      never repeat a citation ID within one item's citations array. An unavailable URL,
       missing advisory record, absent policy file, or ambiguous statement is a
       coverage gap, never evidence that no policy or exclusion exists. If no
       authoritative exclusion is established, default to inclusion or unknown;
@@ -339,7 +363,7 @@ recipes:
       explains exactly which root-cause features match.
 
   hypothesis_verify:
-    version: 1
+    version: 2
     label: Semantic hypothesis verification
     phase: hypothesis_verification
     intent_type: verify
@@ -358,6 +382,30 @@ recipes:
       three causal challenges: whether bypassing the protection still reaches
       the operation, whether the protection is dormant or configuration-only,
       and whether an upstream proxy/middleware assumption has a bypass path.
+      A guard's presence is not its effect. Exercise its actual predicate against
+      representative attacker-controlled values and encodings; record which
+      values pass, the resulting value/state, and whether the sink still runs.
+      Refute only if the cited branch blocks the concrete attack case before the
+      security-sensitive operation. If behavior depends on configuration, inspect
+      defaults and the ordinary supported enabled mode; a default-off feature
+      remains in scope when enabled in a documented, non-attacker-controlled
+      deployment. If runtime/deployment evidence is unavailable, retain that
+      uncertainty with outcome=blocked instead of treating configuration as proof.
+      Add at least one protection_checks entry for every result. If the path has
+      no relevant guard, explicitly use result=none_found and predicate_result=
+      not_applicable, with source citations showing the reviewed path. Link each
+      check to an attacker_cases case_id so the tested predicate and sink outcome
+      refer to the same representative input. A confirmed or refuted result must
+      have no unknown attacker-control, sink-reachability, protection, or
+      configuration outcomes. For a configured feature, ordinary_enabled_mode
+      must be analyzed even when the default is disabled or conditional. Mark
+      whether exploitation requires deliberate administrator misconfiguration;
+      a normal documented enabled mode is not itself misconfiguration. If the
+      needed deployment/configuration facts cannot be established from source,
+      preserve them as blocked rather than assuming the safe setting.
+      If exploitation requires deliberate administrator misconfiguration, do
+      not call it a confirmed vulnerability; use refuted for that threat-model
+      claim and describe the residual hardening/design concern in the rationale.
       Do not switch to another candidate.
 
       Return exactly one raw JSON object and no prose or markdown:
@@ -377,6 +425,33 @@ recipes:
              "kind": "source", "observation": "attacker controls id",
              "citation_id": "c1"}
           ],
+          "security_checks": {
+            "attacker_cases": [
+              {"case_id": "case1", "input_class": "path parameter",
+               "representative_value": "../private/config.yml",
+               "attacker_control": "yes | no | unknown",
+               "sink_reachable": "yes | no | unknown",
+               "security_effect": "concrete confidentiality, integrity, availability, or none",
+               "citation_ids": ["c1"]}
+            ],
+            "protection_checks": [
+              {"protection": "canonical path containment check",
+               "predicate": "resolvedPath starts with canonicalRoot",
+               "attacker_case_id": "case1",
+               "predicate_result": "accepts | rejects | transforms | not_applicable | unknown",
+               "resulting_value": "resolved path or explicit unknown",
+               "result": "blocks | bypassable | not_on_path | none_found | unknown",
+               "sink_reachable": "yes | no | unknown",
+               "citation_ids": ["c1"]}
+            ],
+            "configuration_analysis": {
+              "default_mode": "enabled | disabled | conditional | unknown | not_applicable",
+              "ordinary_enabled_mode": "analyzed | not_applicable | unknown",
+              "requires_admin_misconfiguration": "yes | no | unknown | not_applicable",
+              "summary": "default, normal supported enabled mode, and whether unsafe behavior needs admin misconfiguration",
+              "citation_ids": ["c1"]
+            }
+          },
           "provenance": {"source_type": "llm", "source_ref": "optional reference"},
           "root_cause": "Optional broken invariant in concise prose",
           "variants_checked": ["Optional sibling endpoint or symbol labels"],

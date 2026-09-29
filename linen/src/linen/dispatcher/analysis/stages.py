@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from linen.dispatcher.analysis.artifacts import load_artifact
-from linen.dispatcher.analysis import codeql, recon, scope_gate
+from linen.dispatcher.analysis import codeql, coverage, recon, scope_gate
 from linen.dispatcher.config import AuditConfig
 from linen.server.models import AuditStage, Fact, Intent, ProjectDetail
 
@@ -52,6 +52,10 @@ def stage_definitions(config: AuditConfig, audit_mode: str) -> list[StageDefinit
             )
             for index, category in enumerate(config.recon.categories)
         )
+        result.append(StageDefinition(
+            "recon-coverage-review", "Independent Recon coverage review", 100,
+            "recon.coverage-review", True,
+        ))
     if audit_mode == "scope":
         result.append(StageDefinition("audit-summary", "Audit summary", 110, "audit.summary", True))
     return result
@@ -119,19 +123,42 @@ def _definition_status(
         "scope-adjudication": scope_gate.ADJUDICATION_INTENT,
         "audit-summary": "@analysis:audit-summary",
         "recon-snapshot": recon.SNAPSHOT_INTENT,
+        "recon-coverage-review": recon.COVERAGE_REVIEW_INTENT,
         "codeql-candidates": codeql.INTENT,
     }.get(definition.stage_id, None)
-    if definition.stage_id.startswith("recon-") and definition.stage_id != "recon-snapshot":
+    if definition.stage_id.startswith("recon-") and definition.stage_id not in {
+        "recon-snapshot", "recon-coverage-review",
+    }:
         description = recon.category_description(definition.stage_id.removeprefix("recon-"))
     if description is None:
         description = f"@analysis:{definition.stage_id}"
     intent = _intent(project, description)
     fact = _fact(project, intent)
     status, _unused_run_id, detail = _result_status(intent, fact, workdir)
-    if definition.stage_id.startswith("recon-") and definition.stage_id != "recon-snapshot":
+    if definition.stage_id == "recon-coverage-review" and fact is not None:
+        try:
+            record = recon.coverage_review_record(fact, workdir)
+            status = "satisfied"
+            detail = (
+                f"Independent review recorded {len(record.get('items', []))} omission(s); "
+                "actionable items route through Recon and unresolved items remain residual gaps."
+            )
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            status, detail = "failed", f"Invalid coverage review artifact: {exc}"
+    if (
+        definition.stage_id == "scope-adjudication"
+        and fact is not None
+        and not coverage.reviewed(project, fact.id)
+    ):
+        status = "blocked"
+        detail = "Scope adjudication requires a valid, firm independent review."
+    if definition.stage_id.startswith("recon-") and definition.stage_id not in {
+        "recon-snapshot", "recon-coverage-review",
+    }:
+        category = definition.stage_id.removeprefix("recon-")
         matches = [
             item for item in project.intents
-            if recon.category_from_description(item.description) == definition.stage_id.removeprefix("recon-")
+            if recon.category_from_description(item.description) == category
             and item.source_generation == project.project.source_generation
             and item.plan_revision == project.project.plan_revision
         ]
@@ -147,8 +174,29 @@ def _definition_status(
         else:
             try:
                 record = recon.result_record(fact, workdir)
-                status = "satisfied" if record.get("status") == "complete" else "blocked"
-                detail = record.get("summary") or "Recon coverage is partial."
+                if record.get("status") == "complete":
+                    status = "satisfied"
+                    detail = record.get("summary")
+                elif (
+                    record.get("status") == "partial"
+                    and len(matches) >= config.recon.max_runs_per_category
+                ):
+                    # The configured recon contract explicitly permits a
+                    # bounded category search to end with documented gaps.
+                    # Mark the work obligation satisfied while preserving
+                    # those gaps for the final report; this is not a claim of
+                    # complete source coverage or repository safety.
+                    status = "satisfied"
+                    gaps = record.get("gaps", [])
+                    gap_text = "; ".join(str(gap) for gap in gaps[:4])
+                    detail = (
+                        "Configured recon run limit reached with partial coverage. "
+                        "Residual gaps must remain explicit in the audit summary."
+                        + (f" Gaps: {gap_text}" if gap_text else "")
+                    )
+                else:
+                    status = "blocked"
+                    detail = record.get("summary") or "Recon coverage is partial."
             except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
                 status, detail = "failed", f"Invalid recon artifact: {exc}"
     if definition.stage_id == "codeql-candidates" and definition.enabled:

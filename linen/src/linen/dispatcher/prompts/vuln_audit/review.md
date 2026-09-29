@@ -35,6 +35,15 @@ Search ALL 5 layers for protections that could block the claimed attack. Do NOT 
 
 If a protection exists but might be disabled by configuration, **check the actual configuration** (`*.toml`, `*.yaml`, env vars, feature flags) — do not assume defaults.
 
+For each protection, state the concrete attacker input or identity tested, the
+predicate/policy outcome, the value or state after the check, and whether the
+claimed sensitive operation remains reachable. A cited guard is not evidence
+that it blocks the path until its effect is traced. If a feature defaults off,
+also inspect a normal supported enabled configuration and analyze that branch;
+default-off is a precondition, not a safety proof. If the necessary deployment
+fact cannot be determined from frozen source, retain it as uncertainty instead
+of treating the control as effective.
+
 # 8 Claude False-Positive Patterns (Mandatory Check)
 
 For EVERY hypothesis, explicitly check against these 8 known Claude FP patterns. Mark each as `not applicable`, `MATCH: <evidence>`, or `partial: <evidence>`.

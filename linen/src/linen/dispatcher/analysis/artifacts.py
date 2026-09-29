@@ -289,6 +289,7 @@ def vulnerability_trace_proof(
     trace: list[dict[str, Any]], endpoint_id: str | None, outcome: str, snapshot_id: str,
     *, provenance: Any = None, root_cause: str | None = None,
     variants_checked: list[str] | None = None,
+    security_checks: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if provenance is None:
         provenance = {"source_type": "llm"}
@@ -324,6 +325,7 @@ def vulnerability_trace_proof(
             "candidate_outcome": outcome,
             "snapshot_id": snapshot_id,
             "provenance": normalized_provenance,
+            **({"security_checks": security_checks} if security_checks is not None else {}),
             **({"root_cause": root_cause.strip()} if isinstance(root_cause, str) and root_cause.strip() else {}),
             **({"variants_checked": [value.strip() for value in variants_checked if value.strip()]}
                if isinstance(variants_checked, list) else {}),

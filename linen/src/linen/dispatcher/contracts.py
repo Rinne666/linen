@@ -112,6 +112,12 @@ def validate_reason_payload(
         data = payload
     if not isinstance(data, dict):
         raise ValueError("accepted must be true or false")
+    if not data:
+        # The Reason prompt explicitly permits a no-op when no useful
+        # investigation or completion action remains. Requiring an Intent
+        # whenever the queue is empty turns that valid decision into a false
+        # task failure and can restart the same blocked audit indefinitely.
+        return "noop", None
     complete = data.get("complete")
     intents = data.get("intents")
     resolve = data.get("resolve")
