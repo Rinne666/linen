@@ -476,3 +476,28 @@ recipes:
       but its rationale must name the missing hop. refuted and blocked require
       type=candidate_disposition. Include at least one exact frozen-source
       citation for every outcome and bind every trace step to one citation_id.
+
+      Optional deterministic pre-screen metadata: only when outcome=confirmed
+      and the traced sink context is clearly one of the supported pairs, you may
+      include all three fields `vulnerability_class`, `sink_context`, and
+      `path_conditions`. Supported pairs are `xss` or `cross_site_scripting`
+      with `html_text`, and `command_injection` or `os_command_injection` with
+      `posix_shell_argument`. Each path condition must be an exact object with
+      `file`, `line`, `expression`, and Boolean `branch_taken`; its line must
+      already have an exact citation and a trace step, and `expression` must
+      occur verbatim on that frozen source line. Include only the specific
+      branch predicates the traced path follows. If the class/context is
+      unsupported, any condition is uncertain or cannot be bound to both trace
+      and citation, or the path is not represented clearly, omit all three
+      fields. Unsupported predicate forms may remain source-bound; the
+      deterministic evaluator will return UNKNOWN and normal review continues.
+      When a Python trace includes a simple sanitizer assignment, add optional
+      `data_symbol` to the relevant trace steps only when the local value is
+      explicit in source. Use the input variable on the immediately preceding
+      trace step and sanitizer step, and the sanitizer output variable on the
+      sink step. The evaluator checks the sanitizer assignment and that its
+      output is an argument to the cited sink line; it does not resolve aliases.
+      Omit `data_symbol` whenever that direct flow is unclear so the screen
+      returns UNKNOWN.
+      The dispatcher evaluates this metadata before proposing a cold
+      vulnerability-proof review. Do not state a pre-screen verdict yourself.

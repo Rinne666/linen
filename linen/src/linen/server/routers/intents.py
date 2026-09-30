@@ -44,6 +44,7 @@ from linen.server.services import (
     validate_goal_not_in_sources,
 )
 from linen.server.uvpg import (
+    DYNAMIC_PROOF_GAPS,
     GAP_CONTRACTS,
     candidate_proof_facts,
     canonical_proof_edges,
@@ -415,9 +416,11 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
         now = utcnow()
         fid = next_fact_id(conn, project_id)
         obligation = parse_proof_obligation(intent_row["description"])
+        dynamic_proof = False
+        proof_payload = body.proof
         if obligation is not None:
             candidate_id, gap_code, generation, target_fact_id = obligation
-            if gap_code == "UNREVIEWED_EVIDENCE":
+            if gap_code in {"UNREVIEWED_EVIDENCE", "UNREVIEWED_DYNAMIC_EVIDENCE"}:
                 raise HTTPException(409, {"code": "REVIEW_OBLIGATION_REQUIRES_REVIEW_ENDPOINT"})
             contract = GAP_CONTRACTS.get(gap_code)
             source_ids = {row["fact_id"] for row in conn.execute(
@@ -436,6 +439,55 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
                 after = candidate_proof_facts(conn, project_id, candidate_id, "capability_after")
                 if len(before) != 1 or len(after) != 1:
                     raise HTTPException(409, {"code": "CAPABILITY_DELTA_REQUIRES_LOCAL_BEFORE_AFTER"})
+            if gap_code in DYNAMIC_PROOF_GAPS:
+                assert proof_payload is not None
+                run = conn.execute(
+                    "SELECT r.*, i.type AS intent_type FROM runs r LEFT JOIN intents i "
+                    "ON i.project_id = r.project_id AND i.id = r.intent_id "
+                    "WHERE r.project_id = ? AND r.intent_id = ? "
+                    "ORDER BY r.started_at DESC, r.run_id DESC LIMIT 1",
+                    (project_id, intent_id),
+                ).fetchone()
+                if (
+                    run is None
+                    or run["source_generation"] != project["source_generation"]
+                    or run["status"] not in {"completed", "succeeded"}
+                    or not (run["intent_type"] or "").startswith("poc:isolated")
+                ):
+                    raise HTTPException(409, {"code": "DYNAMIC_PROOF_REQUIRES_SUCCESSFUL_ISOLATED_RUN"})
+                try:
+                    artifact_ids = json.loads(run["artifact_ids"] or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    artifact_ids = []
+                if not isinstance(artifact_ids, list) or not artifact_ids:
+                    raise HTTPException(409, {"code": "DYNAMIC_PROOF_REQUIRES_RUN_ARTIFACTS"})
+                attributes = dict(proof_payload.attributes)
+                observed_outcome = attributes.get("observed_outcome")
+                capability_observed = attributes.get("capability_observed")
+                if capability_observed is None and isinstance(observed_outcome, dict):
+                    capability_observed = observed_outcome.get(
+                        "capability_observed", observed_outcome.get("capability"),
+                    )
+                if (
+                    not isinstance(attributes.get("oracle_kind"), str)
+                    or not attributes["oracle_kind"].strip()
+                    or observed_outcome is None
+                    or capability_observed is None
+                ):
+                    raise HTTPException(422, {"code": "DYNAMIC_PROOF_REQUIRES_ORACLE_AND_CAPABILITY_OBSERVATION"})
+                attributes.update({
+                    "mode": "dynamic",
+                    "candidate_id": candidate_id,
+                    "run_id": run["run_id"],
+                    "artifact_ids": artifact_ids,
+                    "capability_observed": capability_observed,
+                })
+                proof_payload = proof_payload.model_copy(update={
+                    "subject_ids": [candidate_id],
+                    "artifact_ids": artifact_ids,
+                    "attributes": attributes,
+                })
+                dynamic_proof = True
         semantic_type = body.semantic_type or fact_semantic_type(fid, body.type, body.status)
         if semantic_type == "confirmed_finding" or body.type == "confirmed_finding":
             raise HTTPException(
@@ -445,7 +497,7 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
         display_title = body.display_title or fact_display_title(
             fid, body.type, body.description, status=body.status,
         )
-        proof_errors = validate_proof_payload(conn, project_id, body.proof)
+        proof_errors = validate_proof_payload(conn, project_id, proof_payload)
         if proof_errors:
             raise HTTPException(422, {"code": "INVALID_PROVENANCE", "details": proof_errors})
 
@@ -460,8 +512,8 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
                 body.type,
                 semantic_type,
                 body.evidence,
-                json.dumps(body.proof.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
-                if body.proof is not None else None,
+                json.dumps(proof_payload.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+                if proof_payload is not None else None,
                 project["source_generation"],
                 body.status,
             ),
@@ -483,7 +535,7 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
             (project_id, intent_id),
         ).fetchall()
         relation_type = intent_row["relation_type"] if "relation_type" in intent_row.keys() else "produces"
-        if obligation is not None:
+        if obligation is not None and not dynamic_proof:
             canonical_proof_edges(
                 conn, project_id, obligation[0], fid, obligation[1],
                 created_by="server.proof-contract", created_at=now,

@@ -37,6 +37,36 @@ may select a profile when it has a concrete unresolved question; each profile ha
 count. The query task is deterministic, isolated, and does not require the Pi
 or Codex CLI process itself to hold database or Docker access. The resulting
 paths return to Reason as Recon evidence.
+
+Reason may also propose a semantic recipe from current `architecture_map` or
+`contract_map` Facts and the active Recon snapshot. The dispatcher accepts only
+a bounded data contract, stores it as a hash-addressed artifact tied to those
+Facts and the current snapshot manifest, then creates an Intent referencing
+that artifact. Execution stays dispatcher-controlled: `frozen_grep.literal`
+uses a fixed standard-library runner in the configured review sandbox with a
+read-only frozen-source mount and `network=none`; `codeql.profile` selects only
+an operator-configured CodeQL profile. Recipe data cannot supply code, shell
+commands, regular expressions, query text, or query paths. Results are stored
+as `dynamic_recipe_result` Facts with canonical source citations and recipe,
+snapshot, and sandbox provenance. Tree-sitter is not currently available.
+
+This capability requires semantic recipes plus at least one configured safe
+executor. Literal search is advertised only with an enabled offline review
+sandbox and an empty environment allowlist. CodeQL recipes require the active
+CodeQL stage and a configured profile. The semantic-map flow uses the Recon
+snapshot, so it can run alongside CodeQL without creating a second source
+snapshot.
+
+Semantic vulnerability verification also has a conservative deterministic
+pre-screen after the worker trace is canonicalized and before the candidate is
+sent for proof review. It checks only supported XSS-to-HTML-text and
+command-injection-to-POSIX-shell paths, and returns PASS, FAIL, or UNKNOWN.
+Unsupported or unbound metadata fails open as UNKNOWN; only a proven
+unsatisfiable path or a clearly recognized sanitizer produces a terminal
+candidate disposition. Its receipt cites and hashes the frozen source. Since
+the screen consumes the completed semantic-verification trace, it avoids
+downstream proof review cost rather than the verification worker call itself.
+
 Other query engines can follow the same contract: read the same frozen
 snapshot, run a preconfigured query in isolation, and return bounded paths with
 canonical citations and `source_type`/`source_ref` provenance. Joern is not yet

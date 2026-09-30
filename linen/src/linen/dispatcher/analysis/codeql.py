@@ -34,6 +34,7 @@ from linen.server.models import Fact, Intent, ProjectDetail
 
 INTENT = "@analysis:codeql-path-candidates"
 QUERY_PREFIX = "@analysis:codeql-query:"
+ALIAS_RESOLUTION_PROFILE = "alias-resolution"
 _BEGIN = "===LINEN_CODEQL_BEGIN:{}==="
 _END = "===LINEN_CODEQL_END:{}==="
 _SYMBOL = re.compile(r"[^\s\x00-\x1f]{1,300}")
@@ -682,8 +683,15 @@ def reason_instructions(project: ProjectDetail, workdir: Path, config: CodeQLCon
                 or attempts >= config.max_query_attempts_per_profile
             ):
                 continue
+            purpose = ""
+            if category == ALIAS_RESOLUTION_PROFILE and "cpp" in config.query_profiles[category]:
+                purpose = (
+                    " Use it for C/C++ paths whose target depends on function pointers, "
+                    "virtual dispatch, or other indirect calls; inspect the emitted path "
+                    "steps and source citations as alias-resolution evidence."
+                )
             profile_lines.append(
-                f"- {category}: if useful, submit an Intent with `action: search`, "
+                f"- {category}:{purpose} If useful, submit an Intent with `action: search`, "
                 f"`type: search`, description `{QUERY_PREFIX}{category}`, and `from` "
                 f"containing both snapshot Fact and initial CodeQL Fact {fact.id}; set "
                 f"`target` to `codeql-query:{category}:attempt:{attempts + 1}`. "
@@ -708,7 +716,10 @@ def reason_instructions(project: ProjectDetail, workdir: Path, config: CodeQLCon
             f"{profile_text}\n"
             "Never write shell commands or arbitrary query paths into an Intent. Profile names "
             "are the only query selector; dispatcher validates and executes their configured "
-            "query suites. Each profile can be requested at most once per plan.\n"
+            "query suites. Each profile can be requested at most once per plan. For C/C++, "
+            "an optional `alias-resolution` profile can use an audited, image-baked CodeQL "
+            "data-flow query to resolve indirect-call paths. It still reports source-code "
+            "paths only; binary firmware analysis is not supported by this profile.\n"
             "CodeQL gaps and limits:\n"
             f"{gap_text}\n"
             "A completed scan or zero returned paths is not proof that the project is safe.\n"

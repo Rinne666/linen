@@ -89,7 +89,7 @@ def _reason_frontier_seed_ids(
     relevant_event_types = {
         "audit_task_concluded", "audit_task_failed", "audit_task_abandoned",
         "audit_task_retry_requested", "review_created", "technical_confirmation",
-        "dynamic_verification_pass",
+        "dynamic_verification_pass", "proof_strategy_replan_required",
     }
     for event in reversed(trigger_events or []):
         if event.event_type not in relevant_event_types:
@@ -555,6 +555,13 @@ def run_reason_task(
                             "Create an ordinary Intent with a canonical type and description when useful:\n"
                             + "\n".join(method_lines)
                         )
+                    prompt += "\n\n" + audit_recipes.dynamic_recipe_reason_instructions(
+                        project,
+                        config.audit,
+                    )
+                    prompt += audit_recipes.dynamic_recipe_reason_context(
+                        project, Path(container_name),
+                    )
                 if not config.audit.poc_sandbox.enabled:
                     prompt += (
                         "\nThe isolated PoC sandbox is disabled. Do not propose "
@@ -562,6 +569,20 @@ def run_reason_task(
                     )
             else:
                 prompt += "\n" + AUDIT_REASON_INSTRUCTIONS
+            strategy_replans = [
+                event for event in trigger_events or []
+                if event.event_type == "proof_strategy_replan_required"
+            ]
+            if strategy_replans:
+                latest = strategy_replans[-1]
+                prompt += (
+                    "\n\nMandatory UVPG strategy replan. The prior proof route exceeded its "
+                    "retry budget. Reconstruct the attack path from the source graph, choose a "
+                    "different entry point or trust-boundary assumption, explain why the prior "
+                    "route failed, and do not recreate the failed recipe or path. Treat this as "
+                    f"candidate {latest.payload.get('candidate_id')} / gap "
+                    f"{latest.payload.get('gap_code')}."
+                )
         worker_manifest, run_envelope = _reason_contracts(
             project,
             worker,
@@ -849,6 +870,29 @@ def run_reason_task(
                             codeql_method = True
                         except (ValueError, TypeError):
                             codeql_method = False
+                    if (
+                        scope_audit
+                        and config.audit.semantic.enabled
+                        and audit_recipes.is_dynamic_recipe_proposal(
+                            intent_data.get("description", "")
+                            if isinstance(intent_data.get("description"), str) else ""
+                        )
+                    ):
+                        try:
+                            audit_recipes.store_dynamic_recipe_proposal(
+                                fresh,
+                                intent_data,
+                                Path(container_name),
+                                config.audit,
+                                run_id=run_envelope.run_id,
+                                producer=worker.name,
+                            )
+                            semantic_method = True
+                        except (ValueError, OSError, TypeError) as exc:
+                            LOG.info(
+                                "dynamic semantic recipe proposal rejected project=%s worker=%s reason=%s",
+                                project.project.id, worker.name, str(exc)[:500],
+                            )
                     if (
                         scope_audit
                         and config.audit.semantic.enabled

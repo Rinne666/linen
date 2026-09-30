@@ -689,9 +689,18 @@ class DispatcherLoop:
                 if fact.source_generation != project.project.source_generation or fact.semantic_type != "candidate_finding":
                     continue
                 response = self.client.plan_proof_gap(project.project.id, fact.id)
-                if response.ok and isinstance(response.data, dict) and response.data.get("created"):
-                    LOG.info("materialized proof-gap intent project=%s candidate=%s intent=%s", project.project.id, fact.id, response.data.get("intent_id"))
-                    return True
+                if response.ok and isinstance(response.data, dict):
+                    if response.data.get("candidate_refuted"):
+                        LOG.info(
+                            "recorded unreachable negative control project=%s candidate=%s fact=%s reused=%s",
+                            project.project.id, fact.id,
+                            response.data.get("negative_control_fact_id"),
+                            response.data.get("reused"),
+                        )
+                        return True
+                    if response.data.get("created_intent"):
+                        LOG.info("materialized proof-gap intent project=%s candidate=%s intent=%s", project.project.id, fact.id, response.data.get("intent_id"))
+                        return True
                 if response.status_code not in {200, 403, 409}:
                     LOG.warning("proof-gap planning failed project=%s candidate=%s status=%s body=%s", project.project.id, fact.id, response.status_code, response.text)
             if proposal_limit == 0:
@@ -954,6 +963,12 @@ class DispatcherLoop:
             and project.project.audit_mode == "scope"
             and codeql.is_intent(intent)
         )
+        dynamic_recipe = (
+            self.config.audit.enabled
+            and self.config.audit.semantic.enabled
+            and project.project.audit_mode == "scope"
+            and audit_recipes.is_dynamic_recipe_intent(intent)
+        )
         selection = self._select_worker(
             project.project.id,
             "explore",
@@ -962,7 +977,7 @@ class DispatcherLoop:
             # including repository-wide reconnaissance.
             worker_preference=project.project.worker_preference,
             provider_required=provider_required,
-            worker_health_required=not codeql_scan,
+            worker_health_required=not (codeql_scan or dynamic_recipe),
         )
         worker = selection.worker
         if (
@@ -1234,6 +1249,11 @@ class DispatcherLoop:
             return False
         if codeql.active_for_project(project, self.config.audit.codeql) and codeql.is_intent(intent):
             return False
+        if (
+            self.config.audit.semantic.enabled
+            and audit_recipes.is_dynamic_recipe_intent(intent)
+        ):
+            return False
         return description != audit_graph.AUDIT_SUMMARY_INTENT
 
     def _scope_gate_pending(self, project: ProjectDetail) -> bool:
@@ -1466,7 +1486,7 @@ class DispatcherLoop:
         for event in trigger_events or []:
             if event.event_type in {
                 "audit_task_abandoned", "technical_confirmation",
-                "dynamic_verification_pass",
+                "dynamic_verification_pass", "proof_strategy_replan_required",
             }:
                 return True
             if event.event_type not in {"audit_task_concluded", "review_created"}:

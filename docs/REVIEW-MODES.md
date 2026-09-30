@@ -311,7 +311,7 @@ tasks:
 |------|----------|
 | LLM 仍可能给出语义上空洞的诊断值 | 结构由代码强制，真实性仍由冻结源码、artifact hash、独立复核与人工裁决保证 |
 | 复核可能长期争论 | 每个 Fact 最多两次自动 Review；首次不确定后只允许一个不同 mode 的 follow-up |
-| Cold-verifier 无真实部署环境 | 普通审计禁止执行目标应用；需要动态证明时只能派生显式 `poc:isolated` |
+| 普通审计没有目标运行时 | 新 Technical Confirmation 需要分别执行 reproduction 和 negative control；只允许显式 `poc:isolated`，并要求配置可信本地镜像 |
 | 自动 mode 选择不理解所有业务语义 | `audit_graph` 确定性处理生命周期，Reason 只补非保留的语义验证边 |
 
 ---

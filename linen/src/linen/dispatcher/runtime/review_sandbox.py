@@ -57,7 +57,8 @@ class DockerReviewProcess:
         for name, data in self.inputs.items():
             if name not in {
                 "record.json", "scope.json", "raw.sarif", "report.json", "candidates.json",
-                "routes.json", "guards.json",
+                "routes.json", "guards.json", "semantic_recipe.json",
+                "semantic_recipe_runner.py",
             }:
                 raise ValueError("Unknown isolated review input")
             (input_dir / name).write_bytes(data)

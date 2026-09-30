@@ -121,6 +121,7 @@ from linen.server.models import (
     ProjectDetail,
     ProjectMeta,
     ProjectSummary,
+    ProofPayload,
     ReopenRequest,
     ReopenResponse,
     ReasonClaimRequest,
@@ -135,9 +136,16 @@ from linen.server.uvpg import (
     evaluate_proof_gate,
     evaluate_shadow_gate,
     derive_proof_gaps,
+    candidate_proof_facts,
+    candidate_proof_review,
     NON_INVESTIGATIVE_GAPS,
     NON_AUTOMATIC_REPAIR_GAPS,
+    STRATEGY_REPLAN_AFTER_FAILURES,
+    UNIFIED_REVIEW_KIND,
     proof_graph_fingerprint,
+    proof_recipe_fingerprint,
+    ready_strategy_replan_resolutions,
+    validate_proof_payload,
 )
 from linen.server.dynamic_verification import (
     DYNAMIC_GATE_VERSION,
@@ -399,7 +407,10 @@ def get_uvpg_shadow(project_id: str, fact_id: str):
         return evaluate_shadow_gate(conn, project_id, fact_id).as_dict()
 
 
-def _confirmation_result(result, *, status: str, candidate_id: str, confirmed_fact_id: str | None = None, fingerprint: str | None = None, verification_level: str = "static_confirmed") -> dict:
+def _confirmation_result(result, *, status: str, candidate_id: str, confirmed_fact_id: str | None = None, fingerprint: str | None = None, verification_level: str = "dynamic_confirmed", dynamic_result=None) -> dict:
+    reason_codes = list(result.reason_codes)
+    if dynamic_result is not None and dynamic_result.status != "PASS":
+        reason_codes.extend(dynamic_result.reason_codes)
     payload = {
         "mode": "enforcement",
         "status": status,
@@ -408,9 +419,11 @@ def _confirmation_result(result, *, status: str, candidate_id: str, confirmed_fa
         "gate_version": PROOF_GATE_VERSION,
         "proof_graph_sha256": fingerprint,
         "verification_level": verification_level,
-        "reason_codes": list(result.reason_codes),
+        "reason_codes": sorted(set(reason_codes)),
         "proof_summary": result.proof_summary,
     }
+    if dynamic_result is not None:
+        payload["dynamic_verification"] = dynamic_result.as_dict()
     return payload
 
 
@@ -421,6 +434,7 @@ def get_technical_confirmation(project_id: str, fact_id: str):
         get_project_or_404(conn, project_id)
         result = evaluate_proof_gate(conn, project_id, fact_id)
         fingerprint = proof_graph_fingerprint(conn, project_id, fact_id)
+        dynamic_result = evaluate_dynamic_verification(conn, project_id, fact_id)
         confirmed = conn.execute(
             "SELECT f.id FROM facts f JOIN graph_edges e ON e.target_id = f.id "
             "WHERE e.project_id = ? AND e.source_id = ? AND e.relation_type = 'promotes_to' "
@@ -429,17 +443,18 @@ def get_technical_confirmation(project_id: str, fact_id: str):
         ).fetchone()
         return _confirmation_result(
             result,
-            status="eligible" if result.status == "PASS" else "not_confirmed",
+            status="eligible" if result.status == "PASS" and dynamic_result.status == "PASS" else "not_confirmed",
             candidate_id=fact_id,
             confirmed_fact_id=confirmed["id"] if confirmed else None,
             fingerprint=fingerprint,
-            verification_level=(effective_verification_level(conn, project_id, confirmed["id"]) if confirmed else "static_confirmed"),
+            verification_level=(effective_verification_level(conn, project_id, confirmed["id"]) if confirmed else ("dynamic_confirmed" if dynamic_result.status == "PASS" else "unconfirmed")),
+            dynamic_result=dynamic_result,
         )
 
 
 @router.get("/projects/{project_id}/facts/{fact_id}/dynamic-verification")
 def get_dynamic_verification(project_id: str, fact_id: str):
-    """Evaluate optional dynamic evidence without executing a reproduction."""
+    """Evaluate required dynamic confirmation evidence without executing a run."""
     with get_conn() as conn:
         get_project_or_404(conn, project_id)
         result = evaluate_dynamic_verification(conn, project_id, fact_id)
@@ -497,6 +512,9 @@ def finalize_dynamic_verification(project_id: str, fact_id: str):
 def _proof_status_payload(conn, project_id: str, fact_id: str) -> dict:
     result = evaluate_proof_gate(conn, project_id, fact_id)
     gaps = derive_proof_gaps(conn, project_id, fact_id)
+    dynamic_result = None
+    if result.status == "PASS":
+        dynamic_result = evaluate_dynamic_verification(conn, project_id, fact_id)
     active = {}
     for row in conn.execute(
         "SELECT id, description, type, phase, source_generation FROM intents "
@@ -517,10 +535,409 @@ def _proof_status_payload(conn, project_id: str, fact_id: str) -> dict:
         "candidate_id": fact_id,
         "gate": result.as_dict(),
         "gate_status": result.status,
+        "confirmation_status": (
+            "eligible"
+            if result.status == "PASS" and dynamic_result is not None and dynamic_result.status == "PASS"
+            else "not_confirmed"
+        ),
+        "dynamic_verification": dynamic_result.as_dict() if dynamic_result is not None else None,
         "proof_summary": result.proof_summary,
         "gaps": serialized,
         "active_gap_intents": sorted(active.values(), key=lambda item: item["intent_id"]),
     }
+
+
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _json_object(value: str | None) -> dict:
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _negative_control_key(source_fact, source_proof: ProofPayload) -> str:
+    """Identify a reusable unreachable path by its stable location and cause."""
+    attributes = source_proof.attributes
+    path_keys = (
+        "path_signature", "route_signature", "recipe_id", "path_id",
+        "endpoint_id", "entrypoint_id", "source_signature", "sink_signature",
+        "call_path", "source_location", "sink_location",
+    )
+    cause_keys = (
+        "failure_code", "cause_id", "condition_signature",
+        "reachability_condition", "principal",
+        "trust_boundary",
+    )
+    candidate_ids = [identifier for identifier in source_proof.subject_ids if identifier != source_fact["id"]]
+
+    def scrub(value):
+        if isinstance(value, str):
+            for candidate_id in candidate_ids:
+                value = re.sub(
+                    rf"(?<![A-Za-z0-9_-]){re.escape(candidate_id)}(?![A-Za-z0-9_-])",
+                    "<candidate>", value,
+                )
+            return value
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        if isinstance(value, dict):
+            return {key: scrub(item) for key, item in value.items()}
+        return value
+
+    path = {key: scrub(attributes[key]) for key in path_keys if key in attributes}
+    cause = {key: scrub(attributes[key]) for key in cause_keys if key in attributes}
+    evidence_refs = [
+        {
+            key: getattr(ref, key)
+            for key in (
+                "file", "line_start", "line_end", "excerpt_sha256",
+                "tool", "tool_version", "rule_id",
+            )
+            if getattr(ref, key) is not None
+        }
+        for ref in source_proof.evidence_refs
+    ]
+    evidence_refs.sort(key=lambda item: json.dumps(item, sort_keys=True))
+    if not path and not evidence_refs:
+        # Legacy evidence without structured locations still gets a stable key,
+        # but candidate and run identifiers never participate in the identity.
+        path = {
+            "description": scrub(" ".join(source_fact["description"].split())),
+            "evidence": scrub(" ".join((source_fact["evidence"] or "").split())),
+        }
+    return _canonical_sha256({
+        "schema": "linen-negative-control-v1",
+        "path": path,
+        "evidence_refs": evidence_refs,
+        "cause": cause or {"failure_code": "UNREACHABLE"},
+    })
+
+
+def _strategy_recipe_key(failure_code: str, fact_row, proof_data: dict) -> str:
+    """Use the same stable recipe identity for cooldown and replan resolution."""
+    return proof_recipe_fingerprint(
+        failure_code, fact_row["id"], fact_row["description"],
+        fact_row["evidence"], proof_data,
+    )
+
+
+def _persist_unreachable_refutation(conn, project_id: str, candidate_id: str, gap) -> dict | None:
+    """Refute a candidate only from reviewed reachability evidence and persist its negative control."""
+    project = get_project_or_404(conn, project_id)
+    generation = project["source_generation"]
+    candidate = conn.execute(
+        "SELECT * FROM facts WHERE project_id = ? AND id = ? AND source_generation = ?",
+        (project_id, candidate_id, generation),
+    ).fetchone()
+    if candidate is None or candidate["semantic_type"] not in {"candidate_finding", "rejected_finding"}:
+        return None
+
+    package_review_valid, _, package_verification = candidate_proof_review(
+        conn, project_id, candidate_id,
+    )
+    package_fact_ids = set(candidate_proof_facts(conn, project_id, candidate_id))
+    qualified = []
+    for source_id in gap.related_fact_ids:
+        source = conn.execute(
+            "SELECT * FROM facts WHERE project_id = ? AND id = ? AND source_generation = ?",
+            (project_id, source_id, generation),
+        ).fetchone()
+        if source is None or source["type"] != "reachability":
+            continue
+        source_proof_data = _json_object(source["proof"])
+        try:
+            source_proof = ProofPayload.model_validate(source_proof_data)
+        except Exception:
+            continue
+        if (
+            source_proof.claim_kind != "reachability"
+            or source_proof.attributes.get("failure_code") != "UNREACHABLE"
+            or candidate_id not in source_proof.subject_ids
+            or validate_proof_payload(
+                conn, project_id, source_proof, subject_fact_id=source_id,
+            )
+        ):
+            continue
+        review = conn.execute(
+            "SELECT * FROM reviews WHERE project_id = ? AND fact_id = ? "
+            "AND source_generation = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+            (project_id, source_id, generation),
+        ).fetchone()
+        review_fact_id = source_id
+        review_kind = "reachability_fact"
+        if review is not None:
+            if (
+                review["verdict"] != "VALID"
+                or review["confidence"] not in {"firm", "certain"}
+            ):
+                continue
+        else:
+            # New proof workflows record one unified review on the candidate.
+            # Accept it only when candidate_proof_review confirms the current
+            # graph digest and this reachability Fact is in that graph.
+            if (
+                not package_review_valid
+                or package_verification is None
+                or source_id not in package_fact_ids
+            ):
+                continue
+            review = None
+            for candidate_review in conn.execute(
+                "SELECT * FROM reviews WHERE project_id = ? AND fact_id = ? "
+                "AND source_generation = ? ORDER BY created_at DESC, id DESC",
+                (project_id, candidate_id, generation),
+            ):
+                diagnostics = _json_object(candidate_review["diagnostics"])
+                verification = diagnostics.get("cold_verification")
+                if (
+                    isinstance(verification, dict)
+                    and verification.get("review_kind") == UNIFIED_REVIEW_KIND
+                    and verification == package_verification
+                ):
+                    review = candidate_review
+                    break
+            if (
+                review is None
+                or review["verdict"] != "VALID"
+                or review["confidence"] not in {"firm", "certain"}
+            ):
+                continue
+            review_fact_id = candidate_id
+            review_kind = UNIFIED_REVIEW_KIND
+        qualified.append((source, source_proof, review, review_fact_id, review_kind))
+
+    if not qualified:
+        return {
+            "candidate_refuted": False,
+            "negative_control_created": False,
+            "reason": "unreachable_evidence_not_independently_validated",
+        }
+
+    source, source_proof, review, review_fact_id, review_kind = sorted(
+        qualified, key=lambda item: item[0]["id"],
+    )[0]
+    artifact_hashes = {}
+    artifact_ids = sorted({
+        *source_proof.artifact_ids,
+        *(ref.artifact_id for ref in source_proof.evidence_refs if ref.artifact_id),
+    })
+    if artifact_ids:
+        placeholders = ",".join("?" for _ in artifact_ids)
+        artifact_hashes = {
+            row["artifact_id"]: row["sha256"]
+            for row in conn.execute(
+                f"SELECT artifact_id, sha256 FROM artifacts WHERE project_id = ? "
+                f"AND artifact_id IN ({placeholders}) ORDER BY artifact_id",
+                (project_id, *artifact_ids),
+            )
+        }
+    source_proof_data = source_proof.model_dump(mode="json")
+    source_fact_digest = _canonical_sha256({
+        "id": source["id"], "source_generation": source["source_generation"],
+        "type": source["type"], "semantic_type": source["semantic_type"],
+        "display_title": source["display_title"], "status": source["status"],
+        "description": source["description"], "evidence": source["evidence"],
+        "proof": source_proof_data, "artifact_hashes": artifact_hashes,
+    })
+    source_proof_digest = _canonical_sha256(source_proof_data)
+    review_diagnostics = _json_object(review["diagnostics"])
+    review_digest = _canonical_sha256({
+        "id": review["id"], "source_generation": review["source_generation"],
+        "created_at": review["created_at"], "intent_id": review["intent_id"],
+        "reviewed_fact_id": review_fact_id, "review_kind": review_kind,
+        "verdict": review["verdict"], "confidence": review["confidence"],
+        "summary": review["summary"], "reasoning": review["reasoning"],
+        "created_by": review["created_by"], "diagnostics": review_diagnostics,
+    })
+    graph_digest = proof_graph_fingerprint(conn, project_id, candidate_id)
+    reusable_key = _negative_control_key(source, source_proof)
+    event_key = f"uvpg-unreachable:{candidate_id}:g{generation}:{reusable_key}"
+    prior_event = conn.execute(
+        "SELECT sequence, payload FROM audit_events WHERE project_id = ? AND idempotency_key = ?",
+        (project_id, event_key),
+    ).fetchone()
+    if prior_event is not None:
+        payload = _json_object(prior_event["payload"])
+        return {
+            "candidate_refuted": True,
+            "negative_control_created": False,
+            "reason": "candidate_already_refuted",
+            "negative_control_fact_id": payload.get("negative_control_fact_id"),
+        }
+
+    trusted_negative_ids = set()
+    for row in conn.execute(
+        "SELECT payload FROM audit_events WHERE project_id = ? AND source_generation = ? "
+        "AND event_type = 'candidate_refuted_by_unreachable_path'",
+        (project_id, generation),
+    ):
+        event_payload = _json_object(row["payload"])
+        if event_payload.get("negative_control_key") == reusable_key:
+            trusted_negative_ids.add(event_payload.get("negative_control_fact_id"))
+    reusable = conn.execute(
+        "SELECT id, proof FROM facts WHERE project_id = ? AND source_generation = ? "
+        "AND type = 'negative_control' ORDER BY id",
+        (project_id, generation),
+    ).fetchall()
+    negative_control_id = None
+    for row in reusable:
+        existing_proof = _json_object(row["proof"])
+        existing_attributes = existing_proof.get("attributes", {})
+        if (
+            row["id"] in trusted_negative_ids
+            and existing_attributes.get("mode") == "reviewed_unreachable_path"
+            and existing_attributes.get("reusable") is True
+            and existing_attributes.get("negative_control_key") == reusable_key
+        ):
+            negative_control_id = row["id"]
+            break
+
+    now = utcnow()
+    reused = negative_control_id is not None
+    source_candidate_id = candidate_id
+    if negative_control_id is None:
+        negative_control_id = next_fact_id(conn, project_id)
+        negative_attributes = {
+            "mode": "reviewed_unreachable_path",
+            "failure_code": "UNREACHABLE",
+            "negative_control_key": reusable_key,
+            "reusable": True,
+            "source_candidate_id": source_candidate_id,
+            "source_fact_id": source["id"],
+            "source_fact_sha256": source_fact_digest,
+            "source_proof_sha256": source_proof_digest,
+            "source_review_id": review["id"],
+            "source_review_sha256": review_digest,
+            "source_review_fact_id": review_fact_id,
+            "source_review_kind": review_kind,
+            "source_artifact_sha256s": artifact_hashes,
+            "proof_graph_sha256": graph_digest,
+            "source_generation": generation,
+        }
+        negative_proof_body = {
+            "schema_version": 1,
+            "claim_kind": "negative_control",
+            "subject_ids": sorted({source_candidate_id, source["id"]}),
+            "object_ids": [],
+            "applicability": source_proof.applicability,
+            "attributes": negative_attributes,
+            "evidence_refs": [ref.model_dump(mode="json") for ref in source_proof.evidence_refs],
+            "artifact_ids": source_proof.artifact_ids,
+        }
+        negative_attributes["provenance_sha256"] = _canonical_sha256(negative_proof_body)
+        negative_proof = ProofPayload.model_validate(negative_proof_body)
+        errors = validate_proof_payload(
+            conn, project_id, negative_proof, subject_fact_id=negative_control_id,
+        )
+        if errors:
+            return {
+                "candidate_refuted": False,
+                "negative_control_created": False,
+                "reason": "unreachable_provenance_invalid",
+                "details": errors,
+            }
+        conn.execute(
+            "INSERT INTO facts (id, project_id, description, display_title, type, semantic_type, "
+            "evidence, proof, source_generation, status) VALUES (?, ?, ?, ?, 'negative_control', "
+            "'observation', ?, ?, ?, 'triaged')",
+            (
+                negative_control_id, project_id,
+                f"Reviewed unreachable path: {source['description']}",
+                "Reusable unreachable-path negative control", source["evidence"],
+                json.dumps(negative_proof.model_dump(mode="json"), sort_keys=True, ensure_ascii=False),
+                generation,
+            ),
+        )
+
+    refutation_body = {
+        "candidate_id": candidate_id,
+        "negative_control_fact_id": negative_control_id,
+        "source_reachability_fact_id": source["id"],
+        "source_fact_sha256": source_fact_digest,
+        "source_proof_sha256": source_proof_digest,
+        "source_review_id": review["id"],
+        "source_review_sha256": review_digest,
+        "source_review_fact_id": review_fact_id,
+        "source_review_kind": review_kind,
+        "proof_graph_sha256": graph_digest,
+        "negative_control_key": reusable_key,
+        "source_generation": generation,
+        "reused": reused,
+    }
+    refutation_digest = _canonical_sha256(refutation_body)
+    candidate_proof = _json_object(candidate["proof"])
+    candidate_proof.setdefault("schema_version", 1)
+    candidate_proof.setdefault("claim_kind", "candidate_finding")
+    candidate_proof.setdefault("subject_ids", [])
+    candidate_proof.setdefault("object_ids", [])
+    candidate_proof.setdefault("applicability", {})
+    candidate_attributes = candidate_proof.get("attributes")
+    if not isinstance(candidate_attributes, dict):
+        candidate_attributes = {}
+    candidate_attributes.update({
+        "candidate_outcome": "refuted",
+        "refutation_reason": "unreachable",
+        "negative_control_fact_id": negative_control_id,
+        "negative_control_key": reusable_key,
+        "refutation_sha256": refutation_digest,
+        "refutation_proof_graph_sha256": graph_digest,
+    })
+    candidate_proof["attributes"] = candidate_attributes
+    conn.execute(
+        "UPDATE facts SET status = 'false_positive', semantic_type = 'rejected_finding', proof = ? "
+        "WHERE project_id = ? AND id = ?",
+        (json.dumps(candidate_proof, sort_keys=True, ensure_ascii=False), project_id, candidate_id),
+    )
+    create_graph_edge(
+        conn, project_id, source_kind="fact", source_id=negative_control_id,
+        target_kind="fact", target_id=candidate_id, relation_type="refutes",
+        created_by="server.uvpg",
+        metadata={"negative_control_key": reusable_key, "refutation_sha256": refutation_digest},
+        created_at=now,
+    )
+    bump_graph_revision(conn, project_id)
+    append_event(
+        conn, project_id,
+        "candidate_refuted_by_unreachable_path" if not reused else "candidate_refuted_by_reused_negative_control",
+        "server.uvpg", entity_kind="fact", entity_id=candidate_id,
+        idempotency_key=event_key,
+        payload={**refutation_body, "refutation_sha256": refutation_digest},
+        created_at=now,
+    )
+    return {
+        "candidate_refuted": True,
+        "negative_control_created": not reused,
+        "reason": "candidate_refuted" if not reused else "candidate_refuted_by_reused_negative_control",
+        "negative_control_fact_id": negative_control_id,
+        "negative_control_key": reusable_key,
+        "refutation_sha256": refutation_digest,
+        "reused": reused,
+    }
+
+
+def _consume_ready_strategy_replans(conn, project_id: str, candidate_id: str) -> int:
+    """Append an immutable receipt when independently reviewed alternate evidence is ready."""
+    consumed = 0
+    for resolution in ready_strategy_replan_resolutions(conn, project_id, candidate_id):
+        event_key = (
+            "uvpg-strategy-replan-resolved:"
+            f"{resolution['required_event_sequence']}"
+        )
+        append_event(
+            conn, project_id, "proof_strategy_replan_resolved", "dispatcher.proof-gap",
+            entity_kind="fact", entity_id=candidate_id,
+            idempotency_key=event_key,
+            payload=resolution,
+        )
+        consumed += 1
+    return consumed
 
 
 @router.get("/projects/{project_id}/facts/{fact_id}/proof-status")
@@ -536,7 +953,21 @@ def plan_proof_gap(project_id: str, fact_id: str):
     """Create at most one deterministic, candidate-bound proof obligation."""
     with get_conn() as conn:
         project = check_project_active(conn, project_id)
+        _consume_ready_strategy_replans(conn, project_id, fact_id)
         status = _proof_status_payload(conn, project_id, fact_id)
+        gaps = derive_proof_gaps(conn, project_id, fact_id)
+        unreachable_gap = next((gap for gap in gaps if gap.code == "UNREACHABLE"), None)
+        if unreachable_gap is not None:
+            refutation = _persist_unreachable_refutation(
+                conn, project_id, fact_id, unreachable_gap,
+            )
+            if refutation is not None:
+                return {
+                    "created_intent": False,
+                    **refutation,
+                    "candidate_id": fact_id,
+                    **_proof_status_payload(conn, project_id, fact_id),
+                }
         assessment = latest_finding_assessment(conn, project_id, fact_id)
         if assessment is not None:
             verdict, confidence, details = assessment
@@ -552,20 +983,117 @@ def plan_proof_gap(project_id: str, fact_id: str):
                 # the proof-status diagnostics visible without creating an
                 # unbounded chain of exploitability obligations.
                 return {
-                    "created": False,
+                    "created_intent": False,
                     "reason": "candidate_assessed_as_non_vulnerability",
                     **status,
                 }
-        selected = next((gap for gap in derive_proof_gaps(conn, project_id, fact_id) if gap.code not in NON_INVESTIGATIVE_GAPS and gap.code not in NON_AUTOMATIC_REPAIR_GAPS), None)
+        strategy_gap = next((
+            gap for gap in gaps
+            if gap.failure_class in {"wrong_path", "wrong_boundary_assumption"}
+        ), None)
+        if strategy_gap is not None:
+            proof_prefix = f"@uvpg:proof:{fact_id}:"
+            related_ids = set(strategy_gap.related_fact_ids)
+            recipe_keys = set()
+            failed_fact_ids = set()
+            if related_ids:
+                placeholders = ",".join("?" for _ in related_ids)
+                failure_rows = conn.execute(
+                    f"SELECT id, description, evidence, proof FROM facts WHERE project_id = ? "
+                    f"AND source_generation = ? AND id IN ({placeholders}) ORDER BY id",
+                    (project_id, project["source_generation"], *sorted(related_ids)),
+                ).fetchall()
+                for row in failure_rows:
+                    proof_data = _json_object(row["proof"])
+                    attrs = proof_data.get("attributes", {})
+                    if isinstance(attrs, dict) and attrs.get("failure_code") == strategy_gap.code:
+                        recipe_keys.add(_strategy_recipe_key(strategy_gap.code, row, proof_data))
+                        failed_fact_ids.add(row["id"])
+            if not recipe_keys or not failed_fact_ids:
+                return {"created_intent": False, "reason": "strategy_recipe_identity_missing", **status}
+            failed_fact_ids = sorted(failed_fact_ids)
+            recipe_set_sha256 = _canonical_sha256({
+                "recipe_keys": sorted(recipe_keys),
+                "failed_fact_ids": failed_fact_ids,
+            })
+            event_key = f"uvpg-strategy-replan:{strategy_gap.key}:{recipe_set_sha256}"
+            prior_replan = conn.execute(
+                "SELECT sequence FROM audit_events WHERE project_id = ? AND idempotency_key = ?",
+                (project_id, event_key),
+            ).fetchone()
+            if prior_replan is not None:
+                return {"created_intent": False, "reason": "strategy_replan_already_requested", **status}
+            failures = 0
+            if recipe_keys:
+                matching_fact_ids = failed_fact_ids
+                if matching_fact_ids:
+                    placeholders = ",".join("?" for _ in matching_fact_ids)
+                    failures = conn.execute(
+                        f"SELECT COUNT(DISTINCT i.id) AS attempts FROM intents i "
+                        f"JOIN facts f ON f.project_id = i.project_id AND f.id = i.to_fact_id "
+                        f"LEFT JOIN intent_errors e ON e.project_id = i.project_id AND e.intent_id = i.id "
+                        f"WHERE i.project_id = ? AND i.source_generation = ? "
+                        f"AND i.to_fact_id IN ({placeholders}) AND i.description LIKE ? "
+                        f"AND (i.concluded_at IS NOT NULL OR e.id IS NOT NULL)",
+                        (
+                            project_id, project["source_generation"],
+                            *matching_fact_ids, f"{proof_prefix}%",
+                        ),
+                    ).fetchone()["attempts"]
+            if failures >= STRATEGY_REPLAN_AFTER_FAILURES:
+                hint = (
+                    f"@uvpg:strategy-replan candidate={fact_id} code={strategy_gap.code} "
+                    f"generation={project['source_generation']}: Rebuild the attack path from "
+                    "the source graph. Choose a different entry point or trust-boundary model "
+                    "and do not repeat the failed recipe. Record why the previous path failed."
+                )
+                duplicate_hint = conn.execute(
+                    "SELECT 1 FROM hints WHERE project_id = ? AND content = ? LIMIT 1",
+                    (project_id, hint),
+                ).fetchone()
+                if duplicate_hint is None:
+                    hint_id = next_hint_id(conn, project_id)
+                    conn.execute(
+                        "INSERT INTO hints (id, project_id, content, creator, created_at) "
+                        "VALUES (?, ?, ?, 'dispatcher.proof-gap', ?)",
+                        (hint_id, project_id, hint, utcnow()),
+                    )
+                    bump_graph_revision(conn, project_id)
+                append_event(
+                    conn, project_id, "proof_strategy_replan_required", "dispatcher.proof-gap",
+                    entity_kind="fact", entity_id=fact_id,
+                    payload={
+                        "candidate_id": fact_id,
+                        "gap_code": strategy_gap.code,
+                        "failure_class": strategy_gap.failure_class,
+                        "source_generation": project["source_generation"],
+                        "failed_attempts": failures,
+                        "failed_recipe_keys": sorted(recipe_keys),
+                        "failed_fact_ids": failed_fact_ids,
+                        "failed_recipe_set_sha256": recipe_set_sha256,
+                        "previous_intent_prefix": proof_prefix,
+                    },
+                    idempotency_key=event_key,
+                )
+                return {"created_intent": False, "reason": "strategy_replan_required", **_proof_status_payload(conn, project_id, fact_id)}
+        eligible_gaps = [
+            gap for gap in gaps
+            if gap.code not in NON_INVESTIGATIVE_GAPS
+            and gap.code not in NON_AUTOMATIC_REPAIR_GAPS
+            and gap.failure_class not in {"wrong_path", "wrong_boundary_assumption"}
+        ]
+        if strategy_gap is not None and not eligible_gaps:
+            return {"created_intent": False, "reason": "strategy_retry_cooldown", **status}
+        selected = eligible_gaps[0] if eligible_gaps else None
         if selected is None:
-            return {"created": False, "reason": "no_investigative_gap", **status}
+            return {"created_intent": False, "reason": "no_investigative_gap", **status}
         existing = conn.execute(
             "SELECT id FROM intents WHERE project_id = ? AND to_fact_id IS NULL AND concluded_at IS NULL "
             "AND source_generation = ? AND description LIKE ? ORDER BY id LIMIT 1",
             (project_id, project["source_generation"], f"@uvpg:proof:{selected.key}:%"),
         ).fetchone()
         if existing is not None:
-            return {"created": False, "reason": "duplicate_open_obligation", "intent_id": existing["id"], **status}
+            return {"created_intent": False, "reason": "duplicate_open_obligation", "intent_id": existing["id"], **status}
         now = utcnow()
         intent_id = next_intent_id(conn, project_id)
         description = f"@uvpg:proof:{selected.key}:{selected.suggested_intent_type}:{selected.expected_fact_type or 'evidence'} {selected.description}"
@@ -578,7 +1106,7 @@ def plan_proof_gap(project_id: str, fact_id: str):
         conn.execute("INSERT INTO intent_sources (intent_id, project_id, fact_id) VALUES (?, ?, ?)", (intent_id, project_id, source_fact_id))
         bump_graph_revision(conn, project_id)
         append_event(conn, project_id, "proof_gap_intent_created", "dispatcher.proof-gap", entity_kind="intent", entity_id=intent_id, payload={"candidate_id": fact_id, "gap": selected.as_dict()}, created_at=now)
-        return {"created": True, "intent_id": intent_id, "gap": selected.as_dict(), **_proof_status_payload(conn, project_id, fact_id)}
+        return {"created_intent": True, "intent_id": intent_id, "gap": selected.as_dict(), **_proof_status_payload(conn, project_id, fact_id)}
 
 
 @router.post("/projects/{project_id}/facts/{fact_id}/technical-confirmation")
@@ -624,11 +1152,16 @@ def confirm_technical_finding(project_id: str, fact_id: str):
         if result.status != "PASS":
             return JSONResponse(
                 status_code=409,
-                content=_confirmation_result(result, status="not_confirmed", candidate_id=fact_id, fingerprint=fingerprint),
+                content=_confirmation_result(result, status="not_confirmed", candidate_id=fact_id, fingerprint=fingerprint, verification_level="unconfirmed", dynamic_result=dynamic_result),
+            )
+        if dynamic_result.status != "PASS":
+            return JSONResponse(
+                status_code=409,
+                content=_confirmation_result(result, status="not_confirmed", candidate_id=fact_id, fingerprint=fingerprint, verification_level="unconfirmed", dynamic_result=dynamic_result),
             )
         if fingerprint != proof_graph_fingerprint(conn, project_id, fact_id):
             result = replace(result, reason_codes=(*result.reason_codes, "PROOF_GRAPH_CHANGED"))
-            return JSONResponse(status_code=409, content=_confirmation_result(result, status="not_confirmed", candidate_id=fact_id, fingerprint=fingerprint))
+            return JSONResponse(status_code=409, content=_confirmation_result(result, status="not_confirmed", candidate_id=fact_id, fingerprint=fingerprint, verification_level="unconfirmed", dynamic_result=dynamic_result))
 
         now = utcnow()
         confirmed_id = next_fact_id(conn, project_id)
@@ -641,7 +1174,7 @@ def confirm_technical_finding(project_id: str, fact_id: str):
                 "candidate_id": fact_id,
                 "gate_version": PROOF_GATE_VERSION,
                 "proof_graph_sha256": fingerprint,
-                "verification_level": "dynamic_confirmed" if dynamic_result.status == "PASS" else "static_confirmed",
+                "verification_level": "dynamic_confirmed",
                 "confirmed_at": now,
             },
         }
@@ -665,7 +1198,7 @@ def confirm_technical_finding(project_id: str, fact_id: str):
                     f"{receipt.get('positive_run_id')}:{receipt.get('negative_run_id')}:{DYNAMIC_GATE_VERSION}"
                 ), payload=receipt, created_at=now,
             )
-        return _confirmation_result(result, status="confirmed", candidate_id=fact_id, confirmed_fact_id=confirmed_id, fingerprint=fingerprint, verification_level="dynamic_confirmed" if dynamic_result.status == "PASS" else "static_confirmed")
+        return _confirmation_result(result, status="confirmed", candidate_id=fact_id, confirmed_fact_id=confirmed_id, fingerprint=fingerprint, verification_level="dynamic_confirmed", dynamic_result=dynamic_result)
 
 
 @router.delete("/projects/{project_id}", status_code=204)
