@@ -12,10 +12,13 @@ from linen.dispatcher.config import DispatchConfig
 from linen.dispatcher.protocol.client import LinenClient
 from linen.dispatcher.runtime.backend import LocalBackend
 from linen.dispatcher.runtime.cancellation import TaskCancellation
+from linen.dispatcher.runtime.process import ProcessResult
 from linen.dispatcher.scheduler.loop import DispatcherLoop
+from linen.dispatcher.tasks import reason as reason_task
 from linen.dispatcher.tasks.explore import run_explore_task
 from linen.server import db
 from linen.server.app import app
+from conftest import FakeDriver, FakeLease
 
 
 @pytest.mark.skipif(
@@ -70,7 +73,10 @@ def test_codeql_candidate_reaches_persisted_graph_and_reason(tmp_path, monkeypat
                 "network": "none",
                 "languages": ["python"],
                 "query_suites": {
-                    "python": [os.environ["LINEN_CODEQL_TEST_SUITE"]],
+                    "python": [
+                        "codeql/python-queries:codeql-suites/python-security-extended.qls",
+                        os.environ["LINEN_CODEQL_TEST_SUITE"],
+                    ],
                 },
                 "query_profiles": {
                     "input-validation": {
@@ -190,6 +196,42 @@ def test_codeql_candidate_reaches_persisted_graph_and_reason(tmp_path, monkeypat
         assert "Category query results" in codeql.reason_instructions(
             persisted, workdir, config.audit.codeql,
         )
+
+        # Exercise the real Reason prompt path with the worker process stubbed:
+        # the dispatcher must pass the machine path, not only persist a Fact.
+        reason_driver = FakeDriver()
+        reason_lease = FakeLease()
+        monkeypatch.setattr(reason_task, "get_driver", lambda *_args, **_kwargs: reason_driver)
+        monkeypatch.setattr(
+            reason_task.HeartbeatLease, "for_reason",
+            lambda *_args, **_kwargs: reason_lease,
+        )
+        reason_response = json.dumps({
+            "accepted": True,
+            "data": {
+                "intents": [{
+                    "from": [result_fact.id],
+                    "action": "verify",
+                    "target": "CodeQL source-to-sink path",
+                    "type": "verify",
+                    "description": "Verify the CodeQL input-to-SQL path in application context",
+                }],
+            },
+        })
+        monkeypatch.setattr(
+            reason_task, "run_worker_process",
+            lambda *_args, **_kwargs: ProcessResult(0, reason_response, ""),
+        )
+        assert reason_task.run_reason_task(
+            config, client, backend, persisted, client.export_project(project_id),
+            worker, TaskCancellation(),
+        ) == "success"
+        reason_prompt = reason_driver.execute_prompts[0]
+        assert "CodeQL machine-path evidence" in reason_prompt
+        assert result_fact.id in reason_prompt
+        assert "app/source.py:2" in reason_prompt
+        assert "app/service.py:5" in reason_prompt
+
         assert dispatcher._reconcile_audit_stages(persisted)
         persisted = client.get_project(project_id)
         codeql_stage = next(

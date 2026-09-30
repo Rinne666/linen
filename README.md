@@ -215,13 +215,19 @@ suites already inside the trusted image. Reason, using the project's selected
 CLI, can request a profile to answer a concrete unresolved question; the
 dispatcher runs that suite in isolation and returns canonicalized path
 candidates. Model output cannot supply shell commands or arbitrary query paths.
-To build a local image from an official, platform-matching Linux CodeQL bundle,
-run `scripts/build_codeql_image.sh /path/to/codeql-bundle-linux-*.tar.zst
-linen-codeql:local`. For example, a Python suite can use
+To build a local image from an official Linux CodeQL bundle matching the Docker
+platform, run `scripts/build_codeql_image.sh
+/path/to/codeql-bundle-linux-arm64.tar.zst linen-codeql:local` (or use the
+official `codeql-bundle-linux64.tar.zst` on x64). The script streams the
+Zstandard archive through the host tar implementation, selects the matching
+Docker platform, and checks the installed CLI and Python/JavaScript query packs
+before returning. A Python suite can use
 `codeql/python-queries:codeql-suites/python-security-extended.qls`; include only
 languages for which the bundle contains the corresponding query pack. The
 script does not download the bundle or install a host CodeQL CLI.
-The opt-in real-Docker plumbing test can use its tiny QL fixture pack:
+The opt-in real-Docker test runs the official Python security-extended suite
+alongside a tiny fixture query, persists the resulting path in Linen, and
+checks that Reason receives it in the worker prompt:
 
 ```bash
 docker build --build-arg BASE_IMAGE=linen-codeql:local \
