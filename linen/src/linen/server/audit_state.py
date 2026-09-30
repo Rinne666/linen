@@ -23,6 +23,7 @@ from linen.server.services import (
     audit_completion_blockers_from_db,
     get_project_or_404,
     next_graph_edge_id,
+    scope_summary_records_review_exhausted_candidate,
     utcnow,
 )
 
@@ -559,6 +560,36 @@ def completion_gate_from_db(
         row for row in candidate_rows
         if row["status"] == "draft" or not _decisively_reviewed(conn, project_id, row["id"])
     ]
+    summary_candidate_ids: set[str] = set()
+    if audit_mode == "scope":
+        summary_candidate_ids = {
+            row["fact_id"]
+            for row in conn.execute(
+                "SELECT summary.id AS summary_id, s.fact_id FROM facts summary "
+                "JOIN intents i ON i.project_id = summary.project_id AND i.to_fact_id = summary.id "
+                "JOIN intent_sources s ON s.project_id = i.project_id AND s.intent_id = i.id "
+                "WHERE summary.project_id = ? AND summary.source_generation = ? "
+                "AND summary.type = 'audit_summary' AND i.type = 'synthesize' "
+                "AND i.description = '@analysis:audit-summary' "
+                "AND i.source_generation = ? AND i.plan_revision = ?",
+                (project_id, generation, generation, plan_revision),
+            )
+            if scope_summary_records_review_exhausted_candidate(
+                conn, project_id, row["summary_id"], row["fact_id"],
+            )
+        }
+    exhausted_candidates = [
+        row for row in candidate_rows
+        if row["id"] in summary_candidate_ids
+    ]
+    exhausted_candidate_ids = {row["id"] for row in exhausted_candidates}
+    blocking_unresolved_candidates = [
+        row for row in unresolved_candidates if row["id"] not in exhausted_candidate_ids
+    ]
+    finding_review_evidence_ids = list(dict.fromkeys(
+        [row["id"] for row in unresolved_candidates]
+        + [row["id"] for row in exhausted_candidates]
+    ))
     technically_confirmed_candidate_ids = {
         row["source_id"]
         for row in conn.execute(
@@ -575,19 +606,34 @@ def completion_gate_from_db(
         row for row in candidate_rows
         if row["semantic_type"] == "candidate_finding"
         and row["status"] == "triaged"
+        and row["id"] not in exhausted_candidate_ids
         and row["id"] not in technically_confirmed_candidate_ids
         and _strongly_reviewed(conn, project_id, row["id"])
     ]
     add(
         "finding_reviews",
         "Every candidate has an evidence-based assessment",
-        not unresolved_candidates,
-        "All candidates have decisive threat-model and impact assessments." if not unresolved_candidates
-        else f"{len(unresolved_candidates)} candidate finding(s) still require a decisive evidence-based assessment.",
-        evidence_ids=[row["id"] for row in unresolved_candidates],
+        not blocking_unresolved_candidates,
+        (
+            f"{len(exhausted_candidates)} candidate finding(s) exhausted bounded proof review and remain explicitly unresolved in the scope summary; none is treated as confirmed or rejected."
+            if exhausted_candidates and not blocking_unresolved_candidates
+            else "All candidates have decisive threat-model and impact assessments."
+            if not unresolved_candidates
+            else f"{len(blocking_unresolved_candidates)} candidate finding(s) still require a decisive evidence-based assessment."
+        ),
+        evidence_ids=finding_review_evidence_ids,
+        blocking=(
+            audit_mode != "none"
+            and (not exhausted_candidates or bool(blocking_unresolved_candidates))
+        ),
         # Generic blackboards retain candidate facts but have no adversarial
         # finding gate; this preserves the legacy completion contract.
-        status="not_applicable" if audit_mode == "none" else None,
+        status=(
+            "not_applicable" if audit_mode == "none"
+            else "pending" if exhausted_candidates and not blocking_unresolved_candidates
+            else "pass" if not unresolved_candidates
+            else "fail"
+        ),
     )
     selected_ids = list(from_ids or [])
     if not selected_ids and project["status"] == "completed":

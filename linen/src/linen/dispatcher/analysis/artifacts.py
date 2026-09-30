@@ -476,7 +476,10 @@ def review_inputs(project: ProjectDetail, fact: Fact, workdir: Path) -> dict[str
         record = {key: artifact[key] for key in (
             "id", "kind", "snapshot", "cells", "config", "status", "producer", "coverage",
             "candidate_count", "route_count", "guard_patterns", "counts", "results",
-            "input_fact_ids", "confirmed_vulnerability_ids", "errors", "recipe",
+            "input_fact_ids", "confirmed_vulnerability_ids", "unresolved_reviews",
+            "unresolved_followups", "residual_gaps", "configured_lenses_complete",
+            "coverage_complete", "coverage_basis", "assumption_space_exhaustiveness",
+            "errors", "recipe",
             "subject_fact_id", "citations", "items", "recipe_fact_ids", "worker_evidence",
             "statement", "repository", "sources", "gaps", "trust_boundaries",
             "pre_exclusions", "conflicts", "decision_scope",

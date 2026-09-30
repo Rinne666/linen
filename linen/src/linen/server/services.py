@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import json
+import re
 
 import sqlite3
 from datetime import datetime, timezone
@@ -22,6 +23,11 @@ from linen.server.models import (
     Review,
     REVIEWLESS_INTERMEDIATE_FACT_TYPES,
 )
+from linen.server.uvpg import MAX_UNIFIED_PROOF_REVIEW_ATTEMPTS, UNIFIED_REVIEW_KIND
+
+
+_SUMMARY_MANIFEST_SHA256_RE = re.compile(r"(?m)^manifest_sha256: [0-9a-fA-F]{64}[ \t]*$")
+
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -447,6 +453,23 @@ def audit_completion_blockers_from_db(
             )
     if audit_mode == "scope" and (len(required_ids) != 1 or from_ids != required_ids):
         blockers.append("Scope audit completion must reference exactly one audit_summary fact.")
+
+    # A scope audit may close its workflow after the bounded candidate-proof
+    # review policy is exhausted, provided the current audit summary records
+    # that candidate as residual evidence. This is an operational terminal
+    # disposition only: the finding remains a candidate and is never promoted
+    # or treated as a decisive proof review.
+    exhausted_summary_candidates: set[str] = set()
+    if audit_mode == "scope":
+        for summary_id in required_ids:
+            if facts[summary_id]["type"] != "audit_summary":
+                continue
+            for candidate_id in parents.get(summary_id, []):
+                if scope_summary_records_review_exhausted_candidate(
+                    conn, project_id, summary_id, candidate_id,
+                ):
+                    exhausted_summary_candidates.add(candidate_id)
+
     visited: set[str] = set()
     active: set[str] = set()
 
@@ -461,7 +484,11 @@ def audit_completion_blockers_from_db(
         if fact is None or fact_id == "goal":
             blockers.append(f"Invalid evidence reference: {fact_id}.")
             return
-        if fact["status"] not in {"triaged", "false_positive", "fixed", "accepted_risk"}:
+        review_exhausted = fact_id in exhausted_summary_candidates
+        if (
+            fact["status"] not in {"triaged", "false_positive", "fixed", "accepted_risk"}
+            and not review_exhausted
+        ):
             blockers.append(f"{fact_id} has unresolved status {fact['status']}.")
         if not fact["evidence"] or not fact["evidence"].strip():
             blockers.append(f"{fact_id} lacks evidence.")
@@ -488,9 +515,16 @@ def audit_completion_blockers_from_db(
                 )
             )
         )
-        if not technical_confirmation and not deterministic_intermediate and not terminal_review_valid:
+        if (
+            not technical_confirmation
+            and not deterministic_intermediate
+            and not terminal_review_valid
+            and not review_exhausted
+        ):
             blockers.append(
-                f"{fact_id} needs a firm/certain review supporting its terminal disposition."
+                f"{fact_id} needs a firm/certain review or an explicit bounded review-exhaustion residual."
+                if audit_mode == "scope"
+                else f"{fact_id} needs a firm/certain review supporting its terminal disposition."
             )
         if not parents.get(fact_id):
             blockers.append(f"{fact_id} has no incoming evidence chain.")
@@ -519,6 +553,105 @@ def audit_completion_blockers_from_db(
                     f"Scope finding or disposition {fact_id} is not included in audit_summary ancestry."
                 )
     return blockers
+
+
+def scope_review_exhausted_candidate(
+    conn: sqlite3.Connection, project_id: str, fact_id: str,
+) -> bool:
+    """Whether a current scope candidate exhausted unified proof reviews.
+
+    The review cap closes dispatch only. It does not change the candidate's
+    status, finding classification, or technical-confirmation requirements.
+    """
+    project = get_project_or_404(conn, project_id)
+    if project["audit_mode"] != "scope":
+        return False
+    generation = project["source_generation"] if "source_generation" in project.keys() else 1
+    fact = conn.execute(
+        "SELECT type, semantic_type, status, source_generation FROM facts "
+        "WHERE project_id = ? AND id = ?",
+        (project_id, fact_id),
+    ).fetchone()
+    if (
+        fact is None
+        or fact["source_generation"] != generation
+        or fact["type"] != "vulnerability"
+        or fact["semantic_type"] != "candidate_finding"
+        or fact["status"] not in {"draft", "triaged"}
+    ):
+        return False
+
+    attempts = 0
+    rows = conn.execute(
+        "SELECT verdict, confidence, diagnostics FROM reviews "
+        "WHERE project_id = ? AND fact_id = ? "
+        "AND source_generation = ? ORDER BY created_at, id",
+        (project_id, fact_id, generation),
+    )
+    for row in rows:
+        try:
+            diagnostics = json.loads(row["diagnostics"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(diagnostics, dict):
+            continue
+        verification = diagnostics.get("cold_verification")
+        if not (
+            isinstance(verification, dict)
+            and verification.get("review_kind") == UNIFIED_REVIEW_KIND
+            and verification.get("candidate_id") == fact_id
+        ):
+            continue
+        if row["verdict"] == "VALID" and row["confidence"] in {"firm", "certain"}:
+            return False
+        attempts += 1
+    return attempts >= MAX_UNIFIED_PROOF_REVIEW_ATTEMPTS
+
+
+def scope_summary_records_review_exhausted_candidate(
+    conn: sqlite3.Connection, project_id: str, summary_id: str, fact_id: str,
+) -> bool:
+    """Whether a current scope summary explicitly records an exhausted candidate."""
+    project = get_project_or_404(conn, project_id)
+    if project["audit_mode"] != "scope":
+        return False
+    generation = project["source_generation"] if "source_generation" in project.keys() else 1
+    plan_revision = project["plan_revision"] if "plan_revision" in project.keys() else 1
+
+    summary = conn.execute(
+        "SELECT type, source_generation, evidence FROM facts WHERE project_id = ? AND id = ?",
+        (project_id, summary_id),
+    ).fetchone()
+    if (
+        summary is None
+        or summary["type"] != "audit_summary"
+        or summary["source_generation"] != generation
+        or not isinstance(summary["evidence"], str)
+    ):
+        return False
+
+    evidence = summary["evidence"]
+    candidate_marker = re.compile(
+        rf"(?m)^review_exhausted_candidate_id:[ \t]*{re.escape(fact_id)}[ \t]*$"
+    )
+    if (
+        candidate_marker.search(evidence) is None
+        or _SUMMARY_MANIFEST_SHA256_RE.search(evidence) is None
+    ):
+        return False
+
+    direct_source = conn.execute(
+        "SELECT 1 FROM intents i JOIN intent_sources s "
+        "ON s.project_id = i.project_id AND s.intent_id = i.id "
+        "WHERE i.project_id = ? AND i.to_fact_id = ? AND i.type = 'synthesize' "
+        "AND i.description = '@analysis:audit-summary' "
+        "AND i.source_generation = ? AND i.plan_revision = ? AND s.fact_id = ? LIMIT 1",
+        (project_id, summary_id, generation, plan_revision, fact_id),
+    ).fetchone()
+    return bool(
+        direct_source is not None
+        and scope_review_exhausted_candidate(conn, project_id, fact_id)
+    )
 
 
 def clear_project_reason(conn: sqlite3.Connection, project_id: str) -> None:

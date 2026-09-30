@@ -100,6 +100,7 @@ NON_AUTOMATIC_REPAIR_GAPS = frozenset({
 })
 _OBLIGATION_RE = re.compile(r"^@uvpg:proof:(?P<candidate>[^:]+):(?P<code>[A-Z0-9_]+)(?::f(?P<target>[^:]+))?:g(?P<generation>[0-9]+)\b")
 UNIFIED_REVIEW_KIND = "vulnerability_proof"
+MAX_UNIFIED_PROOF_REVIEW_ATTEMPTS = 3
 # Kept as a compatibility marker for callers that imported the old constant.
 # New gates require one candidate-local proof-package review instead of this
 # collection of per-role reviews.
