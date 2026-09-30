@@ -191,7 +191,11 @@ class LocalBackend:
         link = workdir.path / "repo"
         if link.is_symlink() or link.exists():
             return
-        target_path = Path(target)
+        # Resolve relative config paths against the dispatcher process CWD.
+        # Passing a relative target directly to symlink_to() would instead
+        # resolve it relative to the project workdir and create a dangling or
+        # incorrect worker-visible `repo` link.
+        target_path = Path(target).expanduser().absolute()
         if not target_path.exists():
             LOG.warning(
                 "target repo path does not exist project=%s target=%s — skipping symlink",

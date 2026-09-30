@@ -14,12 +14,19 @@ from linen.dispatcher.analysis import codeql, coverage, recon, scope_gate
 from linen.dispatcher.analysis.artifacts import ancestor_ids, digest, write_json
 from linen.dispatcher.config import AuditConfig
 from linen.server.models import Fact, ProjectDetail, REVIEWLESS_INTERMEDIATE_FACT_TYPES
-from linen.server.uvpg import PROOF_GATE_VERSION, REQUIRED_ROLES
+from linen.server.uvpg import (
+    MAX_UNIFIED_PROOF_REVIEW_ATTEMPTS,
+    PROOF_GATE_VERSION,
+    REQUIRED_ROLES,
+)
 
 
 CREATOR = "dispatcher.audit"
 AUDIT_SUMMARY_INTENT = "@analysis:audit-summary"
 MAX_STAGE_INTENT_ATTEMPTS = 4
+MAX_CANDIDATE_PROOF_REVIEW_ATTEMPTS = MAX_UNIFIED_PROOF_REVIEW_ATTEMPTS
+
+
 def managed_description(description: str) -> bool:
     value = description.strip()
     return (
@@ -186,6 +193,115 @@ def _has_unified_vulnerability_review(project: ProjectDetail, fact_id: str) -> b
     return False
 
 
+def _review_exhaustion(project: ProjectDetail, fact: Fact) -> dict | None:
+    """Return an explicit unresolved disposition when no bounded review remains.
+
+    A review cap only closes the orchestration loop. It never changes the
+    candidate's semantic type or turns an inconclusive review into a verdict.
+    Candidate proof-package reviews have their own retry route; other Facts
+    follow the bounded mode sequence in ``_review_proposals``.
+    """
+    if fact.status in {"false_positive", "fixed", "accepted_risk"}:
+        return None
+
+    all_reviews = sorted(
+        (review for review in project.reviews if review.fact_id == fact.id),
+        key=lambda review: (review.created_at, review.id),
+    )
+    if (
+        fact.type == "vulnerability"
+        and fact.semantic_type == "candidate_finding"
+        and not _has_unified_vulnerability_review(project, fact.id)
+    ):
+        proof_reviews = [
+            review for review in all_reviews
+            if review.source_generation == fact.source_generation
+            and isinstance(review.cold_verification, dict)
+            and review.cold_verification.get("review_kind") == "vulnerability_proof"
+            and review.cold_verification.get("candidate_id") == fact.id
+        ]
+        if len(proof_reviews) < MAX_CANDIDATE_PROOF_REVIEW_ATTEMPTS:
+            return None
+        return _review_exhaustion_record(
+            project, fact, proof_reviews, MAX_CANDIDATE_PROOF_REVIEW_ATTEMPTS,
+        )
+
+    if _reviewed(project, fact.id):
+        return None
+
+    reviews = coverage.effective_reviews(project, fact.id)
+    if not reviews:
+        return None
+    modes = {
+        intent.type or "review" for intent in project.intents
+        if len(intent.from_) == 1 and intent.from_[0] == fact.id
+        and (intent.type or "").startswith("review")
+    }
+    review_text = "\n".join(
+        f"{review.summary}\n{review.reasoning or ''}" for review in all_reviews
+    ).lower()
+    source_text_missing = any(
+        marker in review_text
+        for marker in (
+            "source files are absent", "source unavailable", "source files unavailable",
+            "no source text", "could not inspect source", "could not verify the code",
+        )
+    )
+    if len(reviews) >= 2:
+        may_receive_source_retry = (
+            source_text_missing
+            and len(reviews) < 3
+            and "review:cold-verifier" not in modes
+        )
+        if may_receive_source_retry:
+            return None
+        limit = 3 if source_text_missing and "review:cold-verifier" not in modes else 2
+    else:
+        next_mode = (
+            "review:contradiction-reasoner"
+            if any(review.verdict == "NEEDS_REVIEW" for review in reviews)
+            else "review:cold-verifier"
+        )
+        if next_mode not in modes:
+            return None
+        # The only available independent mode was already used. Treat this as
+        # the terminal bound rather than leaving a review obligation dangling.
+        limit = len(reviews)
+    return _review_exhaustion_record(project, fact, reviews, limit)
+
+
+def _review_exhaustion_record(
+    project: ProjectDetail,
+    fact: Fact,
+    reviews: list,
+    attempt_limit: int,
+) -> dict:
+    return {
+        "fact_id": fact.id,
+        "type": fact.type,
+        "semantic_type": fact.semantic_type,
+        "status": fact.status,
+        "description": fact.description,
+        "evidence": fact.evidence,
+        "attempt_count": len(reviews),
+        "attempt_limit": attempt_limit,
+        "latest_verdict": reviews[-1].verdict,
+        "disposition": "review_exhausted",
+        "source_intents": [
+            {"intent_id": intent.id, "fact_ids": list(intent.from_)}
+            for intent in project.intents if intent.to == fact.id
+        ],
+        "reviews": [
+            {
+                "verdict": review.verdict,
+                "confidence": review.confidence,
+                "summary": review.summary,
+            }
+            for review in reviews
+        ],
+    }
+
+
 def _review_proposals(project: ProjectDetail) -> list[dict]:
     proposals = []
     open_reviews = {
@@ -231,9 +347,13 @@ def _review_proposals(project: ProjectDetail) -> list[dict]:
             and fact.semantic_type == "candidate_finding"
             and not _has_unified_vulnerability_review(project, fact.id)
             and fact.id not in open_reviews
+            and fact.status not in {"false_positive", "fixed", "accepted_risk"}
         ):
             description = f"@analysis:review:{fact.id}:vulnerability-proof"
-            if not _proposal_exists(project, description):
+            if (
+                _review_exhaustion(project, fact) is None
+                and not _proposal_exists(project, description)
+            ):
                 proposals.append({
                     "from": [fact.id],
                     "type": "review:cold-verifier",
@@ -241,6 +361,8 @@ def _review_proposals(project: ProjectDetail) -> list[dict]:
                 })
             continue
         if fact.status in {"false_positive", "fixed", "accepted_risk"} or fact.id in open_reviews:
+            continue
+        if _review_exhaustion(project, fact) is not None:
             continue
         # UVPG proof atoms are inputs to the candidate-local proof-package
         # review.  Do not create a second, generic per-Fact review path for
@@ -538,8 +660,15 @@ def audit_summary_inputs(
                 }
             ):
                 continue
-            if not _reviewed(project, fact.id):
+            exhaustion = _review_exhaustion(project, fact)
+            if not _reviewed(project, fact.id) and exhaustion is None:
                 return None
+            if exhaustion is not None:
+                # A generic review of the candidate does not replace the
+                # candidate-local proof-package review. Preserve that failed
+                # proof review even when another review made the Fact triaged.
+                required_ids.add(fact.id)
+                continue
             required_ids.add(fact.id)
         return sorted(required_ids)
     except (ValueError, OSError, KeyError, TypeError):
@@ -562,6 +691,11 @@ def audit_summary_fact(
         and fact.id in inputs
     ]
     unresolved_followups = _unresolved_followups(project, inputs)
+    unresolved_reviews = [
+        disposition for fact in project.facts
+        if fact.id in inputs
+        and (disposition := _review_exhaustion(project, fact)) is not None
+    ]
     blindspot_fact = recon.coverage_review_fact(project)
     blindspot_record = recon.coverage_review_record(blindspot_fact, workdir) if blindspot_fact else {}
     review_categories = {
@@ -674,11 +808,24 @@ def audit_summary_fact(
         }
         for item in unresolved_followups
     )
+    residual_gaps.extend(
+        {
+            "category": "review-exhausted",
+            "gap": (
+                f"{item['fact_id']} remains unresolved after "
+                f"{item['attempt_count']} of {item['attempt_limit']} bounded review attempt(s) "
+                f"(latest verdict: {item['latest_verdict']}); it is retained as a candidate, "
+                "not a confirmed or rejected finding"
+            ),
+        }
+        for item in unresolved_reviews
+    )
     record = {
-        "schema_version": 3,
+        "schema_version": 4,
         "kind": "scope_audit_summary",
         "input_fact_ids": inputs,
         "confirmed_vulnerability_ids": sorted(vulnerabilities),
+        "unresolved_reviews": unresolved_reviews,
         "unresolved_followups": unresolved_followups,
         "reconnaissance": categories,
         "independent_coverage_review": {
@@ -730,6 +877,19 @@ def audit_summary_fact(
         "assumption_space_exhaustiveness: not_proven\n"
         f"residual_gaps: {len(residual_gaps)}\n"
         + ("\n".join(visible_gap_lines) if visible_gap_lines else "residual_gaps: none")
+        + (
+            "\n" + "\n".join(
+                f"review_exhausted_candidate_id:{item['fact_id']}"
+                for item in unresolved_reviews
+                if item["type"] == "vulnerability"
+                and item["semantic_type"] == "candidate_finding"
+            )
+            if any(
+                item["type"] == "vulnerability"
+                and item["semantic_type"] == "candidate_finding"
+                for item in unresolved_reviews
+            ) else ""
+        )
     )
     return {
         "type": "audit_summary",
@@ -737,6 +897,7 @@ def audit_summary_fact(
             f"Scope audit synthesis completed with {len(vulnerabilities)} confirmed vulnerabilities; "
             f"{len(partial_categories)} partial category result(s), "
             f"{len(residual_gaps)} explicit residual gap(s), "
+            f"{len(unresolved_reviews)} exhausted review(s), "
             f"{len(unresolved_followups)} unresolved follow-up fact(s), and "
             f"{sum(len(item['leads']) for item in categories)} reconnaissance lead(s) are retained. "
             + ("Reconnaissance branches reached their required terminal state. "

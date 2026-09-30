@@ -17,6 +17,7 @@ from pathlib import Path
 import requests
 
 from linen.dispatcher.analysis import audit_graph, audit_recipes, codeql, coverage, scope_gate, stages
+from linen.dispatcher.analysis.source_preflight import preflight_source_repository
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.models import RunningTask
 from linen.dispatcher.protocol.client import LinenClient
@@ -368,6 +369,60 @@ class DispatcherLoop:
         self.project_cursor += 1
         return [by_id[project_id] for project_id in ordered_ids]
 
+    def _source_audit_preflight(self, project: ProjectDetail) -> bool:
+        """Block managed audits before any model call when source is unavailable."""
+        if (
+            not self.config.audit.enabled
+            or project.project.audit_mode not in {"scope", "hypothesis"}
+        ):
+            return True
+
+        project_id = project.project.id
+        try:
+            # Ensure the preflight inspects the exact workdir and `repo` path
+            # that a worker receives. This also attempts to materialize the
+            # configured per-project or dispatcher-level source link.
+            workdir = Path(self.container_manager.ensure_running(project_id))
+            configured_root = project.project.repo_root or self.config.local.repo_root
+            failure = preflight_source_repository(
+                workdir,
+                configured_root,
+                self.config.audit.recon.exclude,
+            )
+        except Exception as exc:
+            failure = f"Could not prepare the worker-visible source workspace: {exc}."
+
+        if failure is None:
+            return True
+
+        remediation = (
+            "Set project repo_root or dispatcher local.repo_root to an existing readable source "
+            "directory. Ensure the dispatcher worker can traverse it and that <workspace>/repo "
+            "resolves to that same directory, then resume the project."
+        )
+        response = self.client.report_project_worker_issue(
+            project_id,
+            worker="dispatcher.source-preflight",
+            task_type="reason",
+            code="source_repository_preflight_failed",
+            message=f"Source audit preflight failed: {failure}",
+            remediation=remediation,
+        )
+        if not response.ok:
+            LOG.warning(
+                "source audit preflight issue could not be persisted project=%s status=%s body=%s",
+                project_id,
+                response.status_code,
+                response.text,
+            )
+        else:
+            LOG.warning(
+                "blocked source audit before model work project=%s reason=%s",
+                project_id,
+                failure,
+            )
+        return False
+
     def _try_dispatch_project(self, summary: ProjectSummary) -> bool:
         skip_scope = f"project:{summary.id}:skip"
         container_name = self.container_manager.container_name(summary.id)
@@ -395,6 +450,8 @@ class DispatcherLoop:
                 project.project.status,
             )
             return False
+        if not self._source_audit_preflight(project):
+            return True
         self._honor_manual_provider_retries(project)
         # Managed audit mechanics are derived exclusively from the exported
         # graph and immutable project artifacts. Scope mode derives the Recon DAG;
