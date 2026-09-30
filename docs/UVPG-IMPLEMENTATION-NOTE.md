@@ -15,7 +15,7 @@ The current shadow increment adds:
 - a read-only `/projects/{project_id}/facts/{fact_id}/uvpg-shadow` endpoint and `evaluate_shadow_gate()` result. It reports `gate_version=uvpg-proof-v1`, PASS/FAIL, deterministic reason codes, and a proof summary; it cannot create a confirmed finding, mutate state, or block completion;
 - export-compatible `proof` data and a migration for legacy databases.
 
-The proof field is intentionally optional, so legacy Facts and exports continue to work. Legacy boards may receive a deterministic FAIL with missing closure reasons; their APIs remain readable. Large evidence remains in Artifact storage; `Fact.evidence` remains human-readable. `poc:isolated` and sandbox policy are untouched.
+The proof field is intentionally optional, so legacy Facts and exports continue to work. Legacy boards may receive a deterministic FAIL with missing closure reasons; their APIs remain readable. Large evidence remains in Artifact storage; `Fact.evidence` remains human-readable. `poc:isolated` keeps its existing sandbox policy. New Technical Confirmation requires reviewed, hash-bound dynamic reproduction and negative-control evidence from separate successful isolated runs.
 
 The strict closure requires independent Facts for attacker control, reachability,
 security invariant, security boundary, capability before/after/delta, negative
@@ -44,8 +44,9 @@ completion-compatible.
 endpoint and the enforcing confirmation endpoint. Its protocol version is
 `uvpg-proof-v1`; shadow/enforcement are modes, not separate rule sets. A
 confirmation stores the candidate id, gate version, proof graph SHA-256,
-verification level (`static_confirmed`), and timestamp in the confirmed Fact
-proof payload and audit event. Promotion is atomic and idempotent.
+verification level (`dynamic_confirmed` for new promotions), and timestamp in
+the confirmed Fact proof payload and audit event. Promotion is atomic and
+idempotent. Historical promotions retain their recorded verification level.
 
 Completion does not auto-confirm. New candidates do not satisfy hypothesis
 completion; a confirmed Fact does, through its promotion ancestry. Legacy
@@ -92,11 +93,38 @@ reachability, defenses, and capability change.
 Provenance/type/excerpt repair gaps remain non-automatic blockers until a
 complete replacement/rebinding lifecycle exists.
 
-`GET .../proof-status` is read-only. `POST .../proof-gaps/plan` creates only a
-bounded Intent and never creates a proof Fact, confirms a finding, or changes
-Completion. Candidate context is limited to the candidate's current proof
-subgraph, Gate summary, and derived gaps. Generation changes naturally remove
-old facts/edges from the current view; old proof work cannot close a new
+Each serialized ProofGap includes a `failure_class`. Ordinary missing proof and
+review work maps to `insufficient_evidence`; explicit `WRONG_PATH` and
+`WRONG_BOUNDARY_ASSUMPTION` claims map to their own classes. After two completed
+or failed proof Intents for the candidate, either strategy class emits one
+`proof_strategy_replan_required` event and a Reason hint that prohibits the
+same route. The prior failure Facts remain in history. An independently
+reviewed reachability Fact for a distinct route writes an immutable resolution
+receipt, which removes only the old route's strategy blocker from the current
+gap projection.
+
+A reviewed, candidate-bound `UNREACHABLE` result refutes the candidate and
+creates or reuses a candidate-scoped negative-control Fact, then records a
+`refutes` edge and an audit event. If the reachability claim lacks current
+provenance or decisive review, it remains a blocker. `UNFALSIFIABLE` remains a
+blocker until a stronger falsification result exists.
+
+The semantic hypothesis path performs a deterministic pre-screen after its
+source trace is canonicalized and before the candidate can receive a proof
+review. It supports only XSS into HTML text and command injection into a POSIX
+shell argument. A proved unreachable or clearly recognized-sanitized path
+becomes a `candidate_disposition` Fact with a hashed screen receipt. Missing or
+unsupported inputs return `UNKNOWN` and continue through review. The screen
+runs after the semantic verification worker call, so it can avoid downstream
+proof review work but does not avoid that initial call.
+
+`GET .../proof-status` is read-only. `POST .../proof-gaps/plan` normally creates
+only a bounded Intent. Its reviewed-`UNREACHABLE` branch instead creates or
+reuses the hashed negative-control Fact, marks that candidate rejected, and
+records the candidate-local `refutes` edge and audit event; it does not create a
+confirmed finding. Candidate context is limited to the candidate's current
+proof subgraph, Gate summary, and derived gaps. Generation changes naturally
+remove old facts/edges from the current view; old proof work cannot close a new
 generation obligation.
 
 Proof work is part of the existing managed ready window and is not planned when
@@ -115,20 +143,29 @@ Review is an evidence-quality decision only. A `VALID` decisive Review keeps a
 vulnerability candidate as `candidate_finding`; only Technical Confirmation can
 create the single authoritative `confirmed_finding` and its `promotes_to` edge.
 
-Technical Confirmation remains static by default and does not require a PoC.
-Its immutable creation proof records `verification_level=static_confirmed`.
-The optional dynamic layer is versioned separately as `uvpg-dynamic-v1` and
-evaluates existing `reproduction` and dynamic `negative_control` Facts. Each
-must bind the exact candidate, current generation, an authorized `poc:isolated`
-Run, hashed Artifacts, structured oracle observations, and decisive independent
-Reviews. Positive and negative observations must demonstrate a deterministic
-capability delta; a successful process exit or positive PoC alone is
-insufficient.
+Static UVPG remains the first confirmation gate. New Technical Confirmation is
+blocked until the separately versioned `uvpg-dynamic-v1` gate passes. The proof
+gap planner then creates one `poc:isolated` Intent for a reproduction and one
+for a negative control. Each Fact is bound server-side to the successful Run
+for its own Intent and to that Run's registered Artifact IDs; the worker cannot
+choose those identities. Both Facts require decisive independent Reviews,
+matching oracle kinds, separate runs and artifacts, and distinct observed
+capabilities. A successful process exit or positive reproduction alone is
+insufficient. The dispatcher must enable `audit.poc_sandbox` and provide its
+trusted local image before these Intents can execute; otherwise the dynamic
+gate remains incomplete and Technical Confirmation stays blocked.
 
-`evaluate_dynamic_verification()` is read-only. The status and finalize
-endpoints never execute commands; finalization appends one idempotent
+The current evidence contract still takes `oracle_kind`, `observed_outcome`,
+and `capability_observed` from the worker's Fact and requires an independent
+Review. The server binds those claims to real isolated Runs and Artifacts but
+does not yet parse a separate out-of-band oracle or execute a host-owned
+capability probe. That stronger non-self-attesting oracle remains future work.
+
+`evaluate_dynamic_verification()` is read-only. The status and confirmation
+endpoints never execute commands; the explicit `poc:isolated` worker runs are
+the only execution source. Successful confirmation appends one idempotent
 `dynamic_verification_pass` audit event. `effective_verification_level()`
 derives `dynamic_confirmed` only while that current-generation receipt and its
-Run/Artifact hashes still validate; otherwise an authoritative confirmation
-remains `static_confirmed`. No second confirmed Fact is created and dynamic
-verification is not part of mandatory static ProofGap production.
+Run/Artifact hashes still validate. Previously confirmed records remain
+readable with their historical `static_confirmed` level. No second confirmed
+Fact is created.

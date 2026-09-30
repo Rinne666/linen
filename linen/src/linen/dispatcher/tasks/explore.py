@@ -66,8 +66,30 @@ def _proof_obligation_contract(intent: Intent) -> str:
         f"Return exactly one fact with `type` set to `{expected_type}`. "
         "Do not substitute `validation`, `reachability`, or another nearby type. "
         "If the expected claim is not established, still use the required type and state the "
-        "negative result precisely in `description` and `evidence`. The dispatcher binds the "
+        "negative result precisely in `description` and `evidence`. When evidence shows a "
+        "wrong attack route, wrong trust-boundary assumption, unreachable path, or an "
+        "unfalsifiable hypothesis, set `proof.attributes.failure_code` to exactly one of "
+        "`WRONG_PATH`, `WRONG_BOUNDARY_ASSUMPTION`, `UNREACHABLE`, or `UNFALSIFIABLE`; "
+        "otherwise omit it. The dispatcher binds the "
         "server-owned proof identity; do not invent candidate or fact identifiers.\n"
+        + (
+            "For every reachability Fact, include proof.attributes.path_signature: a concise, "
+            "stable description of the concrete entrypoint-to-sink route and trust-boundary "
+            "assumption. Keep the same signature only when retrying the same recipe; a replan "
+            "must use a distinct signature for its new route.\n"
+            if expected_type == "reachability"
+            else ""
+        )
+        + (
+            "For an isolated dynamic proof, include proof.attributes.oracle_kind, "
+            "proof.attributes.observed_outcome, and proof.attributes.capability_observed. "
+            "Describe the exact capability your isolated program observed. The server binds "
+            "the candidate, successful run, and run artifacts after execution; do not invent "
+            "run IDs or artifact IDs. Keep the reproduction and negative control as separate "
+            "tasks and use the same probe in both.\n"
+            if gap_code in {"MISSING_DYNAMIC_REPRODUCTION", "MISSING_DYNAMIC_NEGATIVE_CONTROL"}
+            else ""
+        )
     )
 
 
@@ -280,6 +302,57 @@ def run_explore_task(
                 fact["description"], source="codeql_machine_path_scan",
                 phase_ms=int((time.perf_counter() - task_started) * 1000),
                 fact_type=fact["type"], evidence=fact["evidence"], fact_status="triaged",
+            )
+
+        if (
+            scope_audit
+            and config.audit.semantic.enabled
+            and audit_recipes.is_dynamic_recipe_intent(intent)
+        ):
+            try:
+                fact = audit_recipes.dynamic_recipe_outcome_fact(
+                    project, intent, Path(container_name), config.audit,
+                    cancellation, lease,
+                )
+            except Exception as exc:
+                if cancellation.is_cancelled or lease.failure is not None:
+                    best_effort_release(client, project.project.id, intent.id, worker.name)
+                    return "cancelled" if cancellation.is_cancelled else "failed"
+                message = (
+                    "Dispatcher-isolated semantic recipe failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                response = client.report_intent_error(
+                    project.project.id,
+                    intent.id,
+                    worker.name,
+                    task_type="explore",
+                    code="semantic_recipe_execution_failed",
+                    classification="blocked",
+                    message=message[:2000],
+                    remediation=(
+                        "Check the stored recipe hash, frozen snapshot, configured offline "
+                        "sandbox image, and selected preconfigured CodeQL profile."
+                    ),
+                )
+                if not response.ok:
+                    best_effort_release(client, project.project.id, intent.id, worker.name)
+                    return "failed"
+                return "blocked"
+            if cancellation.is_cancelled or lease.failure is not None:
+                best_effort_release(client, project.project.id, intent.id, worker.name)
+                return "cancelled" if cancellation.is_cancelled else "failed"
+            return write_conclude_result(
+                client,
+                project.project.id,
+                intent.id,
+                worker.name,
+                fact["description"],
+                source="dispatcher_dynamic_semantic_recipe",
+                phase_ms=int((time.perf_counter() - task_started) * 1000),
+                fact_type=fact["type"],
+                evidence=fact["evidence"],
+                fact_status="triaged",
             )
 
         if scope_audit:

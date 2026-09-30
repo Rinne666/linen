@@ -101,6 +101,11 @@ audit:
     #   input-validation:
     #     javascript:
     #       - /opt/codeql/queries/javascript/input-validation.qls
+    # Optional C/C++ alias resolution stays limited to a query suite baked
+    # into this trusted image; the model can request the profile name only.
+    #   alias-resolution:
+    #     cpp:
+    #       - /opt/codeql/queries/cpp/alias-resolution.qls
     languages: [python, javascript]
     timeout: 1800
     threads: 2
@@ -129,10 +134,10 @@ audit:
     network: none  # bridge permits model API access, but is not an egress allowlist
     env_allowlist: []  # Explicitly name only the API credentials the image needs.
   poc_sandbox:
-    enabled: false
-    # Required before a `poc:isolated` graph branch may execute. The image
-    # must already exist locally; Linen never pulls it and never falls back
-    # to host execution.
+    enabled: true
+    # New technical confirmations require separate isolated reproduction and
+    # negative-control runs. Prepare this trusted image locally; Linen never
+    # pulls it and never falls back to host execution.
     image: "linen-worker-poc:latest"
     network: none
     env_allowlist: []

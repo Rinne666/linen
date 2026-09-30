@@ -73,9 +73,11 @@ Agent 不直接认领 Intent，不直接 heartbeat，不直接调用 linen API�
     或带 lead 的结果才额外触发 Reason，避免每个覆盖单元都支付一次策略推理调用。
     Reason 失败时确认本轮已读取的事件游标，但不确认执行期间新到的事件，防止同一
     失败触发无限重试，同时保留并发产生的新证据唤醒后续分析。
-16. `poc:isolated` Intent 只有在 `audit.poc_sandbox.enabled=true` 时可运行；源码以
+16. 新 Technical Confirmation 要求分别执行 reproduction 和 negative-control
+    `poc:isolated` 任务。Intent 只有在 `audit.poc_sandbox.enabled=true` 时可运行；源码以
     只读冻结快照挂载到一次性容器，不挂载 host HOME、图历史或 Docker socket，且
-    失败后禁止切回 host conclude fallback。
+    失败后禁止切回 host conclude fallback。服务端绑定 Run 和 Artifact 身份，模型不能
+    指定这些标识。
 
 补充：
 

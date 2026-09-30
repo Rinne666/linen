@@ -38,6 +38,8 @@ REASON_CODES = frozenset({
     "INVALID_EDGE_RELATION", "STALE_PROOF_GENERATION", "INVALID_SOURCE_EXCERPT",
     "ARTIFACT_HASH_MISMATCH", "PROOF_GRAPH_TOO_LARGE",
     "PROOF_GRAPH_CHANGED",
+    "WRONG_PATH", "WRONG_BOUNDARY_ASSUMPTION", "UNREACHABLE", "UNFALSIFIABLE",
+    "INVALID_FAILURE_CODE",
 })
 REQUIRED_ROLES = {
     "attacker_control": "MISSING_ATTACKER_CONTROL", "reachability": "MISSING_REACHABILITY",
@@ -54,6 +56,8 @@ GAP_PRIORITY = {
     "MISSING_CAPABILITY_AFTER": 10, "MISSING_CAPABILITY_DELTA": 11,
     "MISSING_NEGATIVE_CONTROL": 12, "MISSING_IMPACT": 13,
     "AMBIGUOUS_CAPABILITY_DELTA": 11, "ROLE_TYPE_MISMATCH": 2,
+    "WRONG_PATH": 0, "WRONG_BOUNDARY_ASSUMPTION": 0,
+    "UNREACHABLE": 0, "UNFALSIFIABLE": 1,
 }
 GAP_CONTRACTS = {
     "MISSING_ATTACKER_CONTROL": ("attacker_control", "verify", "depends_on", "Verify attacker-controlled input, identity, or state."),
@@ -65,14 +69,34 @@ GAP_CONTRACTS = {
     "MISSING_CAPABILITY_DELTA": ("capability_delta", "characterize", "depends_on", "Characterize the capability delta and cite its before/after facts."),
     "MISSING_NEGATIVE_CONTROL": ("negative_control", "validate", "depends_on", "Establish a safe baseline, deny rule, or other negative control."),
     "MISSING_IMPACT": ("impact_observation", "characterize", "observed_by", "Characterize the concrete security impact of the candidate."),
+    "MISSING_DYNAMIC_REPRODUCTION": ("reproduction", "poc:isolated", "produces", "Execute a minimal candidate reproduction in the isolated PoC sandbox and record the observed capability."),
+    "MISSING_DYNAMIC_NEGATIVE_CONTROL": ("negative_control", "poc:isolated", "produces", "Execute a matched negative-control program in a separate isolated PoC run and record the baseline capability."),
 }
+DYNAMIC_PROOF_GAPS = frozenset({
+    "MISSING_DYNAMIC_REPRODUCTION",
+    "MISSING_DYNAMIC_NEGATIVE_CONTROL",
+})
+STRATEGY_REPLAN_AFTER_FAILURES = 2
+STRATEGY_ERROR_CODES = frozenset({"WRONG_PATH", "WRONG_BOUNDARY_ASSUMPTION"})
+UNREACHABLE_CODES = frozenset({"UNREACHABLE"})
+UNFALSIFIABLE_CODES = frozenset({"UNFALSIFIABLE"})
+CLASSIFIED_FAILURE_CODES = (
+    STRATEGY_ERROR_CODES | UNREACHABLE_CODES | UNFALSIFIABLE_CODES
+)
+INTEGRITY_ERROR_CODES = frozenset({
+    "PROOF_CYCLE", "CROSS_CANDIDATE_EVIDENCE", "INVALID_EDGE_RELATION",
+    "PROOF_GRAPH_TOO_LARGE", "PROOF_GRAPH_CHANGED", "INVALID_PROVENANCE",
+    "INVALID_SOURCE_EXCERPT", "STALE_PROOF_GENERATION", "ROLE_TYPE_MISMATCH",
+    "INVALID_FAILURE_CODE",
+})
 NON_INVESTIGATIVE_GAPS = frozenset({
     "CONTRADICTED_EVIDENCE",
     "PROOF_CYCLE", "CROSS_CANDIDATE_EVIDENCE", "INVALID_EDGE_RELATION", "PROOF_GRAPH_TOO_LARGE",
-    "PROOF_GRAPH_CHANGED",
+    "PROOF_GRAPH_CHANGED", "UNREACHABLE", "UNFALSIFIABLE",
 })
 NON_AUTOMATIC_REPAIR_GAPS = frozenset({
     "INVALID_PROVENANCE", "INVALID_SOURCE_EXCERPT", "STALE_PROOF_GENERATION", "ROLE_TYPE_MISMATCH",
+    "INVALID_FAILURE_CODE",
 })
 _OBLIGATION_RE = re.compile(r"^@uvpg:proof:(?P<candidate>[^:]+):(?P<code>[A-Z0-9_]+)(?::f(?P<target>[^:]+))?:g(?P<generation>[0-9]+)\b")
 UNIFIED_REVIEW_KIND = "vulnerability_proof"
@@ -156,6 +180,14 @@ class ProofGap:
         target = f":f{self.target_fact_id}" if self.target_fact_id else ""
         return f"{self.candidate_id}:{self.code}{target}:g{self.source_generation}"
 
+    @property
+    def failure_class(self) -> str:
+        if self.code in CLASSIFIED_FAILURE_CODES:
+            return self.code.lower()
+        if self.code in INTEGRITY_ERROR_CODES:
+            return "integrity_error"
+        return "insufficient_evidence"
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "candidate_id": self.candidate_id, "code": self.code, "role": self.role,
@@ -165,11 +197,12 @@ class ProofGap:
             "expected_fact_type": self.expected_fact_type, "description": self.description,
             "status": self.status, "source_generation": self.source_generation, "key": self.key,
             "target_fact_id": self.target_fact_id,
+            "failure_class": self.failure_class,
         }
 
 
 _IGNORED_BLACKBOARD_RELATIONS = frozenset({
-    "promotes_to", "produces", "reviews", "variant_of", "supersedes",
+    "promotes_to", "produces", "reviews", "variant_of", "supersedes", "refutes",
 })
 
 
@@ -386,6 +419,67 @@ def candidate_proof_facts(conn: sqlite3.Connection, project_id: str, candidate_i
     return list(view.proof_fact_ids)
 
 
+def proof_recipe_fingerprint(
+    failure_code: str,
+    fact_id: str,
+    description: str,
+    evidence: str | None,
+    proof_data: dict[str, Any],
+) -> str:
+    """Hash stable recipe/path identity without candidate, run, or fact IDs."""
+    attributes = proof_data.get("attributes", {})
+    if not isinstance(attributes, dict):
+        attributes = {}
+    candidate_ids = [
+        identifier for identifier in proof_data.get("subject_ids", [])
+        if identifier != fact_id
+    ]
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, str):
+            for candidate_id in candidate_ids:
+                value = re.sub(
+                    rf"(?<![A-Za-z0-9_-]){re.escape(candidate_id)}(?![A-Za-z0-9_-])",
+                    "<candidate>", value,
+                )
+            return value
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        if isinstance(value, dict):
+            return {key: scrub(item) for key, item in value.items()}
+        return value
+
+    for key in ("path_signature", "route_signature", "path_id", "recipe_id"):
+        if key in attributes:
+            identity = {"kind": key, "value": scrub(attributes[key])}
+            break
+    else:
+        refs = proof_data.get("evidence_refs", [])
+        stable_refs = [
+            {
+                key: ref.get(key)
+                for key in ("file", "line_start", "line_end", "excerpt_sha256")
+                if ref.get(key) is not None
+            }
+            for ref in refs if isinstance(ref, dict)
+        ]
+        if stable_refs:
+            identity = {
+                "evidence_refs": sorted(
+                    stable_refs, key=lambda item: json.dumps(item, sort_keys=True),
+                ),
+            }
+        else:
+            identity = {
+                "description": scrub(" ".join((description or "").split())),
+                "evidence": scrub(" ".join((evidence or "").split())),
+            }
+    material = {"failure_code": failure_code, "recipe": identity}
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(),
+    ).hexdigest()
+
+
 def _safe_artifact_path(project: sqlite3.Row, row: sqlite3.Row) -> Path:
     path = Path(row["workspace_path"])
     resolved = path.resolve(strict=True)
@@ -405,6 +499,10 @@ def validate_proof_payload(conn: sqlite3.Connection, project_id: str, proof: Pro
     if project is None:
         return ["INVALID_PROVENANCE"]
     errors: set[str] = set()
+    if "failure_code" in proof.attributes:
+        failure_code = proof.attributes["failure_code"]
+        if not isinstance(failure_code, str) or failure_code not in CLASSIFIED_FAILURE_CODES:
+            errors.add("INVALID_FAILURE_CODE")
     known = {row["id"] for row in conn.execute("SELECT id FROM facts WHERE project_id = ? UNION SELECT id FROM intents WHERE project_id = ?", (project_id, project_id))}
     if subject_fact_id:
         known.add(subject_fact_id)
@@ -483,6 +581,210 @@ def proof_graph_fingerprint(conn: sqlite3.Connection, project_id: str, candidate
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
 
 
+def resolved_strategy_failure_fact_ids(
+    conn: sqlite3.Connection, project_id: str, candidate_id: str, failure_code: str,
+) -> set[str]:
+    """Return historical failure Facts explicitly retired by consumed replans."""
+    generation_row = conn.execute(
+        "SELECT source_generation FROM projects WHERE id = ?", (project_id,),
+    ).fetchone()
+    if generation_row is None:
+        return set()
+    fact_ids: set[str] = set()
+    rows = conn.execute(
+        "SELECT payload FROM audit_events WHERE project_id = ? AND entity_id = ? "
+        "AND source_generation = ? AND event_type = 'proof_strategy_replan_resolved'",
+        (project_id, candidate_id, generation_row["source_generation"]),
+    ).fetchall()
+    for row in rows:
+        payload = _loads(row["payload"], {})
+        if payload.get("gap_code") != failure_code:
+            continue
+        values = payload.get("failed_fact_ids", [])
+        if isinstance(values, list):
+            fact_ids.update(value for value in values if isinstance(value, str))
+    return fact_ids
+
+
+def ready_strategy_replan_resolutions(
+    conn: sqlite3.Connection, project_id: str, candidate_id: str,
+) -> list[dict[str, Any]]:
+    """Find reviewed, later reachability Facts that can consume pending replans."""
+    project = conn.execute(
+        "SELECT source_generation FROM projects WHERE id = ?", (project_id,),
+    ).fetchone()
+    if project is None:
+        return []
+    generation = project["source_generation"]
+    required = conn.execute(
+        "SELECT sequence, event_id, created_at, payload FROM audit_events "
+        "WHERE project_id = ? AND entity_kind = 'fact' AND entity_id = ? "
+        "AND source_generation = ? AND event_type = 'proof_strategy_replan_required' "
+        "ORDER BY sequence",
+        (project_id, candidate_id, generation),
+    ).fetchall()
+    if not required:
+        return []
+    consumed_rows = conn.execute(
+        "SELECT payload FROM audit_events WHERE project_id = ? AND entity_kind = 'fact' "
+        "AND entity_id = ? AND source_generation = ? "
+        "AND event_type = 'proof_strategy_replan_resolved'",
+        (project_id, candidate_id, generation),
+    ).fetchall()
+    consumed = {
+        payload.get("required_event_sequence")
+        for row in consumed_rows
+        if isinstance((payload := _loads(row["payload"], {})).get("required_event_sequence"), int)
+    }
+    proof_fact_ids = set(candidate_proof_facts(conn, project_id, candidate_id))
+    rows = conn.execute(
+        "SELECT * FROM facts WHERE project_id = ? AND source_generation = ? "
+        "AND type = 'reachability' ORDER BY id",
+        (project_id, generation),
+    ).fetchall()
+    package_review_valid, _, package_verification = candidate_proof_review(
+        conn, project_id, candidate_id,
+    )
+    results: list[dict[str, Any]] = []
+    for event in required:
+        if event["sequence"] in consumed:
+            continue
+        payload = _loads(event["payload"], {})
+        failure_code = payload.get("gap_code")
+        failed_keys = payload.get("failed_recipe_keys")
+        failed_fact_ids = payload.get("failed_fact_ids")
+        if (
+            failure_code not in STRATEGY_ERROR_CODES
+            or not isinstance(failed_keys, list)
+            or not failed_keys
+            or not isinstance(failed_fact_ids, list)
+            or not failed_fact_ids
+        ):
+            continue
+        failed_recipe_keys = {value for value in failed_keys if isinstance(value, str)}
+        failed_fact_ids = {value for value in failed_fact_ids if isinstance(value, str)}
+        if not failed_recipe_keys or not failed_fact_ids:
+            continue
+
+        for fact_row in rows:
+            fact = Fact(**dict(fact_row))
+            proof = fact.proof
+            if (
+                proof is None
+                or proof.claim_kind != "reachability"
+                or candidate_id not in proof.subject_ids
+                # A candidate-bound Fact that was never incorporated into
+                # this candidate's proof projection cannot replace the stale
+                # route that is keeping the gate blocked. Keep it available
+                # for reuse, but consume the replan only after it is part of
+                # the currently reviewed candidate proof graph.
+                or fact.id not in proof_fact_ids
+            ):
+                continue
+            attributes = proof.attributes
+            failure_value = attributes.get("failure_code")
+            if (
+                failure_value in CLASSIFIED_FAILURE_CODES
+                or attributes.get("reachable") is False
+                or str(attributes.get("prescreen_status", "")).upper() == "FAIL"
+                or validate_proof_payload(
+                    conn, project_id, proof, subject_fact_id=fact.id,
+                )
+            ):
+                continue
+            recipe_key = proof_recipe_fingerprint(
+                failure_code, fact.id, fact.description, fact.evidence,
+                proof.model_dump(mode="json"),
+            )
+            if recipe_key in failed_recipe_keys:
+                continue
+            produced_after = conn.execute(
+                "SELECT 1 FROM intents WHERE project_id = ? AND to_fact_id = ? "
+                "AND source_generation = ? AND concluded_at > ? LIMIT 1",
+                (project_id, fact.id, generation, event["created_at"]),
+            ).fetchone()
+            if produced_after is None:
+                continue
+
+            review = conn.execute(
+                "SELECT * FROM reviews WHERE project_id = ? AND fact_id = ? "
+                "AND source_generation = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (project_id, fact.id, generation),
+            ).fetchone()
+            review_fact_id = fact.id
+            review_kind = "reachability_fact"
+            if review is not None and review["created_at"] > event["created_at"]:
+                if (
+                    review["verdict"] != "VALID"
+                    or review["confidence"] not in {"firm", "certain"}
+                ):
+                    continue
+            else:
+                if (
+                    not package_review_valid
+                    or package_verification is None
+                    or fact.id not in proof_fact_ids
+                ):
+                    continue
+                review = None
+                for candidate_review in conn.execute(
+                    "SELECT * FROM reviews WHERE project_id = ? AND fact_id = ? "
+                    "AND source_generation = ? ORDER BY created_at DESC, id DESC",
+                    (project_id, candidate_id, generation),
+                ):
+                    diagnostics = _review_diagnostics(candidate_review)
+                    verification = diagnostics.get("cold_verification")
+                    if (
+                        isinstance(verification, dict)
+                        and verification.get("review_kind") == UNIFIED_REVIEW_KIND
+                        and verification == package_verification
+                        and candidate_review["created_at"] > event["created_at"]
+                    ):
+                        review = candidate_review
+                        break
+                if (
+                    review is None
+                    or review["verdict"] != "VALID"
+                    or review["confidence"] not in {"firm", "certain"}
+                ):
+                    continue
+                review_fact_id = candidate_id
+                review_kind = UNIFIED_REVIEW_KIND
+
+            review_material = {
+                "review_id": review["id"],
+                "review_fact_id": review_fact_id,
+                "review_kind": review_kind,
+                "created_at": review["created_at"],
+                "intent_id": review["intent_id"],
+                "verdict": review["verdict"],
+                "confidence": review["confidence"],
+                "summary": review["summary"],
+                "reasoning": review["reasoning"],
+                "diagnostics": _review_diagnostics(review),
+            }
+            review_sha256 = hashlib.sha256(
+                json.dumps(review_material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(),
+            ).hexdigest()
+            results.append({
+                "required_event_sequence": event["sequence"],
+                "required_event_id": event["event_id"],
+                "gap_code": failure_code,
+                "failed_recipe_keys": sorted(failed_recipe_keys),
+                "failed_fact_ids": sorted(failed_fact_ids),
+                "resolution_fact_id": fact.id,
+                "resolution_recipe_key": recipe_key,
+                "review_id": review["id"],
+                "review_fact_id": review_fact_id,
+                "review_kind": review_kind,
+                "review_sha256": review_sha256,
+                "proof_graph_sha256": proof_graph_fingerprint(conn, project_id, candidate_id),
+                "source_generation": generation,
+            })
+            break
+    return results
+
+
 @dataclass(frozen=True)
 class ShadowGateResult:
     status: str
@@ -544,10 +846,23 @@ def evaluate_shadow_gate(conn: sqlite3.Connection, project_id: str, fact_id: str
             reasons.add("UNREVIEWED_EVIDENCE")
         if unified_reason in {"CONTRADICTED_EVIDENCE", "CROSS_CANDIDATE_EVIDENCE", "PROOF_GRAPH_CHANGED"}:
             reasons.add(unified_reason)
+    resolved_failure_facts = {
+        code: resolved_strategy_failure_fact_ids(conn, project_id, fact_id, code)
+        for code in STRATEGY_ERROR_CODES
+    }
     for identifier in view.proof_fact_ids:
         proof = facts[identifier].proof
         if proof is not None and proof.claim_kind in REQUIRED_ROLES and facts[identifier].type != proof.claim_kind:
             reasons.add("ROLE_TYPE_MISMATCH")
+        if proof is not None:
+            failure_code = proof.attributes.get("failure_code")
+            if isinstance(failure_code, str) and failure_code in CLASSIFIED_FAILURE_CODES:
+                resolved = (
+                    failure_code in STRATEGY_ERROR_CODES
+                    and identifier in resolved_failure_facts[failure_code]
+                )
+                if not resolved:
+                    reasons.add(failure_code)
         reasons.update(validate_proof_payload(conn, project_id, proof, subject_fact_id=identifier))
     summary = view.as_dict()
     summary["legacy_role_result"] = sorted(hinted)
@@ -614,6 +929,14 @@ def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_
             continue
         elif code in NON_AUTOMATIC_REPAIR_GAPS:
             role, intent_type, relation, description, expected = None, "blocked", None, "Repair this proof evidence manually before further investigation.", None
+        elif code in CLASSIFIED_FAILURE_CODES:
+            role, intent_type, relation, expected = None, "blocked", None, None
+            description = {
+                "WRONG_PATH": "The current source-to-sink route was rejected; request a strategy replan after the retry threshold.",
+                "WRONG_BOUNDARY_ASSUMPTION": "The current trust-boundary assumption was rejected; request a strategy replan after the retry threshold.",
+                "UNREACHABLE": "A reviewed reachability result marks this candidate path unreachable.",
+                "UNFALSIFIABLE": "The current candidate cannot be falsified with the available evidence; keep it blocked.",
+            }[code]
         elif code == "ROLE_TYPE_MISMATCH":
             role, intent_type, relation, description, expected = None, "validate", None, "Repair the proof claim type and re-verify its evidence.", None
         else:
@@ -643,6 +966,28 @@ def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_
             )
         elif code == "AMBIGUOUS_CAPABILITY_DELTA":
             related = tuple(sorted(view.facts_by_role.get("capability_delta", [])))
+        elif code in CLASSIFIED_FAILURE_CODES:
+            rows = conn.execute(
+                "SELECT id, description, evidence, proof FROM facts WHERE project_id = ? AND id IN ({}) ORDER BY id".format(",".join("?" for _ in view.proof_fact_ids)),
+                (project_id, *view.proof_fact_ids),
+            ).fetchall() if view.proof_fact_ids else []
+            resolved = (
+                resolved_strategy_failure_fact_ids(conn, project_id, candidate_fact_id, code)
+                if code in STRATEGY_ERROR_CODES else set()
+            )
+            related_values = []
+            for row in rows:
+                proof_data = _loads(row["proof"], {})
+                attributes = proof_data.get("attributes", {})
+                if not isinstance(attributes, dict) or attributes.get("failure_code") != code:
+                    continue
+                if (
+                    code in STRATEGY_ERROR_CODES
+                    and row["id"] in resolved
+                ):
+                    continue
+                related_values.append(row["id"])
+            related = tuple(related_values)
         elif code.startswith("MISSING_"):
             dependency_roles = {
                 "MISSING_ATTACKER_CONTROL": (), "MISSING_REACHABILITY": (),
@@ -659,6 +1004,50 @@ def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_
             related = tuple(sorted(view.proof_fact_ids))
         gap_status = "blocked" if code in NON_INVESTIGATIVE_GAPS or code in NON_AUTOMATIC_REPAIR_GAPS else "missing"
         gaps.append(ProofGap(candidate_fact_id, code, role, GAP_PRIORITY.get(code, 99), related, intent_type, relation, expected, description, gap_status, generation))
+
+    # Dynamic proof is a separate, mandatory confirmation stage. Keep its
+    # executable work out of the static proof graph, but derive its missing
+    # obligations from the same candidate and generation.
+    if result.status == "PASS":
+        from linen.server.dynamic_verification import evaluate_dynamic_verification
+
+        dynamic = evaluate_dynamic_verification(conn, project_id, candidate_fact_id)
+        for code in dynamic.reason_codes:
+            if code in DYNAMIC_PROOF_GAPS:
+                role, intent_type, relation, description = GAP_CONTRACTS[code]
+                gaps.append(ProofGap(
+                    candidate_fact_id, code, role, 14, (candidate_fact_id,),
+                    intent_type, relation, role, description, "missing", generation,
+                ))
+        if "UNREVIEWED_DYNAMIC_EVIDENCE" in dynamic.reason_codes:
+            rows = conn.execute(
+                "SELECT * FROM facts WHERE project_id = ? AND source_generation = ? "
+                "AND type IN ('reproduction', 'negative_control') ORDER BY id",
+                (project_id, generation),
+            ).fetchall()
+            for row in rows:
+                fact = Fact(**dict(row))
+                proof = fact.proof
+                attributes = proof.attributes if proof is not None else {}
+                if (
+                    attributes.get("mode") != "dynamic"
+                    or attributes.get("candidate_id") != candidate_fact_id
+                    or candidate_fact_id not in (proof.subject_ids if proof else [])
+                ):
+                    continue
+                reviewed = conn.execute(
+                    "SELECT verdict, confidence FROM reviews WHERE project_id = ? AND fact_id = ? "
+                    "ORDER BY created_at, id", (project_id, fact.id),
+                ).fetchall()
+                if reviewed and reviewed[-1]["verdict"] == "VALID" and reviewed[-1]["confidence"] in {"firm", "certain"}:
+                    continue
+                gaps.append(ProofGap(
+                    candidate_fact_id, "UNREVIEWED_DYNAMIC_EVIDENCE", fact.type,
+                    15, (fact.id,), "review:cold-verifier", "reviews", None,
+                    "Independently verify the isolated run, artifact, oracle observation, and capability probe for this dynamic proof Fact.",
+                    "missing", generation, fact.id,
+                ))
+        gaps.sort(key=lambda gap: (gap.priority, gap.code, gap.target_fact_id or ""))
     return gaps
 
 
@@ -673,7 +1062,7 @@ def canonical_proof_edges(conn: sqlite3.Connection, project_id: str, candidate_i
     """Create only the server-owned edges allowed by one obligation contract."""
     from linen.server.audit_state import create_graph_edge
     contract = GAP_CONTRACTS.get(code)
-    if contract is None:
+    if contract is None or code in DYNAMIC_PROOF_GAPS:
         return []
     role, _intent, relation, _description = contract
     edge_pairs: list[tuple[str, str, str]] = []

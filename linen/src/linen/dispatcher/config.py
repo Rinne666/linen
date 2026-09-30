@@ -267,7 +267,7 @@ class ReconConfig(BaseModel):
         return value
 
 
-CodeQLLanguage = Literal["csharp", "java", "javascript", "python", "ruby"]
+CodeQLLanguage = Literal["csharp", "cpp", "java", "javascript", "python", "ruby"]
 
 
 class CodeQLConfig(ReviewSandboxConfig):
@@ -549,11 +549,6 @@ class DispatchConfig(BaseModel):
             raise ValueError("audit recon requires audit.enabled")
         if self.audit.recon.enabled and self.audit.mode != "scope":
             raise ValueError("audit recon requires scope mode")
-        if self.audit.recon.enabled and self.audit.semantic.enabled:
-            raise ValueError(
-                "audit.recon and audit.semantic cannot both be enabled; semantic recipes "
-                "currently require a coverage snapshot"
-            )
         if self.audit.recon.enabled and not any(
             "explore" in worker.task_types for worker in self.workers
         ):

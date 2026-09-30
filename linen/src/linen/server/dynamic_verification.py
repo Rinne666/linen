@@ -1,7 +1,8 @@
-"""Deterministic, read-only verification of optional dynamic evidence.
+"""Deterministic, read-only verification of dynamic confirmation evidence.
 
-Dynamic verification strengthens the existing UVPG result.  It never creates
-Facts, changes Fact state, executes a command, or promotes a candidate.
+New Technical Confirmation requires this dynamic gate after static UVPG passes.
+It never creates Facts, changes Fact state, executes a command, or promotes a
+candidate; isolated runs and their reviewed Facts must already exist.
 """
 from __future__ import annotations
 

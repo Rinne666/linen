@@ -229,7 +229,12 @@ def canonical_vulnerability_trace(
         causal_keys = {"file", "line", "symbol", "kind", "observation", "citation_id"}
         if (
             not isinstance(step, dict)
-            or set(step) not in (legacy_keys, causal_keys, causal_keys | {"endpoint_id"})
+            or set(step) not in (
+                legacy_keys, legacy_keys | {"data_symbol"},
+                causal_keys, causal_keys | {"endpoint_id"},
+                causal_keys | {"data_symbol"},
+                causal_keys | {"endpoint_id", "data_symbol"},
+            )
         ):
             raise ValueError(
                 "Every trace step requires file, line, symbol, kind, observation, "
@@ -242,6 +247,7 @@ def canonical_vulnerability_trace(
         observation = step["observation"]
         citation_id = step["citation_id"]
         endpoint_id = step.get("endpoint_id")
+        data_symbol = step.get("data_symbol")
         citation = citation_by_id.get(citation_id) if isinstance(citation_id, str) else None
         if (
             not isinstance(filename, str)
@@ -256,6 +262,14 @@ def canonical_vulnerability_trace(
             or not observation.strip()
             or citation is None
             or (endpoint_id is not None and not isinstance(endpoint_id, str))
+            or (
+                data_symbol is not None
+                and (
+                    not isinstance(data_symbol, str)
+                    or not data_symbol.strip()
+                    or len(data_symbol) > 200
+                )
+            )
         ):
             raise ValueError("Invalid vulnerability trace step")
         if endpoint_id is not None:
@@ -281,6 +295,8 @@ def canonical_vulnerability_trace(
         }
         if endpoint_id is not None:
             normalized_step["endpoint_id"] = endpoint_id
+        if data_symbol is not None:
+            normalized_step["data_symbol"] = data_symbol.strip()
         normalized.append(normalized_step)
     return normalized
 
@@ -290,6 +306,9 @@ def vulnerability_trace_proof(
     *, provenance: Any = None, root_cause: str | None = None,
     variants_checked: list[str] | None = None,
     security_checks: dict[str, Any] | None = None,
+    vulnerability_class: str | None = None,
+    sink_context: str | None = None,
+    path_conditions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if provenance is None:
         provenance = {"source_type": "llm"}
@@ -312,6 +331,36 @@ def vulnerability_trace_proof(
         or any(not isinstance(value, str) or not value.strip() or len(value) > 500 for value in variants_checked)
     ):
         raise ValueError("Trace variants_checked must be a bounded list of non-empty labels")
+    if vulnerability_class is not None and (
+        not isinstance(vulnerability_class, str)
+        or not vulnerability_class.strip()
+        or len(vulnerability_class) > 80
+    ):
+        raise ValueError("Trace vulnerability_class must be bounded non-empty text")
+    if sink_context is not None and (
+        not isinstance(sink_context, str)
+        or not sink_context.strip()
+        or len(sink_context) > 80
+    ):
+        raise ValueError("Trace sink_context must be bounded non-empty text")
+    if path_conditions is not None and (
+        not isinstance(path_conditions, list)
+        or len(path_conditions) > 64
+        or any(
+            not isinstance(condition, dict)
+            or set(condition) != {"file", "line", "expression", "branch_taken"}
+            or not isinstance(condition.get("file"), str)
+            or not condition["file"].strip()
+            or type(condition.get("line")) is not int
+            or condition["line"] < 1
+            or not isinstance(condition.get("expression"), str)
+            or not condition["expression"].strip()
+            or len(condition["expression"]) > 512
+            or type(condition.get("branch_taken")) is not bool
+            for condition in path_conditions
+        )
+    ):
+        raise ValueError("Trace path_conditions must be a bounded array of source-bound predicates")
     normalized_provenance = {"source_type": provenance["source_type"].strip()}
     if provenance.get("source_ref"):
         normalized_provenance["source_ref"] = provenance["source_ref"].strip()
@@ -325,6 +374,11 @@ def vulnerability_trace_proof(
             "candidate_outcome": outcome,
             "snapshot_id": snapshot_id,
             "provenance": normalized_provenance,
+            **({"vulnerability_class": vulnerability_class.strip()}
+               if isinstance(vulnerability_class, str) and vulnerability_class.strip() else {}),
+            **({"sink_context": sink_context.strip()}
+               if isinstance(sink_context, str) and sink_context.strip() else {}),
+            **({"path_conditions": path_conditions} if path_conditions is not None else {}),
             **({"security_checks": security_checks} if security_checks is not None else {}),
             **({"root_cause": root_cause.strip()} if isinstance(root_cause, str) and root_cause.strip() else {}),
             **({"variants_checked": [value.strip() for value in variants_checked if value.strip()]}
@@ -415,7 +469,7 @@ def review_inputs(project: ProjectDetail, fact: Fact, workdir: Path) -> dict[str
         "coverage_plan", "recon_snapshot", "recon", "module_summary", "audit_summary",
         "architecture_map", "authz_matrix", "state_model", "cross_service_map",
         "contract_map", "hypothesis_batch", "variant_batch", "semantic_summary",
-        "policy_evidence", "scope_adjudication",
+        "dynamic_recipe_result", "policy_evidence", "scope_adjudication",
     }
     if fact.type in artifact_fact_types:
         path, artifact = load_artifact(fact, workdir)
@@ -428,6 +482,7 @@ def review_inputs(project: ProjectDetail, fact: Fact, workdir: Path) -> dict[str
             "pre_exclusions", "conflicts", "decision_scope",
             "technical_exploitability_unchanged", "evidence_gaps",
             "leads", "snapshot_id", "snapshot_fact_id", "languages",
+            "recipe_artifact_sha256", "operations", "codeql_profiles", "provenance",
         ) if key in artifact}
         inputs["record.json"] = json.dumps(record, ensure_ascii=False).encode()
     elif fact.type == "coverage_result":
