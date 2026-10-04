@@ -729,6 +729,11 @@ def run_explore_task(
                     "triaged" if fact["type"] in audit_graph.REVIEWLESS_INTERMEDIATE_FACT_TYPES
                     else "draft"
                 ),
+                candidate_budget=(
+                    config.audit.max_candidate_findings
+                    if config.audit.enabled and project.project.audit_mode != "none"
+                    else None
+                ),
                 proof=fact.get("proof"),
             )
         if did_timeout(first):
@@ -911,6 +916,11 @@ def _run_context_continuation(
             fact_status=(
                 "triaged" if fact["type"] in audit_graph.REVIEWLESS_INTERMEDIATE_FACT_TYPES
                 else "draft"
+            ),
+            candidate_budget=(
+                config.audit.max_candidate_findings
+                if config.audit.enabled and project.project.audit_mode != "none"
+                else None
             ),
             proof=fact.get("proof"),
         )
@@ -1250,6 +1260,11 @@ def _try_conclude_fallback(
         fact_status=(
             "triaged" if fact["type"] in audit_graph.REVIEWLESS_INTERMEDIATE_FACT_TYPES
             else "draft"
+        ),
+        candidate_budget=(
+            config.audit.max_candidate_findings
+            if config.audit.enabled and fresh_project.project.audit_mode != "none"
+            else None
         ),
         proof=fact.get("proof"),
     )

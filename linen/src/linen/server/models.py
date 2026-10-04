@@ -645,6 +645,18 @@ class PiExecutionPage(BaseModel):
     limit: int
 
 
+class WorkerCallCost(BaseModel):
+    calls: int = 0
+    duration_ms: int = 0
+    unarchived_attempts: int = 0
+
+
+class ProjectCostLedger(BaseModel):
+    project_id: str
+    total: WorkerCallCost = Field(default_factory=WorkerCallCost)
+    by_category: dict[str, WorkerCallCost] = Field(default_factory=dict)
+
+
 class PiExecutionDetail(PiExecutionSummary):
     prompt: str = ""
     response: str = ""
@@ -922,6 +934,9 @@ class ConcludeRequest(BaseModel):
     type: str | None = None
     evidence: str | None = None
     proof: ProofPayload | None = None
+    # Dispatcher policy for audit candidate creation. The server applies this
+    # atomically at the Fact write boundary; generic projects ignore it.
+    candidate_budget: int = Field(default=8, ge=1, le=100)
     display_title: str | None = None
     semantic_type: str | None = None
     # Lifecycle status of the new fact. Defaults to 'draft' — the explore

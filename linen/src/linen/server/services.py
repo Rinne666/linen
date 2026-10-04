@@ -380,6 +380,31 @@ def project_meta_from_row(row: sqlite3.Row) -> ProjectMeta:
     )
 
 
+def _is_candidate_budget_residual(
+    conn: sqlite3.Connection,
+    project_id: str,
+    fact_id: str,
+    evidence: str | None,
+) -> bool:
+    try:
+        record = json.loads(evidence or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not (
+        isinstance(record, dict)
+        and record.get("kind") == "candidate_budget_residual"
+        and isinstance(record.get("dedupe_key"), str)
+        and record.get("dedupe_key", "").startswith("candidate-budget-residual:g")
+    ):
+        return False
+    return conn.execute(
+        "SELECT 1 FROM audit_events WHERE project_id = ? "
+        "AND event_type = 'candidate_budget_overflow_recorded' "
+        "AND entity_kind = 'fact' AND entity_id = ? LIMIT 1",
+        (project_id, fact_id),
+    ).fetchone() is not None
+
+
 def audit_completion_blockers_from_db(
     conn: sqlite3.Connection, project_id: str, from_ids: list[str]
 ) -> list[str]:
@@ -465,8 +490,13 @@ def audit_completion_blockers_from_db(
             if facts[summary_id]["type"] != "audit_summary":
                 continue
             for candidate_id in parents.get(summary_id, []):
-                if scope_summary_records_review_exhausted_candidate(
-                    conn, project_id, summary_id, candidate_id,
+                if (
+                    scope_summary_records_review_exhausted_candidate(
+                        conn, project_id, summary_id, candidate_id,
+                    )
+                    or scope_summary_records_candidate_budget_overflow(
+                        conn, project_id, summary_id, candidate_id,
+                    )
                 ):
                     exhausted_summary_candidates.add(candidate_id)
 
@@ -502,7 +532,15 @@ def audit_completion_blockers_from_db(
                 technical_confirmation = False
         deterministic_intermediate = (
             fact["status"] == "triaged"
-            and fact["type"] in REVIEWLESS_INTERMEDIATE_FACT_TYPES
+            and (
+                fact["type"] in REVIEWLESS_INTERMEDIATE_FACT_TYPES
+                or (
+                    fact["type"] == "coverage_result"
+                    and _is_candidate_budget_residual(
+                        conn, project_id, fact_id, fact["evidence"],
+                    )
+                )
+            )
         )
         terminal_review_valid = (
             latest_review is not None
@@ -652,6 +690,54 @@ def scope_summary_records_review_exhausted_candidate(
         direct_source is not None
         and scope_review_exhausted_candidate(conn, project_id, fact_id)
     )
+
+
+def scope_summary_records_candidate_budget_overflow(
+    conn: sqlite3.Connection, project_id: str, summary_id: str, fact_id: str,
+) -> bool:
+    """Whether a current summary records this candidate as residual budget overflow."""
+    project = get_project_or_404(conn, project_id)
+    if project["audit_mode"] != "scope":
+        return False
+    generation = project["source_generation"] if "source_generation" in project.keys() else 1
+    plan_revision = project["plan_revision"] if "plan_revision" in project.keys() else 1
+    candidate = conn.execute(
+        "SELECT type, semantic_type, source_generation FROM facts "
+        "WHERE project_id = ? AND id = ?",
+        (project_id, fact_id),
+    ).fetchone()
+    summary = conn.execute(
+        "SELECT type, source_generation, evidence FROM facts WHERE project_id = ? AND id = ?",
+        (project_id, summary_id),
+    ).fetchone()
+    if (
+        candidate is None
+        or candidate["type"] != "vulnerability"
+        or candidate["semantic_type"] != "candidate_finding"
+        or candidate["source_generation"] != generation
+        or summary is None
+        or summary["type"] != "audit_summary"
+        or summary["source_generation"] != generation
+        or not isinstance(summary["evidence"], str)
+    ):
+        return False
+    marker = re.compile(
+        rf"(?m)^candidate_budget_overflow_id:[ \t]*{re.escape(fact_id)}[ \t]*$"
+    )
+    if (
+        marker.search(summary["evidence"]) is None
+        or _SUMMARY_MANIFEST_SHA256_RE.search(summary["evidence"]) is None
+    ):
+        return False
+    direct_source = conn.execute(
+        "SELECT 1 FROM intents i JOIN intent_sources s "
+        "ON s.project_id = i.project_id AND s.intent_id = i.id "
+        "WHERE i.project_id = ? AND i.to_fact_id = ? AND i.type = 'synthesize' "
+        "AND i.description = '@analysis:audit-summary' "
+        "AND i.source_generation = ? AND i.plan_revision = ? AND s.fact_id = ? LIMIT 1",
+        (project_id, summary_id, generation, plan_revision, fact_id),
+    ).fetchone()
+    return direct_source is not None
 
 
 def clear_project_reason(conn: sqlite3.Connection, project_id: str) -> None:

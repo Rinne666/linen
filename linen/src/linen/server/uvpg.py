@@ -18,6 +18,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
+from collections.abc import Iterable
 
 from linen.server.models import Fact, GraphEdge, ProofPayload
 
@@ -372,6 +373,92 @@ def unreviewed_required_facts(view: ProofGraphView) -> list[str]:
             latest = reviews[-1] if reviews else None
             if latest is None or latest["verdict"] != "VALID" or latest["confidence"] not in {"firm", "certain"}:
                 targets.append(fact_id)
+    return targets
+
+
+def candidate_proof_package_review_ready(reason_codes: Iterable[str]) -> bool:
+    """Whether a complete, source-valid package can receive its unified review.
+
+    Missing package review and a stale fingerprint are expected at this stage.
+    Classified failure claims can also be reviewed as part of a complete
+    package. Every structural, provenance, and contradiction reason keeps the
+    package review deferred.
+    """
+    allowed = {"UNREVIEWED_EVIDENCE", "PROOF_GRAPH_CHANGED", *CLASSIFIED_FAILURE_CODES}
+    return not (set(reason_codes) - allowed)
+
+
+def _unreviewed_strategy_reachability_facts(
+    conn: sqlite3.Connection,
+    project_id: str,
+    candidate_id: str,
+    view: ProofGraphView,
+    reason_codes: Iterable[str],
+) -> list[tuple[str, str]]:
+    """Find failure claims or alternate routes needing separate semantic review."""
+    if not view.proof_fact_ids:
+        return []
+    active_reasons = set(reason_codes)
+    reviewable_reasons = {
+        "UNREVIEWED_EVIDENCE", "PROOF_GRAPH_CHANGED", *CLASSIFIED_FAILURE_CODES,
+        *(code for code in active_reasons if code.startswith("MISSING_")),
+    }
+    if (
+        "AMBIGUOUS_CAPABILITY_DELTA" in active_reasons
+        and "MISSING_CAPABILITY_DELTA" in active_reasons
+        and not view.facts_by_role.get("capability_delta")
+    ):
+        reviewable_reasons.add("AMBIGUOUS_CAPABILITY_DELTA")
+    if active_reasons - reviewable_reasons:
+        return []
+    strategy_blocked = bool(active_reasons & STRATEGY_ERROR_CODES)
+    placeholders = ",".join("?" for _ in view.proof_fact_ids)
+    rows = conn.execute(
+        f"SELECT * FROM facts WHERE project_id = ? AND source_generation = "
+        f"(SELECT source_generation FROM projects WHERE id = ?) "
+        f"AND id IN ({placeholders}) ORDER BY id",
+        (project_id, project_id, *view.proof_fact_ids),
+    ).fetchall()
+    targets = []
+    for row in rows:
+        fact = Fact(**dict(row))
+        proof = fact.proof
+        failure_code = proof.attributes.get("failure_code") if proof else None
+        if (
+            proof is None
+            or proof.claim_kind not in REQUIRED_ROLES
+            or candidate_id not in proof.subject_ids
+            or (
+                not (
+                    failure_code in CLASSIFIED_FAILURE_CODES
+                    and proof.claim_kind in REQUIRED_ROLES
+                )
+                and not (
+                    strategy_blocked
+                    and proof.claim_kind == "reachability"
+                    and failure_code is None
+                    and proof.attributes.get("reachable") is not False
+                    and str(proof.attributes.get("prescreen_status", "")).upper() != "FAIL"
+                )
+            )
+            or validate_proof_payload(
+                conn, project_id, proof, subject_fact_id=fact.id,
+            )
+        ):
+            continue
+        reviews = view.reviews_by_fact.get(fact.id, [])
+        latest = reviews[-1] if reviews else None
+        if latest is not None and (
+            latest["verdict"] == "INVALID"
+            or (
+                latest["verdict"] == "VALID"
+                and latest["confidence"] in {"firm", "certain"}
+            )
+        ):
+            continue
+        if len(reviews) >= 2:
+            continue
+        targets.append((fact.id, failure_code or "ALTERNATE_REACHABILITY"))
     return targets
 
 
@@ -893,6 +980,10 @@ def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_
         reason_codes.add("UNREVIEWED_EVIDENCE")
     generation_row = conn.execute("SELECT source_generation FROM projects WHERE id = ?", (project_id,)).fetchone()
     generation = generation_row["source_generation"] if generation_row else 0
+    package_review_ready = candidate_proof_package_review_ready(result.reason_codes)
+    classified_failure_reviews = _unreviewed_strategy_reachability_facts(
+        conn, project_id, candidate_fact_id, view, reason_codes,
+    )
     gaps: list[ProofGap] = []
     for code in sorted(reason_codes, key=lambda value: (GAP_PRIORITY.get(value, 99), value)):
         if code in NON_INVESTIGATIVE_GAPS:
@@ -904,6 +995,27 @@ def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_
             # obligations until the unified review is recorded.
             has_candidate_review = bool(view.reviews_by_fact.get(candidate_fact_id))
             if stale_unified_review:
+                if package_review_ready:
+                    gaps.append(ProofGap(
+                        candidate_fact_id, code, "candidate", GAP_PRIORITY.get(code, 99),
+                        (candidate_fact_id,), "review:cold-verifier", "reviews", None,
+                        "Independently falsify or validate the complete current candidate-local vulnerability proof.",
+                        "missing", generation, candidate_fact_id,
+                    ))
+                continue
+            if not package_review_ready:
+                if has_candidate_review:
+                    for target in unreviewed_required_facts(view):
+                        role = next((r for r, ids in view.facts_by_role.items() if target in ids), None)
+                        gaps.append(ProofGap(
+                            candidate_fact_id, code, role, GAP_PRIORITY.get(code, 99),
+                            (target,), "review:devils-advocate", "reviews", None,
+                            "Independently review this candidate-specific proof Fact.",
+                            "missing", generation, target,
+                        ))
+                continue
+            targets = unreviewed_required_facts(view) if has_candidate_review else [candidate_fact_id]
+            if not has_candidate_review and package_review_ready:
                 gaps.append(ProofGap(
                     candidate_fact_id, code, "candidate", GAP_PRIORITY.get(code, 99),
                     (candidate_fact_id,), "review:cold-verifier", "reviews", None,
@@ -911,14 +1023,7 @@ def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_
                     "missing", generation, candidate_fact_id,
                 ))
                 continue
-            targets = unreviewed_required_facts(view) if has_candidate_review else [candidate_fact_id]
             if not has_candidate_review:
-                gaps.append(ProofGap(
-                    candidate_fact_id, code, "candidate", GAP_PRIORITY.get(code, 99),
-                    (candidate_fact_id,), "review:cold-verifier", "reviews", None,
-                    "Independently falsify or validate the complete current candidate-local vulnerability proof.",
-                    "missing", generation, candidate_fact_id,
-                ))
                 continue
             for target in targets:
                 role = next((candidate_role for candidate_role, ids in view.facts_by_role.items() if target in ids), None)
@@ -1006,6 +1111,17 @@ def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_
         gap_status = "blocked" if code in NON_INVESTIGATIVE_GAPS or code in NON_AUTOMATIC_REPAIR_GAPS else "missing"
         gaps.append(ProofGap(candidate_fact_id, code, role, GAP_PRIORITY.get(code, 99), related, intent_type, relation, expected, description, gap_status, generation))
 
+    # Semantic failure/alternate-route reviews are independent obligations.
+    # Emit them even when legacy per-Fact reviews keep the compatibility gate
+    # from reporting UNREVIEWED_EVIDENCE for the candidate package.
+    for target, failure_code in classified_failure_reviews:
+        gaps.append(ProofGap(
+            candidate_fact_id, "UNREVIEWED_EVIDENCE", "failure_claim", 0,
+            (target,), "review:devils-advocate", "reviews", None,
+            f"Independently assess the candidate-bound {failure_code} claim in this proof Fact.",
+            "missing", generation, target,
+        ))
+
     # Dynamic proof is a separate, mandatory confirmation stage. Keep its
     # executable work out of the static proof graph, but derive its missing
     # obligations from the same candidate and generation.
@@ -1048,7 +1164,7 @@ def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_
                     "Independently verify the isolated run, artifact, oracle observation, and capability probe for this dynamic proof Fact.",
                     "missing", generation, fact.id,
                 ))
-        gaps.sort(key=lambda gap: (gap.priority, gap.code, gap.target_fact_id or ""))
+    gaps.sort(key=lambda gap: (gap.priority, gap.code, gap.target_fact_id or ""))
     return gaps
 
 

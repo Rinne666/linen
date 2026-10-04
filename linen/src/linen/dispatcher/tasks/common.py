@@ -1386,6 +1386,7 @@ def write_conclude_result(
     fact_type: str | None = None,
     evidence: str | None = None,
     fact_status: str = "draft",
+    candidate_budget: int | None = None,
     proof: dict[str, Any] | None = None,
 ) -> str:
     return write_conclude_result_with_fact_id(
@@ -1400,6 +1401,7 @@ def write_conclude_result(
         fact_type=fact_type,
         evidence=evidence,
         fact_status=fact_status,
+        candidate_budget=candidate_budget,
         proof=proof,
     ).status
 
@@ -1417,6 +1419,7 @@ def write_conclude_result_with_fact_id(
     fact_type: str | None = None,
     evidence: str | None = None,
     fact_status: str = "draft",
+    candidate_budget: int | None = None,
     proof: dict[str, Any] | None = None,
 ) -> ConcludeWriteResult:
     conclude_options: dict[str, Any] = {
@@ -1424,6 +1427,8 @@ def write_conclude_result_with_fact_id(
         "evidence": evidence,
         "status": fact_status,
     }
+    if candidate_budget is not None:
+        conclude_options["candidate_budget"] = candidate_budget
     if proof is not None:
         conclude_options["proof"] = proof
     response = client.conclude(

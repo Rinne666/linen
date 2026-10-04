@@ -472,6 +472,16 @@ class AuditConfig(BaseModel):
     # defaults to scope coverage rather than stopping after one hypothesis.
     enabled: bool = False
     mode: Literal["hypothesis", "scope"] = "scope"
+    # Bound candidate findings before they fan out into expensive proof work.
+    max_candidate_findings: int = Field(default=8, gt=0, le=100)
+    # Hard runtime budgets are enforced by the dispatcher, before it derives
+    # audit work or dispatches another worker process.
+    max_runs_per_project: int = Field(default=250, gt=0, le=100_000)
+    wall_clock_budget_seconds: int = Field(default=43_200, gt=0, le=604_800)
+    # Health signals stop repeated no-op strategy calls and surface idle audits.
+    reason_noop_limit: int = Field(default=3, gt=0, le=10)
+    reason_noop_cooldown_seconds: int = Field(default=900, gt=0, le=86_400)
+    idle_stall_seconds: int = Field(default=1_800, gt=0, le=604_800)
     # Read-only migration support for projects created with the retired
     # coverage-cell pipeline. New scope projects use Recon.
     coverage: CoverageConfig = Field(default_factory=CoverageConfig)

@@ -961,13 +961,37 @@ def plan_proof_gap(project_id: str, fact_id: str):
             refutation = _persist_unreachable_refutation(
                 conn, project_id, fact_id, unreachable_gap,
             )
-            if refutation is not None:
+            if refutation is not None and refutation.get("candidate_refuted"):
                 return {
                     "created_intent": False,
                     **refutation,
                     "candidate_id": fact_id,
                     **_proof_status_payload(conn, project_id, fact_id),
                 }
+            if refutation is not None:
+                unreachable_sources = set(unreachable_gap.related_fact_ids)
+                has_dispatchable_review = any(
+                    gap.code == "UNREVIEWED_EVIDENCE"
+                    and gap.status == "missing"
+                    and gap.suggested_intent_type in {
+                        "review:devils-advocate", "review:cold-verifier",
+                    }
+                    and (
+                        gap.target_fact_id in unreachable_sources
+                        or (
+                            gap.target_fact_id == fact_id
+                            and gap.suggested_intent_type == "review:cold-verifier"
+                        )
+                    )
+                    for gap in gaps
+                )
+                if not has_dispatchable_review:
+                    return {
+                        "created_intent": False,
+                        **refutation,
+                        "candidate_id": fact_id,
+                        **status,
+                    }
         assessment = latest_finding_assessment(conn, project_id, fact_id)
         if assessment is not None:
             verdict, confidence, details = assessment
@@ -991,6 +1015,12 @@ def plan_proof_gap(project_id: str, fact_id: str):
             gap for gap in gaps
             if gap.failure_class in {"wrong_path", "wrong_boundary_assumption"}
         ), None)
+        semantic_review_pending = any(
+            gap.code == "UNREVIEWED_EVIDENCE"
+            and gap.role == "failure_claim"
+            and gap.target_fact_id is not None
+            for gap in gaps
+        )
         if strategy_gap is not None:
             proof_prefix = f"@uvpg:proof:{fact_id}:"
             related_ids = set(strategy_gap.related_fact_ids)
@@ -1021,7 +1051,7 @@ def plan_proof_gap(project_id: str, fact_id: str):
                 "SELECT sequence FROM audit_events WHERE project_id = ? AND idempotency_key = ?",
                 (project_id, event_key),
             ).fetchone()
-            if prior_replan is not None:
+            if prior_replan is not None and not semantic_review_pending:
                 return {"created_intent": False, "reason": "strategy_replan_already_requested", **status}
             failures = 0
             if recipe_keys:
@@ -1075,7 +1105,8 @@ def plan_proof_gap(project_id: str, fact_id: str):
                     },
                     idempotency_key=event_key,
                 )
-                return {"created_intent": False, "reason": "strategy_replan_required", **_proof_status_payload(conn, project_id, fact_id)}
+                if not semantic_review_pending:
+                    return {"created_intent": False, "reason": "strategy_replan_required", **_proof_status_payload(conn, project_id, fact_id)}
         eligible_gaps = [
             gap for gap in gaps
             if gap.code not in NON_INVESTIGATIVE_GAPS

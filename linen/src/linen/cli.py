@@ -1,7 +1,9 @@
 from pathlib import Path
 import json
+from urllib.parse import quote
 
 import click
+import requests
 import uvicorn
 
 from linen.dispatcher.logging import configure_logging
@@ -105,6 +107,29 @@ def coverage_report(config_path: Path, project_id: str):
         raise click.ClickException(str(exc)) from exc
     finally:
         client.close()
+
+
+@main.command("cost")
+@click.option("--project-id", required=True, help="Project whose worker calls to summarize")
+@click.option(
+    "--server-url",
+    default="http://127.0.0.1:9000",
+    envvar="LINEN_SERVER_URL",
+    show_default=True,
+    help="Base URL of the linen API server",
+)
+def cost_report(project_id: str, server_url: str):
+    """Print persisted worker call counts and durations for a project."""
+    url = f"{server_url.rstrip('/')}/projects/{quote(project_id, safe='')}/cost"
+    try:
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise click.ClickException(f"Could not fetch project cost ledger: {exc}") from exc
+    try:
+        click.echo(json.dumps(response.json(), ensure_ascii=False, indent=2))
+    except ValueError as exc:
+        raise click.ClickException("Server returned invalid JSON for the cost ledger") from exc
 
 
 @main.command("audit-benchmark")

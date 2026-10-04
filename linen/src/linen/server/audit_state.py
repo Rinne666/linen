@@ -23,6 +23,7 @@ from linen.server.services import (
     audit_completion_blockers_from_db,
     get_project_or_404,
     next_graph_edge_id,
+    scope_summary_records_candidate_budget_overflow,
     scope_summary_records_review_exhausted_candidate,
     utcnow,
 )
@@ -574,8 +575,13 @@ def completion_gate_from_db(
                 "AND i.source_generation = ? AND i.plan_revision = ?",
                 (project_id, generation, generation, plan_revision),
             )
-            if scope_summary_records_review_exhausted_candidate(
-                conn, project_id, row["summary_id"], row["fact_id"],
+            if (
+                scope_summary_records_review_exhausted_candidate(
+                    conn, project_id, row["summary_id"], row["fact_id"],
+                )
+                or scope_summary_records_candidate_budget_overflow(
+                    conn, project_id, row["summary_id"], row["fact_id"],
+                )
             )
         }
     exhausted_candidates = [
@@ -615,7 +621,7 @@ def completion_gate_from_db(
         "Every candidate has an evidence-based assessment",
         not blocking_unresolved_candidates,
         (
-            f"{len(exhausted_candidates)} candidate finding(s) exhausted bounded proof review and remain explicitly unresolved in the scope summary; none is treated as confirmed or rejected."
+            f"{len(exhausted_candidates)} candidate finding(s) remain unresolved but are explicitly retained as residuals in the scope summary; none is treated as confirmed or rejected."
             if exhausted_candidates and not blocking_unresolved_candidates
             else "All candidates have decisive threat-model and impact assessments."
             if not unresolved_candidates
