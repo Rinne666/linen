@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
 import inspect
 import json
 import logging
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import requests
 
+from linen.contracts import AuditEventEnvelope
 from linen.dispatcher.analysis import audit_graph, audit_recipes, codeql, coverage, scope_gate, stages
 from linen.dispatcher.analysis.source_preflight import preflight_source_repository
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
@@ -29,7 +31,7 @@ from linen.dispatcher.workers.registry import get_driver
 from linen.dispatcher.tasks.explore import run_explore_task
 from linen.dispatcher.tasks.reason import run_reason_task
 from linen.dispatcher.tasks.review import run_review_task
-from linen.server.models import AuditEvent, Intent, ProjectDetail, ProjectSummary
+from linen.server.models import AuditEvent, CompletionGate, Intent, ProjectDetail, ProjectSummary
 
 LOG = logging.getLogger(__name__)
 UNHEALTHY_RETRY_AFTER_SECONDS = 5
@@ -79,6 +81,10 @@ class DispatcherLoop:
         self._startup_healthchecks_checked = False
         self._orphan_recovery_done: set[str] = set()
         self._orphan_recovery_reported: set[str] = set()
+        self._reason_noop_streak: dict[str, int] = {}
+        self._reason_cooldown_until: dict[str, float] = {}
+        self._reason_cooldown_restored: set[str] = set()
+        self._audit_idle_state: dict[str, dict[str, float | int | None]] = {}
 
     def close(self) -> None:
         if self.futures:
@@ -424,6 +430,12 @@ class DispatcherLoop:
         return False
 
     def _try_dispatch_project(self, summary: ProjectSummary) -> bool:
+        if not hasattr(self, "_reason_cooldown_until"):
+            self._reason_cooldown_until = {}
+        if not hasattr(self, "_reason_cooldown_restored"):
+            self._reason_cooldown_restored = set()
+        if not hasattr(self, "_audit_idle_state"):
+            self._audit_idle_state = {}
         skip_scope = f"project:{summary.id}:skip"
         container_name = self.container_manager.container_name(summary.id)
         if container_name in self._cleanup_pending:
@@ -450,6 +462,43 @@ class DispatcherLoop:
                 project.project.status,
             )
             return False
+        budget_state = self._audit_project_budget_state(project)
+        if budget_state == "unavailable":
+            self._log_changed(
+                f"project:{summary.id}:audit_budget_unavailable",
+                logging.WARNING,
+                "defer audit dispatch because persisted runs are unavailable project=%s",
+                summary.id,
+            )
+            return False
+        if budget_state is not None:
+            code, message, occurred_at = budget_state
+            budget_limit = (
+                getattr(self.config.audit, "max_runs_per_project", 250)
+                if code == "audit_run_budget_exhausted"
+                else getattr(self.config.audit, "wall_clock_budget_seconds", 43200)
+            )
+            self._append_runtime_health_event(
+                project,
+                "audit_budget_blocked",
+                code,
+                {
+                    "message": message,
+                    "budget_limit": budget_limit,
+                    "occurred_at": occurred_at,
+                },
+            )
+            self._log_changed(
+                f"project:{summary.id}:audit_budget:{code}",
+                logging.WARNING,
+                "audit project budget exhausted project=%s code=%s detail=%s",
+                summary.id,
+                code,
+                message,
+            )
+            if self._complete_if_gate_ready(project):
+                return True
+            return False
         if not self._source_audit_preflight(project):
             return True
         self._honor_manual_provider_retries(project)
@@ -475,6 +524,17 @@ class DispatcherLoop:
                 if reason_trigger is not None else []
             )
             if reason_trigger is not None and self._reason_may_run(project, trigger_events):
+                self._restore_reason_cooldown(project)
+                cooldown_until = self._reason_cooldown_until.get(summary.id, 0.0)
+                if time.time() < cooldown_until:
+                    self._log_changed(
+                        f"project:{summary.id}:reason_noop_cooldown",
+                        logging.INFO,
+                        "cool down stalled reason project=%s remaining=%.0fs",
+                        summary.id,
+                        cooldown_until - time.time(),
+                    )
+                    return False
                 if at_capacity:
                     self._log_changed(
                         f"{skip_scope}:max_project_workers",
@@ -486,6 +546,8 @@ class DispatcherLoop:
                     return False
                 export_yaml = self.client.export_project(summary.id)
                 return self._dispatch_reason(project, export_yaml, reason_trigger, trigger_events)
+
+        self._observe_audit_idle_health(project)
 
         completion_gate = None
         if (
@@ -506,32 +568,8 @@ class DispatcherLoop:
                     completion_gate.ready
                     and project.project.completion_policy == "goal_based"
                 ):
-                    sources = self._completion_sources(project)
-                    if sources:
-                        response = self.client.complete(
-                            project.project.id,
-                            sources,
-                            (
-                                "Audit pipeline converged: required stages, managed Skill "
-                                "receipts, independent reviews, and terminal evidence passed "
-                                "the Completion Gate."
-                            ),
-                            "dispatcher.completion-gate",
-                        )
-                        if response.ok:
-                            LOG.info(
-                                "completion gate committed project=%s sources=%s",
-                                project.project.id,
-                                sources,
-                            )
-                            return True
-                        if response.status_code not in {403, 409}:
-                            LOG.warning(
-                                "completion gate commit failed project=%s status=%s body=%s",
-                                project.project.id,
-                                response.status_code,
-                                response.text,
-                            )
+                    if self._commit_completion_gate(project, completion_gate):
+                        return True
                 elif not completion_gate.ready:
                     self._log_changed(
                         f"{skip_scope}:completion_gate",
@@ -645,32 +683,8 @@ class DispatcherLoop:
             and project.project.completion_policy == "exhaustive"
             and completion_gate.ready
         ):
-            sources = self._completion_sources(project)
-            if sources:
-                response = self.client.complete(
-                    project.project.id,
-                    sources,
-                    (
-                        "Audit pipeline converged: required stages, managed Skill "
-                        "receipts, independent reviews, and terminal evidence passed "
-                        "the Completion Gate."
-                    ),
-                    "dispatcher.completion-gate",
-                )
-                if response.ok:
-                    LOG.info(
-                        "completion gate committed project=%s sources=%s",
-                        project.project.id,
-                        sources,
-                    )
-                    return True
-                if response.status_code not in {403, 409}:
-                    LOG.warning(
-                        "completion gate commit failed project=%s status=%s body=%s",
-                        project.project.id,
-                        response.status_code,
-                        response.text,
-                    )
+            if self._commit_completion_gate(project, completion_gate):
+                return True
         self._log_changed(
             f"{skip_scope}:graph_unchanged",
             logging.DEBUG,
@@ -682,6 +696,375 @@ class DispatcherLoop:
             len(project.intents),
         )
         return False
+
+    def _audit_project_budget_state(
+        self, project: ProjectDetail,
+    ) -> tuple[str, str, str] | str | None:
+        """Return a deterministic audit budget blocker before materialization or dispatch."""
+        if project.project.audit_mode == "none":
+            return None
+        list_runs = getattr(getattr(self, "client", None), "list_runs", None)
+        if list_runs is None:
+            return "unavailable"
+        try:
+            runs = list_runs(project.project.id)
+        except Exception:
+            LOG.exception("audit run budget lookup failed project=%s", project.project.id)
+            return "unavailable"
+
+        run_ids = {
+            self._run_value(run, "run_id")
+            for run in runs
+            if isinstance(self._run_value(run, "run_id"), str)
+        }
+        matched_run_ids: set[str] = set()
+        unregistered_local_runs = 0
+        for task in self.futures.values():
+            if task.project_id != project.project.id:
+                continue
+            if isinstance(task.run_id, str) and task.run_id in run_ids:
+                matched_run_ids.add(task.run_id)
+                continue
+
+            matched_run = None
+            for run in runs:
+                run_id = self._run_value(run, "run_id")
+                if not isinstance(run_id, str) or run_id in matched_run_ids:
+                    continue
+                if self._run_value(run, "worker_name") != task.worker_name:
+                    continue
+                if self._run_value(run, "status") not in {"queued", "running"}:
+                    continue
+                run_intent_id = self._run_value(run, "intent_id")
+                if task.intent_id is not None:
+                    if run_intent_id != task.intent_id:
+                        continue
+                elif run_intent_id is not None or not str(
+                    self._run_value(run, "task_type") or ""
+                ).startswith("reason"):
+                    continue
+                matched_run = run_id
+                break
+            if matched_run is None:
+                # Dispatch is asynchronous: reserve a local slot until this
+                # task's first persisted run appears, then count that run only.
+                unregistered_local_runs += 1
+            else:
+                matched_run_ids.add(matched_run)
+        run_count = len(runs) + unregistered_local_runs
+        max_runs = getattr(self.config.audit, "max_runs_per_project", 250)
+        if run_count >= max_runs:
+            run_starts = sorted(
+                (
+                    (self._timestamp_seconds(self._run_value(run, "started_at")),
+                     self._run_value(run, "started_at"))
+                    for run in runs
+                ),
+                key=lambda item: item[0] if item[0] is not None else float("inf"),
+            )
+            occurrence = (
+                run_starts[min(max_runs - 1, len(run_starts) - 1)][1]
+                if run_starts else project.project.created_at
+            )
+            if not isinstance(occurrence, str) or not occurrence.strip():
+                occurrence = project.project.created_at
+            return (
+                "audit_run_budget_exhausted",
+                f"Run budget exhausted at the configured limit of {max_runs} runs.",
+                occurrence,
+            )
+
+        started_values = [
+            self._timestamp_seconds(self._run_value(run, "started_at"))
+            for run in runs
+        ]
+        started_values = [value for value in started_values if value is not None]
+        wall_clock_budget = getattr(self.config.audit, "wall_clock_budget_seconds", 43200)
+        if started_values and time.time() - min(started_values) >= wall_clock_budget:
+            deadline = datetime.fromtimestamp(
+                min(started_values) + wall_clock_budget, timezone.utc,
+            ).isoformat().replace("+00:00", "Z")
+            return (
+                "audit_wall_clock_budget_exhausted",
+                f"Wall-clock budget exhausted ({wall_clock_budget} seconds).",
+                deadline,
+            )
+        return None
+
+    @staticmethod
+    def _run_value(run: object, key: str) -> object:
+        return run.get(key) if isinstance(run, Mapping) else getattr(run, key, None)
+
+    @staticmethod
+    def _timestamp_seconds(value: object) -> float | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            return None
+
+    def _append_runtime_health_event(
+        self,
+        project: ProjectDetail,
+        event_type: str,
+        code: str,
+        payload: dict[str, object],
+    ) -> int | None:
+        append = getattr(getattr(self, "client", None), "append_event", None)
+        if append is None:
+            return None
+        sequence = project.project.event_seq
+        idempotency_key = (
+            f"dispatcher-health:{code}:g{project.project.source_generation}"
+            f":p{project.project.plan_revision}"
+        )
+        if event_type == "audit_budget_blocked":
+            idempotency_key += f":limit={payload.get('budget_limit', 'unknown')}"
+        else:
+            idempotency_key += f":e{sequence}"
+        occurrence = payload.get("occurred_at")
+        created_at = (
+            occurrence.strip()
+            if isinstance(occurrence, str) and occurrence.strip()
+            else project.project.created_at
+        )
+        event = AuditEventEnvelope(
+            event_id=f"health-{hashlib.sha256(idempotency_key.encode()).hexdigest()[:24]}",
+            project_id=project.project.id,
+            idempotency_key=idempotency_key,
+            event_type=event_type,
+            actor="dispatcher.health",
+            entity_kind="project",
+            entity_id=project.project.id,
+            graph_revision=project.project.graph_revision,
+            source_generation=project.project.source_generation,
+            plan_revision=project.project.plan_revision,
+            payload={"code": code, **payload},
+            created_at=created_at,
+        )
+        try:
+            response = append(event)
+        except Exception:
+            LOG.exception("runtime health event write failed project=%s code=%s", project.project.id, code)
+            return None
+        if hasattr(response, "ok") and not response.ok:
+            LOG.warning(
+                "runtime health event write rejected project=%s code=%s status=%s",
+                project.project.id,
+                code,
+                getattr(response, "status_code", "unknown"),
+            )
+            return None
+        if isinstance(response, Mapping):
+            result_sequence = response.get("sequence")
+        else:
+            result_sequence = getattr(response, "sequence", None)
+            result_data = getattr(response, "data", None)
+            if result_sequence is None and result_data is not None:
+                result_sequence = (
+                    result_data.get("sequence")
+                    if isinstance(result_data, Mapping)
+                    else getattr(result_data, "sequence", None)
+                )
+        try:
+            return int(result_sequence) if result_sequence is not None else sequence + 1
+        except (TypeError, ValueError):
+            return sequence + 1
+
+    def _observe_reason_noop(self, task: RunningTask) -> None:
+        project_id = task.project_id
+        if not hasattr(self, "_reason_noop_streak"):
+            self._reason_noop_streak = {}
+        if not hasattr(self, "_reason_cooldown_until"):
+            self._reason_cooldown_until = {}
+        streak = self._reason_noop_streak.get(project_id, 0) + 1
+        self._reason_noop_streak[project_id] = streak
+        limit = getattr(self.config.audit, "reason_noop_limit", 3)
+        if streak < limit:
+            return
+        try:
+            project = self.client.get_project(project_id)
+        except Exception:
+            LOG.exception("reason no-op health lookup failed project=%s", project_id)
+            return
+        if project.project.audit_mode == "none":
+            self._reason_noop_streak.pop(project_id, None)
+            return
+        if self._project_open_intent_count(project) != 0:
+            self._reason_noop_streak[project_id] = 0
+            return
+        cooldown = getattr(self.config.audit, "reason_noop_cooldown_seconds", 900)
+        until = time.time() + cooldown
+        self._reason_cooldown_until[project_id] = until
+        no_op_at = None
+        if task.run_id:
+            try:
+                runs = self.client.list_runs(project_id)
+                run = next(
+                    (item for item in runs if self._run_value(item, "run_id") == task.run_id),
+                    None,
+                )
+                no_op_at = self._run_value(run, "finished_at") if run is not None else None
+            except Exception:
+                LOG.debug("reason no-op run lookup failed project=%s run=%s", project_id, task.run_id, exc_info=True)
+        self._append_runtime_health_event(
+            project,
+            "audit_stall_detected",
+            "reason_noop_streak",
+            {
+                "consecutive_noop_runs": streak,
+                "cooldown_seconds": cooldown,
+                "occurred_at": (
+                    no_op_at
+                    if isinstance(no_op_at, str)
+                    else datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                ),
+            },
+        )
+        self._reason_noop_streak[project_id] = 0
+        LOG.warning(
+            "audit reason stalled project=%s no_op_runs=%s cooldown_seconds=%s",
+            project_id,
+            streak,
+            cooldown,
+        )
+
+    def _restore_reason_cooldown(self, project: ProjectDetail) -> None:
+        """Recover an active no-op cooldown from its persisted health event."""
+        project_id = project.project.id
+        if project_id in self._reason_cooldown_restored:
+            return
+        getter = getattr(getattr(self, "client", None), "get_audit_events", None)
+        if getter is None:
+            return
+        after = project.project.reason_last_seen_event_seq
+        through = project.project.event_seq
+        events: list[AuditEvent] = []
+        try:
+            while after < through:
+                page = getter(project_id, after=after, limit=2000)
+                if not page:
+                    break
+                events.extend(event for event in page if event.sequence <= through)
+                last = max(event.sequence for event in page)
+                if last <= after:
+                    break
+                after = last
+        except Exception:
+            LOG.debug("reason cooldown recovery failed project=%s", project_id, exc_info=True)
+            return
+        self._reason_cooldown_restored.add(project_id)
+        for event in reversed(events):
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            if (
+                event.event_type != "audit_stall_detected"
+                or payload.get("code") != "reason_noop_streak"
+                or event.source_generation != project.project.source_generation
+                or event.plan_revision != project.project.plan_revision
+            ):
+                continue
+            occurred_at = self._timestamp_seconds(payload.get("occurred_at") or event.created_at)
+            cooldown = payload.get("cooldown_seconds")
+            if occurred_at is None:
+                return
+            try:
+                until = occurred_at + max(0, int(cooldown))
+            except (TypeError, ValueError):
+                return
+            if until > time.time():
+                self._reason_cooldown_until[project_id] = until
+            return
+
+    def _observe_audit_idle_health(self, project: ProjectDetail) -> None:
+        if project.project.audit_mode == "none":
+            return
+        if not hasattr(self, "_audit_idle_state"):
+            self._audit_idle_state = {}
+        if (
+            project.project.status != "active"
+            or self._project_open_intent_count(project) != 0
+            or any(task.project_id == project.project.id for task in self.futures.values())
+        ):
+            self._audit_idle_state.pop(project.project.id, None)
+            return
+
+        project_id = project.project.id
+        now = time.time()
+        state = self._audit_idle_state.get(project_id)
+        current_seq = project.project.event_seq
+        if state is None:
+            last_event_at = None
+            latest_event = None
+            if current_seq > 0:
+                getter = getattr(getattr(self, "client", None), "get_audit_events", None)
+                if getter is not None:
+                    try:
+                        events = getter(project_id, after=current_seq - 1, limit=1)
+                        if events:
+                            latest_event = events[-1]
+                            last_event_at = self._timestamp_seconds(events[-1].created_at)
+                    except Exception:
+                        LOG.debug("latest audit event lookup failed project=%s", project_id, exc_info=True)
+            if last_event_at is None:
+                last_event_at = self._timestamp_seconds(project.project.created_at)
+            state = {
+                "event_seq": current_seq,
+                "event_at": last_event_at if last_event_at is not None else now,
+                "health_seq": (
+                    latest_event.sequence
+                    if latest_event is not None
+                    and latest_event.event_type == "audit_stall_detected"
+                    and isinstance(latest_event.payload, dict)
+                    and latest_event.payload.get("code") == "no_event_progress"
+                    and latest_event.source_generation == project.project.source_generation
+                    and latest_event.plan_revision == project.project.plan_revision
+                    else None
+                ),
+            }
+            self._audit_idle_state[project_id] = state
+        else:
+            health_seq = state.get("health_seq")
+            if current_seq > int(health_seq or state.get("event_seq") or 0):
+                last_event_at = None
+                getter = getattr(getattr(self, "client", None), "get_audit_events", None)
+                if getter is not None:
+                    try:
+                        events = getter(project_id, after=current_seq - 1, limit=1)
+                        if events:
+                            last_event_at = self._timestamp_seconds(events[-1].created_at)
+                    except Exception:
+                        LOG.debug("latest audit event lookup failed project=%s", project_id, exc_info=True)
+                state = {
+                    "event_seq": current_seq,
+                    "event_at": last_event_at if last_event_at is not None else now,
+                    "health_seq": None,
+                }
+                self._audit_idle_state[project_id] = state
+
+        idle_since = state.get("event_at")
+        idle_limit = getattr(self.config.audit, "idle_stall_seconds", 1800)
+        if idle_since is None or now - float(idle_since) < idle_limit:
+            return
+        if state.get("health_seq") is not None:
+            return
+        health_seq = self._append_runtime_health_event(
+            project,
+            "audit_stall_detected",
+            "no_event_progress",
+            {
+                "event_seq": current_seq,
+                "idle_seconds": idle_limit,
+                "threshold_seconds": idle_limit,
+                "occurred_at": datetime.fromtimestamp(
+                    float(idle_since) + idle_limit, timezone.utc,
+                ).isoformat().replace("+00:00", "Z"),
+            },
+        )
+        state["health_seq"] = health_seq
 
     @staticmethod
     def _completion_sources(project: ProjectDetail) -> list[str]:
@@ -706,6 +1089,63 @@ class DispatcherLoop:
                 )
             ]
         return []
+
+    def _commit_completion_gate(
+        self, project: ProjectDetail, gate: CompletionGate,
+    ) -> bool:
+        if not gate.ready:
+            return False
+        sources = self._completion_sources(project)
+        if not sources:
+            return False
+        response = self.client.complete(
+            project.project.id,
+            sources,
+            (
+                "Audit pipeline converged: required stages, managed Skill "
+                "receipts, independent reviews, and terminal evidence passed "
+                "the Completion Gate."
+            ),
+            "dispatcher.completion-gate",
+        )
+        if response.ok:
+            LOG.info(
+                "completion gate committed project=%s sources=%s",
+                project.project.id,
+                sources,
+            )
+            return True
+        if response.status_code not in {403, 409}:
+            LOG.warning(
+                "completion gate commit failed project=%s status=%s body=%s",
+                project.project.id,
+                response.status_code,
+                response.text,
+            )
+        return False
+
+    def _complete_if_gate_ready(self, project: ProjectDetail) -> bool:
+        """Permit only gate-backed completion when an audit budget is exhausted."""
+        if (
+            project.project.reason is not None
+            or project.project.audit_mode == "none"
+            or (
+                project.project.completion_policy == "exhaustive"
+                and self._project_open_intent_count(project) > 0
+            )
+            or not hasattr(self.client, "get_completion_gate")
+        ):
+            return False
+        try:
+            gate = self.client.get_completion_gate(project.project.id)
+        except Exception as exc:
+            LOG.warning(
+                "completion gate read failed project=%s error=%s",
+                project.project.id,
+                exc,
+            )
+            return False
+        return self._commit_completion_gate(project, gate)
 
     def _materialize_audit_intents(self, project: ProjectDetail) -> bool:
         if not self.config.audit.enabled or project.project.audit_mode == "none":
@@ -742,8 +1182,15 @@ class DispatcherLoop:
         # highest-value obligation and suppresses duplicate open Intents. It
         # never creates a Fact or calls Technical Confirmation here.
         if hasattr(self.client, "plan_proof_gap") and proposal_limit > 0 and not priority_scope_gate:
+            over_budget_candidates = audit_graph.candidate_budget_overflow_ids(
+                project, self.config.audit.max_candidate_findings,
+            )
             for fact in sorted(project.facts, key=lambda item: item.id):
-                if fact.source_generation != project.project.source_generation or fact.semantic_type != "candidate_finding":
+                if (
+                    fact.source_generation != project.project.source_generation
+                    or fact.semantic_type != "candidate_finding"
+                    or fact.id in over_budget_candidates
+                ):
                     continue
                 response = self.client.plan_proof_gap(project.project.id, fact.id)
                 if response.ok and isinstance(response.data, dict):
@@ -1600,6 +2047,10 @@ class DispatcherLoop:
             self.worker_provider_until = {}
         if not hasattr(self, "worker_provider_reason"):
             self.worker_provider_reason = {}
+        if not hasattr(self, "_reason_noop_streak"):
+            self._reason_noop_streak = {}
+        if not hasattr(self, "_reason_cooldown_until"):
+            self._reason_cooldown_until = {}
         done = [future for future in self.futures if future.done()]
         for future in done:
             task = self.futures.pop(future)
@@ -1612,7 +2063,7 @@ class DispatcherLoop:
                         task.task_type,
                         task.worker_name,
                     )
-                elif outcome != "success":
+                elif outcome not in {"success", "noop"}:
                     LOG.warning(
                         "task finished project=%s task=%s worker=%s outcome=%s",
                         task.project_id,
@@ -1650,7 +2101,7 @@ class DispatcherLoop:
                         outcome,
                         retry_after_seconds,
                     )
-                elif outcome == "success" and task.provider_required:
+                elif outcome in {"success", "noop"} and task.provider_required:
                     removed = self.worker_provider_until.pop(task.worker_name, None)
                     self.worker_provider_reason.pop(task.worker_name, None)
                     if removed is not None:
@@ -1668,9 +2119,15 @@ class DispatcherLoop:
                     )
                 else:
                     self.worker_rejected_until.pop(rejection_key, None)
+                if task.task_type == "reason":
+                    if outcome == "noop":
+                        self._observe_reason_noop(task)
+                    elif outcome == "success":
+                        self._reason_noop_streak.pop(task.project_id, None)
+                        self._reason_cooldown_until.pop(task.project_id, None)
                 if outcome in PROJECT_PAUSING_CLI_ISSUES:
                     self._pause_project_for_cli_issue(task, outcome)
-                elif outcome not in {"success", "cancelled", "blocked"}:
+                elif outcome not in {"success", "noop", "cancelled", "blocked"}:
                     self._record_intent_error(task, outcome)
             except Exception as exc:
                 LOG.exception("task crashed project=%s task=%s worker=%s", task.project_id, task.task_type, task.worker_name)

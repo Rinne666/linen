@@ -10,7 +10,13 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from linen.server.db import get_conn
-from linen.server.models import PiExecutionDetail, PiExecutionPage, PiExecutionSummary
+from linen.server.models import (
+    PiExecutionDetail,
+    PiExecutionPage,
+    PiExecutionSummary,
+    ProjectCostLedger,
+    WorkerCallCost,
+)
 from linen.server.services import get_project_or_404
 
 
@@ -239,6 +245,89 @@ def list_pi_executions(
         total=len(summaries),
         offset=offset,
         limit=limit,
+    )
+
+
+_COST_CATEGORIES = ("reason", "explore", "review", "poc", "unclassified")
+
+
+def _cost_category(phase: str, run: tuple[str | None, str | None] | None) -> str:
+    task_type, intent_type = run or (None, None)
+    if (intent_type or "").startswith("poc:isolated") or (task_type or "").startswith("poc:"):
+        return "poc"
+
+    phase = phase.lower() or (task_type or "").lower()
+    if phase.startswith("reason") or task_type == "reason":
+        return "reason"
+    if phase.startswith("review") or task_type == "review":
+        return "review"
+    if (
+        phase.startswith(("explore", "scope_adjudication", "recon_", "semantic_recipe"))
+        or task_type == "explore"
+    ):
+        return "explore"
+    if phase.startswith("poc"):
+        return "poc"
+    return "unclassified"
+
+
+@router.get("/projects/{project_id}/cost", response_model=ProjectCostLedger)
+def get_project_cost(project_id: str) -> ProjectCostLedger:
+    """Aggregate persisted worker invocation archives for one project."""
+    with get_conn() as conn:
+        get_project_or_404(conn, project_id)
+        runs = {
+            row["run_id"]: (row["task_type"], row["intent_type"])
+            for row in conn.execute(
+                "SELECT r.run_id, r.task_type, i.type AS intent_type "
+                "FROM runs r LEFT JOIN intents i "
+                "ON i.project_id = r.project_id AND i.id = r.intent_id "
+                "WHERE r.project_id = ?",
+                (project_id,),
+            )
+        }
+
+    totals = {category: WorkerCallCost() for category in _COST_CATEGORIES}
+    total = WorkerCallCost()
+    archived_run_ids: set[str] = set()
+    directory = _execution_dir(project_id)
+    if directory.is_dir():
+        for candidate in directory.glob("*.json"):
+            try:
+                record_path = _record_path(project_id, candidate.stem)
+                record = _load_record(record_path)
+            except HTTPException:
+                continue
+            # Each archive represents one launched worker process. Keep counting
+            # calls with absent/invalid timing, but treat their duration as zero.
+            if not isinstance(record.get("worker"), str) or not isinstance(record.get("phase"), str):
+                continue
+            run_id = str(record.get("run_id")) if record.get("run_id") else None
+            if run_id in runs:
+                archived_run_ids.add(run_id)
+            category = _cost_category(
+                record["phase"],
+                runs.get(run_id) if run_id else None,
+            )
+            duration = _nonnegative_int(record.get("duration_ms"))
+            totals[category].calls += 1
+            totals[category].duration_ms += duration
+            total.calls += 1
+            total.duration_ms += duration
+
+    # Runs are registered before process startup. Track runs without an archive
+    # separately so setup failures are not presented as worker invocations.
+    for run_id, run in runs.items():
+        if run_id in archived_run_ids:
+            continue
+        category = _cost_category("", run)
+        totals[category].unarchived_attempts += 1
+        total.unarchived_attempts += 1
+
+    return ProjectCostLedger(
+        project_id=project_id,
+        total=total,
+        by_category=totals,
     )
 
 

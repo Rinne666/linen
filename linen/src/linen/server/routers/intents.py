@@ -3,6 +3,7 @@ import json
 
 from fastapi import APIRouter, HTTPException
 
+from linen.candidate_attempts import is_candidate_attempt
 from linen.server.db import get_conn
 from linen.server.audit_state import (
     append_event,
@@ -66,6 +67,7 @@ router = APIRouter(tags=["intents"])
 COVERAGE_PREFIX = "@coverage:"
 AUDIT_CREATOR = "dispatcher.audit"
 COMPACTED_INTENT_TYPE = "cancelled:coverage-compaction"
+CANDIDATE_BUDGET_RESIDUAL_KIND = "candidate_budget_residual"
 
 
 @router.post(
@@ -404,16 +406,248 @@ def resolve(project_id: str, intent_id: str, body: ResolveIntentRequest):
             raise HTTPException(409, str(exc)) from exc
 
 
+def _candidate_attempt_count(conn, project_id: str, source_generation: int) -> int:
+    """Count vulnerability Facts created during this source generation.
+
+    Reviews and UVPG refutations can change semantic_type after a candidate is
+    created. Those settled attempts still consume the generation's budget.
+    """
+    rows = conn.execute(
+        "SELECT type, semantic_type FROM facts WHERE project_id = ? "
+        "AND type = 'vulnerability' AND source_generation = ?",
+        (project_id, source_generation),
+    ).fetchall()
+    return sum(
+        is_candidate_attempt(row["type"], row["semantic_type"])
+        for row in rows
+    )
+
+
+def _record_candidate_budget_residual(
+    conn,
+    project,
+    intent_row,
+    body: ConcludeRequest,
+    *,
+    candidate_count: int,
+    candidate_budget: int,
+    created_at: str,
+) -> ConcludeResponse:
+    """Conclude an overflow candidate into one provenance-bearing residual Fact."""
+    project_id = project["id"]
+    generation = project["source_generation"]
+    source_rows = conn.execute(
+        "SELECT fact_id FROM intent_sources WHERE project_id = ? AND intent_id = ? ORDER BY rowid",
+        (project_id, intent_row["id"]),
+    ).fetchall()
+    source_ids = [row["fact_id"] for row in source_rows]
+    record = {
+        "source_intent_id": intent_row["id"],
+        "source_intent_description": intent_row["description"],
+        "source_fact_ids": source_ids,
+        "candidate_description": body.description,
+        "candidate_evidence": body.evidence,
+        "candidate_proof": (
+            body.proof.model_dump(mode="json") if body.proof is not None else None
+        ),
+        "recorded_at": created_at,
+    }
+
+    residual_row = None
+    for row in conn.execute(
+        "SELECT id, description, evidence FROM facts WHERE project_id = ? "
+        "AND type = 'coverage_result' AND source_generation = ? ORDER BY id",
+        (project_id, generation),
+    ).fetchall():
+        try:
+            payload = json.loads(row["evidence"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("kind") == CANDIDATE_BUDGET_RESIDUAL_KIND
+            and payload.get("dedupe_key") == f"candidate-budget-residual:g{generation}"
+        ):
+            residual_row = row
+            break
+
+    if residual_row is None:
+        residual_id = next_fact_id(conn, project_id)
+        residual = {
+            "schema_version": 1,
+            "kind": CANDIDATE_BUDGET_RESIDUAL_KIND,
+            "dedupe_key": f"candidate-budget-residual:g{generation}",
+            "source_generation": generation,
+            "max_candidate_findings": candidate_budget,
+            "candidate_count_at_overflow": candidate_count,
+            "overflow_leads": [record],
+        }
+        residual_description = (
+            f"Candidate budget residual: 1 lead retained beyond the configured limit "
+            f"of {candidate_budget}."
+        )
+        conn.execute(
+            "INSERT INTO facts (id, project_id, description, display_title, type, semantic_type, "
+            "evidence, source_generation, status) VALUES (?, ?, ?, ?, 'coverage_result', "
+            "'coverage', ?, ?, 'triaged')",
+            (
+                residual_id, project_id, residual_description,
+                "Candidate budget residual",
+                json.dumps(residual, ensure_ascii=False, sort_keys=True), generation,
+            ),
+        )
+    else:
+        residual_id = residual_row["id"]
+        try:
+            residual = json.loads(residual_row["evidence"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            residual = {}
+        if not isinstance(residual, dict) or residual.get("kind") != CANDIDATE_BUDGET_RESIDUAL_KIND:
+            residual = {
+                "schema_version": 1,
+                "kind": CANDIDATE_BUDGET_RESIDUAL_KIND,
+                "dedupe_key": f"candidate-budget-residual:g{generation}",
+                "source_generation": generation,
+                "max_candidate_findings": candidate_budget,
+                "candidate_count_at_overflow": candidate_count,
+                "overflow_leads": [],
+            }
+        leads = residual.setdefault("overflow_leads", [])
+        if not isinstance(leads, list):
+            leads = []
+            residual["overflow_leads"] = leads
+        residual["dedupe_key"] = f"candidate-budget-residual:g{generation}"
+        if not any(
+            isinstance(item, dict) and item.get("source_intent_id") == intent_row["id"]
+            for item in leads
+        ):
+            leads.append(record)
+        residual["max_candidate_findings"] = candidate_budget
+        residual_description = (
+            f"Candidate budget residual: {len(leads)} lead(s) retained beyond the configured "
+            f"limit of {candidate_budget}."
+        )
+        conn.execute(
+            "UPDATE facts SET description = ?, display_title = ?, semantic_type = 'coverage', "
+            "evidence = ?, status = 'triaged' WHERE project_id = ? AND id = ?",
+            (
+                residual_description, "Candidate budget residual",
+                json.dumps(residual, ensure_ascii=False, sort_keys=True), project_id,
+                residual_id,
+            ),
+        )
+
+    conn.execute(
+        "UPDATE intents SET to_fact_id = ?, worker = ?, last_heartbeat_at = ?, concluded_at = ? "
+        "WHERE id = ? AND project_id = ?",
+        (residual_id, body.worker, created_at, created_at, intent_row["id"], project_id),
+    )
+    resolve_intent_errors(
+        conn,
+        project_id,
+        intent_row["id"],
+        resolution="candidate overflow retained as residual coverage evidence",
+        resolved_at=created_at,
+    )
+    relation_type = intent_row["relation_type"] or "produces"
+    for source_id in source_ids:
+        create_graph_edge(
+            conn,
+            project_id,
+            source_kind="fact",
+            source_id=source_id,
+            target_kind="fact",
+            target_id=residual_id,
+            relation_type=relation_type,
+            created_by="server.candidate-budget",
+            metadata={
+                "intent_id": intent_row["id"],
+                "candidate_budget_overflow": True,
+            },
+            created_at=created_at,
+        )
+    bump_graph_revision(conn, project_id)
+    append_event(
+        conn,
+        project_id,
+        "candidate_budget_overflow_recorded",
+        "server.candidate-budget",
+        entity_kind="fact",
+        entity_id=residual_id,
+        payload={
+            "source_intent_id": intent_row["id"],
+            "overflow_lead_source_fact_ids": source_ids,
+            "candidate_budget": candidate_budget,
+            "candidate_count_before_overflow": candidate_count,
+        },
+        created_at=created_at,
+    )
+    append_event(
+        conn,
+        project_id,
+        "audit_task_concluded",
+        body.worker,
+        entity_kind="intent",
+        entity_id=intent_row["id"],
+        payload={
+            "fact_id": residual_id,
+            "type": "coverage_result",
+            "semantic_type": "coverage",
+            "relation_type": relation_type,
+            "candidate_budget_overflow": True,
+        },
+        created_at=created_at,
+    )
+    updated = conn.execute(
+        "SELECT * FROM intents WHERE id = ? AND project_id = ?",
+        (intent_row["id"], project_id),
+    ).fetchone()
+    return ConcludeResponse(
+        fact=Fact(
+            id=residual_id,
+            description=residual_description,
+            display_title="Candidate budget residual",
+            type="coverage_result",
+            semantic_type="coverage",
+            evidence=json.dumps(residual, ensure_ascii=False, sort_keys=True),
+            source_generation=generation,
+            status="triaged",
+        ),
+        intent=intent_to_model(conn, updated, project_id),
+    )
+
+
 @router.post(
     "/projects/{project_id}/intents/{intent_id}/conclude",
     response_model=ConcludeResponse,
 )
 def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
     with get_conn() as conn:
+        # Candidate count and Fact write form one serialized policy decision.
+        # Without IMMEDIATE, two concurrent workers could both observe room
+        # below the configured cap and exceed it together.
+        conn.execute("BEGIN IMMEDIATE")
         project = check_project_active(conn, project_id)
         intent_row = get_claimable_open_intent_or_404(conn, project_id, intent_id, body.worker)
 
         now = utcnow()
+        if (
+            body.type == "vulnerability"
+            and project["audit_mode"] != "none"
+        ):
+            candidate_count = _candidate_attempt_count(
+                conn, project_id, project["source_generation"],
+            )
+            if candidate_count >= body.candidate_budget:
+                return _record_candidate_budget_residual(
+                    conn,
+                    project,
+                    intent_row,
+                    body,
+                    candidate_count=candidate_count,
+                    candidate_budget=body.candidate_budget,
+                    created_at=now,
+                )
         fid = next_fact_id(conn, project_id)
         obligation = parse_proof_obligation(intent_row["description"])
         dynamic_proof = False
@@ -488,7 +722,11 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
                     "attributes": attributes,
                 })
                 dynamic_proof = True
-        semantic_type = body.semantic_type or fact_semantic_type(fid, body.type, body.status)
+        semantic_type = (
+            fact_semantic_type(fid, body.type, body.status)
+            if body.type == "vulnerability"
+            else body.semantic_type or fact_semantic_type(fid, body.type, body.status)
+        )
         if semantic_type == "confirmed_finding" or body.type == "confirmed_finding":
             raise HTTPException(
                 422,

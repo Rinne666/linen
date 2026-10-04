@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -20,7 +21,45 @@ from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.process import ProcessResult
 from linen.dispatcher.scheduler.loop import DispatcherLoop
 from linen.dispatcher.tasks import explore
+from linen.server.routers.intents import _candidate_attempt_count
 from linen.server.models import Fact, Intent, ProjectDetail, ProjectMeta, ProofPayload, Review
+
+
+def test_confirmed_promotions_do_not_consume_candidate_attempt_budget():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE facts (project_id TEXT, type TEXT, semantic_type TEXT, source_generation INTEGER)"
+    )
+    conn.executemany(
+        "INSERT INTO facts VALUES ('proj_001', 'vulnerability', ?, 1)",
+        [("candidate_finding",)] * 4 + [("confirmed_finding",)] * 4,
+    )
+    assert _candidate_attempt_count(conn, "proj_001", 1) == 4
+
+    facts = [
+        Fact(
+            id=f"f{index:03d}", description="attempt", type="vulnerability",
+            semantic_type=("candidate_finding" if index <= 4 else "confirmed_finding"),
+            source_generation=1,
+        )
+        for index in range(1, 9)
+    ]
+    board = ProjectDetail(
+        project=ProjectMeta(
+            id="proj_001", title="audit", status="active", bootstrap_enabled=False,
+            audit_mode="hypothesis", created_at="2026-01-01T00:00:00Z",
+            source_generation=1,
+        ),
+        facts=facts, intents=[], hints=[], reviews=[],
+    )
+    assert audit_graph.candidate_budget_overflow_ids(board, 4) == set()
+
+    conn.execute(
+        "INSERT INTO facts VALUES ('proj_001', 'vulnerability', 'rejected_finding', 1)"
+    )
+    assert _candidate_attempt_count(conn, "proj_001", 1) == 5
+    conn.close()
 
 
 def _approve(client, project_id: str, fact_id: str) -> None:

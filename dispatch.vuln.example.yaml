@@ -36,6 +36,14 @@ server: "http://127.0.0.1:9000"
 audit:
   enabled: true
   mode: scope
+  # Hard dispatcher-enforced limits keep audit cost bounded. The wall clock
+  # starts at the first persisted worker run for this project.
+  max_candidate_findings: 8
+  max_runs_per_project: 250
+  wall_clock_budget_seconds: 43200
+  reason_noop_limit: 3
+  reason_noop_cooldown_seconds: 900
+  idle_stall_seconds: 1800
   # Mandatory scope gate. The dispatcher freezes local policy files and
   # optional maintainer/advisory material; an Explore worker then produces a
   # quoted threat-model and policy assessment for independent review.

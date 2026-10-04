@@ -995,6 +995,8 @@ def run_reason_task(
             total_ms,
         )
         ack_event_seq = project.project.event_seq
+        if kind == "noop":
+            return "noop"
         return "success"
     finally:
         lease.stop()

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 import json
+import pytest
+from types import SimpleNamespace
 
 from linen.dispatcher.analysis import coverage
 from linen.dispatcher.models import RunningTask
@@ -606,6 +608,98 @@ def test_fresh_reason_event_precedes_ready_goal_based_completion() -> None:
     project.project.reason_last_seen_event_seq = 9
     assert loop._try_dispatch_project(_summary("proj_001", "active"))
     assert completed == [["f-terminal"]]
+
+
+@pytest.mark.parametrize(
+    ("policy", "ready", "open_intent", "claimed_reason", "expected"),
+    [
+        ("goal_based", True, False, False, True),
+        ("goal_based", True, True, False, True),
+        ("exhaustive", True, False, False, True),
+        ("exhaustive", True, True, False, False),
+        ("goal_based", False, False, False, False),
+        ("goal_based", True, False, True, False),
+    ],
+)
+def test_exhausted_budget_allows_only_gate_ready_completion(
+    policy: str,
+    ready: bool,
+    open_intent: bool,
+    claimed_reason: bool,
+    expected: bool,
+) -> None:
+    loop = _loop()
+    loop.config = SimpleNamespace(
+        runtime=SimpleNamespace(max_project_workers=2),
+        audit=SimpleNamespace(max_runs_per_project=250, wall_clock_budget_seconds=43200),
+    )
+    loop.futures = {}
+    project = make_project(
+        intents=[make_intent("i-optional")] if open_intent else [],
+    )
+    project.project.audit_mode = "hypothesis"
+    project.project.completion_policy = policy
+    if claimed_reason:
+        project.project.reason = object()
+    project.facts.append(Fact(
+        id="f-terminal", description="reviewed negative assurance",
+        type="negative_assurance", semantic_type="negative_assurance",
+        status="triaged", source_generation=1,
+    ))
+    gate = CompletionGate(
+        project_id=project.project.id, lifecycle_status="active", execution_status="idle",
+        audit_mode="hypothesis", source_generation=1, plan_revision=1,
+        ready=ready, checks=[], blockers=[] if ready else ["evidence missing"],
+    )
+    completed: list[list[str]] = []
+    loop.container_manager = type(
+        "Containers", (), {"container_name": lambda _self, project_id: project_id}
+    )()
+
+    class Client:
+        def get_project(self, _project_id):
+            return project
+
+        def get_completion_gate(self, _project_id):
+            return gate
+
+        def complete(self, _project_id, sources, _description, _worker):
+            completed.append(sources)
+            return ApiResult(200, {})
+
+    loop.client = Client()
+    loop._audit_project_budget_state = lambda _project: (
+        "audit_run_budget_exhausted", "run budget exhausted", "2026-01-01T00:00:00Z",
+    )
+    loop._append_runtime_health_event = lambda *_args, **_kwargs: None
+
+    assert loop._try_dispatch_project(_summary("proj_001", "active")) is expected
+    assert bool(completed) is expected
+
+
+def test_unavailable_budget_state_stays_blocked_without_completion_check() -> None:
+    loop = _loop()
+    loop.config = SimpleNamespace(
+        runtime=SimpleNamespace(max_project_workers=2),
+        audit=SimpleNamespace(max_runs_per_project=250, wall_clock_budget_seconds=43200),
+    )
+    loop.futures = {}
+    project = make_project()
+    project.project.audit_mode = "hypothesis"
+    loop.container_manager = type(
+        "Containers", (), {"container_name": lambda _self, project_id: project_id}
+    )()
+
+    class Client:
+        def get_project(self, _project_id):
+            return project
+
+        def get_completion_gate(self, _project_id):
+            raise AssertionError("gate must not run when persisted budget state is unavailable")
+
+    loop.client = Client()
+    loop._audit_project_budget_state = lambda _project: "unavailable"
+    assert not loop._try_dispatch_project(_summary("proj_001", "active"))
 
 
 def test_provider_failure_classifier_reads_only_explicit_error_fields() -> None:

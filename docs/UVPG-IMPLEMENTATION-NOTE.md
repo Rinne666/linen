@@ -17,6 +17,8 @@ The current shadow increment adds:
 
 The proof field is intentionally optional, so legacy Facts and exports continue to work. Legacy boards may receive a deterministic FAIL with missing closure reasons; their APIs remain readable. Large evidence remains in Artifact storage; `Fact.evidence` remains human-readable. `poc:isolated` keeps its existing sandbox policy. New Technical Confirmation requires reviewed, hash-bound dynamic reproduction and negative-control evidence from separate successful isolated runs.
 
+The candidate-attempt budget counts original current-generation `vulnerability` Facts. A promoted `confirmed_finding` copy does not consume another slot; a rejected or otherwise dispositioned original candidate continues to consume its slot. Once the audit run or wall-clock budget is exhausted, the dispatcher stops materializing and dispatching worker work. It may still commit completion when the existing Completion Gate is ready; exhaustive completion also waits for all open intents to close.
+
 The strict closure requires independent Facts for attacker control, reachability,
 security invariant, security boundary, capability before/after/delta, negative
 control, and impact observation. New vulnerability candidates receive one
@@ -92,6 +94,16 @@ verifier handles only semantic falsification such as attacker control,
 reachability, defenses, and capability change.
 Provenance/type/excerpt repair gaps remain non-automatic blockers until a
 complete replacement/rebinding lifecycle exists.
+
+The package cold review is scheduled only after the candidate-local proof
+structure and source checks are complete, so filling missing roles does not
+invalidate a review that ran against a partial package. Legacy per-Fact review
+boards remain supported. Classified failure claims and alternate reachability
+routes keep their own candidate-bound semantic reviews, including when a
+legacy candidate review suppresses the package-level `UNREVIEWED_EVIDENCE`
+reason. A proof mutation after package review still stales its fingerprint and
+requires a new package review. This changes review timing only: it does not
+reduce the required proof Facts or bypass the dynamic gate.
 
 Each serialized ProofGap includes a `failure_class`. Ordinary missing proof and
 review work maps to `insufficient_evidence`; explicit `WRONG_PATH` and

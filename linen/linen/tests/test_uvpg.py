@@ -12,6 +12,7 @@ from linen.server.routers.projects import plan_proof_gap
 from linen.server.routers.intents import conclude
 from linen.server.models import Fact, ProofPayload
 from linen.server.uvpg import (
+    candidate_proof_package_review_ready,
     collect_candidate_proof_subgraph,
     derive_proof_gaps,
     evaluate_shadow_gate,
@@ -266,6 +267,280 @@ def test_review_gap_targets_one_proof_fact_and_closes_after_review(tmp_path, mon
     ))
     with db.get_conn() as conn:
         assert "UNREVIEWED_EVIDENCE" not in evaluate_shadow_gate(conn, "p", "candidate").reason_codes
+
+
+def test_candidate_package_review_waits_for_structure_and_source_validity(tmp_path, monkeypatch):
+    _strict_board(
+        tmp_path, monkeypatch,
+        omit={
+            "attacker_control", "reachability", "security_invariant", "security_boundary",
+            "capability_before", "capability_after", "capability_delta", "negative_control",
+            "impact_observation",
+        },
+    )
+    with db.get_conn() as conn:
+        conn.execute("DELETE FROM reviews")
+    assert not candidate_proof_package_review_ready({
+        "UNREVIEWED_EVIDENCE", "MISSING_ATTACKER_CONTROL", "MISSING_REACHABILITY",
+    })
+    with db.get_conn() as conn:
+        gaps = derive_proof_gaps(conn, "p", "candidate")
+    assert not any(
+        gap.code == "UNREVIEWED_EVIDENCE" and gap.target_fact_id == "candidate"
+        for gap in gaps
+    )
+    planned = plan_proof_gap("p", "candidate")
+    assert planned["created_intent"] is True
+    assert planned["gap"]["code"] == "MISSING_ATTACKER_CONTROL"
+
+
+def test_unreachable_failure_gets_targeted_review_before_refutation(tmp_path, monkeypatch):
+    _strict_board(
+        tmp_path, monkeypatch,
+        omit={
+            "attacker_control", "reachability", "security_invariant", "security_boundary",
+            "capability_before", "capability_after", "capability_delta", "negative_control",
+            "impact_observation",
+        },
+    )
+    with db.get_conn() as conn:
+        conn.execute("DELETE FROM reviews")
+        proof = {
+            "schema_version": 1,
+            "claim_kind": "reachability",
+            "subject_ids": ["candidate"],
+            "attributes": {"failure_code": "UNREACHABLE"},
+        }
+        conn.execute(
+            "INSERT INTO facts (id, project_id, description, type, proof) "
+            "VALUES ('unreachable', 'p', 'route cannot be reached', 'reachability', ?)",
+            (json.dumps(proof),),
+        )
+        conn.execute(
+            "INSERT INTO graph_edges (id, project_id, source_kind, source_id, "
+            "target_kind, target_id, relation_type, created_at, created_by) "
+            "VALUES ('candidate-unreachable', 'p', 'fact', 'candidate', 'fact', "
+            "'unreachable', 'depends_on', 'now', 'test')"
+        )
+
+    planned = plan_proof_gap("p", "candidate")
+    assert planned["created_intent"] is True
+    assert planned["gap"]["code"] == "UNREVIEWED_EVIDENCE"
+    assert planned["gap"]["target_fact_id"] == "unreachable"
+    assert planned["gap"]["suggested_intent_type"] == "review:devils-advocate"
+    with db.get_conn() as conn:
+        source = conn.execute(
+            "SELECT fact_id FROM intent_sources WHERE intent_id = ?",
+            (planned["intent_id"],),
+        ).fetchone()["fact_id"]
+    assert source == "unreachable"
+    create_review("p", "unreachable", CreateReviewRequest(
+        verdict="VALID", confidence="firm", summary="path is unreachable",
+        created_by="ablation-reviewer", intent_id=planned["intent_id"],
+    ))
+    refuted = plan_proof_gap("p", "candidate")
+    assert refuted["candidate_refuted"] is True
+
+
+def test_unreachable_review_exhaustion_keeps_candidate_blocked(tmp_path, monkeypatch):
+    _strict_board(
+        tmp_path, monkeypatch,
+        omit={
+            "attacker_control", "reachability", "security_invariant", "security_boundary",
+            "capability_before", "capability_after", "capability_delta", "negative_control",
+            "impact_observation",
+        },
+    )
+    with db.get_conn() as conn:
+        conn.execute("DELETE FROM reviews")
+        proof = {
+            "schema_version": 1,
+            "claim_kind": "reachability",
+            "subject_ids": ["candidate"],
+            "attributes": {"failure_code": "UNREACHABLE"},
+        }
+        conn.execute(
+            "INSERT INTO facts (id, project_id, description, type, proof) "
+            "VALUES ('unreachable', 'p', 'route cannot be reached', 'reachability', ?)",
+            (json.dumps(proof),),
+        )
+        conn.execute(
+            "INSERT INTO graph_edges (id, project_id, source_kind, source_id, "
+            "target_kind, target_id, relation_type, created_at, created_by) "
+            "VALUES ('candidate-unreachable', 'p', 'fact', 'candidate', 'fact', "
+            "'unreachable', 'depends_on', 'now', 'test')"
+        )
+
+    for _ in range(2):
+        planned = plan_proof_gap("p", "candidate")
+        assert planned["created_intent"] is True
+        assert planned["gap"]["target_fact_id"] == "unreachable"
+        create_review("p", "unreachable", CreateReviewRequest(
+            verdict="NEEDS_REVIEW", confidence="tentative",
+            summary="insufficient basis to decide", created_by="reviewer",
+            intent_id=planned["intent_id"],
+        ))
+
+    blocked = plan_proof_gap("p", "candidate")
+    assert blocked["created_intent"] is False
+    assert blocked["candidate_refuted"] is False
+    assert blocked["reason"] == "unreachable_evidence_not_independently_validated"
+    with db.get_conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM intents WHERE project_id = 'p'"
+        ).fetchone()["n"] == 2
+
+
+def test_unreachable_invalid_provenance_does_not_dispatch_missing_role_work(tmp_path, monkeypatch):
+    _strict_board(
+        tmp_path, monkeypatch,
+        omit={
+            "attacker_control", "reachability", "security_invariant", "security_boundary",
+            "capability_before", "capability_after", "capability_delta", "negative_control",
+            "impact_observation",
+        },
+    )
+    with db.get_conn() as conn:
+        conn.execute("DELETE FROM reviews")
+        proof = {
+            "schema_version": 1,
+            "claim_kind": "reachability",
+            "subject_ids": ["candidate"],
+            "attributes": {"failure_code": "UNREACHABLE"},
+            "evidence_refs": [{"line_start": 1, "line_end": 1, "file": "missing.txt"}],
+        }
+        conn.execute(
+            "INSERT INTO facts (id, project_id, description, type, proof) "
+            "VALUES ('unreachable', 'p', 'route cannot be reached', 'reachability', ?)",
+            (json.dumps(proof),),
+        )
+        conn.execute(
+            "INSERT INTO graph_edges (id, project_id, source_kind, source_id, "
+            "target_kind, target_id, relation_type, created_at, created_by) "
+            "VALUES ('candidate-unreachable', 'p', 'fact', 'candidate', 'fact', "
+            "'unreachable', 'depends_on', 'now', 'test')"
+        )
+
+    blocked = plan_proof_gap("p", "candidate")
+    assert blocked["created_intent"] is False
+    assert blocked["candidate_refuted"] is False
+    assert blocked["reason"] == "unreachable_evidence_not_independently_validated"
+    with db.get_conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM intents WHERE project_id = 'p'"
+        ).fetchone()["n"] == 0
+
+
+def test_strategy_replan_reviews_alternate_reachability_and_resolves_old_failure(tmp_path, monkeypatch):
+    _strict_board(tmp_path, monkeypatch)
+    import linen.server.audit_state as audit_state
+    import linen.server.kernel as kernel
+    import linen.server.routers.projects as projects_router
+
+    ticks = iter(range(10, 100))
+    def test_utcnow():
+        return f"2026-01-01T00:00:{next(ticks):02d}Z"
+
+    monkeypatch.setattr(audit_state, "utcnow", test_utcnow)
+    monkeypatch.setattr(kernel, "utcnow", test_utcnow)
+    monkeypatch.setattr(projects_router, "utcnow", test_utcnow)
+    with db.get_conn() as conn:
+        # _strict_board provides reviewed required roles and a legacy VALID
+        # candidate review without unified-package diagnostics.
+        failed_proof = {
+            "schema_version": 1,
+            "claim_kind": "reachability",
+            "subject_ids": ["candidate"],
+            "attributes": {"failure_code": "WRONG_PATH"},
+        }
+        conn.execute(
+            "INSERT INTO facts (id, project_id, description, type, proof) "
+            "VALUES ('old-route', 'p', 'stale source to sink route', 'reachability', ?)",
+            (json.dumps(failed_proof),),
+        )
+        conn.execute(
+            "INSERT INTO graph_edges (id, project_id, source_kind, source_id, "
+            "target_kind, target_id, relation_type, created_at, created_by) "
+            "VALUES ('candidate-old-route', 'p', 'fact', 'candidate', 'fact', "
+            "'old-route', 'depends_on', '2026-01-01T00:00:00Z', 'test')"
+        )
+        for index in range(2):
+            intent_id = f"failed-attempt-{index}"
+            conn.execute(
+                "INSERT INTO intents (id, project_id, to_fact_id, description, type, "
+                "creator, created_at, concluded_at) VALUES (?, 'p', 'old-route', ?, "
+                "'reachability', 'test', ?, ?)",
+                (
+                    intent_id,
+                    f"@uvpg:proof:candidate:WRONG_PATH:g1:reachability failed attempt {index}",
+                    f"2026-01-01T00:00:0{index}Z",
+                    f"2026-01-01T00:00:0{index + 1}Z",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO intent_sources (intent_id, project_id, fact_id) "
+                "VALUES (?, 'p', 'candidate')",
+                (intent_id,),
+            )
+
+        initial_gate = evaluate_shadow_gate(conn, "p", "candidate")
+        assert "UNREVIEWED_EVIDENCE" not in initial_gate.reason_codes
+
+    first = plan_proof_gap("p", "candidate")
+    assert first["created_intent"] is True
+    assert first["gap"]["target_fact_id"] == "old-route"
+    create_review("p", "old-route", CreateReviewRequest(
+        verdict="VALID", confidence="firm", summary="the old route is invalid",
+        created_by="reviewer", intent_id=first["intent_id"],
+    ))
+    already_requested = plan_proof_gap("p", "candidate")
+    assert already_requested["reason"] == "strategy_replan_already_requested"
+
+    with db.get_conn() as conn:
+        alternate_proof = {
+            "schema_version": 1,
+            "claim_kind": "reachability",
+            "subject_ids": ["candidate"],
+            "attributes": {"reachable": True},
+        }
+        conn.execute(
+            "INSERT INTO facts (id, project_id, description, type, proof) "
+            "VALUES ('new-route', 'p', 'alternate source to sink route', 'reachability', ?)",
+            (json.dumps(alternate_proof),),
+        )
+        conn.execute(
+            "INSERT INTO graph_edges (id, project_id, source_kind, source_id, "
+            "target_kind, target_id, relation_type, created_at, created_by) "
+            "VALUES ('candidate-new-route', 'p', 'fact', 'candidate', 'fact', "
+            "'new-route', 'depends_on', '2026-01-01T00:00:50Z', 'test')"
+        )
+        conn.execute(
+            "INSERT INTO intents (id, project_id, to_fact_id, description, type, "
+            "creator, created_at, concluded_at) VALUES ('new-route-result', 'p', "
+            "'new-route', 'alternate route investigation', 'reachability', 'test', "
+            "'2026-01-01T00:00:49Z', '2026-01-01T00:00:51Z')"
+        )
+        conn.execute(
+            "INSERT INTO intent_sources (intent_id, project_id, fact_id) "
+            "VALUES ('new-route-result', 'p', 'candidate')"
+        )
+
+    alternate_review = plan_proof_gap("p", "candidate")
+    assert alternate_review["created_intent"] is True
+    assert alternate_review["gap"]["target_fact_id"] == "new-route"
+    create_review("p", "new-route", CreateReviewRequest(
+        verdict="VALID", confidence="firm", summary="alternate route is supported",
+        created_by="reviewer", intent_id=alternate_review["intent_id"],
+    ))
+    plan_proof_gap("p", "candidate")
+    with db.get_conn() as conn:
+        resolved = conn.execute(
+            "SELECT COUNT(*) AS n FROM audit_events WHERE project_id = 'p' "
+            "AND event_type = 'proof_strategy_replan_resolved'"
+        ).fetchone()["n"]
+        result = evaluate_shadow_gate(conn, "p", "candidate")
+    assert resolved == 1
+    assert "WRONG_PATH" not in result.reason_codes
 
 
 def test_repair_gap_is_blocked_without_auto_intent(tmp_path, monkeypatch):

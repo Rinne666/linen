@@ -13,6 +13,7 @@ from pathlib import Path
 from linen.dispatcher.analysis import codeql, coverage, recon, scope_gate
 from linen.dispatcher.analysis.artifacts import ancestor_ids, digest, write_json
 from linen.dispatcher.config import AuditConfig
+from linen.candidate_attempts import is_candidate_attempt
 from linen.server.models import Fact, ProjectDetail, REVIEWLESS_INTERMEDIATE_FACT_TYPES
 from linen.server.uvpg import (
     MAX_UNIFIED_PROOF_REVIEW_ATTEMPTS,
@@ -25,6 +26,63 @@ CREATOR = "dispatcher.audit"
 AUDIT_SUMMARY_INTENT = "@analysis:audit-summary"
 MAX_STAGE_INTENT_ATTEMPTS = 4
 MAX_CANDIDATE_PROOF_REVIEW_ATTEMPTS = MAX_UNIFIED_PROOF_REVIEW_ATTEMPTS
+CANDIDATE_BUDGET_RESIDUAL_KIND = "candidate_budget_residual"
+
+
+def candidate_budget_overflow_ids(
+    project: ProjectDetail,
+    max_candidate_findings: int,
+) -> set[str]:
+    """Return current-generation candidate attempts beyond the stable budget."""
+    attempts = []
+    for fact in project.facts:
+        if (
+            not is_candidate_attempt(fact.type, fact.semantic_type)
+            or fact.source_generation != project.project.source_generation
+        ):
+            continue
+        attempts.append(fact)
+    def order(fact: Fact) -> tuple[int, int | str, str]:
+        suffix = fact.id[1:] if fact.id.startswith("f") else ""
+        if suffix.isdecimal():
+            return (0, int(suffix), fact.id)
+        return (1, fact.id, fact.id)
+
+    attempts.sort(key=order)
+    return {fact.id for fact in attempts[max_candidate_findings:]}
+
+
+def _candidate_budget_residual_payload(fact: Fact) -> dict | None:
+    if fact.type != "coverage_result" or fact.semantic_type != "coverage":
+        return None
+    try:
+        payload = json.loads(fact.evidence or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("kind") != CANDIDATE_BUDGET_RESIDUAL_KIND:
+        return None
+    return payload
+
+
+def _candidate_budget_overflow_records(
+    project: ProjectDetail,
+    max_candidate_findings: int,
+) -> list[dict]:
+    overflow_ids = candidate_budget_overflow_ids(project, max_candidate_findings)
+    records = []
+    for fact in sorted(project.facts, key=lambda item: item.id):
+        if fact.id not in overflow_ids:
+            continue
+        records.append({
+            "candidate_fact_id": fact.id,
+            "description": fact.description,
+            "evidence": fact.evidence,
+            "source_intents": [
+                {"intent_id": intent.id, "source_fact_ids": list(intent.from_)}
+                for intent in project.intents if intent.to == fact.id
+            ],
+        })
+    return records
 
 
 def managed_description(description: str) -> bool:
@@ -103,6 +161,14 @@ def _technical_confirmation(project: ProjectDetail, fact: Fact) -> bool:
 
 def _summary_dispositioned(project: ProjectDetail, fact: Fact) -> bool:
     """Whether a follow-up Fact can safely be a parent of the final summary."""
+    residual = _candidate_budget_residual_payload(fact)
+    if (
+        fact.status == "triaged"
+        and residual is not None
+        and fact.evidence
+        and fact.evidence.strip()
+    ):
+        return True
     if (
         fact.status == "triaged"
         and fact.type in REVIEWLESS_INTERMEDIATE_FACT_TYPES
@@ -302,8 +368,14 @@ def _review_exhaustion_record(
     }
 
 
-def _review_proposals(project: ProjectDetail) -> list[dict]:
+def _review_proposals(
+    project: ProjectDetail,
+    max_candidate_findings: int = 8,
+) -> list[dict]:
     proposals = []
+    over_budget_candidates = candidate_budget_overflow_ids(
+        project, max_candidate_findings,
+    )
     open_reviews = {
         intent.from_[0]
         for intent in project.intents
@@ -321,6 +393,11 @@ def _review_proposals(project: ProjectDetail) -> list[dict]:
             prior_modes.setdefault(intent.from_[0], set()).add(intent.type or "review")
     for fact in project.facts:
         if fact.id in {"origin", "goal"} or fact.type == "recon":
+            continue
+        if (
+            fact.type == "vulnerability"
+            and fact.id in over_budget_candidates
+        ):
             continue
         if fact.type in REVIEWLESS_INTERMEDIATE_FACT_TYPES:
             continue
@@ -346,19 +423,10 @@ def _review_proposals(project: ProjectDetail) -> list[dict]:
             fact.type == "vulnerability"
             and fact.semantic_type == "candidate_finding"
             and not _has_unified_vulnerability_review(project, fact.id)
-            and fact.id not in open_reviews
-            and fact.status not in {"false_positive", "fixed", "accepted_risk"}
         ):
-            description = f"@analysis:review:{fact.id}:vulnerability-proof"
-            if (
-                _review_exhaustion(project, fact) is None
-                and not _proposal_exists(project, description)
-            ):
-                proposals.append({
-                    "from": [fact.id],
-                    "type": "review:cold-verifier",
-                    "description": description,
-                })
+            # Candidate-local proof-package reviews are planned only by the
+            # server's proof-gap projection, which can verify closure and
+            # source provenance before requesting the cold-verifier pass.
             continue
         if fact.status in {"false_positive", "fixed", "accepted_risk"} or fact.id in open_reviews:
             continue
@@ -641,8 +709,20 @@ def audit_summary_inputs(
                 and _summary_dispositioned(project, fact)
             ):
                 required_ids.add(fact.id)
+        over_budget_candidates = candidate_budget_overflow_ids(
+            project, config.max_candidate_findings,
+        )
         for fact in project.facts:
             if fact.id in {"origin", "goal"} or fact.type == "audit_summary":
+                continue
+            if (
+                fact.type == "vulnerability"
+                and fact.id in over_budget_candidates
+            ):
+                # Historical candidates created before the hard writer gate
+                # remain visible in the residual artifact, but do not fan out
+                # into per-candidate review or proof work.
+                required_ids.add(fact.id)
                 continue
             if recon_mode and fact.id in module_ids:
                 continue
@@ -670,6 +750,11 @@ def audit_summary_inputs(
                 required_ids.add(fact.id)
                 continue
             required_ids.add(fact.id)
+        required_ids.update(
+            fact.id for fact in project.facts
+            if _candidate_budget_residual_payload(fact) is not None
+            and fact.source_generation == project.project.source_generation
+        )
         return sorted(required_ids)
     except (ValueError, OSError, KeyError, TypeError):
         return None
@@ -742,6 +827,38 @@ def audit_summary_fact(
         {"category": item["category"], "gap": gap}
         for item in categories for gap in item["gaps"]
     ]
+    candidate_budget_residual_facts = [
+        fact for fact in project.facts
+        if fact.source_generation == project.project.source_generation
+        and _candidate_budget_residual_payload(fact) is not None
+    ]
+    candidate_budget_overflow_candidates = _candidate_budget_overflow_records(
+        project, config.max_candidate_findings,
+    )
+    candidate_budget_overflow_leads = [
+        {
+            "residual_fact_id": fact.id,
+            **lead,
+        }
+        for fact in candidate_budget_residual_facts
+        for lead in (_candidate_budget_residual_payload(fact) or {}).get(
+            "overflow_leads", [],
+        )
+        if isinstance(lead, dict)
+    ]
+    if candidate_budget_overflow_candidates or candidate_budget_overflow_leads:
+        overflow_count = (
+            len(candidate_budget_overflow_candidates)
+            + len(candidate_budget_overflow_leads)
+        )
+        residual_gaps.append({
+            "category": "candidate-budget",
+            "gap": (
+                f"{overflow_count} candidate lead(s) exceeded the configured limit of "
+                f"{config.max_candidate_findings}; original claims, evidence, source intents, "
+                "and provenance are retained in the candidate-budget residual Fact(s)."
+            ),
+        })
     for item in categories:
         for uncovered in item.get("coverage_dimensions", {}).get("uncovered_items", []):
             if uncovered.get("status") == "unresolved":
@@ -827,6 +944,12 @@ def audit_summary_fact(
         "confirmed_vulnerability_ids": sorted(vulnerabilities),
         "unresolved_reviews": unresolved_reviews,
         "unresolved_followups": unresolved_followups,
+        "candidate_budget_residual": {
+            "max_candidate_findings": config.max_candidate_findings,
+            "residual_fact_ids": [fact.id for fact in candidate_budget_residual_facts],
+            "overflow_leads": candidate_budget_overflow_leads,
+            "historical_overflow_candidates": candidate_budget_overflow_candidates,
+        },
         "reconnaissance": categories,
         "independent_coverage_review": {
             "fact_id": blindspot_fact.id if blindspot_fact else None,
@@ -890,6 +1013,13 @@ def audit_summary_fact(
                 for item in unresolved_reviews
             ) else ""
         )
+        + (
+            "\n" + "\n".join(
+                f"candidate_budget_overflow_id:{item['candidate_fact_id']}"
+                for item in candidate_budget_overflow_candidates
+            )
+            if candidate_budget_overflow_candidates else ""
+        )
     )
     return {
         "type": "audit_summary",
@@ -939,7 +1069,9 @@ def required_intents(
         else:
             if not _reviewed(project, evidence.id):
                 review_proposals = [
-                    proposal for proposal in _review_proposals(project)
+                    proposal for proposal in _review_proposals(
+                        project, config.max_candidate_findings,
+                    )
                     if proposal["from"] == [evidence.id]
                 ][:limit]
                 if review_proposals:
@@ -957,7 +1089,9 @@ def required_intents(
                 plan_anchor = evidence.id
             elif not _reviewed(project, adjudication.id):
                 review_proposals = [
-                    proposal for proposal in _review_proposals(project)
+                    proposal for proposal in _review_proposals(
+                        project, config.max_candidate_findings,
+                    )
                     if proposal["from"] == [adjudication.id]
                 ][:limit]
                 if review_proposals:
@@ -989,7 +1123,7 @@ def required_intents(
                     plan_anchor = evidence.id
                 else:
                     plan_anchor = adjudication.id
-    reviews = _review_proposals(project)
+    reviews = _review_proposals(project, config.max_candidate_findings)
     if reviews:
         return reviews[:limit]
 

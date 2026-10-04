@@ -369,6 +369,7 @@ class LinenClient:
         fact_type: str | None = None,
         evidence: str | None = None,
         status: str = "draft",
+        candidate_budget: int | None = None,
         display_title: str | None = None,
         semantic_type: str | None = None,
         proof: dict[str, Any] | None = None,
@@ -382,6 +383,8 @@ class LinenClient:
             body["type"] = fact_type
         if evidence is not None:
             body["evidence"] = evidence
+        if candidate_budget is not None:
+            body["candidate_budget"] = candidate_budget
         if display_title is not None:
             body["display_title"] = display_title
         if semantic_type is not None:
