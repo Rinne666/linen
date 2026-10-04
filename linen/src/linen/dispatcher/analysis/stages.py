@@ -38,7 +38,7 @@ def stage_definitions(config: AuditConfig, audit_mode: str) -> list[StageDefinit
             StageDefinition("scope-evidence", "Scope evidence", 10, "scope.evidence", config.scope_adjudication.enabled, config.scope_adjudication.enabled),
             StageDefinition("scope-adjudication", "Scope adjudication", 20, "scope.adjudication", config.scope_adjudication.enabled, config.scope_adjudication.enabled),
         ])
-    if audit_mode == "scope" and config.recon.enabled:
+    if audit_mode == "scope" and config.recon_active:
         result.append(StageDefinition("recon-snapshot", "Frozen source snapshot", 30, "recon.snapshot", True))
         if config.codeql.enabled:
             result.append(StageDefinition(

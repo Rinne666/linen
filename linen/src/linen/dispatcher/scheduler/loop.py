@@ -1749,7 +1749,7 @@ class DispatcherLoop:
             and scope_gate.is_evidence_intent(intent)
         ):
             return False
-        if self.config.audit.recon.enabled and description == "@analysis:recon-snapshot":
+        if self.config.audit.recon_active and description == "@analysis:recon-snapshot":
             return False
         if codeql.active_for_project(project, self.config.audit.codeql) and codeql.is_intent(intent):
             return False

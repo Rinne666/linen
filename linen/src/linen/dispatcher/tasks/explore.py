@@ -251,7 +251,7 @@ def run_explore_task(
             )
 
         if (scope_audit and intent.type == "search"
-                and config.audit.recon.enabled
+                and config.audit.recon_active
                 and intent.description.strip() == recon.SNAPSHOT_INTENT):
             fact = recon.create_snapshot(
                 Path(container_name) / "repo", Path(container_name),
@@ -453,12 +453,12 @@ def run_explore_task(
         coverage_task = scope_audit and intent.description.startswith(coverage.CELL_PREFIX)
         recon_task = (
             scope_audit
-            and config.audit.recon.enabled
+            and config.audit.recon_active
             and intent.description.startswith(recon.CATEGORY_PREFIX)
         )
         coverage_review_task = (
             scope_audit
-            and config.audit.recon.enabled
+            and config.audit.recon_active
             and intent.description.strip() == recon.COVERAGE_REVIEW_INTENT
         )
         task_timeout = (
@@ -1037,12 +1037,12 @@ def _try_conclude_fallback(
     coverage_task = scope_audit and intent.description.startswith(coverage.CELL_PREFIX)
     recon_task = (
         scope_audit
-        and config.audit.recon.enabled
+        and config.audit.recon_active
         and intent.description.startswith(recon.CATEGORY_PREFIX)
     )
     coverage_review_task = (
         scope_audit
-        and config.audit.recon.enabled
+        and config.audit.recon_active
         and intent.description.strip() == recon.COVERAGE_REVIEW_INTENT
     )
     scope_adjudication_task = (
@@ -1294,14 +1294,14 @@ def _managed_result(config, project, intent, container_name, payload, fact):
                 config.runtime.prompt_group,
             )
         if (
-            config.audit.recon.enabled
+            config.audit.recon_active
             and intent.description.startswith(recon.CATEGORY_PREFIX)
         ):
             return recon.outcome_fact(
                 payload, project, intent, Path(container_name), config.audit.recon,
             )
         if (
-            config.audit.recon.enabled
+            config.audit.recon_active
             and intent.description.strip() == recon.COVERAGE_REVIEW_INTENT
         ):
             return recon.coverage_review_outcome_fact(
