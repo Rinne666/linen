@@ -1255,6 +1255,7 @@ def _normalize_security_checks(
             raise ValueError("Protection check has an invalid assessment")
         normalized_protections.append({
             **{key: check[key].strip() for key in text_fields},
+            "predicate_result": check["predicate_result"],
             "result": check["result"],
             "sink_reachable": check["sink_reachable"],
             "citation_ids": _security_check_refs(check["citation_ids"], citation_ids, "Protection check"),

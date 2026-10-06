@@ -411,13 +411,25 @@ def resolve_intent(
     if row["worker"] is not None:
         raise KernelConflict(f"Intent is currently claimed by {row['worker']}")
     blocked = conn.execute(
-        "SELECT id FROM intent_errors WHERE project_id = ? AND intent_id = ? "
+        "SELECT id, code FROM intent_errors WHERE project_id = ? AND intent_id = ? "
         "AND classification = 'blocked' AND resolved_at IS NULL "
         "ORDER BY last_failed_at DESC, id DESC LIMIT 1",
         (project_id, intent_id),
     ).fetchone()
     if blocked is None:
         raise KernelConflict("Intent has no unresolved blocked error")
+
+    if body.action == "retry":
+        prior_retries = conn.execute(
+            "SELECT COUNT(*) FROM intent_errors WHERE project_id = ? AND intent_id = ? "
+            "AND code = ? AND resolution LIKE 'retry requested by %'",
+            (project_id, intent_id, blocked["code"]),
+        ).fetchone()[0]
+        if blocked["code"] == "invalid_blackboard_result" or prior_retries:
+            raise KernelConflict(
+                "Automatic retry budget exhausted; correct the recorded cause "
+                "and use the manual Retry intent action"
+            )
 
     now = utcnow()
     resolution = f"{body.action} requested by {body.actor}"

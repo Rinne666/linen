@@ -15,8 +15,9 @@ from linen.dispatcher.config import CoverageConfig, ReviewSandboxConfig
 from linen.dispatcher.runtime.backend import LocalBackend
 from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.process import ProcessResult
-from linen.dispatcher.runtime.review_sandbox import DockerReviewProcess
+from linen.dispatcher.runtime.review_sandbox import DockerReviewProcess, ReviewSandboxBackend
 from linen.dispatcher.tasks import explore, reason, review
+from linen.dispatcher.scheduler.loop import DispatcherLoop
 from linen.dispatcher.workers.base import DriverResult
 from linen.server.models import AuditStage, Fact, ProjectDetail, ProjectMeta
 
@@ -37,8 +38,10 @@ def scope_setup(api, tmp_path, *, topics=None):
     client.heartbeat(pid, iid, "tester")
     current = client.get_project(pid)
     intent = next(i for i in current.intents if i.id == iid)
-    assert explore.run_explore_task(cfg, client, backend, current, client.export_project(pid), intent,
-                                    cfg.workers[0], TaskCancellation()) == "success"
+    # Archived coverage plans remain readable; they are no longer dispatched.
+    payload = coverage.create_plan(repo, Path(backend.ensure_running(pid)), cfg.audit.coverage)
+    assert client.conclude(pid, iid, "tester", payload["description"],
+                          fact_type=payload["type"], evidence=payload["evidence"], status="triaged").ok
     current = client.get_project(pid)
     fact, path, plan = coverage.get_plan(current, Path(backend.container_name(pid)))
     return cfg, backend, pid, fact, path, plan
@@ -47,7 +50,8 @@ def scope_setup(api, tmp_path, *, topics=None):
 def test_stage_obligations_are_frozen_until_plan_revision_changes(tmp_path):
     cfg = config(tmp_path)
     cfg.audit.mode = "scope"
-    cfg.audit.semantic.enabled = True
+    cfg.audit.recon.enabled = True
+    cfg.audit.codeql.enabled = True
     board = ProjectDetail(
         project=ProjectMeta(
             id="proj_frozen", title="audit", status="active", bootstrap_enabled=False,
@@ -57,34 +61,35 @@ def test_stage_obligations_are_frozen_until_plan_revision_changes(tmp_path):
         intents=[], hints=[], reviews=[],
     )
     registered = stages.reconcile(cfg.audit, board, tmp_path)
-    semantic = next(row for row in registered if row["stage_id"] == "semantic-analysis")
-    assert semantic["required"] is True
+    codeql_stage = next(row for row in registered if row["stage_id"] == "codeql-candidates")
+    assert codeql_stage["required"] is True
     board.stages = [AuditStage(
         **row, source_generation=1, plan_revision=1, updated_at="2026-01-01T00:00:00Z",
     ) for row in registered]
 
-    cfg.audit.semantic.enabled = False
+    cfg.audit.codeql.enabled = False
     reconciled = stages.reconcile(cfg.audit, board, tmp_path)
-    semantic = next(row for row in reconciled if row["stage_id"] == "semantic-analysis")
-    assert semantic["required"] is True
-    assert semantic["status"] == "pending"
+    codeql_stage = next(row for row in reconciled if row["stage_id"] == "codeql-candidates")
+    assert codeql_stage["required"] is True
+    assert codeql_stage["status"] == "pending"
 
     replanned = board.model_copy(deep=True)
     replanned.project.plan_revision += 1
     replanned.stages = []
-    semantic_after_replan = next(
-        row for row in stages.reconcile(cfg.audit, replanned, tmp_path)
-        if row["stage_id"] == "semantic-analysis"
+    codeql_after_replan = next(
+        (row for row in stages.reconcile(cfg.audit, replanned, tmp_path)
+        if row["stage_id"] == "codeql-candidates"), None,
     )
-    assert semantic_after_replan["required"] is False
+    assert codeql_after_replan is None
 
-    cfg.audit.semantic.enabled = True
+    cfg.audit.recon.enabled = True
+    cfg.audit.codeql.enabled = True
     replanned.project.plan_revision += 1
-    semantic_after_second_replan = next(
+    codeql_after_second_replan = next(
         row for row in stages.reconcile(cfg.audit, replanned, tmp_path)
-        if row["stage_id"] == "semantic-analysis"
+        if row["stage_id"] == "codeql-candidates"
     )
-    assert semantic_after_second_replan["required"] is True
+    assert codeql_after_second_replan["required"] is True
 
 
 def approve(client, pid, fid):
@@ -216,7 +221,7 @@ def test_plan_covers_every_file_topic_pair(tmp_path):
         coverage.create_plan(repo, work, CoverageConfig(max_cells=1, files_per_cell=1))
 
 
-def test_scope_reviews_coverage_results_but_not_plan_or_summaries(api, tmp_path, monkeypatch):
+def test_legacy_coverage_remains_reviewable_without_completing_recon(api, tmp_path, monkeypatch):
     _, client = api
     cfg, backend, pid, fact, path, plan = scope_setup(api, tmp_path)
     work = Path(backend.container_name(pid))
@@ -251,107 +256,11 @@ def test_scope_reviews_coverage_results_but_not_plan_or_summaries(api, tmp_path,
     module_fact = next(i.to for i in client.get_project(pid).intents if i.id == module_intent_id)
     assert next(item for item in client.get_project(pid).facts if item.id == module_fact).status == "triaged"
 
-    trace_intent = client.create_intent(
-        pid, [fact.id], "ordinary reviewed trace", "reasoner", intent_type="trace",
-    ).data["id"]
-    client.heartbeat(pid, trace_intent, "tester")
-    trace_response = client.conclude(
-        pid, trace_intent, "tester", "No exploitable path in this trace",
-        fact_type="observation", evidence="a.py:1",
-    )
-    trace_fact = trace_response.data["fact"]["id"]
-    approve(client, pid, trace_fact)
+    # Old coverage artifacts are readable but cannot substitute for Recon.
+    cfg.audit.recon.enabled = True
+    assert audit_graph.audit_summary_inputs(client.get_project(pid), work, cfg.audit) is None
+    assert not client.get_completion_gate(pid).ready
 
-    client.create_intent(
-        pid, [trace_fact], "search sibling endpoint", "reasoner", intent_type="search",
-    )
-
-    current = client.get_project(pid)
-    inputs = audit_graph.audit_summary_inputs(current, work, cfg.audit)
-    assert set(inputs) == {module_fact}
-    summary_intent_id = client.create_intent(
-        pid, inputs, audit_graph.AUDIT_SUMMARY_INTENT,
-        "dispatcher.audit", intent_type="synthesize",
-    ).data["id"]
-    client.heartbeat(pid, summary_intent_id, "tester")
-    current = client.get_project(pid)
-    summary_intent = next(i for i in current.intents if i.id == summary_intent_id)
-    assert explore.run_explore_task(
-        cfg, client, backend, current, client.export_project(pid), summary_intent,
-        cfg.workers[0], TaskCancellation(),
-    ) == "success"
-    summary_fact = next(i.to for i in client.get_project(pid).intents if i.id == summary_intent_id)
-    assert next(item for item in client.get_project(pid).facts if item.id == summary_fact).status == "triaged"
-
-    optional_intent_id = client.create_intent(
-        pid, [trace_fact], "inspect sibling endpoint", "reasoner", intent_type="search",
-    ).data["id"]
-    client.heartbeat(pid, optional_intent_id, "tester")
-    optional_result = client.conclude(
-        pid, optional_intent_id, "tester", "No candidate found on sibling path",
-        fact_type="observation", evidence="a.py:2",
-    )
-    assert optional_result.ok
-    assert client.get_completion_gate(pid, [summary_fact]).ready
-    assert audit_graph.scope_blockers(client.get_project(pid), work, cfg.audit, [summary_fact]) == []
-
-    current_project = client.get_project(pid)
-    stage_row = {
-        "stage_id": "required-observation",
-        "label": "Required observation stage",
-        "phase_order": 99,
-        "required": True,
-        "status": "pending",
-        "detail": f"Review required output {optional_result.data['fact']['id']}",
-    }
-    required_stage = client.reconcile_audit_stages(
-        pid, [stage_row], source_generation=current_project.project.source_generation,
-        plan_revision=current_project.project.plan_revision,
-    )
-    assert required_stage.ok
-    gate = client.get_completion_gate(pid, [summary_fact])
-    assert not gate.ready
-    assert any("Required observation stage" in blocker for blocker in gate.blockers)
-    changed_stage = client.reconcile_audit_stages(
-        pid, [{**stage_row, "label": "Changed label", "phase_order": 1,
-              "required": False, "status": "satisfied", "detail": None}],
-        source_generation=current_project.project.source_generation,
-        plan_revision=current_project.project.plan_revision,
-    )
-    assert changed_stage.ok
-    frozen_stage = next(
-        stage for stage in client.get_project(pid).stages
-        if stage.stage_id == "required-observation"
-    )
-    assert frozen_stage.label == "Required observation stage"
-    assert frozen_stage.phase_order == 99
-    assert frozen_stage.required is True
-    rejected_stage_set_change = client.reconcile_audit_stages(
-        pid, [stage_row, {**stage_row, "stage_id": "new-obligation"}],
-        source_generation=current_project.project.source_generation,
-        plan_revision=current_project.project.plan_revision,
-    )
-    assert rejected_stage_set_change.status_code == 409
-    assert client.get_completion_gate(pid, [summary_fact]).ready
-
-    scope_prompt = (Path(__file__).parents[2] / "src/linen/dispatcher/prompts/vuln_audit/reason_scope.md").read_text()
-    completion_instructions = coverage.reason_instructions(
-        client.get_project(pid), work, cfg.audit.coverage,
-    )
-    for prompt_text in (scope_prompt, completion_instructions):
-        lowered = prompt_text.lower()
-        assert "no open intents" not in lowered
-        assert "no intent remains" not in lowered
-        assert "all intents finished" not in lowered
-
-    monkeypatch.setattr(reason, "get_driver", lambda _: FakeDriver())
-    monkeypatch.setattr(reason, "run_worker_process", lambda *a, **k: ProcessResult(0, json.dumps({
-        "accepted": True, "data": {"complete": {"from": [summary_fact], "description": "All planned checks complete; zero findings"}},
-    }), ""))
-    current = client.get_project(pid)
-    assert reason.run_reason_task(cfg, client, backend, current, client.export_project(pid),
-                                  cfg.workers[0], TaskCancellation()) == "success"
-    assert client.get_project(pid).project.status == "completed"
 
 
 def test_needs_followup_stays_uncovered_and_retry_links_history(api, tmp_path, monkeypatch):
@@ -364,13 +273,10 @@ def test_needs_followup_stays_uncovered_and_retry_links_history(api, tmp_path, m
     approve(client, pid, result)
     state = coverage.coverage_state(client.get_project(pid), work, cfg.audit.coverage)
     assert state["cells"][0]["status"] == "needs_followup"
-    retry = next(
-        proposal for proposal in audit_graph.required_intents(
-            client.get_project(pid), work, cfg.audit,
-        )
-        if proposal["description"] == coverage.cell_description(plan, cell)
-    )
-    assert retry["from"] == [fact.id, result]
+    assert audit_graph.required_intents(client.get_project(pid), work, cfg.audit) == []
+    coverage.validate_intent(client.get_project(pid), work, cfg.audit.coverage, {
+        "from": [fact.id, result], "type": "verify", "description": coverage.cell_description(plan, cell),
+    })
     with pytest.raises(ValueError, match="prior outcome"):
         coverage.validate_intent(client.get_project(pid), work, cfg.audit.coverage, {
             "from": [fact.id], "type": "verify", "description": coverage.cell_description(plan, cell),
@@ -393,13 +299,10 @@ def test_invalid_coverage_review_becomes_retryable(api, tmp_path, monkeypatch):
 
     state = coverage.coverage_state(client.get_project(pid), work, cfg.audit.coverage)
     assert state["cells"][0]["status"] == "invalid"
-    retry = next(
-        proposal for proposal in audit_graph.required_intents(
-            client.get_project(pid), work, cfg.audit,
-        )
-        if proposal["description"] == coverage.cell_description(plan, cell)
-    )
-    assert retry["from"] == [fact.id, result]
+    assert audit_graph.required_intents(client.get_project(pid), work, cfg.audit) == []
+    coverage.validate_intent(client.get_project(pid), work, cfg.audit.coverage, {
+        "from": [fact.id, result], "type": "verify", "description": coverage.cell_description(plan, cell),
+    })
 
     replacement = run_cell(
         api, cfg, backend, pid, fact, plan, cell, monkeypatch, parents=[result],
@@ -531,12 +434,80 @@ def test_sandbox_rejects_privileged_or_host_environment():
         ReviewSandboxConfig(env_allowlist=["HOME"])
 
 
+def test_budget_health_event_reuses_immutable_event_across_graph_changes_and_restart(api, caplog):
+    _, client = api
+    current = project(api)
+    pid = current.project.id
+    loop = DispatcherLoop.__new__(DispatcherLoop)
+    loop.client = client
+    payload = {"message": "Run budget exhausted", "budget_limit": 60,
+               "occurred_at": "2026-01-01T00:00:00Z"}
+    original = loop._append_runtime_health_event(
+        current, "audit_budget_blocked", "audit_run_budget_exhausted", payload,
+    )
+    assert original is not None
+    assert client.create_intent(pid, ["origin"], "More work", "tester").ok
+    changed = client.get_project(pid)
+    assert changed.project.graph_revision > current.project.graph_revision
+    assert loop._append_runtime_health_event(
+        changed, "audit_budget_blocked", "audit_run_budget_exhausted", payload,
+    ) == original
+    restarted = DispatcherLoop.__new__(DispatcherLoop)
+    restarted.client = client
+    assert restarted._append_runtime_health_event(
+        changed, "audit_budget_blocked", "audit_run_budget_exhausted", payload,
+    ) == original
+    events = client.get_audit_events(pid)
+    budget = [event for event in events if event.event_type == "audit_budget_blocked"]
+    assert len(budget) == 1
+    from linen.server.db import get_conn
+    with get_conn() as conn:
+        stored_revision = conn.execute(
+            "SELECT graph_revision FROM audit_events WHERE project_id = ? AND sequence = ?",
+            (pid, original),
+        ).fetchone()[0]
+    assert stored_revision == current.project.graph_revision
+    assert "runtime health event write rejected" not in caplog.text
+    revised_payload = {**payload, "budget_limit": 61}
+    assert restarted._append_runtime_health_event(
+        changed, "audit_budget_blocked", "audit_run_budget_exhausted", revised_payload,
+    ) != original
+    assert len([event for event in client.get_audit_events(pid)
+                if event.event_type == "audit_budget_blocked"]) == 2
+
+
 def test_missing_docker_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr("linen.dispatcher.runtime.review_sandbox.shutil.which", lambda _: None)
     proc = DockerReviewProcess(ReviewSandboxConfig(enabled=True, image="no-image"), tmp_path,
                                {"id": "test", "files": {}}, tmp_path / "run", ["sh"], {}, 2)
     with pytest.raises(RuntimeError, match="refusing host fallback"):
         proc.start()
+
+
+def test_review_archive_is_project_bound_and_rejects_symlinks(tmp_path):
+    work = tmp_path / "project"
+    work.mkdir()
+    backend = ReviewSandboxBackend(ReviewSandboxConfig(), tmp_path, {}, work / ".linen-reviews")
+    archive = work / ".linen-executions"
+    record = archive / "run.json"
+    backend.write_text_file(str(work), str(record), '{"returncode": 0}')
+    assert json.loads(record.read_text()) == {"returncode": 0}
+    with pytest.raises(ValueError, match="different project"):
+        backend.write_text_file(str(tmp_path), str(record), "bad")
+    with pytest.raises(ValueError, match="inside"):
+        backend.write_text_file(str(work), str(work / "escape.json"), "bad")
+    outside = tmp_path / "private.json"
+    outside.write_text("private")
+    record.unlink()
+    record.symlink_to(outside)
+    with pytest.raises(OSError):
+        backend.write_text_file(str(work), str(record), "bad")
+    assert outside.read_text() == "private"
+    record.unlink()
+    archive.rmdir()
+    archive.symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        backend.write_text_file(str(work), str(record), "bad")
 
 
 @pytest.mark.skipif(not os.environ.get("LINEN_DOCKER_TEST_IMAGE"), reason="Set LINEN_DOCKER_TEST_IMAGE for real isolation tests")
@@ -593,7 +564,16 @@ def test_review_task_uses_real_container_and_saves_execution(api, tmp_path, monk
     client.heartbeat(pid, iid, "tester")
     current = client.get_project(pid)
     intent = next(i for i in current.intents if i.id == iid)
-    response = json.dumps({"accepted": True, "data": {"verdict": "VALID", "confidence": "firm", "summary": "scope checked"}})
+    response = json.dumps({"accepted": True, "data": {
+        "verdict": "VALID", "confidence": "firm", "summary": "scope checked",
+        "cold_verification": {
+            "sub_claims": [{"claim": "frozen source is readable", "verified": True}],
+            "sub_claim_failure": False, "static_status": "verified",
+            "poc_status": "not_applicable", "prosecution": "Source and record mounted",
+            "defense": "This fixture makes no vulnerability claim",
+            "severity_challenged": True, "isolation_observed": True,
+        },
+    }})
 
     class ContainerDriver(FakeDriver):
         def build_execute(self, worker, prompt, session):
@@ -610,6 +590,12 @@ def test_review_task_uses_real_container_and_saves_execution(api, tmp_path, monk
     assert execution["snapshot"] == plan["snapshot"]["id"]
     assert execution["image_id"].startswith("sha256:")
     assert Path(execution["artifact"]).is_file()
+    records = list((Path(backend.container_name(pid)) / ".linen-executions").glob("*.json"))
+    assert len(records) == 1
+    record = json.loads(records[0].read_text())
+    assert record["returncode"] == 0 and record["phase"] == "review_execute"
+    assert json.loads(Path(record["stdout"]).read_text()) == json.loads(response)
+    assert Path(record["stderr"]).is_file()
     assert "Prior graph reasoning should be withheld" not in driver.prompts[0]
 
 

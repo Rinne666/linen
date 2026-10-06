@@ -22,7 +22,6 @@ from linen.server.services import get_project_or_404
 
 router = APIRouter(tags=["executions"])
 
-DEFAULT_WORKSPACE_ROOT = Path.home() / ".local" / "share" / "linen" / "workspaces"
 _workspace_root_override: Path | None = None
 _EXECUTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 
@@ -36,7 +35,11 @@ def workspace_root() -> Path:
     if _workspace_root_override is not None:
         return _workspace_root_override
     configured = os.environ.get("LINEN_WORKSPACE_ROOT")
-    return Path(configured).expanduser().resolve() if configured else DEFAULT_WORKSPACE_ROOT.resolve()
+    # LocalBackend uses the dispatcher's current directory when the config does
+    # not set local.workspace_root. Use that same default so API archive and
+    # artifact reads find the files the dispatcher writes in a standard local
+    # setup.
+    return Path(configured).expanduser().resolve() if configured else Path.cwd().resolve()
 
 
 def _execution_dir(project_id: str) -> Path:
@@ -251,8 +254,9 @@ def list_pi_executions(
 _COST_CATEGORIES = ("reason", "explore", "review", "poc", "unclassified")
 
 
-def _cost_category(phase: str, run: tuple[str | None, str | None] | None) -> str:
-    task_type, intent_type = run or (None, None)
+def _cost_category(phase: str, run: dict[str, object] | None) -> str:
+    task_type = str(run.get("task_type") or "") if run else ""
+    intent_type = str(run.get("intent_type") or "") if run else ""
     if (intent_type or "").startswith("poc:isolated") or (task_type or "").startswith("poc:"):
         return "poc"
 
@@ -277,15 +281,50 @@ def get_project_cost(project_id: str) -> ProjectCostLedger:
     with get_conn() as conn:
         get_project_or_404(conn, project_id)
         runs = {
-            row["run_id"]: (row["task_type"], row["intent_type"])
+            row["run_id"]: {
+                "task_type": row["task_type"],
+                "intent_type": row["intent_type"],
+                "stage": row["stage"],
+                "status": row["status"],
+                "error_id": row["error_id"],
+            }
             for row in conn.execute(
-                "SELECT r.run_id, r.task_type, i.type AS intent_type "
+                "SELECT r.run_id, r.task_type, r.stage, i.type AS intent_type, r.status, r.error_id "
                 "FROM runs r LEFT JOIN intents i "
                 "ON i.project_id = r.project_id AND i.id = r.intent_id "
                 "WHERE r.project_id = ?",
                 (project_id,),
             )
         }
+        attempt_metadata: dict[tuple[str, str], dict] = {}
+        for row in conn.execute(
+            "SELECT e.run_id, e.payload, r.stage FROM audit_events e "
+            "JOIN runs r ON r.project_id = e.project_id AND r.run_id = e.run_id "
+            "WHERE e.project_id = ? AND e.event_type = 'execution_attempt_finished' "
+            "AND e.actor = 'dispatcher.execution' "
+            "AND e.source_generation = r.source_generation "
+            "AND e.plan_revision = r.plan_revision",
+            (project_id,),
+        ):
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            phase = payload.get("phase") if isinstance(payload, dict) else None
+            attempt_status = payload.get("attempt_status") if isinstance(payload, dict) else None
+            process_started = payload.get("process_started") if isinstance(payload, dict) else None
+            failure_code = payload.get("failure_code") if isinstance(payload, dict) else None
+            if (
+                isinstance(phase, str) and phase
+                and attempt_status in {"completed", "failed", "cancelled", "timed_out", "setup_failed", "blocked"}
+                and isinstance(process_started, bool)
+                and (failure_code is None or failure_code in {
+                    "execution_policy_denied", "process_setup_failed", "process_start_failed",
+                    "process_communication_failed", "cancelled", "worker_timeout", "worker_exit_nonzero",
+                })
+                and phase == row["stage"]
+            ):
+                attempt_metadata[(row["run_id"], phase)] = payload
 
     totals = {category: WorkerCallCost() for category in _COST_CATEGORIES}
     total = WorkerCallCost()
@@ -310,10 +349,27 @@ def get_project_cost(project_id: str) -> ProjectCostLedger:
                 runs.get(run_id) if run_id else None,
             )
             duration = _nonnegative_int(record.get("duration_ms"))
-            totals[category].calls += 1
-            totals[category].duration_ms += duration
-            total.calls += 1
-            total.duration_ms += duration
+            process_started = record.get("process_started", True)
+            if not isinstance(process_started, bool):
+                process_started = True
+            status = record.get("attempt_status")
+            if not isinstance(status, str) or not status:
+                status = _legacy_attempt_status(record)
+            failure_code = record.get("failure_code")
+            if not isinstance(failure_code, str) or not failure_code:
+                failure_code = _legacy_failure_code(record)
+            usage = record.get("usage")
+            for bucket in (totals[category], total):
+                bucket.duration_ms += duration
+                if process_started:
+                    bucket.calls += 1
+                elif status == "setup_failed":
+                    bucket.setup_failures += 1
+                _increment(bucket.attempt_status_counts, status)
+                if failure_code:
+                    _increment(bucket.failure_code_counts, failure_code)
+                if process_started:
+                    _add_usage(bucket, usage)
 
     # Runs are registered before process startup. Track runs without an archive
     # separately so setup failures are not presented as worker invocations.
@@ -321,14 +377,98 @@ def get_project_cost(project_id: str) -> ProjectCostLedger:
         if run_id in archived_run_ids:
             continue
         category = _cost_category("", run)
-        totals[category].unarchived_attempts += 1
-        total.unarchived_attempts += 1
+        metadata = attempt_metadata.get((run_id, str(run.get("stage") or "")))
+        attempt_status = metadata.get("attempt_status") if metadata else None
+        run_status = str(run.get("status") or "unknown")
+        # Lifecycle metadata can prove that the worker process started even if
+        # archive persistence failed. It cannot recover duration or provider
+        # usage, so those remain zero/unknown in that case.
+        process_started = metadata.get("process_started") is True if metadata else False
+        status = (
+            str(attempt_status)
+            if attempt_status == "setup_failed"
+            else f"unarchived_{attempt_status}_result_missing"
+            if isinstance(attempt_status, str) and attempt_status
+            else {
+            "running": "unarchived_running_or_interrupted",
+            "failed": "unarchived_failed_result_missing",
+            "timed_out": "unarchived_timed_out_result_missing",
+            "cancelled": "unarchived_cancelled_result_missing",
+            "blocked": "unarchived_blocked_result_missing",
+            "interrupted": "unarchived_interrupted_result_missing",
+            "completed": "unarchived_completed_result_missing",
+            "succeeded": "unarchived_succeeded_result_missing",
+            }.get(run_status, "unarchived_unknown_status")
+        )
+        code_value = metadata.get("failure_code") if metadata else None
+        code = (
+            str(code_value) if isinstance(code_value, str) and code_value
+            else "run_error_recorded" if run.get("error_id")
+            else "archive_missing"
+        )
+        for bucket in (totals[category], total):
+            bucket.unarchived_attempts += 1
+            if process_started:
+                bucket.calls += 1
+                bucket.usage_unknown_calls += 1
+            if attempt_status == "setup_failed":
+                bucket.setup_failures += 1
+            _increment(bucket.attempt_status_counts, status)
+            _increment(bucket.failure_code_counts, code)
 
     return ProjectCostLedger(
         project_id=project_id,
         total=total,
         by_category=totals,
     )
+
+
+def _increment(counts: dict[str, int], key: str) -> None:
+    counts[key] = counts.get(key, 0) + 1
+
+
+def _add_usage(bucket: WorkerCallCost, usage: object) -> None:
+    if not isinstance(usage, dict):
+        bucket.usage_unknown_calls += 1
+        return
+    token_keys = (
+        "input_tokens", "output_tokens", "cached_input_tokens",
+        "cache_creation_input_tokens", "total_tokens",
+    )
+    parsed: dict[str, int] = {}
+    incomplete = False
+    for key in token_keys:
+        value = usage.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            incomplete = True
+        else:
+            parsed[key] = value
+            _increment(bucket.usage_coverage_calls, key)
+    if incomplete:
+        bucket.usage_unknown_calls += 1
+    if "input_tokens" in parsed and "output_tokens" in parsed:
+        bucket.usage_recorded_calls += 1
+    for key, value in parsed.items():
+        prior = getattr(bucket, key)
+        setattr(bucket, key, (prior or 0) + value)
+
+
+def _legacy_attempt_status(record: dict) -> str:
+    if record.get("cancelled"):
+        return "cancelled"
+    if record.get("timed_out"):
+        return "timed_out"
+    try:
+        return "completed" if int(record.get("returncode")) == 0 else "failed"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _legacy_failure_code(record: dict) -> str | None:
+    status = _legacy_attempt_status(record)
+    if status == "completed":
+        return None
+    return {"failed": "worker_exit_nonzero", "timed_out": "worker_timeout", "cancelled": "cancelled"}.get(status, "unknown")
 
 
 @router.get("/projects/{project_id}/executions/{execution_id}", response_model=PiExecutionDetail)

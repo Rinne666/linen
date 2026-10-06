@@ -224,13 +224,22 @@ def post_run(project_id: str, body: RunEnvelope):
     with get_conn() as conn:
         try:
             result = register_run(conn, body)
-            append_contract_event(conn, AuditEventEnvelope(
-                event_id=f"run-{body.run_id}-created", project_id=project_id, run_id=body.run_id,
-                idempotency_key=f"run:{body.run_id}:created", event_type="run_registered", actor="dispatcher",
-                entity_kind="run", entity_id=body.run_id, graph_revision=body.graph_revision,
-                source_generation=body.source_generation, plan_revision=body.plan_revision,
-                payload={"status": result.status}, created_at=result.started_at or utcnow(),
-            ))
+            event_key = f"run:{body.run_id}:created"
+            if conn.execute(
+                "SELECT 1 FROM audit_events WHERE project_id = ? AND idempotency_key = ?",
+                (project_id, event_key),
+            ).fetchone() is None:
+                registered_at = conn.execute(
+                    "SELECT created_at FROM runs WHERE project_id = ? AND run_id = ?",
+                    (project_id, body.run_id),
+                ).fetchone()[0]
+                append_contract_event(conn, AuditEventEnvelope(
+                    event_id=f"run-{body.run_id}-created", project_id=project_id, run_id=body.run_id,
+                    idempotency_key=event_key, event_type="run_registered", actor="dispatcher",
+                    entity_kind="run", entity_id=body.run_id, graph_revision=body.graph_revision,
+                    source_generation=body.source_generation, plan_revision=body.plan_revision,
+                    payload={"status": result.status}, created_at=result.started_at or registered_at,
+                ))
             return result
         except ValueError as exc:
             raise _value_error(exc) from exc

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import pytest
 
 from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage
 from linen.dispatcher.analysis.artifacts import (
+    canonical_source_citations,
     canonical_vulnerability_trace,
     vulnerability_trace_proof,
 )
@@ -268,6 +270,17 @@ def test_semantic_recipe_result_is_cited_then_verified(tmp_path):
                     {"file": "Repository.java", "line": 1, "symbol": "Repository.delete",
                      "kind": "sink", "observation": "id selects the delete target", "citation_id": "t3"},
                 ],
+                "security_checks": {
+                    "attacker_cases": [{"case_id": "other-owner", "input_class": "object identifier",
+                        "representative_value": "B", "attacker_control": "yes", "sink_reachable": "yes",
+                        "security_effect": "Caller A deletes object B", "citation_ids": ["t1", "t3"]}],
+                    "protection_checks": [{"protection": "ownership binding", "predicate": "none found",
+                        "attacker_case_id": "other-owner", "predicate_result": "not_applicable", "resulting_value": "B",
+                        "result": "none_found", "sink_reachable": "yes", "citation_ids": ["t1", "t2", "t3"]}],
+                    "configuration_analysis": {"default_mode": "not_applicable", "ordinary_enabled_mode": "not_applicable",
+                        "requires_admin_misconfiguration": "no", "summary": "The closed source path does not consult configuration",
+                        "citation_ids": ["t1", "t2", "t3"]},
+                },
                 "candidate_disposition": {
                     "fingerprint": candidate["fingerprint"],
                     "outcome": "confirmed",
@@ -282,6 +295,9 @@ def test_semantic_recipe_result_is_cited_then_verified(tmp_path):
     )
     disposition_fact = Fact(id="f-disposition", status="triaged", **disposition)
     assert disposition_fact.proof is not None
+    check = disposition_fact.proof.attributes["security_checks"]["protection_checks"][0]
+    assert check["predicate_result"] == "not_applicable"
+    assert check["resulting_value"] == "B"
     assert [step["symbol"] for step in disposition_fact.proof.attributes["trace"]] == [
         "Controller.delete", "Service.delete", "Repository.delete",
     ]
@@ -524,6 +540,105 @@ def test_semantic_recipe_reports_all_citation_mismatches(tmp_path):
         audit_recipes.outcome_fact(payload, board, intent, workdir, config)
     assert "c1=Api.java:1" in str(captured.value)
     assert "c2=Api.java:1" in str(captured.value)
+
+
+def _frozen_snapshot(tmp_path, files: dict[str, str]):
+    source = tmp_path / "source"
+    manifest: dict[str, str] = {}
+    for relative, content in files.items():
+        target = source / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+        manifest[relative] = hashlib.sha256(content.encode()).hexdigest()
+    return source, {"files": manifest, "skipped": []}
+
+
+def test_citation_binds_workspace_qualified_path_to_frozen_file(tmp_path):
+    """A worker citing the path its own file tools returned -- workspace
+    qualified -- must still bind to the same frozen file, not be rejected."""
+    source, snapshot = _frozen_snapshot(
+        tmp_path, {"testcode/BenchmarkTest00001.py": "param = 1\n"},
+    )
+    citations = canonical_source_citations(
+        [{
+            "id": "c1",
+            "file": ".linen-recon/generation-1/source/testcode/BenchmarkTest00001.py",
+            "line": 1,
+            "code": "param = 1",
+        }],
+        source, snapshot, label="recon",
+    )
+    assert citations == [{
+        "id": "c1", "file": "testcode/BenchmarkTest00001.py", "line": 1, "code": "param = 1",
+    }]
+
+
+def test_citation_binds_bare_filename_when_unambiguous(tmp_path):
+    source, snapshot = _frozen_snapshot(
+        tmp_path, {"testcode/BenchmarkTest00001.py": "param = 1\n"},
+    )
+    citations = canonical_source_citations(
+        [{"id": "c1", "file": "BenchmarkTest00001.py", "line": 1, "code": "param = 1"}],
+        source, snapshot, label="recon",
+    )
+    assert citations[0]["file"] == "testcode/BenchmarkTest00001.py"
+
+
+@pytest.mark.parametrize("cited", ["/etc/passwd", "../outside.py", "other.py", "missing.py"])
+def test_citation_still_rejects_unresolvable_paths(tmp_path, cited):
+    """Path-spelling tolerance must never widen file identity: absolute,
+    escaping, and unknown paths stay hard errors."""
+    source, snapshot = _frozen_snapshot(
+        tmp_path, {"testcode/BenchmarkTest00001.py": "param = 1\n"},
+    )
+    with pytest.raises(ValueError, match="missing from the frozen snapshot or the path does not resolve"):
+        canonical_source_citations(
+            [{"id": "c1", "file": cited, "line": 1, "code": "param = 1"}],
+            source, snapshot, label="recon",
+        )
+
+
+def test_citation_rejects_ambiguous_bare_filename(tmp_path):
+    """Two snapshot files sharing a basename cannot be disambiguated from a
+    bare citation, so the ambiguity must remain a hard error."""
+    source, snapshot = _frozen_snapshot(
+        tmp_path, {"a/util.py": "x = 1\n", "b/util.py": "x = 2\n"},
+    )
+    with pytest.raises(ValueError, match="missing from the frozen snapshot or the path does not resolve"):
+        canonical_source_citations(
+            [{"id": "c1", "file": "util.py", "line": 1, "code": "x = 1"}],
+            source, snapshot, label="recon",
+        )
+
+
+def test_citation_diagnoses_partial_line_with_exact_byte_lengths(tmp_path):
+    complete_line = "<" + ("x" * 966)
+    assert len(complete_line.encode("utf-8")) == 967
+    source, snapshot = _frozen_snapshot(
+        tmp_path, {"templates/web/Index.html": complete_line + "\n"},
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"partial line citation.*first 135 bytes.*967-byte.*[Cc]opy the complete line",
+    ):
+        canonical_source_citations(
+            [{
+                "id": "c1", "file": "templates/web/Index.html", "line": 1,
+                "code": complete_line[:135],
+            }],
+            source, snapshot, label="recon",
+        )
+
+
+def test_citation_diagnoses_line_out_of_range(tmp_path):
+    source, snapshot = _frozen_snapshot(
+        tmp_path, {"testcode/BenchmarkTest00001.py": "param = 1\n"},
+    )
+    with pytest.raises(ValueError, match=r"line 2 is out of range.*1 line"):
+        canonical_source_citations(
+            [{"id": "c1", "file": "testcode/BenchmarkTest00001.py", "line": 2, "code": "param = 1"}],
+            source, snapshot, label="recon",
+        )
 
 
 def test_sibling_endpoints_keep_stable_identities_for_hypotheses(tmp_path):

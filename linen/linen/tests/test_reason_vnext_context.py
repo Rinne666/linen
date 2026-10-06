@@ -598,7 +598,7 @@ def test_reason_context_continuation_stale_snapshot_is_controlled_failure(tmp_pa
     assert client.created_intents == []
 
 
-def test_stale_reason_does_not_ack_triggering_event_and_can_run_again(tmp_path, monkeypatch) -> None:
+def test_stale_reason_acknowledges_old_trigger_without_writing_stale_intents(tmp_path, monkeypatch) -> None:
     project = _project_with_two_edges()
     project.project.event_seq = 12
     project.project.reason_last_seen_event_seq = 11
@@ -640,8 +640,8 @@ def test_stale_reason_does_not_ack_triggering_event_and_can_run_again(tmp_path, 
         make_config(), client, backend, project, "FULL-EXPORT", make_config().workers[0],
         reason.TaskCancellation(), trigger="events:11->12",
     ) == "failed"
-    assert client.acknowledged == [None]
-    assert client.project.project.reason_last_seen_event_seq == 11
+    assert client.acknowledged == [12]
+    assert client.project.project.reason_last_seen_event_seq == 12
     assert client.created_intents == []
 
     from linen.dispatcher.scheduler.loop import DispatcherLoop
@@ -652,7 +652,10 @@ def test_stale_reason_does_not_ack_triggering_event_and_can_run_again(tmp_path, 
         entity_kind="intent", entity_id="i-event", payload={"fact_id": "f002"},
         created_at="2026-01-01T00:00:00Z",
     )
-    assert scheduler._reason_trigger(client.project) == "events:11->12"
+    assert scheduler._reason_trigger(client.project) is None
+    client.project.project.event_seq = 13
+    next(f for f in client.project.facts if f.id == "f002").type = "dataflow"
+    assert scheduler._reason_trigger(client.project) == "events:12->13"
     assert scheduler._reason_may_run(client.project, [event])
 
 
@@ -673,7 +676,7 @@ def test_reason_prompt_filters_open_intents_to_projected_frontier(monkeypatch) -
     assert reason.run_reason_task(
         make_config(), client, backend, project, "FULL-EXPORT", make_config().workers[0],
         reason.TaskCancellation(), lease_id="lease-filter",
-    ) == "success"
+    ) == "noop"
     prompt = driver.execute_prompts[0]
     assert "i000" in prompt
     assert "i039" not in prompt

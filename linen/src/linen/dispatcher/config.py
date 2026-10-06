@@ -148,6 +148,7 @@ class RuntimeConfig(BaseModel):
     interval: int = Field(gt=0)
     healthcheck_timeout: int = Field(gt=0)
     worker_healthcheck: WorkerHealthcheckMode = "startup_only"
+    healthcheck_probe: Literal["availability", "response"] = "availability"
     prompt_group: str = Field(min_length=1)
 
 
@@ -158,8 +159,10 @@ class WorkerConfig(BaseModel):
     type: WorkerType
     task_types: list[TaskType]
     max_running: int = Field(gt=0)
-    # Accepted for compatibility with older dispatch.yaml files. Scheduling
-    # no longer uses priority; project preferences and live load decide.
+    # Higher values win worker selection; an unset value ranks as 0. Ties
+    # break on live load and then at random, so equal priorities still share
+    # work across workers. This is how an operator pins a preferred CLI
+    # (e.g. codex) ahead of the others while keeping the rest as fallback.
     priority: int | None = Field(default=None, ge=0)
     env: dict[str, str] = Field(default_factory=dict)
     # Optional CLI sandbox/tool restriction. Codex audit tasks are dispatched
@@ -481,6 +484,9 @@ class AuditConfig(BaseModel):
     # audit work or dispatches another worker process.
     max_runs_per_project: int = Field(default=250, gt=0, le=100_000)
     wall_clock_budget_seconds: int = Field(default=43_200, gt=0, le=604_800)
+    # Count execute, conclude, and re-dispatch corrections on one explore
+    # intent as a single bounded result-repair budget.
+    max_result_attempts: int = Field(default=3, ge=1, le=10)
     # Health signals stop repeated no-op strategy calls and surface idle audits.
     reason_noop_limit: int = Field(default=3, gt=0, le=10)
     reason_noop_cooldown_seconds: int = Field(default=900, gt=0, le=86_400)

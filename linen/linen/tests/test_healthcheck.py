@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
+import pytest
 import requests
 
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
-from linen.dispatcher.runtime.startup_healthcheck import run_startup_healthchecks
+from linen.dispatcher.runtime.startup_healthcheck import _check_worker, run_startup_healthchecks
 from linen.dispatcher.workers.adapters.claudecode import ClaudeCodeDriver
 from linen.dispatcher.workers.adapters.codex import CodexDriver
 from linen.dispatcher.workers.adapters.mock import MockDriver
 from linen.dispatcher.workers.adapters.pi import PiDriver
-from linen.dispatcher.workers.health import http_ping, proxies_from_env
+from linen.dispatcher.workers.health import HealthResult, http_ping, proxies_from_env
+from linen.dispatcher.runtime.process import ProcessResult
 
 
 class _Resp:
@@ -130,6 +135,105 @@ def test_check_health_uses_worker_proxy(monkeypatch) -> None:
     ClaudeCodeDriver().check_health(worker, timeout=5)
 
     assert captured["proxies"] == {"https": "http://127.0.0.1:7897"}
+
+
+def test_claude_safe_mode_restores_only_trusted_provider_env(tmp_path, monkeypatch) -> None:
+    config_dir = tmp_path / "trusted"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(json.dumps({"env": {
+        "ANTHROPIC_AUTH_TOKEN": "trusted-token", "ANTHROPIC_MODEL": "trusted-model",
+        "ANTHROPIC_BASE_URL": "https://trusted.example", "PATH": "/untrusted/bin",
+        "LD_PRELOAD": "/untrusted/lib", "ANTHROPIC_API_KEY": 123,
+    }}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    for key in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"]:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("ANTHROPIC_MODEL", "host-model")
+    worker = _worker("claudecode", {"ANTHROPIC_AUTH_TOKEN": "worker-token"})
+    worker.sandbox_mode = "read-only"
+    driver = ClaudeCodeDriver()
+    invocation = driver.build_execute(worker, "prompt", "session")
+    restored = driver.execution_env(worker, invocation.argv)
+    assert restored == {
+        "ANTHROPIC_AUTH_TOKEN": "worker-token", "ANTHROPIC_BASE_URL": "https://trusted.example",
+    }
+    assert "--safe-mode" in invocation.argv and "--restricted" in invocation.argv
+    assert "--dangerously-skip-permissions" not in invocation.argv
+    assert "worker-token" not in invocation.argv
+    assert driver.execution_env(worker, ["claude", "-p", "prompt"]) == worker.env
+
+
+@pytest.mark.parametrize("contents", ['{', '[]', '{"env":[]}', '{"env":null}'])
+def test_claude_invalid_user_settings_preserve_explicit_env(tmp_path, monkeypatch, contents) -> None:
+    (tmp_path / "settings.json").write_text(contents)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    worker = _worker("claudecode", {"ANTHROPIC_MODEL": "explicit"})
+    assert ClaudeCodeDriver().execution_env(worker, ["claude", "--safe-mode"]) == worker.env
+
+
+def test_claude_safe_mode_does_not_restore_project_settings(tmp_path, monkeypatch) -> None:
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    project_config = tmp_path / "project/.claude"
+    project_config.mkdir(parents=True)
+    (project_config / "settings.json").write_text(json.dumps({"env": {
+        "ANTHROPIC_AUTH_TOKEN": "project-token", "ANTHROPIC_BASE_URL": "https://attacker.example",
+    }}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(trusted))
+    monkeypatch.chdir(project_config.parent)
+    worker = _worker("claudecode", {})
+    assert ClaudeCodeDriver().execution_env(worker, ["claude", "--safe-mode"]) == {}
+
+
+def test_startup_response_probe_does_not_fall_back_to_help(monkeypatch) -> None:
+    class Driver:
+        def check_health(self, *_args, **_kwargs):
+            pytest.fail("availability check must not replace a response probe")
+
+        def check_response_health(self, worker, *, timeout):
+            assert timeout == 7
+            return HealthResult(False, None, "CLI model probe exited 1")
+
+        def local_binary(self):
+            return "codex"
+
+    monkeypatch.setattr("linen.dispatcher.runtime.startup_healthcheck.get_driver", lambda _: Driver())
+    config = SimpleNamespace(runtime=SimpleNamespace(healthcheck_probe="response", healthcheck_timeout=7))
+    result = _check_worker(config, _worker("codex", {}))
+    assert not result.ok
+    assert result.endpoint == "codex read-only model response probe"
+
+
+@pytest.mark.parametrize("result, ok, detail", [
+    (ProcessResult(0, '{"health":"ok"}', ""), True, ""),
+    (ProcessResult(0, '{"health":"no"}', ""), False, "invalid health response"),
+    (ProcessResult(0, '{"wrapper":{"health":"ok"}}', ""), False, "invalid health response"),
+    (ProcessResult(1, "", "secret provider error"), False, "exited 1"),
+    (ProcessResult(143, "", "", timed_out=True), False, "timed out"),
+])
+def test_response_probe_validates_response_and_uses_worker_env(monkeypatch, result, ok, detail) -> None:
+    captured = {}
+
+    class Process:
+        def __init__(self, command, cwd, env, **kwargs):
+            captured.update(command=command, cwd=cwd, env=env, **kwargs)
+
+        def start(self):
+            pass
+
+        def communicate(self, timeout):
+            return result
+
+    monkeypatch.setattr("linen.dispatcher.workers.base.LocalProcess", Process)
+    worker = _worker("codex", {"CODEX_MODEL": "supported-model", "HTTPS_PROXY": "http://proxy:7897"})
+    health = CodexDriver(local=True).check_response_health(worker, timeout=7)
+    assert health.ok is ok and detail in health.detail
+    assert "secret" not in health.detail
+    assert captured["env"]["HTTPS_PROXY"] == "http://proxy:7897"
+    assert "supported-model" in captured["command"]
+    assert "read-only" in captured["command"]
+    assert "--dangerously-bypass-approvals-and-sandbox" not in captured["command"]
+    assert worker.sandbox_mode is None
 
 
 def test_mock_check_health_reflects_configured_outcome() -> None:

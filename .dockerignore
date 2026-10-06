@@ -1,0 +1,13 @@
+.git
+.linen-runtime
+**/.venv
+**/__pycache__
+**/.pytest_cache
+.env
+.env.*
+dispatch.yaml
+**/*.db
+**/*.db-wal
+**/*.db-shm
+dist
+linen/dist

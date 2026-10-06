@@ -291,7 +291,7 @@ def test_aggregate_fact_status_for_each_verdict(app_with_temp_db):
         )
         assert aggregate_fact_status_from_reviews(conn, pid, "f002", "draft") == "triaged"
 
-    # Sticky terminal status: never overwritten.
+    # An unsupported legacy fixed flag cannot bypass candidate proof review.
     with db.get_conn() as conn:
         conn.execute(
             "INSERT INTO facts (id, project_id, description, type, evidence, status) "
@@ -304,7 +304,7 @@ def test_aggregate_fact_status_for_each_verdict(app_with_temp_db):
             "'x', '2026-01-01T00:00:05Z')",
             (pid,),
         )
-        assert aggregate_fact_status_from_reviews(conn, pid, "f003", "fixed") == "fixed"
+        assert aggregate_fact_status_from_reviews(conn, pid, "f003", "fixed") == "draft"
 
 
 def test_coverage_plan_status_ignores_legacy_vulnerability_review(app_with_temp_db):

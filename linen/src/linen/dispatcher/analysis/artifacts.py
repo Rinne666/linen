@@ -143,6 +143,34 @@ def canonical_endpoint_id(value: Any) -> str:
     return value.strip()
 
 
+def _resolve_snapshot_file(filename: Any, files: dict[str, Any]) -> str | None:
+    """Map a cited path spelling onto a unique frozen-snapshot entry.
+
+    Workers routinely emit `file` exactly as their own file tools reported it --
+    workspace-qualified (``.linen-recon/generation-1/source/testcode/x.py``) or
+    bare (``x.py``) -- rather than relative to the snapshot root.  Path spelling
+    is not a security property: file *identity* and the byte-exact excerpt are.
+    Resolve only unambiguous spellings and reject anything absolute, backslashed,
+    or escaping, so a citation can never be redirected to a different in-snapshot
+    file; an ambiguous spelling stays a hard error.
+    """
+    if not isinstance(filename, str) or not filename:
+        return None
+    if filename in files:
+        return filename
+    if filename.startswith("/") or "\\" in filename:
+        return None
+    parts = PurePosixPath(filename).parts
+    if not parts or ".." in parts or "." in parts:
+        return None
+    candidates = [
+        known
+        for known in files
+        if filename.endswith("/" + known) or known.endswith("/" + filename)
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def canonical_source_citations(
     raw: Any, source: Path, snapshot: dict, *, label: str,
 ) -> list[dict[str, Any]]:
@@ -153,55 +181,93 @@ def canonical_source_citations(
     result = []
     ids: set[str] = set()
     mismatches: list[str] = []
+    mismatch_details: list[str] = []
     files = snapshot.get("files", {})
     for citation in raw:
         if not isinstance(citation, dict) or set(citation) != {"id", "file", "line", "code"}:
             raise ValueError(f"Every {label.lower()} citation requires exactly id, file, line, and code")
         citation_id = citation["id"]
-        filename = citation["file"]
         line = citation["line"]
         code = citation["code"]
-        if (
-            not isinstance(citation_id, str)
-            or not _CITATION_ID.fullmatch(citation_id)
-            or citation_id in ids
-            or not isinstance(filename, str)
-            or filename not in files
-            or type(line) is not int
-            or line < 1
-            or not isinstance(code, str)
-            or not code.strip()
-            or len(code) > 8000
-        ):
-            raise ValueError(f"Invalid {label.lower()} citation")
+        filename = _resolve_snapshot_file(citation["file"], files)
+        # Diagnose the first structural defect precisely.  A bare
+        # "invalid citation" gives a retry nothing to correct, so the acceptance
+        # set is unchanged but the reason is always actionable.
+        if not isinstance(citation_id, str) or not _CITATION_ID.fullmatch(citation_id):
+            defect = f"citation id {citation_id!r} is not a valid identifier"
+        elif citation_id in ids:
+            defect = f"citation id {citation_id} is duplicated"
+        elif filename is None:
+            defect = (
+                f"file is missing from the frozen snapshot or the path does not resolve: "
+                f"{citation['file']!r} (cite a path relative to the source root)"
+            )
+        elif type(line) is not int or line < 1:
+            defect = f"citation {citation_id} line {line!r} must be a positive integer"
+        elif not isinstance(code, str) or not code.strip():
+            defect = f"citation {citation_id} has an empty excerpt"
+        elif len(code) > 8000:
+            defect = f"citation {citation_id} excerpt exceeds 8000 characters"
+        else:
+            defect = None
+        if defect is not None:
+            raise ValueError(f"Invalid {label.lower()} citation: {defect}")
         content = source_bytes(source, filename, files[filename]).decode(
             "utf-8", errors="replace",
         )
         lines = content.splitlines()
+        if line > len(lines):
+            raise ValueError(
+                f"Invalid {label.lower()} citation: line {line} is out of range for "
+                f"{filename!r}; the frozen file has {len(lines)} line(s). "
+                "Choose an existing line or withdraw the claim."
+            )
         excerpt = code.splitlines()
         actual = lines[line - 1:line - 1 + len(excerpt)]
         if actual != excerpt:
-            # Models occasionally lose one indentation level while copying an
-            # otherwise exact excerpt.  Canonicalize only that harmless case;
-            # every non-whitespace byte, file, and line must still match the
-            # immutable snapshot.  Content or line drift remains a hard error.
-            indentation_only = (
+            # Models occasionally lose an indentation level or append trailing
+            # whitespace while copying an otherwise exact excerpt.  Both are
+            # invisible and carry no evidence, so canonicalize whitespace-only
+            # differences.  Every non-whitespace byte, file, and line must
+            # still match the immutable snapshot; content or line drift
+            # remains a hard error.
+            whitespace_only = (
                 len(actual) == len(excerpt)
                 and all(
-                    source_line.lstrip(" \t") == cited_line.lstrip(" \t")
+                    source_line.strip(" \t") == cited_line.strip(" \t")
                     for source_line, cited_line in zip(actual, excerpt, strict=True)
                 )
             )
-            if indentation_only:
+            if whitespace_only:
                 code = "\n".join(actual)
             else:
                 mismatches.append(f"{citation_id}={filename}:{line}")
+                if (
+                    len(actual) == 1
+                    and len(excerpt) == 1
+                    and actual[0].encode("utf-8").startswith(excerpt[0].encode("utf-8"))
+                    and len(excerpt[0].encode("utf-8")) < len(actual[0].encode("utf-8"))
+                ):
+                    cited_bytes = len(excerpt[0].encode("utf-8"))
+                    full_bytes = len(actual[0].encode("utf-8"))
+                    mismatch_details.append(
+                        f"{citation_id}={filename}:{line} is a partial line citation: "
+                        f"the quote contains only the first {cited_bytes} bytes of the "
+                        f"{full_bytes}-byte frozen line. Copy the complete line exactly, "
+                        "or withdraw the claim and record the evidence gap."
+                    )
+                else:
+                    mismatch_details.append(
+                        f"{citation_id}={filename}:{line} content differs from the frozen "
+                        "source; re-read that exact line and copy it byte-for-byte, or "
+                        "withdraw the claim and record the evidence gap."
+                    )
         ids.add(citation_id)
         result.append({"id": citation_id, "file": filename, "line": line, "code": code})
     if mismatches:
         raise ValueError(
             f"{label} citation does not match frozen source "
-            f"({len(mismatches)} mismatch(es)): {', '.join(mismatches)}"
+            f"({len(mismatches)} mismatch(es)): {'; '.join(mismatch_details)}"
         )
     return result
 
@@ -240,7 +306,7 @@ def canonical_vulnerability_trace(
                 "Every trace step requires file, line, symbol, kind, observation, "
                 "and citation_id (or the legacy relation field)"
             )
-        filename = step["file"]
+        filename = _resolve_snapshot_file(step["file"], files)
         line = step["line"]
         symbol = step["symbol"]
         kind = step.get("kind", step.get("relation"))
@@ -250,8 +316,7 @@ def canonical_vulnerability_trace(
         data_symbol = step.get("data_symbol")
         citation = citation_by_id.get(citation_id) if isinstance(citation_id, str) else None
         if (
-            not isinstance(filename, str)
-            or filename not in files
+            filename is None
             or type(line) is not int
             or line < 1
             or not isinstance(symbol, str)

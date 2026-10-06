@@ -152,8 +152,8 @@ def transition_run(conn: sqlite3.Connection, run: RunEnvelope) -> RunEnvelope:
     row = conn.execute("SELECT * FROM runs WHERE project_id = ? AND run_id = ?", (run.project_id, run.run_id)).fetchone()
     now = utcnow()
     current = run_from_row(row)
-    started = run.started_at or (now if run.status == "running" else current.started_at)
-    finished = run.finished_at or (now if run.status in {"completed", "succeeded", "failed", "cancelled", "timed_out", "interrupted", "blocked"} else current.finished_at)
+    started = run.started_at or current.started_at or (now if run.status == "running" else None)
+    finished = run.finished_at or current.finished_at or (now if run.status in {"completed", "succeeded", "failed", "cancelled", "timed_out", "interrupted", "blocked"} else None)
     conn.execute(
         "UPDATE runs SET status = ?, worker_name = ?, worker_type = ?, started_at = ?, finished_at = ?, "
         "artifact_ids = ?, error_id = ?, updated_at = ? WHERE project_id = ? AND run_id = ?",

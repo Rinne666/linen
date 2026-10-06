@@ -25,6 +25,7 @@ from linen.dispatcher.runtime.contracts import (
 from linen.dispatcher.tasks.common import (
     DuplicateTerminalRun,
     ExecutionPolicyDenied,
+    _append_execution_attempt_event,
     _finish_contract_run,
     _start_contract_run,
     run_worker_process,
@@ -486,12 +487,31 @@ def test_policy_denial_blocks_run_without_starting_process(tmp_path) -> None:
     assert {artifact.kind for artifact in client.artifacts} == {
         "execution_record", "stdout", "stderr",
     }
-    assert len(client.events) == 1
-    assert client.events[0].event_type == "execution_policy_denied"
+    assert {event.event_type for event in client.events} == {
+        "execution_attempt_finished", "execution_policy_denied",
+    }
+    attempt_event = next(event for event in client.events if event.event_type == "execution_attempt_finished")
+    assert attempt_event.payload == {
+        "phase": "explore_execute", "attempt_status": "blocked",
+        "process_started": False, "failure_code": "execution_policy_denied",
+    }
     record = json.loads(next((tmp_path / ".linen-executions").glob("*.json")).read_text())
     assert record["execution_mode"] == "policy-gated"
     assert record["isolation"] == "denied"
     assert record["policy_decision"]["reason"] == "insufficient_capabilities"
+
+
+def test_execution_attempt_event_identity_is_stable_across_retries() -> None:
+    client = _PolicyClient()
+    run = _run().model_copy(update={"started_at": None, "finished_at": None})
+    for _ in range(2):
+        _append_execution_attempt_event(
+            client, run, phase="explore_execute", attempt_status="setup_failed",
+            process_started=False, failure_code="process_setup_failed",
+        )
+    first, second = client.events
+    assert first.model_dump(mode="json") == second.model_dump(mode="json")
+    assert first.idempotency_key == f"execution-attempt:{run.run_id}:explore_execute:finished"
 
 
 @pytest.mark.parametrize("missing", ["request", "profile"])

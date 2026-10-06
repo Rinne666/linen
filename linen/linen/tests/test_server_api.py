@@ -242,6 +242,14 @@ def test_gate_identifies_reviewed_candidates_waiting_for_technical_confirmation(
             "confidence": "certain",
             "summary": "independent review passed",
             "created_by": "reviewer",
+            "finding_assessment": {
+                "classification": "vulnerability", "threat_model_status": "in_scope",
+                "threat_model_evidence": ["fixture scope permits ordinary caller input"],
+                "attacker_preconditions": {key: False for key in (
+                    "requires_admin_action", "requires_social_engineering", "requires_out_of_scope_privilege", "requires_insecure_configuration")},
+                "direct_impact": {"confidentiality": True, "integrity": False, "availability": False,
+                                  "documented_trust_boundary_violation": False, "impact_path": "request reaches protected object"},
+            },
         },
     ).status_code == 201
 
@@ -254,13 +262,11 @@ def test_gate_identifies_reviewed_candidates_waiting_for_technical_confirmation(
     assert gate["blockers"] == [evidence_check["detail"]]
 
     rejected = client.post(
-        f"/projects/{project_id}/decisions",
+        f"/projects/{project_id}/facts/{candidate_id}/reviews",
         json={
-            "target_kind": "fact",
-            "target_id": candidate_id,
-            "decision": "reject",
-            "rationale": "The authorization check is enforced by the shared guard.",
-            "actor": "human",
+            "verdict": "INVALID", "confidence": "certain",
+            "summary": "The authorization check is enforced by the shared guard.",
+            "created_by": "independent-reviewer", "finding_assessment": {"classification": "false_positive"},
         },
     )
     assert rejected.status_code == 201, rejected.text
@@ -373,6 +379,35 @@ def test_stopping_project_releases_claims_and_reason_but_keeps_hints_writable(cl
         f"/projects/{project_id}/intents",
         json={"from": ["origin"], "description": "blocked", "creator": "reasoner", "worker": None},
     ).status_code == 403
+
+
+def test_project_worker_issue_resume_event_identifies_repaired_workers(client: TestClient) -> None:
+    project_id = _create_project(client)
+    issue = client.post(
+        f"/projects/{project_id}/worker-issue",
+        json={
+            "worker": "local-claude",
+            "task_type": "explore",
+            "code": "provider_quota_exhausted",
+            "message": "Provider quota exhausted.",
+            "remediation": "Restore quota, then resume the project.",
+        },
+    )
+    assert issue.status_code == 200
+    assert issue.json()["status"] == "stopped"
+
+    resumed = client.put(
+        f"/projects/{project_id}/status", json={"status": "active"},
+    )
+    assert resumed.status_code == 200
+    events = client.get(f"/projects/{project_id}/events?after=0").json()
+    resume_event = next(
+        event for event in events
+        if event["event_type"] == "project_worker_issue_resumed"
+    )
+    assert resume_event["payload"]["worker_issues"] == [
+        {"worker": "local-claude", "code": "provider_quota_exhausted"},
+    ]
 
 
 def test_stopped_project_compacts_surplus_coverage_intents_without_deleting_history(
@@ -494,7 +529,8 @@ def test_json_and_sarif_exports_include_semantics_gate_and_findings(client: Test
     assert payload["facts"][-1]["display_title"] == "Command argument injection"
     assert "graph_edges" in payload
     assert "audit_stages" in payload
-    assert "human_decisions" in payload
+    assert "audit_events" in payload
+    assert "human_decisions" not in payload
 
     sarif = client.get(f"/projects/{project_id}/export?format=sarif")
     assert sarif.status_code == 200
@@ -902,7 +938,7 @@ def test_ui_exposes_report_export_download_and_copyable_sidebar(client: TestClie
 
     assert "Reports & project export" in html
     assert "switchExportTab('summary')" in html
-    assert "Confirmed vulnerabilities, excluded candidates and decision reasons" in html
+    assert "Confirmed vulnerabilities, false positives, design weaknesses and hardening advice" in html
     assert "p.audit_mode === 'none'" in html
     assert "switchExportTab('report')" in html
     assert "downloadExportPreview()" in html
@@ -958,13 +994,11 @@ def test_summary_export_separates_confirmed_excluded_and_pending_findings(
         )
 
     assert client.post(
-        f"/projects/{project_id}/decisions",
+        f"/projects/{project_id}/facts/f002/reviews",
         json={
-            "target_kind": "fact",
-            "target_id": "f002",
-            "decision": "reject",
-            "rationale": "Permission check makes the path unreachable.",
-            "actor": "human",
+            "verdict": "INVALID", "confidence": "certain",
+            "summary": "Permission check makes the path unreachable.", "created_by": "reviewer",
+            "finding_assessment": {"classification": "false_positive"},
         },
     ).status_code == 201
     assert client.post(
@@ -982,10 +1016,10 @@ def test_summary_export_separates_confirmed_excluded_and_pending_findings(
     assert exported.status_code == 200
     assert exported.headers["content-type"].startswith("text/markdown")
     assert "# summary audit — Security Audit Summary" in exported.text
-    assert "**1 confirmed vulnerability · 1 excluded candidate · 1 pending candidate.**" in exported.text
+    assert "**1 confirmed vulnerability · 1 false positive · 0 design weaknesses · 0 hardening recommendations · 1 pending candidate.**" in exported.text
     assert "## Confirmed vulnerabilities" in exported.text
     assert "confirmed issue" in exported.text
-    assert "## Excluded candidates" in exported.text
+    assert "## False positives" in exported.text
     assert "Permission check makes the path unreachable." in exported.text
     assert "## Pending candidates" in exported.text
     assert "Technical Confirmation is still required" in exported.text
@@ -1005,7 +1039,8 @@ def test_ui_uses_semantic_node_titles_typed_edges_and_progressive_detail(
     for family in ("Scope", "Work", "Evidence", "Reasoning", "Outcome"):
         assert f"<b>{family}</b>" in html
     assert "Completion Gate" in html
-    assert "Human decision" in html
+    assert "Technical confirmation" in html
+    assert "Human decision" not in html
     assert "toggleTimelineRaw(entry.id)" in html
     assert "switchExportTab('json')" in html
     assert "switchExportTab('sarif')" in html
@@ -1020,6 +1055,29 @@ def test_project_workbench_groups_secondary_surfaces_without_duplicate_drawer(
         assert f">{label}</button>" in html
     assert ">New intent</button>" in html
     assert ">Add analyst note</button>" in html
-    assert "Execution details" in html
+    assert "Execution &amp; CLI" in html
     assert "activityDrawerOpen" not in html
     assert 'class="graph-header-stats' not in html
+
+
+def test_ui_document_revalidates_after_updates(client: TestClient) -> None:
+    response = client.get('/')
+    assert response.status_code == 200
+    assert response.headers['cache-control'] == 'no-cache'
+    assert response.headers.get('etag')
+
+
+def test_failure_history_does_not_double_count_cumulative_attempts(client: TestClient) -> None:
+    pid = _create_project(client)
+    iid = client.post(f'/projects/{pid}/intents', json={
+        'from': ['origin'], 'description': 'inspect', 'creator': 'reasoner',
+    }).json()['id']
+    url = f'/projects/{pid}/intents/{iid}'
+    body = {'worker': 'worker', 'task_type': 'explore', 'code': 'task_failed',
+            'classification': 'transient', 'message': 'failed', 'max_attempts': 2}
+    for attempt in range(1, 4):
+        assert client.post(url + '/heartbeat', json={'worker': 'worker'}).status_code == 200
+        result = client.post(url + '/fail', json=body)
+        assert result.status_code == 200
+        assert result.json()['attempt_count'] == attempt
+        assert client.post(url + '/retry', json={'actor': 'human'}).status_code == 200

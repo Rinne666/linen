@@ -59,6 +59,7 @@ class DockerReviewProcess:
                 "record.json", "scope.json", "raw.sarif", "report.json", "candidates.json",
                 "routes.json", "guards.json", "semantic_recipe.json",
                 "semantic_recipe_runner.py",
+                "poc.py", "case.json",
             }:
                 raise ValueError("Unknown isolated review input")
             (input_dir / name).write_bytes(data)
@@ -191,6 +192,35 @@ class ReviewSandboxBackend:
         self.writable_workdir = writable_workdir
         self.persistent_workdir = persistent_workdir
         self.last_process: DockerReviewProcess | None = None
+
+    def write_text_file(self, container_name: str, path: str, content: str) -> None:
+        """Archive dispatcher-owned results on the host, outside the container.
+
+        Only flat execution archive files in this project's managed directory
+        are accepted. This does not expose host writes to the review process.
+        """
+        project = self.root.parent.resolve()
+        if Path(container_name).resolve() != project:
+            raise ValueError("Review archive belongs to a different project")
+        archive = project / ".linen-executions"
+        target = Path(path)
+        if not target.is_absolute() or target.parent != archive:
+            raise ValueError("Review archive path must stay inside .linen-executions")
+        if target.suffix not in {".json", ".prompt", ".stdout", ".stderr"}:
+            raise ValueError("Unsupported review archive file")
+        if archive.is_symlink():
+            raise ValueError("Review archive directory must not be a symlink")
+        archive.mkdir(mode=0o700, exist_ok=True)
+        directory = os.open(archive, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            descriptor = os.open(
+                target.name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                0o600, dir_fd=directory,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(content)
+        finally:
+            os.close(directory)
 
     def build_exec_process(self, container_name: str, env: dict[str, str], command: list[str],
                            timeout_seconds: int | None = None, kill_after_seconds: int = 5):

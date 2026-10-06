@@ -11,6 +11,7 @@ FENCED_BLOCK_RE = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.IGNORECASE | re.D
 def extract_json_object(text: str) -> dict[str, Any]:
     decoder = json.JSONDecoder()
     seen: set[str] = set()
+    failure: json.JSONDecodeError | None = None
 
     for candidate in _candidate_segments(text):
         segment = candidate.strip()
@@ -27,11 +28,14 @@ def extract_json_object(text: str) -> dict[str, Any]:
         else:
             if isinstance(parsed, dict):
                 return parsed
+            continue
 
         for start in _object_start_positions(segment):
             try:
                 parsed, _end = decoder.raw_decode(segment[start:])
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                if failure is None:
+                    failure = exc
                 recovered = _close_truncated_json(segment[start:])
                 if recovered is None:
                     continue
@@ -39,6 +43,18 @@ def extract_json_object(text: str) -> dict[str, Any]:
             if isinstance(parsed, dict):
                 return parsed
 
+    if failure is not None:
+        # Describe the outer response, never a nested citation fragment. Keep
+        # the excerpt bounded and JSON-escaped so a repair prompt is readable.
+        context = json.dumps(
+            failure.doc[max(0, failure.pos - 60):failure.pos + 60],
+            ensure_ascii=False,
+        )
+        raise ValueError(
+            f"no JSON object found in output: {failure.msg} at line "
+            f"{failure.lineno}, column {failure.colno} (offset {failure.pos}); "
+            f"context: {context}"
+        ) from failure
     raise ValueError("no JSON object found in output")
 
 
@@ -49,7 +65,29 @@ def _candidate_segments(text: str) -> list[str]:
 
 
 def _object_start_positions(text: str) -> list[int]:
-    return [index for index, char in enumerate(text) if char == "{"]
+    # Only complete outer objects are candidates. Scanning every opening brace
+    # could turn a citation inside a malformed response into the task result.
+    starts: list[int] = []
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "{[":
+            if not stack and char == "{":
+                starts.append(index)
+            stack.append("}" if char == "{" else "]")
+        elif char in "}]" and stack and stack[-1] == char:
+            stack.pop()
+    return starts
 
 
 def _close_truncated_json(text: str) -> dict[str, Any] | None:

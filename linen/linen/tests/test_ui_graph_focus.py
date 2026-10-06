@@ -12,7 +12,7 @@ def test_graph_defaults_to_current_and_exposes_four_projection_views() -> None:
     assert "setGraphView('findings')" in html
     assert "setGraphView('full')" in html
     assert "setGraphView('list')" in html
-    assert 'aria-label="Show current execution focus"' in html
+    assert 'aria-label="Show audit coverage and worker progress"' in html
     assert 'aria-label="Show graph"' in html
 
 
@@ -40,7 +40,7 @@ def test_current_projection_expands_a_bounded_causal_neighborhood() -> None:
     assert "const producerByFact = new Map(" in html
     assert "queue.push({ factId: sourceId, depth: depth + 1 });" in html
     assert "currentContextSummary()" in html
-    assert "Open full map" in html
+    assert "setGraphView('full')" in html
 
 
 def test_full_map_keeps_existing_filters_and_projection_is_client_side() -> None:

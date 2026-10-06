@@ -75,6 +75,24 @@ If a fact in the chain explicitly records a counter-condition (e.g. "all uses of
 
 ## 3. What is the NEXT verification step?
 
+### Source-lead disposition
+
+When Recon or machine-analysis context supplies source-grounded leads, account
+for each lead before completing. Use its frozen-source citations to propose a
+bounded verification Intent, or record source evidence that disproves the path.
+Create a `candidate_finding` only when attacker control, reachability, and a
+concrete security effect are supported by the source; the candidate still needs
+independent review and the final proof gate. A tool lead alone is never a
+candidate verdict. If the source is readable but the security question remains,
+keep it as a verification follow-up. If it depends on unavailable runtime facts
+or the bounded run budget is exhausted, leave it as an explicit unresolved gap.
+When creating a candidate from a supplied lead, include `lead_ref:
+<source_fact_id>/<lead_id>` and exact source and sink `file:line` references in
+the candidate evidence so the graph can attribute it to the right lead, even
+when sibling paths share a file.
+Do not complete while any supplied lead has no candidate, evidence-backed
+rejection, or recorded residual gap.
+
 Look at the open intents. For each hypothesis chain under construction, identify the **first gap** in the chain:
 
 | Chain state | Next intent type |

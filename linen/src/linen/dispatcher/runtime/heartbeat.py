@@ -121,4 +121,4 @@ class HeartbeatLease:
         with self._lock:
             process = self._process
         if process is not None:
-            process.kill()
+            process.cancel(f"heartbeat_lease_lost:{status_code or 'unknown'}")

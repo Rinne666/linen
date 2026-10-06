@@ -818,7 +818,7 @@
     <button type="button" @click="sideTab = 'gate'" class="status-rail-item text-left hover:bg-white transition">
       <div>
         <div class="status-rail-label">Audit progress</div>
-        <div class="status-rail-value" :class="completionGate?.ready ? 'text-emerald-700' : 'text-amber-700'" x-text="auditProgressLabel()"></div>
+        <div class="status-rail-value" :class="completionGate?.ready && auditCoverageSummary().complete === true ? 'text-emerald-700' : 'text-amber-700'" x-text="auditProgressLabel()"></div>
       </div>
     </button>
   </div>
@@ -964,7 +964,7 @@
         </div>
       </section>
 
-      <section x-show="projectPrimaryStatus() && !(graphView === 'current' && project?.project?.audit_mode === 'scope' && projectPrimaryStatus().tone === 'success')" x-cloak
+      <section x-show="projectPrimaryStatus() && !inlineFindingStatus() && !(graphView === 'current' && project?.project?.audit_mode === 'scope' && projectPrimaryStatus().tone === 'success')" x-cloak
         class="absolute left-3 right-3 top-[4.35rem] z-10 rounded-xl border px-4 py-3 shadow-sm"
         :class="projectPrimaryStatus().tone === 'attention' ? 'border-amber-200 bg-amber-50/95' : projectPrimaryStatus().tone === 'blocked' ? 'border-rose-200 bg-rose-50/95' : projectPrimaryStatus().tone === 'success' ? 'border-emerald-200 bg-emerald-50/95' : 'border-slate-200 bg-white/95'"
         role="status" aria-live="polite">
@@ -1118,8 +1118,9 @@
         <div class="mx-auto max-w-4xl">
           <div class="mb-5 flex items-start justify-between gap-4">
             <div>
-              <h2 class="text-lg font-bold tracking-tight text-slate-900">Audit results</h2>
-              <p class="mt-1 text-xs leading-relaxed text-slate-500">Confirmed outcomes, unresolved review, and reconnaissance gaps are separate. Closing recorded categories does not prove every threat class was included.</p>
+              <h2 class="text-lg font-bold tracking-tight text-slate-900" x-text="inlineFindingStatus() ? projectPrimaryStatus().title : 'Audit results'">Audit results</h2>
+              <p class="mt-1 text-xs leading-relaxed" :class="inlineFindingStatus() && projectPrimaryStatus().tone === 'attention' ? 'text-amber-800' : 'text-slate-600'" x-text="inlineFindingStatus() ? projectPrimaryStatus().detail : 'Confirmed outcomes, unresolved review, and reconnaissance gaps are separate. Closing recorded categories does not prove every threat class was included.'"></p>
+              <button x-show="inlineFindingStatus() && projectPrimaryStatus().actionTarget" type="button" @click="openFindingFact(projectPrimaryStatus().actionTarget)" class="mt-2 text-xs font-semibold text-amber-800 underline underline-offset-2 hover:text-amber-950">Open audit summary</button>
             </div>
             <button type="button" @click="showFindingsGraph()"
               class="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 transition hover:border-brand-200 hover:text-brand-700">
@@ -1362,8 +1363,9 @@
               <div class="flex items-start justify-between gap-3 px-4 py-3"
                 :class="completionGate.ready ? 'bg-emerald-50/70' : 'bg-amber-50/70'">
                 <div>
-                  <h3 class="text-sm font-semibold text-slate-800" x-text="completionGate.ready ? 'Ready to complete' : 'Evidence still required'"></h3>
+                  <h3 class="text-sm font-semibold text-slate-800" x-text="completionGate.ready ? (project?.project?.status === 'completed' ? 'Audit completed' : 'Ready to complete') : 'Evidence still required'"></h3>
                   <p class="mt-1 text-[11px] text-slate-500" x-text="`Generation ${completionGate.source_generation} · plan ${completionGate.plan_revision}`"></p>
+                  <p x-show="project?.project?.audit_mode === 'scope' && latestAuditSummaryFact()" class="mt-2 text-xs font-medium text-amber-800" x-text="auditCoverageLabel()"></p>
                 </div>
                 <span class="rounded-md px-2 py-1 text-[10px] font-bold uppercase tracking-wide"
                   :class="completionGate.ready ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'"
@@ -2789,6 +2791,9 @@ function linenApp() {
 
     projectPrimaryStatus() {
       if (!this.project) return null;
+      if (this.project.project.status === 'stopped') {
+        return { eyebrow: 'Paused', title: 'Audit is paused', detail: 'Resume the project when you want the system to continue.', tone: 'neutral' };
+      }
       const candidates = this.technicalConfirmationCandidates();
       if (candidates.length) {
         return {
@@ -2804,6 +2809,19 @@ function linenApp() {
       if (this.project.project.status === 'completed') {
         if (this.project.project.audit_mode !== 'scope') {
           return { eyebrow: 'Complete', title: 'Audit completed', detail: 'The completion checks passed and the audit is closed.', tone: 'success' };
+        }
+        const coverage = this.auditCoverageSummary();
+        if (coverage.complete !== true) {
+          return {
+            eyebrow: 'Complete',
+            title: coverage.complete === false ? 'Audit completed with coverage gaps' : 'Audit completed · coverage unknown',
+            detail: coverage.complete === false
+              ? `${coverage.gaps === null ? 'Unresolved' : coverage.gaps} coverage gap${coverage.gaps === 1 ? '' : 's'} remain. Open the audit summary to inspect the limits of this result.`
+              : 'The audit closed, but its summary does not establish complete coverage.',
+            tone: 'attention',
+            actionLabel: 'Open audit summary',
+            actionTarget: coverage.factId,
+          };
         }
         return {
           eyebrow: 'Complete',
@@ -2833,6 +2851,11 @@ function linenApp() {
         };
       }
       return { eyebrow: 'Paused', title: 'Audit is paused', detail: 'Resume the project when you want the system to continue.', tone: 'neutral' };
+    },
+
+    inlineFindingStatus() {
+      return this.graphView === 'findings' && this.findingsMode === 'list'
+        && this.project?.project?.status === 'completed' && this.project?.project?.audit_mode === 'scope';
     },
 
     executionStatusDotClass() {
@@ -2905,7 +2928,10 @@ function linenApp() {
     auditProgressLabel() {
       if (this.completionGateLoading && !this.completionGate) return 'Checking…';
       if (!this.completionGate) return 'Unavailable';
-      if (this.completionGate.ready) return 'Ready to complete';
+      if (this.completionGate.ready) {
+        if (this.project?.project?.status === 'completed') return this.auditCoverageLabel();
+        return 'Ready to complete';
+      }
       const required = (this.project?.stages || []).filter(stage => stage.required);
       if (required.length) {
         return `${this.satisfiedStageCount()}/${required.length} stages · ${this.completionGate.blockers.length} blockers`;
@@ -3437,13 +3463,29 @@ function linenApp() {
 
     latestAuditSummaryFact() {
       return (this.project?.facts || [])
-        .filter(fact => fact.type === 'audit_summary')
+        .filter(fact => fact.type === 'audit_summary' && !fact.legacy
+          && fact.source_generation === this.project?.project?.source_generation)
         .reduce((latest, fact) => {
           if (!latest) return fact;
           const factTime = Date.parse(this.getProducingIntent(fact.id)?.concluded_at || '') || 0;
           const latestTime = Date.parse(this.getProducingIntent(latest.id)?.concluded_at || '') || 0;
           return factTime >= latestTime ? fact : latest;
         }, null);
+    },
+
+    auditCoverageSummary() {
+      const fact = this.latestAuditSummaryFact();
+      const evidence = String(fact?.evidence || '');
+      const complete = evidence.match(/^coverage_complete:\s*(true|false)\s*$/m)?.[1];
+      const gaps = evidence.match(/^residual_gaps:\s*(\d+)\s*$/m)?.[1];
+      return { complete: complete === undefined ? null : complete === 'true', gaps: gaps === undefined ? null : Number(gaps), factId: fact?.id || null };
+    },
+
+    auditCoverageLabel() {
+      const coverage = this.auditCoverageSummary();
+      if (coverage.complete === true) return 'Recorded coverage complete';
+      if (coverage.complete === false) return coverage.gaps === null ? 'Coverage incomplete' : `${coverage.gaps} coverage gap${coverage.gaps === 1 ? '' : 's'}`;
+      return 'Coverage unknown';
     },
 
     auditSummaryFreshnessLabel() {

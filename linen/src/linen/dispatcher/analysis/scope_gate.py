@@ -122,11 +122,29 @@ def _github_repository(remote: str | None) -> tuple[str, str] | None:
 
 
 def _repository_record(repo: Path) -> dict[str, Any]:
-    remote = _git_value(repo, "remote", "get-url", "origin")
+    git_root = _git_value(repo, "rev-parse", "--show-toplevel")
+    scoped_git = False
+    if git_root:
+        try:
+            resolved_root = Path(git_root).resolve()
+            if resolved_root == repo.resolve():
+                scoped_git = True
+            elif repo.resolve().is_relative_to(resolved_root):
+                tracked = subprocess.run(
+                    ["git", "-C", str(repo), "ls-files", "--cached", "--", "."],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                scoped_git = tracked.returncode == 0 and bool(tracked.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            scoped_git = False
+    remote = _git_value(repo, "remote", "get-url", "origin") if scoped_git else None
     github = _github_repository(remote)
     return {
         "path": str(repo),
-        "commit": _git_value(repo, "rev-parse", "HEAD"),
+        "commit": _git_value(repo, "rev-parse", "HEAD") if scoped_git else None,
         "remote": remote,
         "github": (
             {"owner": github[0], "repository": github[1]} if github else None
@@ -218,10 +236,18 @@ def _normalize_remote_document(body: bytes, content_type: str) -> bytes:
     return text.encode("utf-8")
 
 
-def _gap(source: str, reason: str, *, detail: str | None = None) -> dict[str, str]:
+def _gap(
+    source: str,
+    reason: str,
+    *,
+    detail: str | None = None,
+    collection_key: str | None = None,
+) -> dict[str, str]:
     result = {"source": source, "reason": reason}
     if detail:
         result["detail"] = detail[:1000]
+    if collection_key:
+        result["collection_key"] = collection_key
     return result
 
 
@@ -246,81 +272,133 @@ def collect_evidence(
     gaps: list[dict[str, str]] = []
     snapshot_files: dict[str, str] = {}
     seen: set[Path] = set()
+    source_id_by_path: dict[Path, str] = {}
+    inventory: list[dict[str, Any]] = []
+    inventory_by_key: dict[str, dict[str, Any]] = {}
 
-    def store(content: bytes, snapshot_file: str, record: dict[str, Any]) -> None:
+    def register_source(
+        key: str, kind: str, config_ref: str, configured: bool,
+        configured_value: str | None, applicability: str,
+    ) -> dict[str, Any]:
+        entry = {
+            "source_key": key, "kind": kind, "config_ref": config_ref,
+            "configured": configured, "configured_value": configured_value,
+            "applicability": applicability,
+            "outcome": "pending" if configured else "not_configured",
+            "source_ids": [], "gap_ids": [],
+        }
+        inventory.append(entry)
+        inventory_by_key[key] = entry
+        return entry
+
+    def record_gap(
+        collection_key: str, source_name: str, reason: str, *, detail: str | None = None,
+    ) -> None:
+        gap = _gap(source_name, reason, detail=detail, collection_key=collection_key)
+        gap["id"] = f"gap-{len(gaps) + 1:03d}"
+        gaps.append(gap)
+        inventory_by_key[collection_key]["gap_ids"].append(gap["id"])
+
+    def store(
+        content: bytes, snapshot_file: str, record: dict[str, Any], collection_key: str,
+    ) -> dict[str, Any]:
         target = source_root / snapshot_file
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
         checksum = digest(content)
         snapshot_files[snapshot_file] = checksum
-        sources.append({
+        source_record = {
             "id": f"policy-{len(sources) + 1:03d}",
             **record,
+            "collection_key": collection_key,
             "snapshot_file": snapshot_file,
             "sha256": checksum,
             "bytes": len(content),
             "status": "collected",
-        })
+        }
+        sources.append(source_record)
+        inventory_by_key[collection_key]["source_ids"].append(source_record["id"])
+        return source_record
 
-    limit_recorded = False
-    for pattern in config.local_paths:
+    for pattern_index, pattern in enumerate(config.local_paths):
+        collection_key = f"local_path:{pattern_index:03d}"
+        entry = register_source(
+            collection_key, "repository_glob", f"local_paths[{pattern_index}]",
+            True, pattern, "configured_repository_source",
+        )
         matches = sorted(repo.glob(pattern), key=lambda path: path.as_posix().casefold())
         regular_matches = [path for path in matches if path.is_file()]
         eligible = []
         for path in regular_matches:
             resolved = path.resolve()
+            relative = path.relative_to(repo).as_posix()
+            if path.is_symlink() or not resolved.is_relative_to(repo):
+                record_gap(collection_key, relative, "symlink_or_escape")
+                continue
             if resolved in seen:
+                prior_id = source_id_by_path.get(resolved)
+                if prior_id is not None and prior_id not in entry["source_ids"]:
+                    entry["source_ids"].append(prior_id)
                 continue
             seen.add(resolved)
             eligible.append(path)
-        if not regular_matches:
-            gaps.append(_gap(pattern, "not_found"))
-            continue
-        if not eligible:
-            continue
+        if not matches:
+            record_gap(collection_key, pattern, "not_found")
+        elif not regular_matches:
+            record_gap(collection_key, pattern, "no_regular_files")
         for path in eligible:
             relative = path.relative_to(repo).as_posix()
             resolved = path.resolve()
-            if path.is_symlink() or not resolved.is_relative_to(repo):
-                gaps.append(_gap(relative, "symlink_or_escape"))
-                continue
             if len(sources) >= config.max_documents:
-                if not limit_recorded:
-                    gaps.append(_gap("local_paths", "max_documents_reached"))
-                    limit_recorded = True
+                record_gap(collection_key, relative, "max_documents_reached")
+                entry["outcome"] = "skipped_limit"
                 continue
             content = path.read_bytes()
             if len(content) > config.max_document_bytes:
-                gaps.append(_gap(relative, "max_document_bytes"))
+                record_gap(collection_key, relative, "max_document_bytes")
                 continue
             if b"\x00" in content:
-                gaps.append(_gap(relative, "binary_document"))
+                record_gap(collection_key, relative, "binary_document")
                 continue
-            store(content, f"local/{relative}", {
+            source_record = store(content, f"local/{relative}", {
                 "kind": "repository_document",
                 "location": relative,
                 "content_type": "text/plain",
-            })
+            }, collection_key)
+            source_id_by_path[resolved] = source_record["id"]
 
-    remote_sources: list[tuple[str, str]] = [(url, "configured_policy_url") for url in config.policy_urls]
+    remote_sources: list[tuple[str, str, str]] = []
+    for url_index, url in enumerate(config.policy_urls):
+        collection_key = f"policy_url:{url_index:03d}"
+        register_source(
+            collection_key, "policy_url", f"policy_urls[{url_index}]", True, url,
+            "configured_remote_source",
+        )
+        remote_sources.append((url, "configured_policy_url", collection_key))
+    github_entry = register_source(
+        "github_advisories", "github_security_advisories", "github_advisories",
+        config.github_advisories, None,
+        "configured_remote_source" if config.github_advisories else "not_configured",
+    )
     if config.github_advisories:
         github = repository.get("github")
         if github:
             remote_sources.append((
                 "https://api.github.com/repos/"
                 f"{github['owner']}/{github['repository']}/security-advisories?per_page=100",
-                "github_security_advisories",
+                "github_security_advisories", "github_advisories",
             ))
         else:
-            gaps.append(_gap("github_security_advisories", "github_repository_unresolved"))
+            github_entry["applicability"] = "unresolved_repository"
+            record_gap("github_advisories", "github_security_advisories", "github_repository_unresolved")
+            github_entry["outcome"] = "unresolved"
 
     fetch = fetcher or (lambda url: _fetch_remote(url, config))
-    for url, kind in remote_sources:
+    for url, kind, collection_key in remote_sources:
         if len(sources) >= config.max_documents:
-            if not limit_recorded:
-                gaps.append(_gap("remote_sources", "max_documents_reached"))
-                limit_recorded = True
-            break
+            record_gap(collection_key, url, "max_documents_reached")
+            inventory_by_key[collection_key]["outcome"] = "skipped_limit"
+            continue
         try:
             response = fetch(url)
             body = response.get("body")
@@ -342,9 +420,20 @@ def collect_evidence(
                 "content_type": content_type,
                 "http_status": int(response.get("status_code") or 200),
                 "normalized": True,
-            })
+            }, collection_key)
         except (OSError, ValueError, TypeError, requests.RequestException) as exc:
-            gaps.append(_gap(url, "fetch_failed", detail=str(exc)))
+            record_gap(collection_key, url, "fetch_failed", detail=str(exc))
+
+    for entry in inventory:
+        if entry["outcome"] == "pending":
+            if entry["gap_ids"] and entry["source_ids"]:
+                entry["outcome"] = "partial"
+            elif entry["gap_ids"]:
+                entry["outcome"] = "failed"
+            elif entry["source_ids"]:
+                entry["outcome"] = "collected"
+            else:
+                entry["outcome"] = "not_applicable"
 
     skipped = [
         {"path": item["source"], "reason": item["reason"]}
@@ -360,13 +449,42 @@ def collect_evidence(
         "files": snapshot_files,
         "skipped": skipped,
     }
+    config_snapshot = {
+        "local_paths": config.local_paths,
+        "policy_urls": config.policy_urls,
+        "github_advisories": config.github_advisories,
+    }
+    config_bytes = json.dumps(
+        config_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "id": f"policy-evidence-{uuid.uuid4().hex}",
         "kind": POLICY_EVIDENCE_TYPE,
+        "producer": {
+            "kind": "dispatcher",
+            "component": "linen.dispatcher.analysis.scope_gate",
+            "operation": "collect_evidence",
+            "version": 1,
+            "code_sha256": digest(Path(__file__).read_bytes()),
+        },
         "status": "completed" if sources and not gaps else "partial",
         "repository": repository,
         "config": config.model_dump(mode="json"),
+        "active_source_config": config_snapshot,
+        "active_source_config_sha256": digest(config_bytes),
+        "collection_scope": {
+            "claim": "configured_sources_only",
+            "global_policy_completeness": "not_assessed",
+            "summary": (
+                "Collection outcomes cover only configured local patterns and policy URLs, "
+                "plus GitHub advisories when configured and the repository is resolvable. "
+                "No exhaustive inventory of external policies or advisory sources was performed."
+            ),
+            "configured_source_count": sum(bool(item["configured"]) for item in inventory),
+            "unconfigured_source_count": sum(not item["configured"] for item in inventory),
+        },
+        "configured_sources": inventory,
         "snapshot": snapshot,
         "source": str(source_root),
         "sources": sources,
@@ -378,11 +496,15 @@ def collect_evidence(
         "type": POLICY_EVIDENCE_TYPE,
         "description": (
             f"Policy evidence frozen: {len(sources)} documents, {len(gaps)} explicit gaps "
-            f"({manifest['status']}). No missing source was interpreted as an absence of policy."
+            f"({manifest['status']}) from configured sources only; global policy completeness "
+            "was not assessed. No missing source was interpreted as an absence of policy."
         ),
         "evidence": (
             f"artifact: {path}\nmanifest_sha256: {digest(path.read_bytes())}\n"
             f"snapshot: {snapshot['id']}\nstatus: {manifest['status']}\n"
+            "collector_config_snapshot: "
+            f"{json.dumps(config_snapshot, ensure_ascii=False, sort_keys=True)}\n"
+            f"collector_config_sha256: {digest(config_bytes)}\n"
             f"source: {source_root}"
         ),
     }
@@ -411,6 +533,40 @@ def _evidence_context(
     return fact, source, manifest
 
 
+def _prior_adjudication_review_feedback(
+    project: ProjectDetail, intent: Intent,
+) -> str | None:
+    """Return the latest rejection for a bounded adjudication regeneration."""
+    prior_fact_ids = {
+        previous.to
+        for previous in project.intents
+        if previous.id != intent.id
+        and is_adjudication_intent(previous)
+        and previous.from_ == intent.from_
+        and previous.source_generation == intent.source_generation
+        and previous.plan_revision == intent.plan_revision
+        and previous.to
+    }
+    fact_by_id = {fact.id: fact for fact in project.facts}
+    rejected = [
+        review for review in project.reviews
+        if review.fact_id in prior_fact_ids
+        and review.verdict == "INVALID"
+        and fact_by_id.get(review.fact_id) is not None
+        and fact_by_id[review.fact_id].type == SCOPE_ADJUDICATION_TYPE
+    ]
+    if not rejected:
+        return None
+    review = max(rejected, key=lambda item: (item.created_at, item.id))
+    parts = [review.summary]
+    if review.reasoning:
+        parts.append(review.reasoning)
+    return (
+        f"Independent review rejected prior scope-adjudication Fact {review.fact_id}. "
+        + " ".join(part.strip() for part in parts if part and part.strip())
+    )[:2000]
+
+
 def execution_prompt(
     project: ProjectDetail,
     intent: Intent,
@@ -434,10 +590,17 @@ def execution_prompt(
         "source_root": str(source),
         "repository": manifest.get("repository"),
         "sources": manifest.get("sources", []),
+        "collection_scope": manifest.get("collection_scope", {
+            "claim": "configured_sources_only",
+            "global_policy_completeness": "not_assessed",
+            "summary": "Legacy manifest; only its configured sources can be assessed.",
+        }),
+        "configured_sources": manifest.get("configured_sources", []),
         "collection_gaps": manifest.get("gaps", []),
     }
-    if validation_error:
-        context["previous_validation_error"] = validation_error[:2000]
+    correction_feedback = validation_error or _prior_adjudication_review_feedback(project, intent)
+    if correction_feedback:
+        context["previous_validation_error"] = correction_feedback[:2000]
     output_contract = """Return exactly one raw JSON object and no prose or markdown:
 {
   "accepted": true,
@@ -482,6 +645,21 @@ array. collection_gaps must remain visible in coverage; do not turn an absent
 document into an exclusion. Policy eligibility and technical exploitability
 are separate axes. Use accepted=false only for a genuine policy refusal.
 
+If previous_validation_error is present, treat it as a required correction:
+re-evaluate the disputed claim and state the coverage boundary precisely. In
+particular, distinguish complete assessment of collected configured documents
+from unassessed global policy completeness or an unconfigured source; retain
+those caveats in both coverage and the Fact description.
+
+The collection_scope claim is limited to configured sources. Check each
+configured_sources entry against the attached config, its source_ids, and its
+gap_ids. A `not_configured` entry is an inventory record, not collected
+evidence. `global_policy_completeness: not_assessed` means the producer did not
+inventory all possible external policies or advisory sources; even zero gaps
+must not be described as global completeness. For legacy schema-version-1
+manifests without configured_sources, assess only the sources named in the
+recorded config and explicitly leave global completeness indeterminate.
+
 Provide exactly one source_assessments entry for every source whose manifest
 status is collected. Explicitly evaluate each file, including documents that
 contain no relevant policy; use disposition no_scope_policy only after reading
@@ -490,12 +668,16 @@ coverage partial, and explain the gap. Use only citations that belong to that
 same source file. This is required so reviewers can verify each source rather
 than infer evaluation from a document count.
 
-For every citation, copy the source text verbatim from the cited line(s),
+For every citation, inspect the frozen file with line numbers first (for
+example, `nl -ba {source_root}/local/SECURITY.md`). Cite the displayed 1-based
+source line, then copy its text verbatim from the cited line(s),
 including Markdown link labels and destinations, backticks, punctuation, and
 capitalization. Do not paraphrase or render Markdown when filling `quote`.
 Do not cite a source statement unless at least one trust boundary,
 pre-exclusion, or conflict references that citation ID. Omit unrelated
-statements rather than adding unused citations."""
+statements rather than adding unused citations. Do not guess line numbers from
+the rendered prompt or surrounding context; the dispatcher checks every
+citation against the exact frozen bytes and rejects a mismatch."""
     sections = [
         f"# Audit recipe: {recipe.label} (scope_adjudication v{recipe.version})",
         audit_recipes.load_bundle(prompt_group).common.source_policy,
@@ -503,6 +685,11 @@ statements rather than adding unused citations."""
         "# Recipe instructions\n" + recipe.prompt,
         "# Output contract\n" + output_contract,
     ]
+    if correction_feedback:
+        sections.append(
+            "# Required correction from deterministic validation or independent review\n"
+            + correction_feedback[:2000]
+        )
     return "\n\n".join(sections).strip() + "\n", "scope_adjudication", recipe
 
 
@@ -809,15 +996,20 @@ def outcome_fact(
     directory.mkdir(parents=True)
     path = directory / "result.json"
     write_json(path, record)
+    coverage_scope = (
+        "for the collected configured sources; global policy completeness was not assessed"
+        if manifest.get("collection_scope", {}).get("global_policy_completeness") == "not_assessed"
+        else "under the recorded policy inventory"
+    )
     return {
         "type": SCOPE_ADJUDICATION_TYPE,
         "description": (
             f"Scope adjudicated from {len(manifest.get('sources', []))} frozen policy documents: "
             f"{len(record['trust_boundaries'])} trust boundaries, "
-        f"{len(record['pre_exclusions'])} pre-exclusion decisions, "
-        f"{len(record['coverage']['source_assessments'])} collected sources assessed, "
-        f"{len(record['evidence_gaps'])} policy-source collection gaps; "
-            f"adjudication coverage is {record['coverage']['status']}. "
+            f"{len(record['pre_exclusions'])} pre-exclusion decisions, "
+            f"{len(record['coverage']['source_assessments'])} collected sources assessed, "
+            f"{len(record['evidence_gaps'])} policy-source collection gaps; "
+            f"adjudication coverage is {record['coverage']['status']} {coverage_scope}. "
             "Decisions affect policy eligibility only, not technical exploitability."
         ),
         "evidence": (

@@ -362,3 +362,43 @@ def test_concurrent_blocked_resolve_allows_only_one_transition(client) -> None:
     with ThreadPoolExecutor(max_workers=2) as pool:
         statuses = list(pool.map(resolve, ["retry", "abandon"]))
     assert sorted(statuses) == [200, 409]
+
+
+def test_invalid_result_budget_requires_manual_repair_and_retry(client) -> None:
+    pid = client.post('/projects', json={'title': 'bounded retry', 'origin': 'repo', 'goal': 'done'}).json()['project']['id']
+    iid = client.post(f'/projects/{pid}/intents', json={
+        'from': ['origin'], 'description': 'inspect', 'creator': 'reasoner',
+    }).json()['id']
+    url = f'/projects/{pid}/intents/{iid}'
+    assert client.post(url + '/heartbeat', json={'worker': 'worker'}).status_code == 200
+    failure = client.post(url + '/fail', json={
+        'worker': 'worker', 'task_type': 'explore', 'code': 'invalid_blackboard_result',
+        'classification': 'transient', 'message': 'invalid JSON', 'max_attempts': 1,
+    })
+    assert failure.json()['classification'] == 'blocked'
+    for _ in range(2):
+        denied = client.post(url + '/resolve', json={'actor': 'Reason', 'action': 'retry'})
+        assert denied.status_code == 409
+        assert 'Automatic retry budget exhausted' in denied.text
+    board = client.get(f'/projects/{pid}').json()
+    assert board['errors'][0]['resolved_at'] is None
+    assert client.post(url + '/retry', json={'actor': 'human'}).status_code == 200
+    assert client.post(url + '/heartbeat', json={'worker': 'worker'}).status_code == 200
+
+
+def test_reason_cannot_repeat_automatic_retry_for_same_error_code(client) -> None:
+    pid = client.post('/projects', json={'title': 'bounded episodes', 'origin': 'repo', 'goal': 'done'}).json()['project']['id']
+    iid = client.post(f'/projects/{pid}/intents', json={
+        'from': ['origin'], 'description': 'inspect', 'creator': 'reasoner',
+    }).json()['id']
+    url = f'/projects/{pid}/intents/{iid}'
+    for episode in range(2):
+        assert client.post(url + '/heartbeat', json={'worker': 'worker'}).status_code == 200
+        assert client.post(url + '/fail', json={
+            'worker': 'worker', 'task_type': 'explore', 'code': 'task_failed',
+            'classification': 'transient', 'message': 'unavailable route', 'max_attempts': 1,
+        }).json()['classification'] == 'blocked'
+        result = client.post(url + '/resolve', json={'actor': 'Reason', 'action': 'retry'})
+        assert result.status_code == (200 if episode == 0 else 409)
+    assert client.post(url + '/retry', json={'actor': 'human'}).status_code == 200
+    assert client.post(url + '/heartbeat', json={'worker': 'worker'}).status_code == 200

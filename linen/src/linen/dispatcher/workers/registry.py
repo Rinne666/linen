@@ -5,7 +5,8 @@ from linen.dispatcher.workers.base import WorkerDriver
 
 # All drivers in this build are local-mode drivers: they invoke the host CLI
 # (claude / codex / pi) in the project's working directory, using the user's
-# own logged-in CLI configuration. No API keys are injected by linen.
+# own logged-in CLI configuration. Safe Claude invocations restore only trusted
+# user-level provider environment settings that safe mode would otherwise omit.
 DRIVERS: dict[str, WorkerDriver] = {
     "claudecode": ClaudeCodeDriver(),
     "codex": CodexDriver(local=True),

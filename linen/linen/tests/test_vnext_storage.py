@@ -56,7 +56,7 @@ def test_legacy_audit_events_are_extended_and_backfilled(tmp_path, monkeypatch) 
     assert {"artifacts", "runs", "context_projections", "snapshots"} <= tables
 
 
-def test_snapshot_is_stable_and_run_transition_is_idempotent(client: TestClient) -> None:
+def test_snapshot_is_stable_and_run_transition_is_idempotent(client: TestClient, monkeypatch) -> None:
     project_id = _project(client)
     first = client.get(f"/projects/{project_id}/snapshot").json()
     second = client.get(f"/projects/{project_id}/snapshot").json()
@@ -65,13 +65,22 @@ def test_snapshot_is_stable_and_run_transition_is_idempotent(client: TestClient)
 
     created = client.post(f"/projects/{project_id}/runs", json=_run(project_id))
     assert created.status_code == 201
+    monkeypatch.setattr("linen.server.store.utcnow", lambda: "2999-01-01T00:00:00Z")
+    monkeypatch.setattr("linen.server.routers.vnext.utcnow", lambda: "2999-01-01T00:00:00Z")
     assert client.post(f"/projects/{project_id}/runs", json=_run(project_id)).json() == created.json()
     conflicting_identity = _run(project_id)
     conflicting_identity["task_type"] = "different-task"
     assert client.post(f"/projects/{project_id}/runs", json=conflicting_identity).status_code == 409
     running = _run(project_id, status="running")
-    assert client.put(f"/projects/{project_id}/runs/run-1", json=running).status_code == 200
-    assert client.put(f"/projects/{project_id}/runs/run-1", json=running).status_code == 200
+    first_running = client.put(f"/projects/{project_id}/runs/run-1", json=running)
+    assert first_running.status_code == 200
+    monkeypatch.setattr("linen.server.store.utcnow", lambda: "2999-01-02T00:00:00Z")
+    repeated = client.put(f"/projects/{project_id}/runs/run-1", json=running)
+    assert repeated.status_code == 200 and repeated.json() == first_running.json()
+    assert client.post(f"/projects/{project_id}/runs", json=_run(project_id)).json() == first_running.json()
+    events = client.get(f"/projects/{project_id}/events").json()
+    assert len([event for event in events if event['event_type'] == 'run_registered']) == 1
+    assert len([event for event in events if event['event_type'] == 'run_status_changed']) == 1
     illegal = client.put(f"/projects/{project_id}/runs/run-1", json=_run(project_id, status="queued"))
     assert illegal.status_code == 409
 

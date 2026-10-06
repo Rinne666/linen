@@ -27,8 +27,21 @@ Check all of the following:
    every claimed surface is represented or disclosed as a gap, and every
    vulnerability-looking item remains only a candidate for independent
    verification.
-7. For policy_evidence, every configured local/remote source is either frozen
-   with a matching digest or preserved as an explicit collection gap.
+7. For policy_evidence, the Fact evidence contains a sanitized
+   `collector_config_snapshot` captured by the dispatcher from the active run
+   configuration. Recompute its `collector_config_sha256`, compare that digest
+   with `manifest.active_source_config_sha256`, compare the snapshot with
+   `manifest.active_source_config` and the matching fields in `manifest.config`,
+   then compare each value with every `configured_sources` entry. Verify those
+   entries against source records, hashes, and collection gaps. When this
+   snapshot is present and consistent, do not report the
+   active collector configuration as unavailable. Report only the configured
+   sources represented by that inventory. `global_policy_completeness` is
+   `not_assessed`; never convert zero configured-source gaps into a claim that
+   all external policies, advisories, or other remote sources were inventoried.
+   For legacy schema-version-1 manifests without the inventory or config
+   snapshot, state that only their recorded configuration and source outcomes
+   were checked; global completeness remains indeterminate.
 8. For scope_adjudication, every quotation matches the frozen policy source;
    every trust boundary and pre-exclusion is cited; every exclusion has a
    concrete revival condition; conflicts and unavailable sources remain gaps.
@@ -57,6 +70,11 @@ Return one raw JSON object, without prose or markdown:
 All four `attestation_check` fields are mandatory. Use `INVALID` only for a
 specific contradiction. Use `NEEDS_REVIEW` when required artifacts or frozen
 inputs cannot be checked. Do not emit Facts or Intents.
+
+For every citation, open the referenced immutable file and inspect its exact
+1-based line using a line-numbered view such as `nl -ba <frozen-file>`. Copy
+the quote from that view; never guess a line from the rendered prompt. The
+dispatcher verifies the exact source line and rejects mismatches.
 
 # Context
 

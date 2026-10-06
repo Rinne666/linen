@@ -86,7 +86,7 @@ def test_review_diagnostics_round_trip_and_export(api):
     assert current.reviews[0].cold_verification == diagnostics["cold_verification"]
     exported = yaml.safe_load(client.export_project(pid))
     assert exported["reviews"][0]["cold_verification"] == diagnostics["cold_verification"]
-    assert next(f for f in exported["facts"] if f["id"] == fid)["status"] == "triaged"
+    assert next(f for f in exported["facts"] if f["id"] == fid)["status"] == "draft"
     bad = http.post(f"/projects/{pid}/facts/{fid}/reviews", json={
         "verdict": "VALID", "summary": "bad", "cold_verification": ["not an object"],
     })
@@ -185,6 +185,48 @@ def test_server_allows_scope_summary_to_omit_ordinary_observation(api):
     assert orphan not in next(check for check in gate.checks if check.id == "evidence_chain").evidence_ids
 
 
+def test_reopen_feedback_is_transparent_workflow_context_in_scope_evidence_chain(api):
+    http, client = api
+    pid = project(api, audit_mode="scope").project.id
+    source = add_fact(client, pid, fact_type="source", status="triaged")
+    assert client.create_review(pid, source, "VALID", "source verified", confidence="firm").ok
+    first_summary = add_fact(
+        client, pid, parent=source, fact_type="audit_summary", status="triaged",
+    )
+    completed = client.complete(pid, [first_summary], "initial summary", "reasoner")
+    assert completed.ok, completed.text
+
+    reopened = http.post(
+        f"/projects/{pid}/reopen",
+        json={"description": "Please independently assess the negative control.", "creator": "operator"},
+    )
+    assert reopened.status_code == 200, reopened.text
+    feedback = reopened.json()["fact"]["id"]
+    follow_up = client.create_intent(
+        pid, [feedback, source], "assess negative control", "dispatcher.audit",
+        intent_type="characterize",
+    )
+    assert follow_up.ok, follow_up.text
+    follow_up_id = follow_up.data["id"]
+    assert client.heartbeat(pid, follow_up_id, "tester").ok
+    assessed = client.conclude(
+        pid, follow_up_id, "tester", "negative control is parameterized",
+        fact_type="sanitizer", evidence="file: app.py:10", status="triaged",
+    )
+    assert assessed.ok, assessed.text
+    assessment = assessed.data["fact"]["id"]
+    assert client.create_review(
+        pid, assessment, "VALID", "parameter binding independently verified", confidence="firm",
+    ).ok
+    final_summary = add_fact(
+        client, pid, parent=assessment, fact_type="audit_summary", status="triaged",
+    )
+
+    gate = client.get_completion_gate(pid, [final_summary])
+
+    assert gate.ready, gate.blockers
+
+
 def test_scope_completion_requires_coverage_result_review_but_not_summary_reviews(api):
     _, client = api
     pid = project(api, audit_mode="scope").project.id
@@ -220,9 +262,9 @@ def test_scope_candidate_finding_still_blocks_without_decisive_disposition(api):
     confirmation_check = next(
         (check for check in gate.checks if check.id == "technical_confirmation"),
     )
-    assert finding_check.status == "pass"
-    assert confirmation_check.status == "fail"
-    assert candidate in confirmation_check.evidence_ids
+    assert finding_check.status == "fail"
+    assert candidate in finding_check.evidence_ids
+    assert confirmation_check.status == "pass"  # no reportable candidate passed review yet
 
 
 def test_goal_based_optional_execution_error_is_visible_but_nonblocking(api):
@@ -292,6 +334,33 @@ def test_worker_execution_records_preserve_replay_metadata_and_output(tmp_path):
     assert record["argv_sha256"]
     assert Path(record["stdout"]).read_text() == "stdout"
     assert Path(record["stderr"]).read_text() == "stderr"
+
+
+def test_worker_process_uses_safe_claude_env_without_archiving_credentials(tmp_path, monkeypatch):
+    import sys
+
+    settings = tmp_path / "claude"
+    settings.mkdir()
+    (settings / "settings.json").write_text(json.dumps({"env": {
+        "ANTHROPIC_AUTH_TOKEN": "test-provider-secret",
+    }}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(settings))
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    cfg = config(tmp_path)
+    worker = cfg.workers[0].model_copy(update={"type": "claudecode", "sandbox_mode": "read-only"})
+    backend = LocalBackend(cfg.local)
+    handle = backend.ensure_running("proj_safe_env")
+    result = run_worker_process(
+        backend, handle, worker,
+        [sys.executable, "-c",
+         "import os; print('ok' if os.environ.get('ANTHROPIC_AUTH_TOKEN') else 'missing')",
+         "--safe-mode"],
+        phase="environment_test", timeout_seconds=5,
+    )
+    assert result.returncode == 0 and result.stdout.strip() == "ok"
+    record = next((Path(handle) / ".linen-executions").glob("*.json"))
+    assert "test-provider-secret" not in record.read_text()
+    assert "env" not in json.loads(record.read_text())
 
 
 def test_pi_execution_record_preserves_prompt_without_persisting_argv(tmp_path):
@@ -484,6 +553,7 @@ def test_audit_configuration_requires_review_and_local_rules(tmp_path):
     raw["workers"][0]["task_types"] = ["reason", "explore"]
     with pytest.raises(ValueError, match="review worker"):
         DispatchConfig.model_validate(raw)
+    raw["workers"][0]["task_types"].append("review")
     raw["audit"]["mode"] = "hypothesis"
     raw["audit"]["recon"] = {"enabled": True}
     with pytest.raises(ValueError, match="recon requires scope mode"):
