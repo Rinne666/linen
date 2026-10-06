@@ -59,7 +59,9 @@ def format_failure_summary(results: list[StartupHealthcheckResult]) -> str:
 def _check_worker(config: DispatchConfig, worker: WorkerConfig) -> StartupHealthcheckResult:
     driver = get_driver(worker.type)
     started = time.perf_counter()
-    result = driver.check_health(worker, timeout=config.runtime.healthcheck_timeout)
+    response_probe = config.runtime.healthcheck_probe == "response"
+    check = driver.check_response_health if response_probe else driver.check_health
+    result = check(worker, timeout=config.runtime.healthcheck_timeout)
     duration_ms = int((time.perf_counter() - started) * 1000)
     return StartupHealthcheckResult(
         worker_name=worker.name,
@@ -67,7 +69,8 @@ def _check_worker(config: DispatchConfig, worker: WorkerConfig) -> StartupHealth
         status=result.status,
         duration_ms=duration_ms,
         detail=_preview(result.detail),
-        endpoint=driver.describe_health(worker),
+        endpoint=(f"{driver.local_binary()} read-only model response probe"
+                  if response_probe and driver.local_binary() else driver.describe_health(worker)),
     )
 
 

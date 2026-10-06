@@ -151,6 +151,11 @@ class PiDriver(WorkerDriver):
 
     @classmethod
     def _read_only(cls, worker: WorkerConfig, prompt: str) -> bool:
+        if prompt.lstrip().startswith("# ISOLATED POC EXECUTION TASK"):
+            # Isolated PoC work runs inside the disposable Docker sandbox and
+            # needs write and execution tools; host read-only restrictions do
+            # not apply there.
+            return False
         return worker.sandbox_mode == "read-only" or cls._read_only_recon(prompt)
 
     def extract_session(self, session: str | None, stdout: str, stderr: str) -> str | None:
@@ -166,7 +171,8 @@ class PiDriver(WorkerDriver):
 
     def extract_response_text(self, stdout: str, stderr: str) -> str:
         assistant_message: dict[str, Any] | None = None
-        for event in self._iter_events(stdout):
+        events = self._iter_events(stdout)
+        for event in events:
             event_type = event.get("type")
             if event_type == "turn_end":
                 message = event.get("message")
@@ -180,10 +186,16 @@ class PiDriver(WorkerDriver):
                             assistant_message = message
                             break
         if assistant_message is None:
-            return stdout
+            # A session/tool event is not an assistant's task response. Preserve
+            # raw-text compatibility only when the output is not a Pi stream.
+            return "" if any(event.get("type") in {
+                "session", "agent_start", "agent_end", "turn_start", "turn_end",
+                "message_start", "message_update", "message_end",
+                "tool_execution_start", "tool_execution_end",
+            } for event in events) else stdout
         content = assistant_message.get("content")
         if not isinstance(content, list):
-            return stdout
+            return ""
         parts: list[str] = []
         for item in content:
             if not isinstance(item, dict):
@@ -193,7 +205,7 @@ class PiDriver(WorkerDriver):
             text = item.get("text")
             if isinstance(text, str) and text:
                 parts.append(text)
-        return "\n".join(parts).strip() or stdout
+        return "\n".join(parts).strip()
 
     def _wrap_with_models(self, worker: WorkerConfig, pi_argv: list[str], *, enable_tools: bool = True) -> list[str]:
         script = (

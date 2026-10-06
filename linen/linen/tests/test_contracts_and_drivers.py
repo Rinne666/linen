@@ -22,6 +22,32 @@ def test_parse_json_output_extracts_object_from_markdown_noise() -> None:
     }
 
 
+@pytest.mark.parametrize("output", [
+    '{"accepted":true,"data":{"citations":[{"id":"c1"}]} trailing}',
+    'result: {"accepted":true,"data":{"nested":{"valid":true}}, "broken": }',
+    '```json\n{"accepted":true,"data":{"id":"nested"},"missing":\n```',
+    '[{"accepted":true,"data":{}}]',
+    'result: [{"accepted":true,"data":{}}]',
+    'result: [{"accepted":true,"data":{}}',
+    '"text with {\\"id\\":\\"nested\\"}"',
+])
+def test_parse_json_output_does_not_accept_nested_fragment(output) -> None:
+    with pytest.raises(ValueError, match="no JSON object"):
+        parse_json_output(output)
+
+
+def test_parse_json_output_retains_complete_value_truncation_recovery() -> None:
+    assert parse_json_output('result: {"accepted":true,"data":{"items":[{"id":"c1"}]') == {
+        "accepted": True, "data": {"items": [{"id": "c1"}]},
+    }
+
+
+def test_parse_json_output_ignores_escaped_braces_in_string() -> None:
+    assert parse_json_output('result: {"text":"} \\" {", "data":{"id":1}}\nDone.') == {
+        "text": '} " {', "data": {"id": 1},
+    }
+
+
 def test_extract_context_request_accepts_only_closed_context_required_envelope() -> None:
     payload = {
         "accepted": True,
@@ -118,13 +144,12 @@ def test_reason_payload_rejects_unknown_resolution_action() -> None:
         )
 
 
-def test_reason_payload_requires_intent_when_none_are_open() -> None:
-    with pytest.raises(ValueError, match="intents is required"):
-        validate_reason_payload(
-            {"accepted": True, "data": {}},
-            open_intents_empty=True,
-            max_intents=3,
-        )
+def test_reason_payload_allows_noop_when_none_are_open() -> None:
+    kind, data = validate_reason_payload(
+        {"accepted": True, "data": {}}, open_intents_empty=True, max_intents=3,
+    )
+    assert kind == "noop"
+
 
 
 def test_explore_payload_rejects_planning_text() -> None:
@@ -172,6 +197,22 @@ def test_pi_driver_extracts_session_and_last_assistant_text() -> None:
 
     assert driver.extract_session(None, stdout, "") == "session-123"
     assert driver.extract_response_text(stdout, "") == '{"accepted":true,"data":{}}'
+
+
+@pytest.mark.parametrize("events", [
+    [{"type": "session", "id": "session-123"}],
+    [{"type": "agent_end", "messages": []}],
+    [{"type": "turn_end", "message": {"role": "assistant", "content": []}}],
+    [{"type": "turn_end", "message": {"role": "assistant", "content": "invalid"}}],
+])
+def test_pi_driver_does_not_treat_events_as_response(events) -> None:
+    driver = PiDriver()
+    assert driver.extract_response_text("\n".join(map(json.dumps, events)), "") == ""
+
+
+def test_pi_driver_retains_plain_response_compatibility() -> None:
+    text = '{"accepted":true,"data":{}}'
+    assert PiDriver().extract_response_text(text, "") == text
 
 
 def test_local_process_drain_closes_stream_after_read_failure() -> None:

@@ -31,7 +31,7 @@ def test_task_cancellation_keeps_first_reason_and_cancels_late_process() -> None
     assert process.cancelled == ["project stopped"]
 
 
-def test_heartbeat_conflict_failure_kills_attached_process() -> None:
+def test_heartbeat_conflict_cancels_attached_process_with_reason() -> None:
     process = FakeProcess()
     lease = HeartbeatLease(lambda: ApiResult(409, text="lost"), "intent", "worker", interval=60)
     lease.attach_process(process)
@@ -40,4 +40,5 @@ def test_heartbeat_conflict_failure_kills_attached_process() -> None:
 
     assert lease.failure is not None
     assert lease.failure.status_code == 409
-    assert process.kill_count == 1
+    assert process.cancelled == ["heartbeat_lease_lost:409"]
+    assert process.kill_count == 0

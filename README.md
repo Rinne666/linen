@@ -113,6 +113,21 @@ uv run --project linen linen dispatch \
   --startup-healthcheck-only
 ```
 
+By default, host CLI checks verify installation with `--help`. To also check
+authentication, model availability, and the response path, set
+`runtime.healthcheck_probe: response` and allow enough time with
+`runtime.healthcheck_timeout` (for example, 60 seconds). This sends a small
+model request through each configured adapter in read-only mode and may incur
+provider usage. It does not scan the target or change the project graph.
+
+Local workers inherit the dispatcher's environment. If a CLI needs a proxy,
+set it in `common_env` or that worker's `env`; macOS system proxy settings are
+not automatically inherited by subprocesses. `env.CODEX_MODEL` selects a model
+for the Codex worker without changing the global Codex configuration. Claude
+read-only runs preserve safe mode and restore only allowlisted provider
+variables from the user's Claude settings; host and worker environment
+overrides take precedence. Project Claude settings are never used for this.
+
 Create a project in the UI by supplying an origin and a goal. The Dispatcher
 will schedule reasoning, exploration, and review work as the graph evolves.
 
@@ -201,6 +216,27 @@ Audit mode can provide:
 
 Use this only against systems and source code you are authorized to test.
 
+Codex Recon execute and conclude calls use the CLI's `--output-schema` option
+to constrain JSON shape and enum values. Frozen-source citations and semantic
+evidence still undergo dispatcher validation. Syntax failures include a bounded
+excerpt and the JSON error location in the repair prompt. Use a Codex CLI version
+that supports `--output-schema` on both `exec` and `exec resume`.
+
+Policy evidence manifests identify the dispatcher collector and its code hash.
+Existing immutable manifests are preserved; generate new evidence to obtain
+this metadata. Invalid-result failures stop automatic retry after the configured
+attempt limit. Other blocked errors allow at most one Reason-requested retry
+per error code; manual **Retry intent** remains available after correcting the
+cause. Error attempt counts remain cumulative across resolved episodes.
+
+Isolated Docker reviews archive process results in the project's managed
+`.linen-executions` directory as well as the container receipt. Archive writes
+reject paths outside that directory and symlinks; review containers do not
+receive access to the host archive.
+Budget-exhaustion events reuse their original persisted identity across graph
+updates and dispatcher restarts. Replaying a Run registration or an implicit
+running transition also preserves its initial event and start timestamp.
+
 CodeQL is disabled by default. Enabling it requires a locally available Linux
 analysis image containing the CodeQL CLI and query packs; the image is never
 pulled during an audit. The audit runs it with `network: none`, a read-only
@@ -262,6 +298,21 @@ uv run --project linen linen audit-benchmark \
   --min-stability 0.7
 ```
 
+Export completed projects with frozen-source provenance and measured graph,
+coverage and cost data using `linen audit-evaluation-export`. An evaluator case
+map stays outside worker workspaces; candidate annotations cannot promote a
+finding to confirmed. `linen audit-ablation` compares three independent exports
+per lane and rejects quality/coverage loss or unmeasured graph simplification.
+See [the measured ablation runbook](docs/ABLATION-RUNBOOK.md) for commands,
+attribution rules and acceptance thresholds. Controlled test replays do not
+establish real-model recall.
+
+For local deployment, `linen ops check --config dispatch.yaml` inspects versions
+and prerequisites without a model call. `linen ops backup` and `linen ops restore`
+produce verified SQLite copies at new paths and refuse overwrites. See
+[the operations runbook](docs/OPERATIONS.md) for lifecycle, recovery and evidence
+workspace requirements.
+
 ## Configuration
 
 The portable configuration examples are:
@@ -310,6 +361,10 @@ proof validation, dynamic verification, artifacts, and Dispatcher behavior.
 - [Audit pipeline](docs/AUDIT-PIPELINE.md)
 - [Review modes](docs/REVIEW-MODES.md)
 - [UVPG implementation note](docs/UVPG-IMPLEMENTATION-NOTE.md)
+- [Coverage convergence](docs/COVERAGE-CONVERGENCE.md)
+- [Cost accounting](docs/COST-ACCOUNTING.md)
+- [Measured ablation acceptance](docs/ABLATION-RUNBOOK.md)
+- [Local operations](docs/OPERATIONS.md)
 - [Repository guidelines](AGENTS.md)
 
 ## Project status

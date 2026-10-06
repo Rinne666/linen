@@ -31,6 +31,7 @@ from linen.dispatcher.runtime.contracts import (
 )
 from linen.dispatcher.runtime.backend import ExecutionBackend
 from linen.dispatcher.runtime.cancellation import TaskCancellation
+from linen.dispatcher.runtime.cli_usage import extract_cli_usage
 from linen.dispatcher.runtime.heartbeat import HeartbeatLease
 from linen.dispatcher.runtime.process import ProcessResult
 from linen.dispatcher.runtime.policy import (
@@ -39,6 +40,7 @@ from linen.dispatcher.runtime.policy import (
     evaluate_execution,
 )
 from linen.server.models import Intent
+from linen.dispatcher.workers.registry import get_driver
 
 PROCESS_COMMUNICATE_GRACE_SECONDS = 15
 LOG_PREVIEW_LIMIT = 1200
@@ -81,7 +83,7 @@ def write_context_projection_reference(
     project_handle: str,
     projection: ContextProjection,
     *,
-    phase: str,
+    phase: str = "unknown",
 ) -> str:
     """Write only projected context and identity for a worker reference.
 
@@ -521,6 +523,18 @@ def did_timeout(result: ProcessResult) -> bool:
     return not result.cancelled and (result.timed_out or result.returncode in (124, 137))
 
 
+# Outcomes that claim the worker CLI or its provider configuration is
+# unusable. The scheduler pauses the whole project for these, so they require
+# a process that terminated on its own; a killed or timed-out run cannot
+# prove a configuration problem.
+CONFIGURATION_FAILURE_OUTCOMES = frozenset({
+    "cli_model_unsupported",
+    "cli_model_unrecognized",
+    "cli_auth_failed",
+    "cli_executable_missing",
+})
+
+
 def classify_provider_failure(result: ProcessResult) -> str | None:
     """Classify explicit provider errors without scanning echoed prompt text.
 
@@ -540,7 +554,14 @@ def classify_provider_failure(result: ProcessResult) -> str | None:
             _collect_provider_errors(event, messages)
     if result.returncode != 0:
         if result.stderr:
-            messages.append(result.stderr[-4000:])
+            # Claude Code prints bracketed SDK diagnostics such as
+            # ``[claude-code:unrecognized_model] {...}`` as informational
+            # banners. They also accompany successful runs, so they are not
+            # evidence of a terminal provider rejection.
+            messages.append("\n".join(
+                line for line in result.stderr.splitlines()
+                if not line.lstrip().startswith("[claude-code:")
+            )[-4000:])
         # Claude-style CLIs may emit a provider rejection as one plain-text
         # stdout line while reserving stderr for an SDK diagnostic.  Do not
         # scan arbitrary stdout (it can contain prompt/model text); accept
@@ -574,6 +595,13 @@ def classify_provider_failure(result: ProcessResult) -> str | None:
     )
     if any(marker in normalized for marker in rate_limit_markers):
         return "rate_limited"
+    # Transient provider pressure can surface even when the process is killed,
+    # but a configuration-class outcome must come from a process that exited on
+    # its own. A timed-out or signal-killed run leaves only partial diagnostics
+    # that routinely include informational banners, and pausing the project on
+    # that evidence is wrong.
+    if did_timeout(result):
+        return None
     if (
         "model is not supported when using codex with a chatgpt account" in normalized
         or "model is not supported for this account" in normalized
@@ -597,6 +625,20 @@ def classify_provider_failure(result: ProcessResult) -> str | None:
 def _collect_provider_errors(value: object, messages: list[str]) -> None:
     if not isinstance(value, dict):
         return
+    # Claude Code's JSON result envelope represents provider failures as a
+    # ``type=result`` object with ``is_error=true`` and a plain-text ``result``
+    # field. The text is safe to inspect only under that explicit CLI error
+    # marker; successful result text can contain arbitrary model/source text.
+    if value.get("type") == "result" and value.get("is_error") is True:
+        status = value.get("api_error_status")
+        if status is not None:
+            messages.append(f"api_error_status={status}")
+            if str(status) == "429":
+                messages.append("HTTP 429")
+        for key in ("terminal_reason", "result"):
+            message = value.get(key)
+            if isinstance(message, str):
+                messages.append(message)
     for key in ("errorMessage", "finalError"):
         message = value.get(key)
         if isinstance(message, str):
@@ -797,6 +839,14 @@ def run_worker_process(
     execution_request: ExecutionRequest | None = None,
     sandbox_profile: SandboxProfile | None = None,
 ) -> ProcessResult:
+    if cancellation is not None:
+        timeout_seconds = cancellation.clamp_timeout(timeout_seconds)
+        if run_envelope is not None:
+            updates: dict[str, object] = {}
+            if run_envelope.timeout_seconds != timeout_seconds:
+                updates["timeout_seconds"] = timeout_seconds
+            if updates:
+                run_envelope = run_envelope.model_copy(update=updates)
     effective_recipe_digest = recipe_content_digest or recipe_digest
     if (run_envelope is not None or worker_manifest is not None) and effective_recipe_digest is None:
         effective_recipe_digest = build_recipe_digest(
@@ -821,6 +871,8 @@ def run_worker_process(
     started_at = datetime.now(UTC)
     started = time.perf_counter()
     process = None
+    process_started = False
+    failure_code: str | None = None
 
     policy_decision: PolicyDecision | None = None
     backend_capabilities: BackendCapabilities | None = None
@@ -848,16 +900,41 @@ def run_worker_process(
             sandbox_profile=sandbox_profile,
             policy_decision=policy_decision,
             backend_capabilities=backend_capabilities,
+            process_started=process_started,
+            failure_code=failure_code,
         )
-        artifact_ids = _register_execution_artifacts(
-            client, contract_run, backend, project_handle, record,
-        )
+        try:
+            artifact_ids = _register_execution_artifacts(
+                client, contract_run, backend, project_handle, record,
+            )
+        except Exception:
+            artifact_ids = []
+            LOG.exception(
+                "execution artifact registration failed project=%s run=%s phase=%s",
+                project_handle, contract_run.run_id if contract_run else None, phase,
+            )
         terminal_run = (
             contract_run.model_copy(update={"artifact_ids": artifact_ids})
             if contract_run is not None
             else None
         )
-        _finish_contract_run(client, terminal_run, result, status_override=terminal_status)
+        _finish_contract_run(
+            client, terminal_run, result, status_override=terminal_status,
+            process_started=process_started, failure_code=failure_code,
+            phase=phase,
+        )
+
+    if cancellation is not None and cancellation.is_cancelled:
+        failure_code = cancellation.reason or "cancelled"
+        result = ProcessResult(
+            returncode=130,
+            stdout="",
+            stderr=f"Worker process was not started because the task was cancelled: {failure_code}",
+            cancelled=True,
+            cancel_reason=failure_code,
+        )
+        finalize(result, terminal_status="cancelled")
+        return result
 
     try:
         if execution_request is not None or sandbox_profile is not None:
@@ -880,23 +957,40 @@ def run_worker_process(
         try:
             process = backend.build_exec_process(
                 project_handle,
-                dict(worker.env),
+                get_driver(worker.type).execution_env(worker, argv),
                 argv,
                 timeout_seconds=timeout_seconds,
             )
-            process.start()
+            if cancellation is not None:
+                if not cancellation.start_process(process):
+                    failure_code = cancellation.reason or "cancelled"
+                    result = ProcessResult(
+                        returncode=130,
+                        stdout="",
+                        stderr=(
+                            "Worker process was not started because the task deadline "
+                            f"expired: {failure_code}"
+                        ),
+                        cancelled=True,
+                        cancel_reason=failure_code,
+                    )
+                    finalize(result, terminal_status="cancelled")
+                    return result
+            else:
+                process.start()
+            process_started = True
             if lease is not None:
                 lease.attach_process(process)
-            if cancellation is not None:
-                cancellation.attach_process(process)
         except BaseException as exc:
             # A registered run must not be left running if process setup fails.
+            failure_code = "process_start_failed" if process is not None else "process_setup_failed"
             failure = ProcessResult(returncode=1, stdout="", stderr=f"{type(exc).__name__}: {exc}")
             finalize(failure)
             raise
         try:
             result = process.communicate(timeout=communicate_timeout(timeout_seconds))
         except BaseException as exc:
+            failure_code = "process_communication_failed"
             failure = ProcessResult(returncode=1, stdout="", stderr=f"{type(exc).__name__}: {exc}")
             finalize(failure)
             raise
@@ -931,6 +1025,8 @@ def _write_execution_record(
     sandbox_profile: SandboxProfile | None = None,
     policy_decision: PolicyDecision | None = None,
     backend_capabilities: BackendCapabilities | None = None,
+    process_started: bool = True,
+    failure_code: str | None = None,
 ) -> ExecutionRecordResult | None:
     """Persist the raw process result with stable metadata for later audit.
 
@@ -974,6 +1070,7 @@ def _write_execution_record(
             or recipe_content_digest is not None
             or context_projection_id is not None
         )
+        usage = extract_cli_usage(worker.type, result.stdout)
         record = {
             # Keep legacy records readable and preserve old callers' schema
             # while contract-aware executions get the vNext schema.
@@ -995,6 +1092,13 @@ def _write_execution_record(
             "timed_out": result.timed_out,
             "cancelled": result.cancelled,
             "cancel_reason": result.cancel_reason,
+            "process_started": process_started,
+            "attempt_status": _attempt_status(result, process_started),
+            "failure_code": failure_code or _result_failure_code(result, process_started),
+            # Only provider-reported structured metadata is recorded. Unknown
+            # formats remain null; no estimate is inferred from text length.
+            "usage": usage,
+            "usage_source": "cli_structured" if usage is not None else None,
             "argv_sha256": command_digest,
             "prompt": str(prompt_path) if prompt is not None else None,
             "stdout": str(stdout_path),
@@ -1055,6 +1159,30 @@ def _write_execution_record(
     except Exception as exc:  # Execution evidence must never hide task output.
         LOG.warning("execution record write failed project=%s phase=%s error=%s", project_handle, phase, exc)
         return None
+
+
+def _attempt_status(result: ProcessResult, process_started: bool) -> str:
+    if result.cancelled:
+        return "cancelled"
+    if not process_started:
+        if "ExecutionPolicyDenied:" in result.stderr:
+            return "blocked"
+        return "setup_failed"
+    if result.timed_out or result.returncode in (124, 137):
+        return "timed_out"
+    return "completed" if result.returncode == 0 else "failed"
+
+
+def _result_failure_code(result: ProcessResult, process_started: bool) -> str | None:
+    if result.cancelled:
+        return result.cancel_reason or "cancelled"
+    if not process_started:
+        return "execution_policy_denied" if "ExecutionPolicyDenied:" in result.stderr else "process_setup_failed"
+    if result.timed_out or result.returncode in (124, 137):
+        return "worker_timeout"
+    if result.returncode != 0:
+        return "worker_exit_nonzero"
+    return None
 
 
 def _start_contract_run(
@@ -1193,6 +1321,9 @@ def _finish_contract_run(
     result: ProcessResult,
     *,
     status_override: str | None = None,
+    process_started: bool = True,
+    failure_code: str | None = None,
+    phase: str = "unknown",
 ) -> None:
     if run_envelope is None or client is None:
         return
@@ -1209,19 +1340,78 @@ def _finish_contract_run(
     transition = getattr(client, "transition_run", None)
     if transition is None:
         LOG.error("vNext run transition unavailable run_id=%s status=%s", finished.run_id, status)
+    else:
+        try:
+            response = transition(finished)
+            if hasattr(response, "ok") and not response.ok:
+                LOG.error(
+                    "vNext run transition failed run_id=%s status=%s response_status=%s body=%s",
+                    finished.run_id,
+                    status,
+                    getattr(response, "status_code", None),
+                    getattr(response, "text", ""),
+                )
+        except Exception as exc:  # pragma: no cover - defensive network boundary
+            LOG.error("vNext run transition raised run_id=%s status=%s error=%s", finished.run_id, status, exc)
+    attempt_status = (
+        "blocked" if status_override == "blocked"
+        else _attempt_status(result, process_started)
+    )
+    attempt_failure_code = failure_code or _result_failure_code(result, process_started)
+    _append_execution_attempt_event(
+        client, finished, phase=phase, attempt_status=attempt_status,
+        process_started=process_started, failure_code=attempt_failure_code,
+    )
+
+
+def _append_execution_attempt_event(
+    client: LinenClient,
+    run: RunEnvelope,
+    *,
+    phase: str,
+    attempt_status: str,
+    process_started: bool,
+    failure_code: str | None,
+) -> None:
+    """Persist minimal lifecycle accounting even if archive writes failed."""
+    append = getattr(client, "append_audit_event", None) or getattr(client, "append_event", None)
+    if append is None:
         return
+    stable_id = f"execution-attempt-{run.run_id}-{phase}"
+    event = AuditEventEnvelope(
+        event_id=stable_id,
+        project_id=run.project_id,
+        run_id=run.run_id,
+        idempotency_key=f"execution-attempt:{run.run_id}:{phase}:finished",
+        event_type="execution_attempt_finished",
+        actor="dispatcher.execution",
+        entity_kind="run",
+        entity_id=run.run_id,
+        graph_revision=run.graph_revision,
+        source_generation=run.source_generation,
+        plan_revision=run.plan_revision,
+        payload={
+            "phase": phase,
+            "attempt_status": attempt_status,
+            "process_started": process_started,
+            "failure_code": failure_code,
+        },
+        # started_at is server-persisted and stable across idempotent retries;
+        # the fixed fallback keeps compatibility callers deterministic too.
+        created_at=run.started_at or "1970-01-01T00:00:00Z",
+    )
     try:
-        response = transition(finished)
+        response = append(event)
         if hasattr(response, "ok") and not response.ok:
-            LOG.error(
-                "vNext run transition failed run_id=%s status=%s response_status=%s body=%s",
-                finished.run_id,
-                status,
-                getattr(response, "status_code", None),
-                getattr(response, "text", ""),
+            LOG.warning(
+                "execution attempt metadata event rejected run=%s phase=%s status=%s",
+                run.run_id, phase, getattr(response, "status_code", None),
             )
-    except Exception as exc:  # pragma: no cover - defensive network boundary
-        LOG.error("vNext run transition raised run_id=%s status=%s error=%s", finished.run_id, status, exc)
+    except Exception:
+        LOG.warning(
+            "execution attempt metadata event failed run=%s phase=%s",
+            run.run_id, phase, exc_info=True,
+        )
 
 
 def _register_execution_artifacts(
@@ -1312,19 +1502,22 @@ def _pi_prompt_from_argv(argv: list[str]) -> str | None:
 
 def _prompt_from_argv(argv: list[str]) -> str | None:
     """Extract a worker prompt without persisting the complete argv."""
-    # Pi places the prompt after ``-p`` directly. Claude uses ``-p --`` and
-    # places it after the option terminator, so skip the terminator here.
-    for index in range(len(argv) - 2, -1, -1):
-        if argv[index] == "-p" and argv[index + 1] != "--":
-            return argv[index + 1]
     # Codex/Claude adapters terminate options with ``--`` and place the
-    # prompt immediately after it.  Their session/provider arguments are not
-    # copied into the execution record.
+    # prompt immediately after it.  Check this first: controlled-output
+    # adapters insert value-taking options (e.g. ``--json-schema <schema>``,
+    # ``--output-schema <path>``) between ``-p`` and the terminator, so the
+    # ``-p`` heuristic below can no longer assume ``-p`` is adjacent to ``--``.
     for index in range(len(argv) - 2, -1, -1):
         if argv[index] == "--" and index + 1 < len(argv):
             candidate = argv[index + 1]
             if candidate != "-p":
                 return candidate
+    # Pi places the prompt after ``-p`` directly. Claude uses ``-p --`` with
+    # the prompt after the terminator, which the loop above already handled.
+    # Require the value to look like a prompt rather than another option flag.
+    for index in range(len(argv) - 2, -1, -1):
+        if argv[index] == "-p" and not argv[index + 1].startswith("-"):
+            return argv[index + 1]
     return None
 
 

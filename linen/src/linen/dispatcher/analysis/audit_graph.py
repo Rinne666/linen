@@ -7,6 +7,7 @@ edges.  The dispatcher remains the only component that writes those edges.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from pathlib import Path
 
@@ -62,6 +63,190 @@ def _candidate_budget_residual_payload(fact: Fact) -> dict | None:
     if not isinstance(payload, dict) or payload.get("kind") != CANDIDATE_BUDGET_RESIDUAL_KIND:
         return None
     return payload
+
+
+def _lead_disposition_ledger(
+    project: ProjectDetail,
+    workdir: Path,
+    config: AuditConfig,
+) -> list[dict]:
+    """Keep each source-grounded Recon/CodeQL lead visible through synthesis.
+
+    A lead is dispositioned only when its own source Fact has a descendant
+    candidate or an independently reviewed rejection. Mere inclusion in a
+    summary input list, or a sibling lead from the same Recon run, is not
+    evidence that this particular lead was handled.
+    """
+    sources: list[tuple[Fact, str, dict, dict]] = []
+    for fact in recon.result_facts(project, config.recon):
+        source_intent = next((intent for intent in project.intents if intent.to == fact.id), None)
+        if (
+            fact.source_generation != project.project.source_generation
+            or source_intent is None
+            or source_intent.source_generation != project.project.source_generation
+            or source_intent.plan_revision != project.project.plan_revision
+        ):
+            continue
+        record = recon.result_record(fact, workdir)
+        category = recon.category_from_description(next((
+            intent.description for intent in project.intents if intent.to == fact.id
+        ), "")) or "unknown"
+        for lead in record.get("leads", []):
+            if isinstance(lead, dict):
+                sources.append((fact, category, lead, record))
+    if codeql.active_for_project(project, config.codeql):
+        machine_facts = []
+        initial = codeql.latest_fact(project)
+        initial_intent = next((
+            intent for intent in project.intents if intent.to == initial.id
+        ), None) if initial is not None else None
+        if (
+            initial is not None
+            and initial.source_generation == project.project.source_generation
+            and initial_intent is not None
+            and initial_intent.source_generation == project.project.source_generation
+            and initial_intent.plan_revision == project.project.plan_revision
+        ):
+            machine_facts.append(("codeql", initial))
+        machine_facts.extend(codeql.query_results(project))
+        for category, fact in machine_facts:
+            result_intent = next((
+                intent for intent in project.intents if intent.to == fact.id
+            ), None)
+            if (
+                fact.source_generation != project.project.source_generation
+                or result_intent is None
+                or result_intent.source_generation != project.project.source_generation
+                or result_intent.plan_revision != project.project.plan_revision
+            ):
+                continue
+            record = codeql.result_record(fact, workdir)
+            for lead in record.get("leads", []):
+                if isinstance(lead, dict):
+                    sources.append((fact, f"codeql:{category}", lead, record))
+
+    ledger = []
+    for source_fact, category, lead, record in sources:
+        source_location = _source_location(lead.get("source"))
+        sink_location = _source_location(lead.get("sink"))
+        citation_map = {
+            item["id"]: item for item in record.get("citations", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        lead_citations = [
+            citation_map[citation_id]
+            for citation_id in lead.get("citation_ids", lead.get("citations", []))
+            if citation_id in citation_map
+        ]
+        citation_locations = {
+            (item.get("file"), item.get("line")) for item in lead_citations
+            if isinstance(item.get("file"), str) and isinstance(item.get("line"), int)
+        }
+        sibling_count = sum(1 for row in sources if row[0].id == source_fact.id)
+        related = []
+        for candidate in project.facts:
+            if (
+                source_fact.id not in ancestor_ids(project, [candidate.id])
+                or candidate.source_generation != source_fact.source_generation
+                or candidate.semantic_type not in {"candidate_finding", "rejected_finding"}
+            ):
+                continue
+            candidate_text = f"{candidate.description}\n{candidate.evidence or ''}"
+            if not _candidate_is_bound_to_lead(
+                candidate_text, source_location, sink_location,
+                citation_locations, lead, sibling_count, source_fact.id,
+            ):
+                continue
+            related.append(candidate)
+        reviewed_rejections = []
+        for candidate in related:
+            if candidate.status != "false_positive":
+                continue
+            reviews = coverage.effective_reviews(project, candidate.id)
+            if any(
+                review.verdict == "INVALID" and review.confidence in {"firm", "certain"}
+                for review in reviews
+            ):
+                reviewed_rejections.append(candidate)
+        candidates = [item for item in related if item not in reviewed_rejections]
+        citation_ids = lead.get("citation_ids", lead.get("citations", []))
+        if reviewed_rejections and not candidates:
+            disposition = "rejected_with_independent_evidence"
+        elif candidates:
+            disposition = "candidate_tracked"
+        else:
+            disposition = "unresolved_gap"
+        ledger.append({
+            "source_fact_id": source_fact.id,
+            "category": category,
+            "lead_id": lead.get("id"),
+            "title": lead.get("title", "Unlabeled source lead"),
+            "hypothesis": lead.get("hypothesis", ""),
+            "source": lead.get("source", ""),
+            "sink": lead.get("sink", ""),
+            "citations": list(citation_ids) if isinstance(citation_ids, list) else [],
+            "disposition": disposition,
+            "candidate_fact_ids": [item.id for item in candidates],
+            "rejected_fact_ids": [item.id for item in reviewed_rejections],
+        })
+    return ledger
+
+
+def _source_location(value: object) -> tuple[str, int] | None:
+    if not isinstance(value, str):
+        return None
+    match = re.match(r"^(.*?):(\d+)(?:\b|\s|$)", value.strip())
+    return (match.group(1), int(match.group(2))) if match else None
+
+
+def _candidate_cites_location(text: str, location: tuple[str, int]) -> bool:
+    file, line = location
+    escaped_file = re.escape(file)
+    escaped_line = re.escape(str(line))
+    return bool(re.search(
+        rf"(?<![A-Za-z0-9_./-]){escaped_file}:{escaped_line}(?!\d)",
+        text,
+    ) or re.search(
+        rf"file:\s*{escaped_file}\s*\n\s*line:\s*{escaped_line}(?!\d)",
+        text,
+    ) or re.search(
+        rf"(?<!\d){escaped_line}:\s*{escaped_file}(?![A-Za-z0-9_./-])",
+        text,
+    ))
+
+
+def _candidate_is_bound_to_lead(
+    candidate_text: str,
+    source: tuple[str, int] | None,
+    sink: tuple[str, int] | None,
+    citations: set[tuple[object, object]],
+    lead: dict,
+    sibling_count: int,
+    source_fact_id: str,
+) -> bool:
+    """Associate a candidate with exact path evidence, never just a shared file.
+
+    Candidate text is an attribution hint for the graph ledger, not a trusted
+    security verdict. Ambiguous sibling paths remain unresolved until Reason
+    emits a candidate whose evidence names their specific source/sink lines.
+    """
+    lead_id = lead.get("id")
+    if isinstance(lead_id, str) and lead_id and re.search(
+        rf"(?m)^\s*lead_ref\s*:\s*{re.escape(source_fact_id)}/{re.escape(lead_id)}\s*$",
+        candidate_text,
+    ):
+        return True
+    exact_anchors = [item for item in (source, sink) if item is not None]
+    if exact_anchors:
+        return all(_candidate_cites_location(candidate_text, item) for item in exact_anchors)
+    matched_citations = [
+        (file, line) for file, line in citations
+        if isinstance(file, str) and isinstance(line, int)
+        and _candidate_cites_location(candidate_text, (file, line))
+    ]
+    if matched_citations:
+        return len(matched_citations) >= (2 if sibling_count > 1 else 1)
+    return False
 
 
 def _candidate_budget_overflow_records(
@@ -404,6 +589,11 @@ def _review_proposals(
         if not (
             fact.type in {
                 "coverage_result", "policy_evidence", "scope_adjudication", "vulnerability",
+                # Sanitizer assessments can carry a negative-control claim
+                # (for example, whether parameter binding blocks tainted SQL
+                # input). Review them independently before relying on that
+                # claim in the final audit summary.
+                "sanitizer",
                 # Repository-wide recon follow-ups are source-grounded claims
                 # that can feed the final summary. They are intentionally not
                 # candidate findings, but the evidence chain still requires an
@@ -496,11 +686,11 @@ def _stage_intent_proposal(
 ) -> dict | None:
     """Return an idempotent stage attempt, retrying only when work is missing.
 
-    A result for the same inputs is terminal. A concluded intent without a
-    result must not permanently satisfy the existence check, while changed
-    graph inputs may legitimately require a refreshed result. The retry cap
-    applies to attempts that produced no result Fact; an open attempt remains
-    the single owner of that stage obligation.
+    A valid result for the same inputs is terminal. A concluded intent without
+    a result must not permanently satisfy the existence check, while a Fact
+    rejected by independent review is also eligible for bounded regeneration.
+    Changed graph inputs may legitimately require a refreshed result. An open
+    attempt remains the single owner of that stage obligation.
     """
     if _open(project, description):
         return None
@@ -513,14 +703,21 @@ def _stage_intent_proposal(
         and item.source_generation == project.project.source_generation
         and item.plan_revision == project.project.plan_revision
     ]
-    result_fact_ids = {fact.id for fact in project.facts}
-    if any(
-        item.to in result_fact_ids and item.from_ == from_ids
-        for item in prior
-    ):
+    facts_by_id = {fact.id: fact for fact in project.facts}
+    result_attempts = [
+        item for item in prior
+        if item.to in facts_by_id and item.from_ == from_ids
+    ]
+    usable_result_attempts = [
+        item for item in result_attempts
+        if facts_by_id[item.to].status not in {"false_positive", "fixed"}
+    ]
+    if usable_result_attempts:
         return None
     attempts_without_result = sum(
-        item.to not in result_fact_ids for item in prior
+        item not in result_attempts
+        or facts_by_id[item.to].status in {"false_positive", "fixed"}
+        for item in prior
     )
     if attempts_without_result >= MAX_STAGE_INTENT_ATTEMPTS:
         return None
@@ -659,7 +856,21 @@ def audit_summary_inputs(
                 } | {plan_fact.id})
             ):
                 return None
-            module_ids = [plan_fact.id, *(fact.id for fact in category_facts), blindspot_fact.id]
+            module_ids = [
+                plan_fact.id,
+                *(fact.id for fact in category_facts),
+                *(
+                    fact.id for fact in recon.result_facts(project, config.recon)
+                    if fact.source_generation == project.project.source_generation
+                    and any(
+                        intent.to == fact.id
+                        and intent.source_generation == project.project.source_generation
+                        and intent.plan_revision == project.project.plan_revision
+                        for intent in project.intents
+                    )
+                ),
+                blindspot_fact.id,
+            ]
             if codeql.active_for_project(project, config.codeql):
                 machine_fact = codeql.latest_fact(project)
                 if machine_fact is None:
@@ -823,6 +1034,7 @@ def audit_summary_fact(
             ],
         })
     partial_categories = [item for item in categories if item["status"] == "partial"]
+    lead_disposition_ledger = _lead_disposition_ledger(project, workdir, config)
     residual_gaps = [
         {"category": item["category"], "gap": gap}
         for item in categories for gap in item["gaps"]
@@ -860,12 +1072,29 @@ def audit_summary_fact(
             ),
         })
     for item in categories:
-        for uncovered in item.get("coverage_dimensions", {}).get("uncovered_items", []):
-            if uncovered.get("status") == "unresolved":
+        dimensions = item.get("coverage_dimensions", {})
+        # An `unresolved` row is a declared blind spot, not a coverage claim. It
+        # is non-terminal for every axis, so surface all four rather than only
+        # `uncovered_items`; dropping the others would silently discard exactly
+        # the "could not verify" evidence the report is supposed to preserve.
+        for axis in ("uncovered_items", "parallel_paths", "lifecycle", "exclusion_rationales"):
+            for row in dimensions.get(axis, []):
+                if not isinstance(row, dict) or row.get("status") != "unresolved":
+                    continue
                 residual_gaps.append({
                     "category": item["category"],
-                    "gap": f"{uncovered.get('item')}: {uncovered.get('rationale')}",
+                    "gap": f"[{axis}] {row.get('item')}: {row.get('rationale')}",
                 })
+    for lead in lead_disposition_ledger:
+        if lead["disposition"] == "unresolved_gap":
+            residual_gaps.append({
+                "category": lead["category"],
+                "gap": (
+                    f"Unresolved source lead {lead['lead_id'] or lead['title']}: "
+                    f"{lead['hypothesis']} (source Fact {lead['source_fact_id']}; "
+                    "no linked candidate or independently reviewed rejection was found)"
+                ),
+            })
     blindspot_gaps = []
     if blindspot_record:
         for item in blindspot_record.get("items", []):
@@ -951,6 +1180,7 @@ def audit_summary_fact(
             "historical_overflow_candidates": candidate_budget_overflow_candidates,
         },
         "reconnaissance": categories,
+        "lead_disposition_ledger": lead_disposition_ledger,
         "independent_coverage_review": {
             "fact_id": blindspot_fact.id if blindspot_fact else None,
             "summary": blindspot_record.get("summary"),

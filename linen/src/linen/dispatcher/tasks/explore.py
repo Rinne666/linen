@@ -21,9 +21,11 @@ from linen.dispatcher.prompting import load_prompt, render_prompt
 from linen.dispatcher.protocol.client import LinenClient
 from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.backend import ExecutionBackend
+from linen.dispatcher.workers.base import WorkerDriver
 from linen.dispatcher.runtime.heartbeat import HeartbeatLease
 from linen.dispatcher.runtime.review_sandbox import ReviewSandboxBackend
 from linen.dispatcher.tasks.common import (
+    DuplicateTerminalRun,
     best_effort_release,
     append_context_projection_reference,
     cancel_reason,
@@ -45,9 +47,32 @@ from linen.server.uvpg import GAP_CONTRACTS, parse_proof_obligation
 
 LOG = logging.getLogger(__name__)
 
+# Bounded excerpt of the candidate's cited evidence that crosses into the
+# isolated PoC container. Prior graph reasoning and reviews stay withheld.
+_POC_EVIDENCE_CHAR_CAP = 6000
+
 
 class ProofContractError(ValueError):
     """The worker result did not satisfy a server-authored proof obligation."""
+
+
+def _constrain_recon_output(
+    backend: ExecutionBackend,
+    project_handle: str,
+    driver: WorkerDriver,
+    argv: list[str],
+) -> list[str]:
+    # Both native CLIs can constrain their final response to this schema: codex
+    # via a schema file, claude via inline `--json-schema`. Leaving claude
+    # unconstrained made large recon responses intermittently malformed, which
+    # discards an entire correct analysis and repeats the run.
+    if not driver.supports_output_schema:
+        return argv
+    schema = recon.response_schema()
+    text = json.dumps(schema, ensure_ascii=False)
+    path = f"/tmp/linen-prompts/recon-{canonical_digest(schema)}/response-schema.json"
+    backend.write_text_file(project_handle, path, text)
+    return driver.with_output_schema(argv, path, schema_text=text)
 
 
 def _proof_obligation_contract(intent: Intent) -> str:
@@ -162,6 +187,66 @@ def _report_proof_contract_block(
     return "blocked"
 
 
+def _record_exhausted_recon_gap(
+    config: DispatchConfig,
+    client: LinenClient,
+    backend: ExecutionBackend,
+    project_id: str,
+    intent: Intent,
+    worker_name: str,
+    validation_detail: str,
+    correction_limit: int,
+    *,
+    project: ProjectDetail | None = None,
+    workdir: Path | None = None,
+    cancellation: TaskCancellation | None = None,
+) -> str | None:
+    """Close an exhausted Recon repair budget with a claim-free residual gap."""
+    if not config.audit.enabled or not config.audit.recon_active:
+        return None
+    if cancellation is not None and cancellation.is_cancelled:
+        return None
+    try:
+        current = project or client.get_project(project_id)
+        if current.project.status != "active" or current.project.audit_mode != "scope":
+            return None
+        parsed = recon.parse_category_intent(intent, config.audit.recon, current)
+        if parsed is None:
+            return None
+        category, _subject = parsed
+        root = workdir or Path(backend.ensure_running(current.project.id))
+        payload = recon.unresolved_correction_payload(
+            category,
+            validation_detail,
+            correction_limit=correction_limit,
+        )
+        fact = recon.outcome_fact(
+            payload, current, intent, root, config.audit.recon,
+        )
+        if cancellation is not None and cancellation.is_cancelled:
+            return None
+        return write_conclude_result(
+            client,
+            current.project.id,
+            intent.id,
+            worker_name,
+            fact["description"],
+            source="recon_correction_exhausted",
+            phase_ms=0,
+            fact_type=fact["type"],
+            evidence=fact["evidence"],
+            fact_status="triaged",
+            candidate_budget=config.audit.max_candidate_findings,
+        )
+    except Exception:
+        LOG.exception(
+            "could not persist exhausted Recon gap project=%s intent=%s",
+            project_id,
+            intent.id,
+        )
+        return None
+
+
 def run_explore_task(
     config: DispatchConfig,
     client: LinenClient,
@@ -181,6 +266,27 @@ def run_explore_task(
     lease = HeartbeatLease.for_intent(client, project.project.id, intent.id, worker.name, config.runtime.interval)
     lease.start()
     try:
+        if scope_audit and attempt > config.audit.max_result_attempts:
+            gap_status = _record_exhausted_recon_gap(
+                config,
+                client,
+                backend,
+                project.project.id,
+                intent,
+                worker.name,
+                "No model result passed validation within the configured result-attempt budget.",
+                config.audit.max_result_attempts,
+                project=project,
+                cancellation=cancellation,
+            )
+            if gap_status is not None:
+                return gap_status
+            best_effort_release(client, project.project.id, intent.id, worker.name)
+            return (
+                "invalid_result:automatic result correction limit exhausted "
+                f"after {config.audit.max_result_attempts} model phases; withdraw the invalid claim "
+                "and record the unresolved evidence gap"
+            )
         container_name = backend.ensure_running(project.project.id)
 
         if (
@@ -251,7 +357,7 @@ def run_explore_task(
             )
 
         if (scope_audit and intent.type == "search"
-                and config.audit.recon.enabled
+                and config.audit.recon_active
                 and intent.description.strip() == recon.SNAPSHOT_INTENT):
             fact = recon.create_snapshot(
                 Path(container_name) / "repo", Path(container_name),
@@ -453,12 +559,12 @@ def run_explore_task(
         coverage_task = scope_audit and intent.description.startswith(coverage.CELL_PREFIX)
         recon_task = (
             scope_audit
-            and config.audit.recon.enabled
+            and config.audit.recon_active
             and intent.description.startswith(recon.CATEGORY_PREFIX)
         )
         coverage_review_task = (
             scope_audit
-            and config.audit.recon.enabled
+            and config.audit.recon_active
             and intent.description.strip() == recon.COVERAGE_REVIEW_INTENT
         )
         task_timeout = (
@@ -526,6 +632,11 @@ def run_explore_task(
             prompt += "\n" + SOURCE_DATA_BOUNDARY
         prompt += _proof_obligation_contract(intent)
         if poc_isolated:
+            # Marker prefix consumed by worker adapters: an isolated PoC runs
+            # inside the Docker sandbox, so CLI tool restrictions that protect
+            # the host (read-only explore modes) must not block code execution
+            # in the container.
+            prompt = "# ISOLATED POC EXECUTION TASK\n" + prompt
             prompt += (
                 "\nIsolated PoC execution: the frozen source is mounted read-only at /repo. "
                 "Use only /work or /tmp for generated files. Network and privileges are controlled by "
@@ -534,6 +645,19 @@ def run_explore_task(
                 "Do not attempt persistence, external callbacks, or host access. Return a bounded, "
                 "reproducible validation result as the one Fact for this Intent.\n"
             )
+            if source_fact is not None:
+                # The reproduction target itself: the candidate statement and
+                # its cited evidence. Prior graph reasoning and reviews stay
+                # withheld to preserve independent verification semantics.
+                statement = (source_fact.description or "").strip()
+                cited = (source_fact.evidence or "").strip()
+                if len(cited) > _POC_EVIDENCE_CHAR_CAP:
+                    cited = cited[:_POC_EVIDENCE_CHAR_CAP] + "\n…(evidence truncated)"
+                if statement or cited:
+                    prompt += (
+                        f"\nCandidate statement to reproduce (fact {source_fact.id}):\n"
+                        f"{statement or '(no statement)'}\n\nCited evidence:\n{cited or '(none)'}\n"
+                    )
         if not poc_isolated:
             prompt = append_context_projection_reference(prompt, context_reference)
         recipe_id = recipe_id or (
@@ -563,6 +687,8 @@ def run_explore_task(
         )
         session = driver.prepare_session()
         execute = driver.build_execute(worker, prompt, session)
+        if recon_task:
+            execute.argv = _constrain_recon_output(backend, container_name, driver, execute.argv)
         if poc_isolated and execute.argv[:2] == ["codex", "exec"]:
             execute.argv.insert(2, "--skip-git-repo-check")
         session = execute.session
@@ -701,6 +827,7 @@ def run_explore_task(
                     attempt=attempt,
                     trigger=trigger,
                     proof_contract_failure=isinstance(exc, ProofContractError),
+                    max_result_attempts=(config.audit.max_result_attempts if scope_audit else None),
                 )
             if kind == "rejected":
                 LOG.warning(
@@ -766,6 +893,7 @@ def run_explore_task(
                 failure_detail="Initial coverage/explore execution timed out before producing a valid result",
                 attempt=attempt,
                 trigger=trigger,
+                max_result_attempts=(config.audit.max_result_attempts if scope_audit else None),
             )
         LOG.warning(
             "explore command failed project=%s intent=%s worker=%s code=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -777,6 +905,18 @@ def run_explore_task(
             int((time.perf_counter() - task_started) * 1000),
             preview(first.stdout),
             preview(first.stderr),
+        )
+        best_effort_release(client, project.project.id, intent.id, worker.name)
+        return "failed"
+    except DuplicateTerminalRun as exc:
+        # A deterministic run id already reached a terminal state -- typically an
+        # attempt replayed after a dispatcher restart, or a retry that reused the
+        # same attempt number.  This is not a crash: report a normal failed
+        # attempt so the scheduler advances the attempt counter and derives a
+        # fresh run id instead of re-colliding forever.
+        LOG.warning(
+            "explore attempt collided with a terminal run project=%s intent=%s worker=%s run=%s status=%s",
+            project.project.id, intent.id, worker.name, exc.run.run_id, exc.run.status,
         )
         best_effort_release(client, project.project.id, intent.id, worker.name)
         return "failed"
@@ -817,6 +957,20 @@ def _run_context_continuation(
 ) -> str:
     """Run exactly one fresh-session context continuation for generic explore."""
     phase = "explore_context_continuation"
+    # Context continuation is a bounded subphase of the same logical explore
+    # attempt. It has its own execution identity and fresh session, but it does
+    # not consume another correction/retry ordinal.
+    continuation_attempt = attempt
+    if (
+        config.audit.enabled
+        and project.project.audit_mode != "none"
+        and continuation_attempt > config.audit.max_result_attempts
+    ):
+        best_effort_release(client, project.project.id, intent.id, worker.name)
+        return (
+            "invalid_result:automatic result correction limit exhausted before context continuation; "
+            "record the unresolved context gap"
+        )
     continuation_started = time.perf_counter()
     try:
         expanded = expand_context_projection(client, projection, request)
@@ -856,7 +1010,7 @@ def _run_context_continuation(
             timeout_seconds=config.tasks.explore.timeout,
             prompt=prompt,
             logical_scope=logical_scope,
-            attempt=attempt,
+            attempt=continuation_attempt,
             intent_id=intent.id,
             recipe_id=phase,
         )
@@ -963,6 +1117,7 @@ def _try_conclude_fallback(
     attempt: int = 1,
     trigger: str | None = None,
     proof_contract_failure: bool = False,
+    max_result_attempts: int | None = None,
 ) -> str:
     if not driver.supports_conclude() or not session:
         LOG.info(
@@ -994,6 +1149,30 @@ def _try_conclude_fallback(
         )
         best_effort_release(client, project_id, intent.id, worker.name)
         return "cancelled"
+
+    correction_attempt = attempt + 1
+    if max_result_attempts is not None and correction_attempt > max_result_attempts:
+        gap_status = _record_exhausted_recon_gap(
+            config,
+            client,
+            backend,
+            project_id,
+            intent,
+            worker.name,
+            failure_detail or "The last model result did not pass deterministic validation.",
+            max_result_attempts,
+            workdir=Path(container_name),
+            cancellation=cancellation,
+        )
+        if gap_status is not None:
+            return gap_status
+        best_effort_release(client, project_id, intent.id, worker.name)
+        detail = f": {failure_detail[:1000]}" if failure_detail else ""
+        return (
+            "invalid_result:automatic result correction limit exhausted before conclude "
+            f"after {max_result_attempts} model phases{detail}; withdraw the unsupported claim "
+            "and record the unresolved evidence gap"
+        )
 
     if not project_allows_conclude_fallback(
         client,
@@ -1037,12 +1216,12 @@ def _try_conclude_fallback(
     coverage_task = scope_audit and intent.description.startswith(coverage.CELL_PREFIX)
     recon_task = (
         scope_audit
-        and config.audit.recon.enabled
+        and config.audit.recon_active
         and intent.description.startswith(recon.CATEGORY_PREFIX)
     )
     coverage_review_task = (
         scope_audit
-        and config.audit.recon.enabled
+        and config.audit.recon_active
         and intent.description.strip() == recon.COVERAGE_REVIEW_INTENT
     )
     scope_adjudication_task = (
@@ -1140,13 +1319,15 @@ def _try_conclude_fallback(
             f"explore-conclude:{intent.id}:graph-{projection.graph_revision}:"
             f"trigger-{(trigger or 'scheduler').strip() or 'scheduler'}"
         ),
-        attempt=attempt,
+        attempt=correction_attempt,
         intent_id=intent.id,
         recipe_id=recipe_id,
         recipe_label=recipe_label,
         recipe_version=recipe_version,
     )
     conclude_argv = driver.build_conclude(worker, prompt, session)
+    if recon_task:
+        conclude_argv = _constrain_recon_output(backend, container_name, driver, conclude_argv)
     LOG.info("starting conclude fallback project=%s intent=%s worker=%s", project_id, intent.id, worker.name)
     conclude_started = time.perf_counter()
     result = _run_process(
@@ -1294,14 +1475,14 @@ def _managed_result(config, project, intent, container_name, payload, fact):
                 config.runtime.prompt_group,
             )
         if (
-            config.audit.recon.enabled
+            config.audit.recon_active
             and intent.description.startswith(recon.CATEGORY_PREFIX)
         ):
             return recon.outcome_fact(
                 payload, project, intent, Path(container_name), config.audit.recon,
             )
         if (
-            config.audit.recon.enabled
+            config.audit.recon_active
             and intent.description.strip() == recon.COVERAGE_REVIEW_INTENT
         ):
             return recon.coverage_review_outcome_fact(

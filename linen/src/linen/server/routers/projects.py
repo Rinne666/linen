@@ -1287,7 +1287,14 @@ def update_project_status(project_id: str, body: UpdateProjectStatusRequest):
                 "Human",
                 entity_kind="project",
                 entity_id=project_id,
-                payload={"issue_count": len(open_worker_issues)},
+                payload={
+                    "issue_count": len(open_worker_issues),
+                    "worker_issues": [
+                        {"worker": issue.get("worker"), "code": issue.get("code")}
+                        for issue in open_worker_issues
+                        if isinstance(issue, dict)
+                    ],
+                },
             )
         return project_meta_from_row(get_project_or_404(conn, project_id))
 

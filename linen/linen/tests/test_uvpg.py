@@ -35,6 +35,16 @@ def _proof(*roles: str) -> dict:
     }
 
 
+REPORTABLE_ASSESSMENT = {
+    "classification": "vulnerability", "threat_model_status": "in_scope",
+    "threat_model_evidence": ["Fixture policy permits authenticated object access; crossing owners is forbidden."],
+    "attacker_preconditions": {key: False for key in (
+        "requires_admin_action", "requires_social_engineering", "requires_out_of_scope_privilege", "requires_insecure_configuration")},
+    "direct_impact": {"confidentiality": True, "integrity": False, "availability": False,
+                      "documented_trust_boundary_violation": True, "impact_path": "Attacker A reads protected resource B."},
+}
+
+
 def _setup(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "_db_path", None)
     db.configure(tmp_path / "uvpg.db")
@@ -119,6 +129,8 @@ def _strict_board(tmp_path, monkeypatch, *, omit=(), invalid_review=None, second
         if second_candidate:
             conn.execute("INSERT INTO facts (id, project_id, description, type, semantic_type) VALUES ('candidate-b', 'p', 'other', 'vulnerability', 'candidate_finding')")
             conn.execute("INSERT INTO graph_edges (id, project_id, source_kind, source_id, target_kind, target_id, relation_type, created_at, created_by) VALUES ('cross', 'p', 'fact', 'candidate', 'fact', 'candidate-b', 'depends_on', 'now', 'test')")
+        conn.execute("UPDATE reviews SET diagnostics = ? WHERE fact_id = 'candidate'",
+                     (json.dumps({"finding_assessment": REPORTABLE_ASSESSMENT}),))
     return "candidate"
 
 
@@ -178,7 +190,7 @@ def test_proof_cycle_is_bounded_and_deterministic(tmp_path, monkeypatch):
 
 
 def test_technical_confirmation_promotes_once_and_is_idempotent(tmp_path, monkeypatch):
-    _strict_board(tmp_path, monkeypatch)
+    _dynamic_board(tmp_path, monkeypatch)
     with db.get_conn() as conn:
         conn.execute("UPDATE facts SET evidence = 'frozen evidence' WHERE id = 'candidate'")
     first = confirm_technical_finding("p", "candidate")
@@ -208,9 +220,9 @@ def test_proof_gap_planner_is_prioritized_deduplicated_and_server_binds_edge(tmp
     _strict_board(tmp_path, monkeypatch, omit={"security_invariant"})
     first = plan_proof_gap("p", "candidate")
     second = plan_proof_gap("p", "candidate")
-    assert first["created"] is True
+    assert first["created_intent"] is True
     assert first["gap"]["code"] == "MISSING_INVARIANT"
-    assert second["created"] is False
+    assert second["created_intent"] is False
     assert second["reason"] == "duplicate_open_obligation"
     intent_id = first["intent_id"]
     request = ConcludeRequest(
@@ -553,7 +565,7 @@ def test_repair_gap_is_blocked_without_auto_intent(tmp_path, monkeypatch):
         gaps = derive_proof_gaps(conn, "p", "candidate")
     assert any(gap.code == "INVALID_SOURCE_EXCERPT" and gap.status == "blocked" for gap in gaps)
     planned = plan_proof_gap("p", "candidate")
-    assert planned["created"] is False
+    assert planned["created_intent"] is False
     assert planned["reason"] == "no_investigative_gap"
 
 
@@ -734,11 +746,15 @@ def test_valid_review_never_promotes_candidate(tmp_path, monkeypatch):
         assert conn.execute("SELECT COUNT(*) AS n FROM graph_edges WHERE relation_type = 'promotes_to'").fetchone()["n"] == 0
 
 
-def test_static_confirmation_succeeds_without_dynamic_evidence(tmp_path, monkeypatch):
+def test_static_proof_cannot_confirm_without_dynamic_evidence(tmp_path, monkeypatch):
     _strict_board(tmp_path, monkeypatch)
     result = confirm_technical_finding("p", "candidate")
-    assert result["status"] == "confirmed"
-    assert result["verification_level"] == "static_confirmed"
+    assert result.status_code == 409
+    payload = json.loads(result.body)
+    assert payload["status"] == "not_confirmed"
+    assert payload["verification_level"] == "unconfirmed"
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM facts WHERE semantic_type='confirmed_finding'").fetchone()[0] == 0
 
 
 def test_dynamic_positive_without_negative_is_incomplete(tmp_path, monkeypatch):

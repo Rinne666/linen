@@ -18,7 +18,7 @@ from pathlib import Path
 import requests
 
 from linen.contracts import AuditEventEnvelope
-from linen.dispatcher.analysis import audit_graph, audit_recipes, codeql, coverage, scope_gate, stages
+from linen.dispatcher.analysis import audit_graph, audit_recipes, codeql, coverage, recon, scope_gate, stages
 from linen.dispatcher.analysis.source_preflight import preflight_source_repository
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.models import RunningTask
@@ -71,7 +71,11 @@ class DispatcherLoop:
         self.worker_rejected_until: dict[tuple[str, str, str], float] = {}
         self.worker_provider_until: dict[str, float] = {}
         self.worker_provider_reason: dict[str, str] = {}
+        self.worker_provider_opened_at: dict[str, float] = {}
+        self.worker_provider_origin: dict[str, tuple[str, int]] = {}
         self._manual_provider_retries_seen: set[str] = set()
+        self._provider_resume_event_cursors: dict[str, int] = {}
+        self._execution_attempt_state_cache: dict[tuple[str, int], dict[str, bool]] = {}
         self._restore_provider_circuits()
         self._log_state: dict[str, tuple[int, str, tuple[object, ...]]] = {}
         self._cleanup_pending: set[str] = set()
@@ -85,6 +89,7 @@ class DispatcherLoop:
         self._reason_cooldown_until: dict[str, float] = {}
         self._reason_cooldown_restored: set[str] = set()
         self._audit_idle_state: dict[str, dict[str, float | int | None]] = {}
+        self._audit_deadlines: dict[str, float] = {}
 
     def close(self) -> None:
         if self.futures:
@@ -112,6 +117,7 @@ class DispatcherLoop:
                     self._recover_orphan_runs(summaries)
                     self._refresh_runtime_projects(summaries)
                     self._cancel_inactive_tasks(summaries)
+                    self._enforce_running_audit_budgets(summaries)
                     self._queue_container_cleanups(summaries)
                     self._dispatch_available(summaries)
                 except requests.RequestException as exc:
@@ -188,7 +194,8 @@ class DispatcherLoop:
             )
         LOG.warning(
             "[!] Local mode uses each CLI's own host config: make sure %s already logged in / "
-            "configured and usable directly (e.g. `claude -p ...` works) — linen injects no API keys.",
+            "configured and usable directly (e.g. `claude -p ...` works). For an actual model "
+            "probe, set runtime.healthcheck_probe=response.",
             ", ".join(sorted(available)),
         )
 
@@ -472,36 +479,14 @@ class DispatcherLoop:
             )
             return False
         if budget_state is not None:
-            code, message, occurred_at = budget_state
-            budget_limit = (
-                getattr(self.config.audit, "max_runs_per_project", 250)
-                if code == "audit_run_budget_exhausted"
-                else getattr(self.config.audit, "wall_clock_budget_seconds", 43200)
-            )
-            self._append_runtime_health_event(
-                project,
-                "audit_budget_blocked",
-                code,
-                {
-                    "message": message,
-                    "budget_limit": budget_limit,
-                    "occurred_at": occurred_at,
-                },
-            )
-            self._log_changed(
-                f"project:{summary.id}:audit_budget:{code}",
-                logging.WARNING,
-                "audit project budget exhausted project=%s code=%s detail=%s",
-                summary.id,
-                code,
-                message,
-            )
+            self._record_audit_budget_blocker(project, budget_state)
             if self._complete_if_gate_ready(project):
                 return True
             return False
         if not self._source_audit_preflight(project):
             return True
         self._honor_manual_provider_retries(project)
+        self._honor_project_worker_issue_resumes(project)
         # Managed audit mechanics are derived exclusively from the exported
         # graph and immutable project artifacts. Scope mode derives the Recon DAG;
         # hypothesis mode derives only configured baseline scan
@@ -524,9 +509,20 @@ class DispatcherLoop:
                 if reason_trigger is not None else []
             )
             if reason_trigger is not None and self._reason_may_run(project, trigger_events):
+                if self._reason_waits_for_initial_recon(project, trigger_events):
+                    self._log_changed(
+                        f"project:{summary.id}:reason_wait_initial_recon",
+                        logging.INFO,
+                        "defer warmup reason project=%s until initial Recon categories return",
+                        summary.id,
+                    )
+                    # Do not advance reason_last_seen_event_seq. The first
+                    # post-bootstrap Reason pass will receive the whole event batch.
+                    return False
                 self._restore_reason_cooldown(project)
                 cooldown_until = self._reason_cooldown_until.get(summary.id, 0.0)
-                if time.time() < cooldown_until:
+                priority_wake = self._reason_has_priority_wake(project, trigger_events)
+                if time.time() < cooldown_until and not priority_wake:
                     self._log_changed(
                         f"project:{summary.id}:reason_noop_cooldown",
                         logging.INFO,
@@ -618,14 +614,38 @@ class DispatcherLoop:
                 summary.id,
                 [intent.id for intent in deferred_by_error],
             )
-        if self._scope_gate_pending(project) and unclaimed_intents:
-            self._log_changed(
-                f"{skip_scope}:scope_gate",
-                logging.INFO,
-                "scope adjudication incomplete; dispatching exploratory work while final reporting remains gated project=%s queued_intents=%s",
-                summary.id,
-                [intent.id for intent in unclaimed_intents],
-            )
+        if unclaimed_intents:
+            scope_evidence_pending = self._scope_evidence_review_pending(project)
+            scope_pending = self._scope_gate_pending(project)
+            deferred_by_scope = []
+            if scope_evidence_pending or scope_pending:
+                runnable_intents = []
+                for intent in unclaimed_intents:
+                    description = intent.description.strip()
+                    is_recon_work = (
+                        description == recon.SNAPSHOT_INTENT
+                        or description == recon.COVERAGE_REVIEW_INTENT
+                        or recon.category_from_description(description) is not None
+                        or codeql.is_intent(intent)
+                    )
+                    if scope_evidence_pending and scope_gate.is_adjudication_intent(intent):
+                        deferred_by_scope.append(intent)
+                    elif scope_pending and (
+                        is_recon_work
+                        or description == audit_graph.AUDIT_SUMMARY_INTENT
+                    ):
+                        deferred_by_scope.append(intent)
+                    else:
+                        runnable_intents.append(intent)
+                unclaimed_intents = runnable_intents
+            if deferred_by_scope:
+                self._log_changed(
+                    f"{skip_scope}:scope_gate",
+                    logging.INFO,
+                    "scope gate withholding adjudication or Recon work until required independent reviews pass project=%s intents=%s",
+                    summary.id,
+                    [intent.id for intent in deferred_by_scope],
+                )
         if running_intent_ids and not unclaimed_intents:
             self._log_changed(
                 f"{skip_scope}:explore_running",
@@ -753,6 +773,15 @@ class DispatcherLoop:
                 matched_run_ids.add(matched_run)
         run_count = len(runs) + unregistered_local_runs
         max_runs = getattr(self.config.audit, "max_runs_per_project", 250)
+        wall_clock_budget = getattr(self.config.audit, "wall_clock_budget_seconds", 43200)
+        deadline_epoch = self._wall_clock_deadline(project.project.id, runs)
+        if deadline_epoch is not None and time.time() >= deadline_epoch:
+            deadline = datetime.fromtimestamp(deadline_epoch, timezone.utc).isoformat().replace("+00:00", "Z")
+            return (
+                "audit_wall_clock_budget_exhausted",
+                f"Wall-clock budget exhausted ({wall_clock_budget} seconds).",
+                deadline,
+            )
         if run_count >= max_runs:
             run_starts = sorted(
                 (
@@ -774,22 +803,133 @@ class DispatcherLoop:
                 occurrence,
             )
 
-        started_values = [
+        return None
+
+    def _wall_clock_deadline(self, project_id: str, runs: list[object] | None = None) -> float | None:
+        """Return the persisted project cutoff, with run history as a migration fallback."""
+        deadlines = getattr(self, "_audit_deadlines", None)
+        if deadlines is None:
+            deadlines = {}
+            self._audit_deadlines = deadlines
+        if project_id in deadlines:
+            return deadlines[project_id]
+        budget = getattr(self.config.audit, "wall_clock_budget_seconds", 43200)
+        get_events = getattr(getattr(self, "client", None), "get_audit_events", None)
+        if callable(get_events):
+            try:
+                for event in get_events(project_id, after=0, limit=2000):
+                    payload = getattr(event, "payload", {})
+                    if (
+                        getattr(event, "event_type", None) == "audit_budget_started"
+                        and getattr(event, "actor", None) == "dispatcher.health"
+                        and payload.get("code") == "audit_wall_clock_budget_started"
+                        and payload.get("budget_limit") == budget
+                    ):
+                        deadline = self._timestamp_seconds(payload.get("deadline_at"))
+                        if deadline is not None:
+                            deadlines[project_id] = deadline
+                            return deadline
+            except Exception:
+                LOG.debug("persisted audit deadline lookup failed project=%s", project_id, exc_info=True)
+        if runs is None:
+            try:
+                runs = self.client.list_runs(project_id)
+            except Exception:
+                return None
+        starts = [
             self._timestamp_seconds(self._run_value(run, "started_at"))
             for run in runs
         ]
-        started_values = [value for value in started_values if value is not None]
-        wall_clock_budget = getattr(self.config.audit, "wall_clock_budget_seconds", 43200)
-        if started_values and time.time() - min(started_values) >= wall_clock_budget:
-            deadline = datetime.fromtimestamp(
-                min(started_values) + wall_clock_budget, timezone.utc,
-            ).isoformat().replace("+00:00", "Z")
-            return (
-                "audit_wall_clock_budget_exhausted",
-                f"Wall-clock budget exhausted ({wall_clock_budget} seconds).",
-                deadline,
-            )
+        starts = [started for started in starts if started is not None]
+        if starts:
+            deadline = min(starts) + budget
+            deadlines[project_id] = deadline
+            return deadline
+        # Before the first run row/event is visible, all local tasks share one
+        # in-memory deadline; _task_cancellation persists its origin event.
+        if any(task.project_id == project_id for task in self.futures.values()):
+            deadline = time.time() + budget
+            deadlines[project_id] = deadline
+            return deadline
         return None
+
+    def _task_cancellation(self, project: ProjectDetail) -> TaskCancellation:
+        project_id = project.project.id
+        if project.project.audit_mode == "none":
+            return TaskCancellation()
+        try:
+            runs = self.client.list_runs(project_id)
+        except Exception:
+            LOG.exception("could not restore audit deadline before dispatch project=%s", project_id)
+            runs = []
+        deadline = self._wall_clock_deadline(project_id, runs)
+        wall_clock_budget = getattr(self.config.audit, "wall_clock_budget_seconds", 43200)
+        if deadline is None:
+            started = time.time()
+            deadline = started + wall_clock_budget
+            self._audit_deadlines[project_id] = deadline
+            started_at = datetime.fromtimestamp(started, timezone.utc).isoformat().replace("+00:00", "Z")
+            deadline_at = datetime.fromtimestamp(deadline, timezone.utc).isoformat().replace("+00:00", "Z")
+            self._append_runtime_health_event(
+                project,
+                "audit_budget_started",
+                "audit_wall_clock_budget_started",
+                {
+                    "budget_limit": wall_clock_budget,
+                    "started_at": started_at,
+                    "deadline_at": deadline_at,
+                    "occurred_at": started_at,
+                },
+            )
+        return TaskCancellation(deadline_epoch=deadline)
+
+    def _record_audit_budget_blocker(
+        self,
+        project: ProjectDetail,
+        state: tuple[str, str, str] | str,
+    ) -> None:
+        if state == "unavailable":
+            return
+        code, message, occurred_at = state
+        budget_limit = (
+            getattr(self.config.audit, "max_runs_per_project", 250)
+            if code == "audit_run_budget_exhausted"
+            else getattr(self.config.audit, "wall_clock_budget_seconds", 43200)
+        )
+        self._append_runtime_health_event(
+            project,
+            "audit_budget_blocked",
+            code,
+            {"message": message, "budget_limit": budget_limit, "occurred_at": occurred_at},
+        )
+        self._log_changed(
+            f"project:{project.project.id}:audit_budget:{code}",
+            logging.WARNING,
+            "audit project budget exhausted project=%s code=%s detail=%s",
+            project.project.id,
+            code,
+            message,
+        )
+
+    def _enforce_running_audit_budgets(self, summaries: list[ProjectSummary]) -> None:
+        """Cancel in-flight model work as soon as an audit wall-clock cutoff passes."""
+        active = {task.project_id for task in self.futures.values()}
+        for summary in summaries:
+            if summary.id not in active:
+                continue
+            try:
+                project = self.client.get_project(summary.id)
+                state = self._audit_project_budget_state(project)
+            except Exception:
+                LOG.exception("could not enforce audit deadline project=%s", summary.id)
+                continue
+            if state == "unavailable" or state is None:
+                continue
+            self._record_audit_budget_blocker(project, state)
+            if state[0] == "audit_wall_clock_budget_exhausted":
+                for task in list(self.futures.values()):
+                    if task.project_id == summary.id:
+                        task.cancellation.cancel("audit_wall_clock_budget_exhausted")
 
     @staticmethod
     def _run_value(run: object, key: str) -> object:
@@ -822,10 +962,17 @@ class DispatcherLoop:
             f"dispatcher-health:{code}:g{project.project.source_generation}"
             f":p{project.project.plan_revision}"
         )
-        if event_type == "audit_budget_blocked":
+        if event_type in {"audit_budget_blocked", "audit_budget_started"}:
             idempotency_key += f":limit={payload.get('budget_limit', 'unknown')}"
         else:
             idempotency_key += f":e{sequence}"
+        cache_key = (project.project.id, idempotency_key)
+        if event_type in {"audit_budget_blocked", "audit_budget_started"}:
+            cache = getattr(self, "_budget_health_events", None)
+            if cache is None:
+                cache = self._budget_health_events = {}
+            if cache_key in cache:
+                return cache[cache_key]
         occurrence = payload.get("occurred_at")
         created_at = (
             occurrence.strip()
@@ -852,6 +999,35 @@ class DispatcherLoop:
             LOG.exception("runtime health event write failed project=%s code=%s", project.project.id, code)
             return None
         if hasattr(response, "ok") and not response.ok:
+            if event_type in {"audit_budget_blocked", "audit_budget_started"} and response.status_code == 409:
+                # A restarted dispatcher may encounter a budget event written
+                # at an earlier graph revision. Recover that immutable event;
+                # never replace its content or relax server idempotency checks.
+                getter = getattr(self.client, "get_audit_events", None)
+                after = 0
+                try:
+                    while callable(getter) and after < sequence:
+                        page = getter(project.project.id, after=after, limit=2000)
+                        if not page:
+                            break
+                        for prior in page:
+                            if (
+                                prior.sequence <= sequence
+                                and prior.event_type == event_type
+                                and prior.actor == "dispatcher.health"
+                                and prior.source_generation == project.project.source_generation
+                                and prior.plan_revision == project.project.plan_revision
+                                and prior.payload.get("code") == code
+                                and prior.payload.get("budget_limit") == payload.get("budget_limit")
+                            ):
+                                cache[cache_key] = prior.sequence
+                                return prior.sequence
+                        last = max(prior.sequence for prior in page)
+                        if last <= after:
+                            break
+                        after = last
+                except Exception:
+                    LOG.debug("budget health event recovery failed project=%s", project.project.id, exc_info=True)
             LOG.warning(
                 "runtime health event write rejected project=%s code=%s status=%s",
                 project.project.id,
@@ -871,9 +1047,12 @@ class DispatcherLoop:
                     else getattr(result_data, "sequence", None)
                 )
         try:
-            return int(result_sequence) if result_sequence is not None else sequence + 1
+            result_sequence = int(result_sequence) if result_sequence is not None else sequence + 1
         except (TypeError, ValueError):
-            return sequence + 1
+            result_sequence = sequence + 1
+        if event_type == "audit_budget_blocked":
+            cache[cache_key] = result_sequence
+        return result_sequence
 
     def _observe_reason_noop(self, task: RunningTask) -> None:
         project_id = task.project_id
@@ -894,9 +1073,9 @@ class DispatcherLoop:
         if project.project.audit_mode == "none":
             self._reason_noop_streak.pop(project_id, None)
             return
-        if self._project_open_intent_count(project) != 0:
-            self._reason_noop_streak[project_id] = 0
-            return
+        # Reason's no-op says its strategy pass made no graph progress. Open
+        # Explore/Review work is scheduled independently and must not keep
+        # waking Reason on routine graph churn forever.
         cooldown = getattr(self.config.audit, "reason_noop_cooldown_seconds", 900)
         until = time.time() + cooldown
         self._reason_cooldown_until[project_id] = until
@@ -1321,6 +1500,103 @@ class DispatcherLoop:
             return 1
         return max(int(error.attempt_count) for error in current) + 1
 
+    def _next_intent_attempt(
+        self,
+        project: ProjectDetail,
+        intent: Intent,
+        *,
+        task_type: str,
+    ) -> int:
+        """Continue the correction ordinal across phases and re-dispatches.
+
+        A failed attempt itself advances ``graph_revision`` when its error is
+        recorded, so graph revision cannot scope this budget. Keep the ordinal
+        within the same source generation and plan, which define the actual
+        audit work item.
+        """
+        attempt = self._intent_attempt(project, intent, task_type=task_type)
+        if task_type != "explore" or not (
+            self.config.audit.enabled and project.project.audit_mode != "none"
+        ):
+            return attempt
+        try:
+            runs = self.client.list_runs(project.project.id)
+        except Exception:
+            LOG.exception(
+                "could not restore result-correction attempt project=%s intent=%s",
+                project.project.id, intent.id,
+            )
+            return attempt
+        process_started_by_run = self._execution_attempt_process_states(project)
+        prior_attempts = [
+            int(value)
+            for run in runs
+            if self._run_value(run, "intent_id") == intent.id
+            and not str(self._run_value(run, "task_type") or "").startswith("review")
+            and self._run_value(run, "source_generation") == project.project.source_generation
+            and self._run_value(run, "plan_revision") == project.project.plan_revision
+            and process_started_by_run.get(self._run_value(run, "run_id")) is not False
+            and (value := self._run_value(run, "attempt")) is not None
+        ]
+        return max(attempt, max(prior_attempts, default=0) + 1)
+
+    def _execution_attempt_process_states(
+        self, project: ProjectDetail,
+    ) -> dict[str, bool]:
+        """Read process-start metadata for runs in the current event snapshot.
+
+        A cancelled or policy-blocked run that never started a worker process
+        must not consume a result-correction attempt. Older runs without this
+        event remain conservatively counted.
+        """
+        project_id = project.project.id
+        through = int(getattr(project.project, "event_seq", 0) or 0)
+        cache = getattr(self, "_execution_attempt_state_cache", None)
+        if cache is None:
+            cache = self._execution_attempt_state_cache = {}
+        cache_key = (project_id, through)
+        if cache_key in cache:
+            return cache[cache_key]
+        getter = getattr(getattr(self, "client", None), "get_audit_events", None)
+        if getter is None or through <= 0:
+            return {}
+
+        states: dict[str, bool] = {}
+        after = 0
+        try:
+            while after < through:
+                page = getter(project_id, after=after, limit=2000)
+                if not page:
+                    break
+                for event in page:
+                    if (
+                        event.sequence > through
+                        or event.event_type != "execution_attempt_finished"
+                        or not event.entity_id
+                    ):
+                        continue
+                    started = event.payload.get("process_started")
+                    if isinstance(started, bool):
+                        states[event.entity_id] = started
+                last = max(event.sequence for event in page)
+                if last <= after:
+                    break
+                after = last
+        except Exception:
+            LOG.warning(
+                "execution attempt metadata unavailable project=%s",
+                project_id,
+                exc_info=True,
+            )
+            return {}
+
+        # Keep only the latest event snapshot per project to bound dispatcher
+        # memory while avoiding repeated reads during one scheduler revision.
+        for key in [key for key in cache if key[0] == project_id and key != cache_key]:
+            cache.pop(key, None)
+        cache[cache_key] = states
+        return states
+
     def _reason_attempt(
         self,
         project: ProjectDetail,
@@ -1381,13 +1657,7 @@ class DispatcherLoop:
             "reason",
             worker_preference=project.project.worker_preference,
         )
-        worker = selection.worker
-        if (
-            worker is not None
-            and project.project.audit_mode != "none"
-            and worker.type == "codex"
-        ):
-            worker = worker.model_copy(update={"sandbox_mode": "read-only"})
+        worker = self._codex_audit_sandbox(selection.worker, project)
         if worker is None:
             self._log_changed(
                 f"project:{project.project.id}:worker:reason",
@@ -1421,6 +1691,7 @@ class DispatcherLoop:
                 claim.status_code,
             )
             return False
+        cancellation = self._task_cancellation(project)
         try:
             future = self._submit_task_runner(
                 run_reason_task,
@@ -1430,7 +1701,7 @@ class DispatcherLoop:
                 project,
                 export_yaml,
                 worker,
-                cancellation := TaskCancellation(),
+                cancellation,
                 lease_id=lease_id,
                 trigger=trigger,
                 trigger_events=trigger_events or [],
@@ -1438,6 +1709,7 @@ class DispatcherLoop:
             )
         except Exception:
             LOG.exception("failed to submit reason task project=%s worker=%s", project.project.id, worker.name)
+            cancellation.close()
             self._best_effort_release_reason(project.project.id, worker.name, lease_id)
             return False
         self.futures[future] = RunningTask(
@@ -1483,13 +1755,7 @@ class DispatcherLoop:
             provider_required=provider_required,
             worker_health_required=not (codeql_scan or dynamic_recipe),
         )
-        worker = selection.worker
-        if (
-            worker is not None
-            and project.project.audit_mode != "none"
-            and worker.type == "codex"
-        ):
-            worker = worker.model_copy(update={"sandbox_mode": "read-only"})
+        worker = self._codex_audit_sandbox(selection.worker, project, intent)
         if worker is None:
             self._log_changed(
                 f"project:{project.project.id}:worker:explore",
@@ -1504,7 +1770,7 @@ class DispatcherLoop:
             return False
         self._clear_log_state(f"project:{project.project.id}:worker:explore")
         trigger = f"explore:intent:{intent.id}"
-        attempt = self._intent_attempt(project, intent, task_type="explore")
+        attempt = self._next_intent_attempt(project, intent, task_type="explore")
         claim = self.client.heartbeat(project.project.id, intent.id, worker.name)
         if claim.status_code in (403, 409):
             level = logging.INFO if claim.status_code == 403 else logging.WARNING
@@ -1526,6 +1792,7 @@ class DispatcherLoop:
                 claim.status_code,
             )
             return False
+        cancellation = self._task_cancellation(project)
         try:
             future = self._submit_task_runner(
                 run_explore_task,
@@ -1536,12 +1803,13 @@ class DispatcherLoop:
                 export_yaml,
                 intent,
                 worker,
-                cancellation := TaskCancellation(),
+                cancellation,
                 trigger=trigger,
                 attempt=attempt,
             )
         except Exception:
             LOG.exception("failed to submit explore task project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
+            cancellation.close()
             self._best_effort_release(project.project.id, intent.id, worker.name)
             return False
         self.futures[future] = RunningTask(
@@ -1572,13 +1840,7 @@ class DispatcherLoop:
             "review",
             worker_preference=project.project.worker_preference,
         )
-        worker = selection.worker
-        if (
-            worker is not None
-            and project.project.audit_mode != "none"
-            and worker.type == "codex"
-        ):
-            worker = worker.model_copy(update={"sandbox_mode": "read-only"})
+        worker = self._codex_audit_sandbox(selection.worker, project, intent)
         if worker is None:
             self._log_changed(
                 f"project:{project.project.id}:worker:review",
@@ -1609,6 +1871,7 @@ class DispatcherLoop:
                 project.project.id, intent.id, worker.name, claim.status_code,
             )
             return False
+        cancellation = self._task_cancellation(project)
         try:
             future = self._submit_task_runner(
                 run_review_task,
@@ -1619,12 +1882,13 @@ class DispatcherLoop:
                 export_yaml,
                 intent,
                 worker,
-                cancellation := TaskCancellation(),
+                cancellation,
                 trigger=trigger,
                 attempt=attempt,
             )
         except Exception:
             LOG.exception("failed to submit review task project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
+            cancellation.close()
             self._best_effort_release(project.project.id, intent.id, worker.name)
             return False
         self.futures[future] = RunningTask(
@@ -1640,6 +1904,31 @@ class DispatcherLoop:
         self._clear_project_log_state(project.project.id)
         LOG.info("dispatched review project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
         return True
+
+    @staticmethod
+    def _codex_audit_sandbox(
+        worker: WorkerConfig | None,
+        project: ProjectDetail,
+        intent: Intent | None = None,
+    ) -> WorkerConfig | None:
+        """Default Codex audit work to read-only unless the operator opted out.
+
+        The OS sandbox (``--sandbox read-only``) is the only read-only
+        mechanism Codex exposes, so it stays the safe default for audit
+        tasks. An explicit ``sandbox_mode`` in dispatch.yaml always wins: on
+        hosts that cannot apply a restrictive Seatbelt profile the operator
+        must disclose a different isolation strategy rather than silently
+        lose the worker, and the choice is visible in config review.
+        ``poc:isolated`` runs execute inside the disposable Docker sandbox,
+        where read-only would block the reproduction.
+        """
+        if worker is None or project.project.audit_mode == "none":
+            return worker
+        if worker.type != "codex" or worker.sandbox_mode is not None:
+            return worker
+        if intent is not None and (intent.type or "").startswith("poc:isolated"):
+            return worker
+        return worker.model_copy(update={"sandbox_mode": "read-only"})
 
     def _select_worker(
         self,
@@ -1695,6 +1984,7 @@ class DispatcherLoop:
             if provider_until and provider_until <= now:
                 self.worker_provider_until.pop(worker.name, None)
                 self.worker_provider_reason.pop(worker.name, None)
+                getattr(self, "worker_provider_opened_at", {}).pop(worker.name, None)
                 self._persist_provider_circuits()
             rejected_until = self.worker_rejected_until.get((project_id, task_type, worker.name), 0)
             if worker_health_required and rejected_until > now:
@@ -1749,7 +2039,7 @@ class DispatcherLoop:
             and scope_gate.is_evidence_intent(intent)
         ):
             return False
-        if self.config.audit.recon.enabled and description == "@analysis:recon-snapshot":
+        if self.config.audit.recon_active and description == "@analysis:recon-snapshot":
             return False
         if codeql.active_for_project(project, self.config.audit.codeql) and codeql.is_intent(intent):
             return False
@@ -1760,18 +2050,26 @@ class DispatcherLoop:
             return False
         return description != audit_graph.AUDIT_SUMMARY_INTENT
 
-    def _scope_gate_pending(self, project: ProjectDetail) -> bool:
+    def _scope_evidence_review_pending(self, project: ProjectDetail) -> bool:
         if not (
             self.config.audit.scope_adjudication.enabled
             and project.project.audit_mode == "scope"
         ):
             return False
         evidence = scope_gate.result_for_intent(project, scope_gate.EVIDENCE_INTENT)
-        if (
+        return (
             evidence is None
             or evidence.type != scope_gate.POLICY_EVIDENCE_TYPE
             or not coverage.reviewed(project, evidence.id)
+        )
+
+    def _scope_gate_pending(self, project: ProjectDetail) -> bool:
+        if not (
+            self.config.audit.scope_adjudication.enabled
+            and project.project.audit_mode == "scope"
         ):
+            return False
+        if self._scope_evidence_review_pending(project):
             return True
         adjudication = scope_gate.result_for_intent(
             project, scope_gate.ADJUDICATION_INTENT,
@@ -1853,6 +2151,8 @@ class DispatcherLoop:
                     continue
                 self.worker_provider_until.pop(worker_name, None)
                 self.worker_provider_reason.pop(worker_name, None)
+                getattr(self, "worker_provider_opened_at", {}).pop(worker_name, None)
+                getattr(self, "worker_provider_origin", {}).pop(worker_name, None)
                 changed = True
                 LOG.info(
                     "manual retry cleared provider circuit project=%s intent=%s worker=%s",
@@ -1863,7 +2163,98 @@ class DispatcherLoop:
         if changed:
             self._persist_provider_circuits()
 
+    def _honor_project_worker_issue_resumes(self, project: ProjectDetail) -> None:
+        """Clear provider cooldowns for workers explicitly resumed by an operator."""
+        getter = getattr(getattr(self, "client", None), "get_audit_events", None)
+        if getter is None:
+            return
+        project_id = project.project.id
+        through = int(getattr(project.project, "event_seq", 0) or 0)
+        cursors = getattr(self, "_provider_resume_event_cursors", None)
+        if cursors is None:
+            cursors = self._provider_resume_event_cursors = {}
+        after = cursors.get(project_id, 0)
+        if after >= through:
+            return
+
+        events: list[AuditEvent] = []
+        try:
+            while after < through:
+                page = getter(project_id, after=after, limit=2000)
+                if not page:
+                    break
+                events.extend(event for event in page if event.sequence <= through)
+                last = max(event.sequence for event in page)
+                if last <= after:
+                    break
+                after = last
+        except Exception:
+            LOG.warning(
+                "provider resume events unavailable project=%s",
+                project_id,
+                exc_info=True,
+            )
+            return
+        cursors[project_id] = min(after, through)
+
+        opened_at = getattr(self, "worker_provider_opened_at", {})
+        origins = getattr(self, "worker_provider_origin", None)
+        if origins is None:
+            origins = self.worker_provider_origin = {}
+        changed = False
+        for event in events:
+            if event.event_type != "project_worker_issue_resumed":
+                continue
+            issues = event.payload.get("worker_issues")
+            if not isinstance(issues, list):
+                continue
+            for issue in issues:
+                if not isinstance(issue, dict):
+                    continue
+                worker_name = issue.get("worker")
+                if not isinstance(worker_name, str) or not worker_name:
+                    continue
+                until = self.worker_provider_until.get(worker_name, 0)
+                if until <= 0:
+                    continue
+                origin = origins.get(worker_name)
+                if origin is not None:
+                    origin_project_id, blocked_event_seq = origin
+                    if (
+                        origin_project_id != project_id
+                        or event.sequence <= blocked_event_seq
+                    ):
+                        continue
+                else:
+                    # Older circuit files have no event provenance. Retain the
+                    # timestamp guard for those files only.
+                    try:
+                        resumed_at = datetime.fromisoformat(
+                            event.created_at.replace("Z", "+00:00")
+                        ).timestamp()
+                    except (AttributeError, ValueError):
+                        continue
+                    circuit_opened_at = opened_at.get(worker_name)
+                    if circuit_opened_at is not None and resumed_at < circuit_opened_at:
+                        continue
+                self.worker_provider_until.pop(worker_name, None)
+                self.worker_provider_reason.pop(worker_name, None)
+                opened_at.pop(worker_name, None)
+                origins.pop(worker_name, None)
+                changed = True
+                LOG.info(
+                    "project worker issue resume cleared provider circuit project=%s worker=%s",
+                    project_id,
+                    worker_name,
+                )
+        if changed:
+            self._persist_provider_circuits()
+
     def _restore_provider_circuits(self) -> None:
+        if getattr(self, "worker_provider_opened_at", None) is None:
+            self.worker_provider_opened_at = {}
+        if getattr(self, "worker_provider_origin", None) is None:
+            self.worker_provider_origin = {}
         path = self._provider_circuit_path()
         if path is None or not path.is_file():
             return
@@ -1881,6 +2272,30 @@ class DispatcherLoop:
                     continue
                 self.worker_provider_until[worker_name] = until
                 self.worker_provider_reason[worker_name] = reason
+                opened_at = state.get("opened_at")
+                if isinstance(opened_at, (int, float)):
+                    self.worker_provider_opened_at[worker_name] = float(opened_at)
+                else:
+                    retry_window = (
+                        QUOTA_EXHAUSTED_RETRY_AFTER_SECONDS
+                        if reason == "quota_exhausted"
+                        else RATE_LIMIT_RETRY_AFTER_SECONDS
+                    )
+                    self.worker_provider_opened_at[worker_name] = max(
+                        0.0, until - retry_window,
+                    )
+                origin_project_id = state.get("origin_project_id")
+                origin_blocked_event_seq = state.get("origin_blocked_event_seq")
+                if (
+                    isinstance(origin_project_id, str)
+                    and origin_project_id
+                    and isinstance(origin_blocked_event_seq, int)
+                    and not isinstance(origin_blocked_event_seq, bool)
+                    and origin_blocked_event_seq >= 0
+                ):
+                    self.worker_provider_origin[worker_name] = (
+                        origin_project_id, origin_blocked_event_seq,
+                    )
                 LOG.warning(
                     "restored worker provider circuit worker=%s outcome=%s retry_in=%.0fs",
                     worker_name,
@@ -1896,12 +2311,20 @@ class DispatcherLoop:
             return
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
+            origins = getattr(self, "worker_provider_origin", {})
             payload = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "workers": {
                     worker_name: {
                         "until": until,
                         "reason": self.worker_provider_reason.get(worker_name, "unavailable"),
+                        "opened_at": getattr(self, "worker_provider_opened_at", {}).get(worker_name),
+                        "origin_project_id": (
+                            origins[worker_name][0] if worker_name in origins else None
+                        ),
+                        "origin_blocked_event_seq": (
+                            origins[worker_name][1] if worker_name in origins else None
+                        ),
                     }
                     for worker_name, until in self.worker_provider_until.items()
                     if until > time.time()
@@ -1951,6 +2374,20 @@ class DispatcherLoop:
     def _project_open_intent_count(self, project: ProjectDetail) -> int:
         return sum(1 for intent in project.intents if intent.to is None and intent.concluded_at is None)
 
+    def _dispatchable_open_intent_count(self, project: ProjectDetail) -> int:
+        """Open intents the scheduler could actually pick up.
+
+        Mirrors the dispatch gate (`_intent_error_allows_dispatch`) so an audit
+        whose only open intents are withheld by an unresolved error is treated
+        as stalled rather than as having pending work.
+        """
+        return sum(
+            1 for intent in project.intents
+            if intent.to is None
+            and intent.concluded_at is None
+            and self._intent_error_allows_dispatch(project, intent)
+        )
+
     def _reason_trigger_events(self, project: ProjectDetail, trigger: str) -> list[AuditEvent]:
         match = re.fullmatch(r"events:(\d+)->(\d+)", trigger)
         getter = getattr(getattr(self, "client", None), "get_audit_events", None)
@@ -1986,13 +2423,19 @@ class DispatcherLoop:
             "candidate_finding", "confirmed_finding", "negative_assurance",
             "candidate_disposition", "source", "sink", "dataflow",
             "sanitizer", "validation", "reachability", "recon",
+            "scope", "hypothesis",
         }
         for event in trigger_events or []:
             if event.event_type in {
                 "audit_task_abandoned", "technical_confirmation",
                 "dynamic_verification_pass", "proof_strategy_replan_required",
+                "human_hint_created",
             }:
                 return True
+            if event.event_type == "audit_task_failed":
+                classification = event.payload.get("classification")
+                if classification in {"blocked", "permanent"} or event.payload.get("retry_at") is None:
+                    return True
             if event.event_type not in {"audit_task_concluded", "review_created"}:
                 continue
             fact_id = event.payload.get("fact_id")
@@ -2007,6 +2450,11 @@ class DispatcherLoop:
             if (
                 fact.semantic_type in strategy_fact_types
                 or fact.type in strategy_fact_types
+                or fact.type in {
+                    "candidate_disposition", "vulnerability", "negative_assurance",
+                    "policy_evidence", "scope_adjudication", "hypothesis_batch",
+                    "variant_batch",
+                }
             ):
                 return True
             if event.event_type == "audit_task_concluded" and fact.type == "coverage_result":
@@ -2038,6 +2486,178 @@ class DispatcherLoop:
                 f"->{project.project.event_seq}"
             )
         return None
+
+    @staticmethod
+    def _reason_has_priority_wake(
+        project: ProjectDetail, trigger_events: list[AuditEvent],
+    ) -> bool:
+        """Events with fresh safety evidence may pass a no-op cooldown."""
+        if not trigger_events:
+            return False
+        significant = {
+            "audit_task_abandoned", "technical_confirmation",
+            "dynamic_verification_pass", "proof_strategy_replan_required",
+            "human_hint_created",
+        }
+        if any(event.event_type in significant for event in trigger_events):
+            return True
+        if any(
+            event.event_type == "audit_task_failed"
+            and (
+                event.payload.get("classification") in {"blocked", "permanent"}
+                or event.payload.get("retry_at") is None
+            )
+            for event in trigger_events
+        ):
+            return True
+        facts_by_id = {fact.id: fact for fact in project.facts}
+        priority_fact_types = {
+            "candidate_finding", "confirmed_finding", "vulnerability",
+            "negative_assurance", "candidate_disposition", "dataflow",
+            "reachability", "recon", "hypothesis_batch", "variant_batch",
+            "policy_evidence", "scope_adjudication",
+        }
+        for event in trigger_events:
+            if event.event_type not in {"audit_task_concluded", "review_created"}:
+                continue
+            fact_id = event.payload.get("fact_id")
+            fact = facts_by_id.get(fact_id) if isinstance(fact_id, str) else None
+            if fact is not None and (
+                fact.semantic_type in {"candidate_finding", "confirmed_finding", "negative_assurance", "scope", "hypothesis"}
+                or fact.type in priority_fact_types
+            ):
+                return True
+        return False
+
+    def _reason_waits_for_initial_recon(
+        self, project: ProjectDetail, trigger_events: list[AuditEvent],
+    ) -> bool:
+        """Batch scope-mode Recon warmup events until configured lenses return.
+
+        This deliberately inspects only current-generation/plan graph rows; it
+        does not open Recon artifacts or write additional protocol facts.
+        """
+        audit = getattr(getattr(self, "config", None), "audit", None)
+        recon_config = getattr(audit, "recon", None)
+        if (
+            project.project.audit_mode != "scope"
+            or recon_config is None
+            or not recon.active_for_project(project, recon_config)
+            or not trigger_events
+        ):
+            return False
+
+        # Human direction, terminal failures, candidate facts, and explicit
+        # security evidence must never wait for the Recon bootstrap barrier.
+        if self._reason_has_non_warmup_priority(project, trigger_events):
+            return False
+
+        current_intents = [
+            intent for intent in project.intents
+            if intent.source_generation == project.project.source_generation
+            and intent.plan_revision == project.project.plan_revision
+        ]
+        managed_descriptions = {
+            recon.SNAPSHOT_INTENT,
+            codeql.INTENT,
+            scope_gate.EVIDENCE_INTENT,
+            scope_gate.ADJUDICATION_INTENT,
+        }
+        has_managed_work = any(
+            intent.to is None
+            and intent.concluded_at is None
+            and (
+                intent.description.strip() in managed_descriptions
+                or intent.description.strip().startswith(codeql.QUERY_PREFIX)
+                or recon.category_from_description(intent.description) is not None
+            )
+            for intent in current_intents
+        )
+        if not has_managed_work:
+            return False
+
+        initial_incomplete = False
+        for category in recon_config.categories:
+            fact = recon.latest_category_fact(project, category)
+            if fact is None or fact.source_generation != project.project.source_generation:
+                initial_incomplete = True
+                continue
+            producer = next((intent for intent in current_intents if intent.to == fact.id), None)
+            if producer is None:
+                initial_incomplete = True
+        if not initial_incomplete:
+            return False
+
+        # Delay only event batches wholly explained by bootstrap/preflight,
+        # policy evidence, or a managed Recon/CodeQL result. A mixed batch may
+        # contain a fresh reason to act, so let normal evidence gating decide.
+        for event in trigger_events:
+            if event.event_type not in {"audit_task_concluded", "review_created"}:
+                return False
+            fact_id = event.payload.get("fact_id")
+            if not isinstance(fact_id, str):
+                return False
+            fact = next((item for item in project.facts if item.id == fact_id), None)
+            if fact is None:
+                return False
+            if fact.type in {"policy_evidence", "bootstrap", "preflight", "source_preflight"}:
+                continue
+            producer = next((intent for intent in current_intents if intent.to == fact.id), None)
+            if producer is None:
+                return False
+            if fact.type == "recon" and (
+                recon.category_from_description(producer.description) is not None
+                or producer.description.strip() == "@analysis:codeql-path-candidates"
+                or producer.description.strip().startswith("@analysis:codeql-query:")
+            ):
+                continue
+            return False
+        return True
+
+    @staticmethod
+    def _reason_has_non_warmup_priority(
+        project: ProjectDetail, trigger_events: list[AuditEvent],
+    ) -> bool:
+        if any(
+            event.event_type in {
+                "human_hint_created", "audit_task_abandoned", "technical_confirmation",
+                "dynamic_verification_pass", "proof_strategy_replan_required",
+            }
+            or event.event_type == "audit_task_failed" and (
+                event.payload.get("classification") in {"blocked", "permanent"}
+                or event.payload.get("retry_at") is None
+            )
+            for event in trigger_events
+        ):
+            return True
+        facts_by_id = {fact.id: fact for fact in project.facts}
+        urgent_types = {
+            "candidate_finding", "confirmed_finding", "vulnerability",
+            "negative_assurance", "candidate_disposition", "source", "sink",
+            "dataflow", "sanitizer", "validation", "reachability",
+            "scope_adjudication", "hypothesis_batch", "variant_batch",
+        }
+        return any(
+            event.event_type in {"audit_task_concluded", "review_created"}
+            and isinstance((fact_id := event.payload.get("fact_id")), str)
+            and (fact := facts_by_id.get(fact_id)) is not None
+            and (
+                fact.type in urgent_types
+                or fact.semantic_type in urgent_types
+                or fact.type == "recon" and DispatcherLoop._recon_fact_has_leads(fact)
+            )
+            for event in trigger_events
+        )
+
+    @staticmethod
+    def _recon_fact_has_leads(fact) -> bool:
+        """Read the exported summary only; do not open provider artifacts."""
+        evidence = fact.evidence if isinstance(fact.evidence, str) else ""
+        for label in ("leads", "candidates"):
+            match = re.search(rf"(?m)^{label}:\s*(\d+)\b", evidence)
+            if match and int(match.group(1)) > 0:
+                return True
+        return False
 
     def _reap_futures(self) -> None:
         # Some embedders and older tests construct the loop without calling
@@ -2088,7 +2708,19 @@ class DispatcherLoop:
                         if outcome == "quota_exhausted"
                         else RATE_LIMIT_RETRY_AFTER_SECONDS
                     )
-                    provider_until = time.time() + retry_after_seconds
+                    now = time.time()
+                    provider_until = now + retry_after_seconds
+                    opened_at = getattr(self, "worker_provider_opened_at", None)
+                    if opened_at is None:
+                        opened_at = self.worker_provider_opened_at = {}
+                    current_until = self.worker_provider_until.get(task.worker_name, 0)
+                    current_reason = self.worker_provider_reason.get(task.worker_name)
+                    new_episode = current_until <= now or current_reason != outcome
+                    if new_episode:
+                        opened_at[task.worker_name] = now
+                    origins = getattr(self, "worker_provider_origin", None)
+                    if origins is not None and (new_episode or outcome == "quota_exhausted"):
+                        origins.pop(task.worker_name, None)
                     self.worker_provider_until[task.worker_name] = max(
                         self.worker_provider_until.get(task.worker_name, 0),
                         provider_until,
@@ -2104,6 +2736,8 @@ class DispatcherLoop:
                 elif outcome in {"success", "noop"} and task.provider_required:
                     removed = self.worker_provider_until.pop(task.worker_name, None)
                     self.worker_provider_reason.pop(task.worker_name, None)
+                    getattr(self, "worker_provider_opened_at", {}).pop(task.worker_name, None)
+                    getattr(self, "worker_provider_origin", {}).pop(task.worker_name, None)
                     if removed is not None:
                         self._persist_provider_circuits()
                 rejection_key = (task.project_id, task.task_type, task.worker_name)
@@ -2132,6 +2766,8 @@ class DispatcherLoop:
             except Exception as exc:
                 LOG.exception("task crashed project=%s task=%s worker=%s", task.project_id, task.task_type, task.worker_name)
                 self._record_intent_error(task, "task_crashed", detail=str(exc))
+            finally:
+                task.cancellation.close()
 
         # Refresh `runtime_project_ids` to mirror the projects that actually
         # still have a running task. Without this, a project stays "in
@@ -2313,6 +2949,26 @@ class DispatcherLoop:
                 )
                 self._record_intent_error(task, outcome, detail=message)
                 return
+            if outcome == "quota_exhausted":
+                data = getattr(response, "data", None)
+                blocked_event_seq = (
+                    data.get("event_seq") if isinstance(data, Mapping) else None
+                )
+                origins = getattr(self, "worker_provider_origin", None)
+                if origins is None:
+                    origins = self.worker_provider_origin = {}
+                # Replace stale provenance even when a compatible API response
+                # omits event_seq; those circuits use the legacy time fallback.
+                origins.pop(task.worker_name, None)
+                if (
+                    isinstance(blocked_event_seq, int)
+                    and not isinstance(blocked_event_seq, bool)
+                    and blocked_event_seq > 0
+                ):
+                    origins[task.worker_name] = (
+                        task.project_id, blocked_event_seq,
+                    )
+                self._persist_provider_circuits()
             LOG.error(
                 "paused project after CLI issue project=%s task=%s worker=%s code=%s intent=%s",
                 task.project_id,

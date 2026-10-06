@@ -459,6 +459,19 @@ def audit_completion_blockers_from_db(
     for review in review_rows:
         reviews.setdefault(review["fact_id"], []).append(review)
 
+    # Reopen feedback is workflow context supplied by an operator, not a
+    # code-evidence claim. Keep its source edge in the completion chain, but
+    # do not require the request itself to carry source citations or a Review.
+    external_feedback_ids = {
+        row["to_fact_id"]
+        for row in conn.execute(
+            "SELECT to_fact_id FROM intents WHERE project_id = ? "
+            "AND description = 'external_feedback' AND to_fact_id IS NOT NULL "
+            "AND source_generation = ?",
+            (project_id, generation),
+        )
+    }
+
     blockers: list[str] = []
     required_types = {"audit_summary"} if audit_mode == "scope" else {"negative_assurance"}
     required_ids = [
@@ -513,6 +526,16 @@ def audit_completion_blockers_from_db(
         fact = facts.get(fact_id)
         if fact is None or fact_id == "goal":
             blockers.append(f"Invalid evidence reference: {fact_id}.")
+            return
+        if fact_id in external_feedback_ids:
+            source_ids = parents.get(fact_id, [])
+            if not source_ids:
+                blockers.append(f"External feedback {fact_id} has no linked source facts.")
+                return
+            active.add(fact_id)
+            for parent_id in source_ids:
+                visit(parent_id)
+            active.remove(fact_id)
             return
         review_exhausted = fact_id in exhausted_summary_candidates
         if (

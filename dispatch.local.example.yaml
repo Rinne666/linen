@@ -16,7 +16,8 @@
 server: "http://127.0.0.1:9000"
 
 runtime:
-  worker_healthcheck: disabled  # no base_url to probe; startup instead checks the CLIs are on PATH
+  worker_healthcheck: disabled  # disable automatic checks; the explicit healthcheck command still works
+  healthcheck_probe: availability  # response sends a small read-only model request through each CLI
   max_workers: 3               # all workers share this host — size to the machine
   max_running_projects: 2
   max_project_workers: 2

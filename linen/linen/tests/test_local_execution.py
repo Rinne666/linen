@@ -9,11 +9,17 @@ from pydantic import ValidationError
 
 from linen.dispatcher.config import DispatchConfig, LocalConfig, WorkerConfig
 from linen.dispatcher.runtime.backend import LocalBackend
+from linen.dispatcher.runtime.contracts import build_execution_contracts
 from linen.dispatcher.runtime.process import LocalProcess
+from linen.dispatcher.protocol.client import ApiResult
 from linen.dispatcher.scheduler import loop as loop_module
 from linen.dispatcher.tasks import common, explore
-from linen.dispatcher.runtime.cancellation import TaskCancellation
+from linen.dispatcher.runtime.cancellation import (
+    CANCELLATION_CLEANUP_GRACE_SECONDS,
+    TaskCancellation,
+)
 from linen.dispatcher.workers.adapters.codex import CodexDriver
+from linen.dispatcher.workers.adapters.claudecode import ClaudeCodeDriver
 from linen.dispatcher.workers.adapters.pi import PiDriver
 from linen.dispatcher.workers.registry import get_driver
 
@@ -111,6 +117,160 @@ def test_local_process_cancel_records_reason() -> None:
 
     assert result.cancelled
     assert result.cancel_reason == "project stopped"
+
+
+def test_audit_deadline_cancels_running_worker_within_cleanup_grace() -> None:
+    process = LocalProcess(
+        ["python3", "-c", "import time; time.sleep(30)"],
+        cwd=os.getcwd(),
+        env=dict(os.environ),
+        timeout_seconds=30,
+        term_grace_seconds=1,
+    )
+    cancellation = TaskCancellation(deadline_epoch=time.time() + 0.35)
+    process.start()
+    cancellation.attach_process(process)
+    started = time.monotonic()
+    try:
+        result = process.communicate(timeout=10)
+    finally:
+        cancellation.attach_process(None)
+        cancellation.close()
+
+    assert result.cancelled
+    assert result.cancel_reason == "audit_wall_clock_budget_exhausted"
+    assert time.monotonic() - started < CANCELLATION_CLEANUP_GRACE_SECONDS
+
+
+def test_pre_cancelled_run_is_terminal_without_starting_worker(tmp_path: Path) -> None:
+    project = make_project(intents=[make_intent()])
+    worker = DispatchConfig.model_validate(make_config()).workers[0]
+    manifest, run = build_execution_contracts(
+        project,
+        worker,
+        "explore_execute",
+        timeout_seconds=30,
+        attempt=1,
+        intent_id="i001",
+        logical_scope="deadline-acceptance",
+        recipe_id="test",
+        recipe_version=1,
+        prompt="test worker invocation",
+    )
+
+    class RecordingClient:
+        def __init__(self):
+            self.registered = None
+            self.terminal = None
+            self.events = []
+
+        def register_run(self, envelope):
+            self.registered = envelope
+            return ApiResult(201, {})
+
+        def transition_run(self, envelope):
+            self.terminal = envelope
+            return ApiResult(200, {})
+
+        def register_artifact(self, _artifact):
+            return _artifact
+
+        def append_audit_event(self, event):
+            self.events.append(event)
+            return ApiResult(201, {})
+
+    class NoWorkerBackend(LocalBackend):
+        def __init__(self, root):
+            super().__init__(LocalConfig(workspace_root=str(root)))
+            self.worker_starts = 0
+
+        def build_exec_process(self, *args, **kwargs):
+            self.worker_starts += 1
+            raise AssertionError("cancelled worker must never be started")
+
+    backend = NoWorkerBackend(tmp_path)
+    project_handle = backend.ensure_running("proj_001")
+    client = RecordingClient()
+    cancellation = TaskCancellation(deadline_epoch=time.time() + 10)
+    cancellation.cancel("audit_wall_clock_budget_exhausted")
+    try:
+        result = common.run_worker_process(
+            backend,
+            project_handle,
+            worker,
+            ["never-run"],
+            phase="explore_execute",
+            timeout_seconds=30,
+            cancellation=cancellation,
+            client=client,
+            run_envelope=run,
+            worker_manifest=manifest,
+            recipe_content_digest=manifest.recipe.digest,
+        )
+    finally:
+        cancellation.close()
+        backend.close()
+
+    assert result.cancelled
+    assert client.registered.status == "running"
+    assert client.terminal.status == "cancelled"
+    assert len(client.terminal.artifact_ids) == 3
+    assert backend.worker_starts == 0
+    finished = [event for event in client.events if event.event_type == "execution_attempt_finished"]
+    assert len(finished) == 1
+    assert finished[0].payload["process_started"] is False
+    assert finished[0].payload["attempt_status"] == "cancelled"
+
+
+def test_deadline_expiring_during_process_setup_never_starts_worker(tmp_path: Path) -> None:
+    worker = DispatchConfig.model_validate(make_config()).workers[0]
+    backend = LocalBackend(LocalConfig(workspace_root=str(tmp_path)))
+    project_handle = backend.ensure_running("proj_001")
+
+    class NeverStartedProcess:
+        def __init__(self):
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+        def communicate(self, timeout):
+            raise AssertionError("process should not be communicated")
+
+        def cancel(self, _reason):
+            return None
+
+        def kill(self):
+            return None
+
+    processes = []
+
+    def slow_process_setup(*_args, **_kwargs):
+        time.sleep(1.2)
+        process = NeverStartedProcess()
+        processes.append(process)
+        return process
+
+    backend.build_exec_process = slow_process_setup
+    cancellation = TaskCancellation(deadline_epoch=time.time() + 1.1)
+    try:
+        result = common.run_worker_process(
+            backend,
+            project_handle,
+            worker,
+            ["never-run"],
+            phase="explore_execute",
+            timeout_seconds=30,
+            cancellation=cancellation,
+        )
+    finally:
+        cancellation.close()
+        backend.close()
+
+    assert result.cancelled
+    assert result.cancel_reason == "audit_wall_clock_budget_exhausted"
+    assert len(processes) == 1
+    assert processes[0].started is False
 
 
 # --------------------------------------------------------------------------- LocalBackend
@@ -307,7 +467,7 @@ def test_codex_local_driver_omits_provider_injection() -> None:
     worker = _bare_worker("codex")
     argv = CodexDriver(local=True).build_execute(worker, "PROMPT", None).argv
 
-    assert argv == ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--", "PROMPT"]
+    assert argv == ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--json", "--", "PROMPT"]
     assert not any("model_providers" in part for part in argv)
     assert "--model" not in argv
 
@@ -333,6 +493,68 @@ def test_registry_returns_local_driver_variants() -> None:
     assert get_driver("pi").local is True
     assert get_driver("claudecode") is get_driver("claudecode")
     assert get_driver("mock") is get_driver("mock")
+
+
+POC_PROMPT = "# ISOLATED POC EXECUTION TASK\nReproduce the candidate in the sandbox.\n"
+READONLY_RECON_PROMPT = "# READ-ONLY RECON TASK\nSurvey the repository.\n"
+
+
+def test_claude_poc_prompt_grants_execution_tools_in_read_only_worker() -> None:
+    worker = _bare_worker("claudecode").model_copy(update={"sandbox_mode": "read-only"})
+    argv = get_driver("claudecode").build_execute(worker, POC_PROMPT, "sess-1").argv
+
+    assert "--dangerously-skip-permissions" in argv
+    assert "--safe-mode" not in argv
+    assert "--restricted" not in argv
+
+
+def test_claude_read_only_prompt_still_restricts_tools() -> None:
+    worker = _bare_worker("claudecode")
+    argv = get_driver("claudecode").build_execute(worker, READONLY_RECON_PROMPT, "sess-1").argv
+
+    assert "--safe-mode" in argv
+    assert "--restricted" in argv
+    assert argv[argv.index("--tools") + 1] == "Read,Grep,Glob"
+    # Plan mode would make strict-output tasks present a plan instead of their
+    # JSON contract; read-only enforcement already comes from the tool allowlist.
+    assert "--permission-mode" not in argv
+
+
+def test_claude_read_only_prompt_allows_only_its_generated_context_projection() -> None:
+    worker = _bare_worker("claudecode").model_copy(update={"sandbox_mode": "read-only"})
+    projection_dir = "/tmp/linen-prompts/explore_execute-ctx-" + "a" * 64
+    prompt = READONLY_RECON_PROMPT + f"\nContext: {projection_dir}/context.json"
+    driver = ClaudeCodeDriver()
+
+    for argv in (
+        driver.build_execute(worker, prompt, "sess-1").argv,
+        driver.build_conclude(worker, prompt, "sess-1"),
+    ):
+        assert argv[argv.index("--add-dir") + 1] == projection_dir
+        assert argv[argv.index("--tools") + 1] == "Read,Grep,Glob"
+        assert "--dangerously-skip-permissions" not in argv
+
+
+def test_claude_read_only_prompt_fails_closed_on_ambiguous_context_paths() -> None:
+    worker = _bare_worker("claudecode").model_copy(update={"sandbox_mode": "read-only"})
+    path_a = "/tmp/linen-prompts/explore_execute-ctx-" + "a" * 64 + "/context.json"
+    path_b = "/tmp/linen-prompts/reason_execute-ctx-" + "b" * 64 + "/context.json"
+    argv = get_driver("claudecode").build_execute(
+        worker, READONLY_RECON_PROMPT + f"\n{path_a}\n{path_b}", "sess-1",
+    ).argv
+
+    assert "--add-dir" not in argv
+
+
+def test_pi_poc_prompt_grants_write_and_bash_tools_in_read_only_worker() -> None:
+    worker = _bare_worker("pi").model_copy(update={"sandbox_mode": "read-only"})
+    argv = PiDriver(local=True).build_execute(worker, POC_PROMPT, None).argv
+
+    tools = argv[argv.index("--tools") + 1]
+    assert "bash" in tools and "write" in tools
+
+    recon_argv = PiDriver(local=True).build_execute(worker, READONLY_RECON_PROMPT, None).argv
+    assert recon_argv[recon_argv.index("--tools") + 1] == "read,grep,find,ls"
 
 
 # --------------------------------------------------------------------------- end to end
@@ -437,5 +659,47 @@ def test_explore_local_cli_rejection_releases_intent(tmp_path: Path, monkeypatch
     )
 
     assert outcome == "rejected"
+    assert client.concluded == []
+    assert client.released == [("proj_001", "i001", "test-worker")]
+
+
+def test_explore_retry_collision_with_terminal_run_fails_without_crashing(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A replayed attempt reuses a deterministic run id. When that id already
+    exists in a terminal state the protocol raises; the task must surface a
+    normal failed attempt so the scheduler advances the attempt counter and
+    derives a fresh run id, instead of dying with an unhandled traceback."""
+    _install_fake_cli(
+        tmp_path,
+        monkeypatch,
+        "claude",
+        "echo '{\"accepted\":true,\"data\":{\"description\":\"local fake fact\"}}'",
+    )
+    monkeypatch.setattr(common, "GRAPH_SNAPSHOT_ROOT", str(tmp_path / "prompts"))
+
+    config = _local_config_for_worker("test-worker", "claudecode")
+    backend = LocalBackend(LocalConfig(workspace_root=str(tmp_path / "work")))
+    intent = make_intent()
+    project = make_project(intents=[intent])
+
+    class TerminalRunClient(FakeClient):
+        def register_run(self, run):
+            return run.model_copy(update={"status": "succeeded"})
+
+    client = TerminalRunClient(project)
+
+    outcome = explore.run_explore_task(
+        config,
+        client,
+        backend,
+        project,
+        "facts:\n- id: f001\n",
+        intent,
+        config.workers[0],
+        TaskCancellation(),
+    )
+
+    assert outcome == "failed"
     assert client.concluded == []
     assert client.released == [("proj_001", "i001", "test-worker")]

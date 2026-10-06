@@ -236,7 +236,7 @@ def report_failure(
             )
 
         historical_attempts = conn.execute(
-            "SELECT COALESCE(SUM(attempt_count), 0) AS attempts "
+            "SELECT COALESCE(MAX(attempt_count), 0) AS attempts "
             "FROM intent_errors WHERE project_id = ? AND intent_id = ? "
             "AND code = ? AND resolved_at IS NOT NULL",
             (project_id, intent_id, body.code),

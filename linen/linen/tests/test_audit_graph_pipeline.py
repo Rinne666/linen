@@ -10,7 +10,7 @@ from click.testing import CliRunner
 
 from test_audit_pipeline import FakeDriver, api, config, project
 from linen.cli import main
-from linen.dispatcher.analysis import audit_graph, coverage, scope_gate
+from linen.dispatcher.analysis import audit_graph, coverage, recon, scope_gate
 from linen.dispatcher.analysis.benchmark import compare_strategies, evaluate
 from linen.dispatcher.config import (
     PocSandboxConfig,
@@ -91,6 +91,7 @@ def _conclude(client, project_id: str, parents: list[str], description: str,
 
 def test_scope_initial_intents_are_derived_from_graph(tmp_path):
     cfg = config(tmp_path, mode="scope")
+    cfg.audit.recon.enabled = True
     from linen.server.models import ProjectDetail, ProjectMeta
 
     board = ProjectDetail(
@@ -103,13 +104,14 @@ def test_scope_initial_intents_are_derived_from_graph(tmp_path):
     )
     proposals = audit_graph.required_intents(board, tmp_path, cfg.audit)
     assert [(item["type"], item["description"]) for item in proposals] == [
-        ("search", "@analysis:coverage-plan"),
+        ("search", recon.SNAPSHOT_INTENT),
     ]
     assert all(item["from"] == ["origin"] for item in proposals)
 
 
-def test_terminal_coverage_plan_is_not_reproposed_forever(tmp_path):
+def test_terminal_recon_snapshot_without_result_has_bounded_retry(tmp_path):
     cfg = config(tmp_path, mode="scope")
+    cfg.audit.recon.enabled = True
     board = ProjectDetail(
         project=ProjectMeta(
             id="proj_001", title="audit", status="active", bootstrap_enabled=False,
@@ -117,13 +119,18 @@ def test_terminal_coverage_plan_is_not_reproposed_forever(tmp_path):
         ),
         facts=[Fact(id="origin", description="repo"), Fact(id="goal", description="audit")],
         intents=[Intent(
-            id="i001", from_=["origin"], description=coverage.PLAN_INTENT,
+            id="i001", from_=["origin"], description=recon.SNAPSHOT_INTENT,
             type="search", creator=audit_graph.CREATOR,
             created_at="2026-01-01T00:00:01Z", concluded_at="2026-01-01T00:00:02Z",
         )],
         hints=[], reviews=[],
     )
 
+    proposals = audit_graph.required_intents(board, tmp_path, cfg.audit)
+    assert len(proposals) == 1
+    assert proposals[0]["target"].endswith("attempt:2")
+    for index in range(2, audit_graph.MAX_STAGE_INTENT_ATTEMPTS + 1):
+        board.intents.append(board.intents[0].model_copy(update={"id": f"i{index:03d}"}))
     assert audit_graph.required_intents(board, tmp_path, cfg.audit) == []
 
 
@@ -257,6 +264,30 @@ def test_coverage_result_keeps_review_because_it_carries_negative_assurance():
     assert proposals[0]["from"] == ["f-coverage"]
 
 
+def test_sanitizer_negative_control_gets_independent_review():
+    board = ProjectDetail(
+        project=ProjectMeta(
+            id="proj_negative_control", title="audit", status="active",
+            bootstrap_enabled=False, audit_mode="scope", created_at="2026-01-01T00:00:00Z",
+        ),
+        facts=[
+            Fact(id="origin", description="repo"), Fact(id="goal", description="audit"),
+            Fact(
+                id="f-negative", description="parameter binding blocks SQL injection",
+                type="sanitizer", semantic_type="observation", status="draft",
+                evidence="testcode/BenchmarkTest00011.py:47-50",
+            ),
+        ],
+        intents=[], hints=[], reviews=[],
+    )
+
+    assert audit_graph._review_proposals(board) == [{
+        "from": ["f-negative"],
+        "type": "review:devils-advocate",
+        "description": "@analysis:review:f-negative",
+    }]
+
+
 def test_legacy_plan_review_does_not_trigger_a_second_llm_attestation(tmp_path):
     board = ProjectDetail(
         project=ProjectMeta(
@@ -306,6 +337,7 @@ def test_legacy_plan_review_does_not_trigger_a_second_llm_attestation(tmp_path):
 def test_scheduler_materializes_graph_intents_idempotently(api, tmp_path):
     _, client = api
     cfg = config(tmp_path, mode="scope")
+    cfg.audit.recon.enabled = True
     board = project(api, audit_mode="scope")
     loop = DispatcherLoop.__new__(DispatcherLoop)
     loop.config = cfg
@@ -314,7 +346,7 @@ def test_scheduler_materializes_graph_intents_idempotently(api, tmp_path):
     assert loop._materialize_audit_intents(board)
     fresh = client.get_project(board.project.id)
     assert {intent.description for intent in fresh.intents} == {
-        "@analysis:coverage-plan",
+        recon.SNAPSHOT_INTENT,
     }
     assert all(intent.creator == audit_graph.CREATOR for intent in fresh.intents)
     assert not loop._materialize_audit_intents(fresh)
@@ -323,6 +355,7 @@ def test_scheduler_materializes_graph_intents_idempotently(api, tmp_path):
 def test_scope_gate_bypasses_a_full_legacy_ready_window(api, tmp_path):
     _, client = api
     cfg = config(tmp_path, mode="scope")
+    cfg.audit.recon.enabled = True
     cfg.audit.scope_adjudication = ScopeAdjudicationConfig(
         enabled=True,
         local_paths=["SECURITY.md"],
@@ -351,6 +384,7 @@ def test_scope_gate_bypasses_a_full_legacy_ready_window(api, tmp_path):
 def test_scope_evidence_missing_repository_becomes_visible_blocker(api, tmp_path):
     _, client = api
     cfg = config(tmp_path, mode="scope")
+    cfg.audit.recon.enabled = True
     cfg.audit.scope_adjudication = ScopeAdjudicationConfig(
         enabled=True,
         local_paths=["SECURITY.md"],
@@ -388,9 +422,69 @@ def test_scope_evidence_missing_repository_becomes_visible_blocker(api, tmp_path
     assert fresh.errors[0].code == "source_repository_missing"
 
 
+def test_exhausted_recon_repair_budget_concludes_claim_free_gap(api, tmp_path, monkeypatch):
+    _, client = api
+    cfg = config(tmp_path, mode="scope")
+    cfg.audit.recon.enabled = True
+    cfg.audit.max_result_attempts = 3
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("value = request.args['value']\nhandle(value)\n")
+    board = project(api, repo=repo, audit_mode="scope")
+    backend = LocalBackend(cfg.local, client)
+    workdir = Path(backend.ensure_running(board.project.id))
+    snapshot = recon.create_snapshot(repo, workdir, 1, cfg.audit.recon)
+    snapshot_intent = client.create_intent(
+        board.project.id, ["origin"], recon.SNAPSHOT_INTENT,
+        audit_graph.CREATOR, intent_type="search",
+    ).data
+    assert client.heartbeat(board.project.id, snapshot_intent["id"], "tester").ok
+    snapshot_write = client.conclude(
+        board.project.id, snapshot_intent["id"], "tester",
+        snapshot["description"], fact_type=snapshot["type"], evidence=snapshot["evidence"],
+    )
+    assert snapshot_write.ok, snapshot_write.text
+    snapshot_fact_id = snapshot_write.data["fact"]["id"]
+    category_intent = client.create_intent(
+        board.project.id, [snapshot_fact_id], recon.category_description("input-validation"),
+        audit_graph.CREATOR, intent_type="search",
+    ).data
+    worker = cfg.workers[0]
+    assert client.heartbeat(board.project.id, category_intent["id"], worker.name).ok
+    current = client.get_project(board.project.id)
+    intent = next(item for item in current.intents if item.id == category_intent["id"])
+    monkeypatch.setattr(
+        explore, "_run_process",
+        lambda *_args, **_kwargs: pytest.fail("exhausted correction budget must not call a model"),
+    )
+
+    outcome = explore.run_explore_task(
+        cfg,
+        client,
+        backend,
+        current,
+        client.export_project(board.project.id),
+        intent,
+        worker,
+        TaskCancellation(),
+        attempt=4,
+    )
+
+    assert outcome == "success"
+    concluded = client.get_project(board.project.id)
+    result = next(f for f in concluded.facts if f.type == "recon")
+    record = recon.result_record(result, workdir)
+    assert result.status == "triaged"
+    assert record["status"] == "partial"
+    assert record["leads"] == []
+    assert record["citations"] == []
+    assert "No model result passed validation" in record["gaps"][0]
+
+
 def test_isolated_poc_uses_sandbox_backend_without_host_fallback(api, tmp_path, monkeypatch):
     _, client = api
     cfg = config(tmp_path, mode="scope")
+    cfg.audit.recon.enabled = True
     cfg.audit.poc_sandbox = PocSandboxConfig(enabled=True, image="trusted-local-image")
     current = project(api, audit_mode="scope")
     pid = current.project.id
@@ -432,7 +526,14 @@ def test_isolated_poc_uses_sandbox_backend_without_host_fallback(api, tmp_path, 
     ) == "success"
     assert len(seen) == 1 and isinstance(seen[0], FakeSandbox)
     assert seen[0] is not host
-    assert "Withheld for isolated proof-of-concept" in driver.prompts[0]
+    prompt = driver.prompts[0]
+    assert "Withheld for isolated proof-of-concept" in prompt
+    # The reproduction target (candidate statement and cited evidence) must
+    # cross into the container; prior graph reasoning stays withheld.
+    assert prompt.startswith("# ISOLATED POC EXECUTION TASK")
+    assert "Candidate statement to reproduce" in prompt
+    assert "Cited evidence" in prompt
+    assert coverage.PLAN_INTENT in prompt
 
 
 def test_benchmark_requires_three_runs_and_reports_stability(tmp_path):

@@ -649,6 +649,17 @@ class WorkerCallCost(BaseModel):
     calls: int = 0
     duration_ms: int = 0
     unarchived_attempts: int = 0
+    setup_failures: int = 0
+    usage_recorded_calls: int = 0
+    usage_unknown_calls: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    total_tokens: int | None = None
+    usage_coverage_calls: dict[str, int] = Field(default_factory=dict)
+    attempt_status_counts: dict[str, int] = Field(default_factory=dict)
+    failure_code_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class ProjectCostLedger(BaseModel):

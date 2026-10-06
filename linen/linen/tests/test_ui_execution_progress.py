@@ -32,6 +32,7 @@ def test_status_rail_surfaces_current_work_recent_activity_and_audit_progress() 
     assert 'x-text="lastActivityLabel()"' in status_rail
     assert ">Audit progress</div>" in status_rail
     assert 'x-text="auditProgressLabel()"' in status_rail
+    assert "completionGate?.ready && auditCoverageSummary().complete === true" in status_rail
 
 
 def test_audit_progress_uses_real_stage_and_gate_counts() -> None:
@@ -51,8 +52,8 @@ def test_reviewed_candidate_blocker_exposes_technical_confirmation_action() -> N
     start = source.index("technicalConfirmationCandidates() {")
     end = source.index("technicalConfirmationFailureMessage(error)", start)
     candidates = source[start:end]
-    assert "currentDecisionForTarget('fact', fact.id)" in candidates
-    assert "['reject', 'exclude'].includes" in candidates
+    assert "ids.has(fact.id)" in candidates
+    assert "fact.semantic_type === 'candidate_finding'" in candidates
     assert "Review passed · technical proof not yet confirmed" in source
     assert "Run technical confirmation" in source
     assert "confirmReviewedFinding(fact.id)" in source
@@ -81,3 +82,23 @@ def test_activity_loader_starts_near_latest_event_and_then_fetches_incrementally
     assert "const after = latestLoaded || Math.max(0, projectEventSeq - 500);" in loader
     assert "`/projects/${projectId}/events?after=${after}&limit=500`" in loader
     assert "eventsBySequence.set(event.sequence, event)" in loader
+
+
+def test_paused_hero_takes_precedence_over_queued_work_and_confirmation() -> None:
+    import json
+    import subprocess
+    source = html()
+    method = source[source.index('projectPrimaryStatus() {'):source.index('executionStatusDotClass() {', source.index('projectPrimaryStatus() {'))]
+    script = 'const view = {' + method + '''
+      project: {project: {status: 'stopped'}},
+      technicalConfirmationCandidates: () => [{id: 'f001'}],
+      workingIntentCount: () => 1,
+      openIntentCount: () => 2,
+    };
+    console.log(JSON.stringify(view.projectPrimaryStatus()));'''
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, check=True)
+    status = json.loads(result.stdout)
+    assert status['eyebrow'] == 'Paused'
+    assert status['title'] == 'Audit is paused'
+    assert 'automatically' not in status['detail']
+    assert not status.get('completionAction')

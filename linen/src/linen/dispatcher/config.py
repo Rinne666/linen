@@ -148,6 +148,7 @@ class RuntimeConfig(BaseModel):
     interval: int = Field(gt=0)
     healthcheck_timeout: int = Field(gt=0)
     worker_healthcheck: WorkerHealthcheckMode = "startup_only"
+    healthcheck_probe: Literal["availability", "response"] = "availability"
     prompt_group: str = Field(min_length=1)
 
 
@@ -158,8 +159,10 @@ class WorkerConfig(BaseModel):
     type: WorkerType
     task_types: list[TaskType]
     max_running: int = Field(gt=0)
-    # Accepted for compatibility with older dispatch.yaml files. Scheduling
-    # no longer uses priority; project preferences and live load decide.
+    # Higher values win worker selection; an unset value ranks as 0. Ties
+    # break on live load and then at random, so equal priorities still share
+    # work across workers. This is how an operator pins a preferred CLI
+    # (e.g. codex) ahead of the others while keeping the rest as fallback.
     priority: int | None = Field(default=None, ge=0)
     env: dict[str, str] = Field(default_factory=dict)
     # Optional CLI sandbox/tool restriction. Codex audit tasks are dispatched
@@ -242,7 +245,10 @@ class ReconConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = True
+    # Opt-in follows audit: None (unset) inherits audit.enabled and scope
+    # mode, so generic configs stay valid and audit configs keep recon on.
+    # Explicit True with audit disabled still fails cross-field validation.
+    enabled: bool | None = None
     categories: list[str] = Field(default_factory=lambda: [
         "input-validation", "authorization", "dangerous-api",
     ])
@@ -478,6 +484,9 @@ class AuditConfig(BaseModel):
     # audit work or dispatches another worker process.
     max_runs_per_project: int = Field(default=250, gt=0, le=100_000)
     wall_clock_budget_seconds: int = Field(default=43_200, gt=0, le=604_800)
+    # Count execute, conclude, and re-dispatch corrections on one explore
+    # intent as a single bounded result-repair budget.
+    max_result_attempts: int = Field(default=3, ge=1, le=10)
     # Health signals stop repeated no-op strategy calls and surface idle audits.
     reason_noop_limit: int = Field(default=3, gt=0, le=10)
     reason_noop_cooldown_seconds: int = Field(default=900, gt=0, le=86_400)
@@ -496,11 +505,23 @@ class AuditConfig(BaseModel):
 
     @model_validator(mode="after")
     def require_repository_recon_for_scope(self) -> "AuditConfig":
-        if self.enabled and self.mode == "scope" and not self.recon.enabled:
+        if self.enabled and self.mode == "scope" and not self.recon_active:
             raise ValueError(
                 "scope audits require audit.recon.enabled; the coverage-cell pipeline is retired"
             )
         return self
+
+    @property
+    def recon_active(self) -> bool:
+        """Whether category reconnaissance runs.
+
+        ``recon.enabled is None`` (unset) inherits ``audit.enabled`` and scope
+        mode, so generic configs stay valid without an audit section while
+        scope audits keep recon on unless explicitly disabled.
+        """
+        if self.recon.enabled is None:
+            return self.enabled and self.mode == "scope"
+        return self.recon.enabled
 
 
 
@@ -555,11 +576,11 @@ class DispatchConfig(BaseModel):
         if self.audit.enabled:
             if not any("review" in worker.task_types for worker in self.workers):
                 raise ValueError("audit mode requires at least one review worker")
-        if self.audit.recon.enabled and not self.audit.enabled:
+        if self.audit.recon.enabled is True and not self.audit.enabled:
             raise ValueError("audit recon requires audit.enabled")
-        if self.audit.recon.enabled and self.audit.mode != "scope":
+        if self.audit.recon.enabled is True and self.audit.mode != "scope":
             raise ValueError("audit recon requires scope mode")
-        if self.audit.recon.enabled and not any(
+        if self.audit.recon_active and not any(
             "explore" in worker.task_types for worker in self.workers
         ):
             raise ValueError("audit.recon requires an explore worker")
@@ -567,7 +588,7 @@ class DispatchConfig(BaseModel):
             raise ValueError("audit.codeql requires audit.enabled")
         if self.audit.codeql.enabled and self.audit.mode != "scope":
             raise ValueError("audit.codeql requires scope mode")
-        if self.audit.codeql.enabled and not self.audit.recon.enabled:
+        if self.audit.codeql.enabled and not self.audit.recon_active:
             raise ValueError("audit.codeql requires a frozen reconnaissance snapshot")
         if self.audit.codeql.enabled and not any(
             "explore" in worker.task_types for worker in self.workers

@@ -119,7 +119,7 @@ class FakeClient:
 
     def conclude(
         self, project_id: str, intent_id: str, worker: str, description: str,
-        *, fact_type: str | None = None, evidence: str | None = None, status: str = "draft",
+        *, fact_type: str | None = None, evidence: str | None = None, status: str = "draft", candidate_budget: int | None = None, proof=None,
     ) -> ApiResult:
         self.concluded.append((project_id, intent_id, worker, description))
         return ApiResult(200, {"fact": {"id": "f002"}})
