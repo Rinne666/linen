@@ -16,8 +16,10 @@ from typing import Any
 from linen.server.models import Fact
 from linen.server.routers.executions import workspace_root
 from linen.server.uvpg import PROOF_GATE_VERSION, evaluate_proof_gate, proof_graph_fingerprint
+from linen.contracts.oracle import OracleObservation, judge_http_observation
+from linen.server.oracle_registry import approved_oracle
 
-DYNAMIC_GATE_VERSION = "uvpg-dynamic-v1"
+DYNAMIC_GATE_VERSION = "uvpg-dynamic-v2-oracle"
 _RUN_SUCCESS = frozenset({"completed", "succeeded"})
 
 
@@ -104,7 +106,7 @@ def _dynamic_facts(conn: sqlite3.Connection, project_id: str, candidate_id: str,
 
 
 def _artifact_path(project: sqlite3.Row, artifact: sqlite3.Row) -> Path | None:
-    root = Path(project["repo_root"]).expanduser().resolve() if project["repo_root"] else (workspace_root() / project["id"]).resolve()
+    root = (workspace_root() / project["id"]).resolve()
     raw = Path(artifact["workspace_path"])
     candidate = raw if raw.is_absolute() else root / raw
     try:
@@ -116,6 +118,65 @@ def _artifact_path(project: sqlite3.Row, artifact: sqlite3.Row) -> Path | None:
     except OSError:
         return None
     return path
+
+
+def _independent_observation(conn: sqlite3.Connection, project: sqlite3.Row, fact: Fact, role: str) -> tuple[dict | None, list[str]]:
+    from linen.dispatcher.runtime.oracle_runner import oracle_checker_digest
+
+    attrs = _attributes(fact)
+    try:
+        definition = approved_oracle(project["id"], attrs.get("candidate_id"), project["source_generation"], project["plan_revision"])
+    except (ValueError, OSError):
+        return None, ["INDEPENDENT_ORACLE_UNAVAILABLE"]
+    run = conn.execute("SELECT * FROM runs WHERE project_id = ? AND run_id = ?", (project["id"], attrs.get("run_id"))).fetchone()
+    if run is None or run["task_type"] != "poc:oracle" or run["worker_type"] != "builtin-oracle":
+        return None, ["UNTRUSTED_DYNAMIC_OBSERVATION"]
+    if run["source_generation"] != project["source_generation"] or run["plan_revision"] != project["plan_revision"]:
+        return None, ["STALE_DYNAMIC_EVIDENCE"]
+    ids = attrs.get("artifact_ids", [])
+    if not isinstance(ids, list) or not ids or any(not isinstance(value, str) for value in ids):
+        return None, ["DYNAMIC_ARTIFACT_MISSING"]
+    observations = []
+    for artifact_id in ids:
+        artifact = conn.execute("SELECT * FROM artifacts WHERE project_id = ? AND artifact_id = ?", (project["id"], artifact_id)).fetchone()
+        if artifact is None or artifact["kind"] != "independent-oracle-observation" or artifact["producer_run_id"] != run["run_id"]:
+            continue
+        path = _artifact_path(project, artifact)
+        if path is None:
+            return None, ["DYNAMIC_ARTIFACT_MISSING"]
+        try:
+            with path.open("rb") as stream:
+                data = stream.read(100001)
+        except OSError:
+            return None, ["DYNAMIC_ARTIFACT_MISSING"]
+        if len(data) > 100000:
+            return None, ["DYNAMIC_ORACLE_INVALID_OBSERVATION"]
+        if hashlib.sha256(data).hexdigest() != artifact["sha256"]:
+            return None, ["DYNAMIC_ARTIFACT_HASH_MISMATCH"]
+        try:
+            receipt = OracleObservation.model_validate_json(data).model_dump(mode="json")
+            expected = {"kind": "independent-oracle-observation", "project_id": project["id"],
+                        "candidate_id": attrs.get("candidate_id"), "run_id": run["run_id"], "role": role,
+                        "source_generation": project["source_generation"], "plan_revision": project["plan_revision"],
+                        "oracle_id": definition.id, "oracle_definition_sha256": definition.canonical_digest(),
+                        "checker_sha256": oracle_checker_digest(), "snapshot_id": definition.source_digest}
+            if any(receipt.get(key) != value for key, value in expected.items()):
+                return None, ["DYNAMIC_ORACLE_BINDING_MISMATCH"]
+            isolation = receipt.get("isolation", {})
+            if any(isolation.get(key) != value for key, value in {
+                "target_network": "none", "observer_network": "target-loopback-only", "host_credentials": "not_injected",
+                "separate_filesystems": True, "separate_pid_namespaces": True, "source_read_only": True,
+            }.items()) or isolation.get("target_container") == isolation.get("observer_container"):
+                return None, ["UNSAFE_DYNAMIC_EXECUTION"]
+            if not isolation.get("target_image_id") or isolation.get("target_image_id") != isolation.get("observer_image_id"):
+                return None, ["DYNAMIC_BASELINE_MISMATCH"]
+            capability = judge_http_observation(definition.predicate, receipt["raw_observation"])
+            if type(receipt.get("capability_observed")) is not bool or capability != receipt["capability_observed"]:
+                return None, ["DYNAMIC_ORACLE_OBSERVATION_MISMATCH"]
+            observations.append(receipt)
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return None, ["DYNAMIC_ORACLE_INVALID_OBSERVATION"]
+    return (observations[0], []) if len(observations) == 1 else (None, ["INDEPENDENT_ORACLE_OBSERVATION_MISSING"])
 
 
 def _validate_run_and_artifacts(
@@ -143,7 +204,7 @@ def _validate_run_and_artifacts(
         return set(), errors
     if run["status"] not in _RUN_SUCCESS:
         errors.append("MISSING_ISOLATED_RUN")
-    if not (run["task_type"] == "poc:isolated" or (run["intent_type"] or "").startswith("poc:isolated")):
+    if not (run["task_type"] in {"poc:isolated", "poc:oracle"} or (run["intent_type"] or "").startswith("poc:isolated")):
         errors.append("UNSAFE_DYNAMIC_EXECUTION")
     run_artifacts = set(_loads(run["artifact_ids"], []))
     declared_artifacts = {value for value in artifact_ids if isinstance(value, str)}
@@ -180,16 +241,6 @@ def _reviewed(conn: sqlite3.Connection, project_id: str, fact_id: str) -> bool:
         "ORDER BY created_at, id", (project_id, fact_id),
     ).fetchall()
     return bool(rows) and rows[-1]["verdict"] == "VALID" and rows[-1]["confidence"] in {"firm", "certain"}
-
-
-def _observed_capability(attributes: dict[str, Any]) -> Any:
-    value = attributes.get("capability_observed")
-    if value is not None:
-        return value
-    outcome = attributes.get("observed_outcome")
-    if isinstance(outcome, dict):
-        return outcome.get("capability_observed", outcome.get("capability"))
-    return None
 
 
 def evaluate_dynamic_verification(
@@ -236,10 +287,16 @@ def evaluate_dynamic_verification(
         reasons.add("DYNAMIC_ORACLE_MISSING")
     if "observed_outcome" not in pos_attrs or "observed_outcome" not in neg_attrs:
         reasons.add("DYNAMIC_ORACLE_MISSING")
-    if _observed_capability(pos_attrs) is None or _observed_capability(neg_attrs) is None:
-        reasons.add("DYNAMIC_ORACLE_MISSING")
-    elif json.dumps(_observed_capability(pos_attrs), sort_keys=True) == json.dumps(_observed_capability(neg_attrs), sort_keys=True):
-        reasons.add("NO_DYNAMIC_CAPABILITY_DELTA")
+    pos_observation, pos_errors = _independent_observation(conn, project, pos, "positive")
+    neg_observation, neg_errors = _independent_observation(conn, project, neg, "negative")
+    reasons.update(pos_errors + neg_errors)
+    if pos_observation is not None and neg_observation is not None:
+        if pos_observation["isolation"]["target_image_id"] != neg_observation["isolation"]["target_image_id"]:
+            reasons.add("DYNAMIC_BASELINE_MISMATCH")
+        if pos_observation["capability_observed"] == neg_observation["capability_observed"]:
+            reasons.add("NO_DYNAMIC_CAPABILITY_DELTA")
+        elif pos_observation["capability_observed"] is not True or neg_observation["capability_observed"] is not False:
+            reasons.add("DYNAMIC_ORACLE_DIRECTION_MISMATCH")
     for key in ("environment_fingerprint", "harness_id", "target_id", "snapshot_id", "config_fingerprint"):
         if key in pos_attrs or key in neg_attrs:
             if pos_attrs.get(key) != neg_attrs.get(key):
@@ -275,7 +332,9 @@ def evaluate_dynamic_verification(
             "artifact_ids": sorted(set(pos_attrs["artifact_ids"]) | set(neg_attrs["artifact_ids"])),
             "artifact_hashes": artifact_hashes,
             "oracle_kind": pos_attrs["oracle_kind"],
-            "observed_delta": {"positive": pos_attrs["observed_outcome"], "negative": neg_attrs["observed_outcome"]},
+            "observed_delta": {"positive": pos_observation["raw_observation"], "negative": neg_observation["raw_observation"]},
+            "independent_oracle": {"id": pos_observation["oracle_id"], "definition_sha256": pos_observation["oracle_definition_sha256"],
+                                   "checker_sha256": pos_observation["checker_sha256"]},
             "status": "PASS",
         }
         dynamic_digest = hashlib.sha256(json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()).hexdigest()

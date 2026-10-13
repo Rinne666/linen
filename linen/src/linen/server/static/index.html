@@ -500,8 +500,8 @@
       padding: 14px 16px;
     }
     .export-dialog-title { padding-right: 36px; }
-    .export-dialog-actions { width: 100%; padding-right: 38px; }
-    .export-dialog-actions > button:not(.export-dialog-close) { flex: 1; justify-content: center; }
+    .export-dialog-header .export-dialog-actions { width: 100%; padding-right: 38px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .export-dialog-actions > a, .export-dialog-actions > button:not(.export-dialog-close) { justify-content: center; }
     .export-dialog-close { position: absolute; top: 12px; right: 12px; }
   }
   @media (prefers-reduced-motion: reduce) {
@@ -2396,6 +2396,10 @@
         </div>
       </div>
       <div class="export-dialog-actions flex items-center gap-2">
+        <a :href="`/projects/${encodeURIComponent(exportProjectId)}/export?format=svg`" target="_blank" rel="noopener"
+          class="inline-flex h-8 items-center rounded-lg border border-slate-200 px-3 text-xs font-medium text-slate-600 hover:bg-slate-50 transition">Graph SVG</a>
+        <a :href="`/projects/${encodeURIComponent(exportProjectId)}/export?format=bundle`" :download="`${exportProjectId}-audit.zip`"
+          class="inline-flex h-8 items-center rounded-lg border border-slate-200 px-3 text-xs font-medium text-slate-600 hover:bg-slate-50 transition">Full bundle</a>
         <button @click="copyYamlPreview()" :disabled="exportLoading || !yamlPreviewText"
           class="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 px-3 text-xs font-medium text-slate-600 hover:bg-slate-50 transition disabled:cursor-not-allowed disabled:opacity-40">
           <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg>
@@ -6894,6 +6898,8 @@ function linenApp() {
       const titles = {
         provider_quota_exhausted: 'Model provider quota exhausted',
         provider_rate_limited: 'Model provider rate limit reached',
+        provider_transport_unavailable: 'Model provider connection failed',
+        reason_execution_failed: 'Reason needs execution repair',
         cli_model_unsupported: 'CLI model is unsupported',
         cli_model_unrecognized: 'CLI model is unrecognized',
         cli_auth_failed: 'CLI authentication failed',

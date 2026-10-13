@@ -6,6 +6,18 @@ from linen.dispatcher.runtime.cancellation import TaskCancellation
 
 
 @dataclass(slots=True)
+class ReasonFailureState:
+    worker_name: str
+    outcome: str
+    attempts: int
+    retry_at: float
+    opened_at: float
+    source_generation: int
+    plan_revision: int
+    blocked_event_seq: int | None = None
+
+
+@dataclass(slots=True)
 class RunningTask:
     project_id: str
     task_type: str

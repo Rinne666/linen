@@ -1,0 +1,14 @@
+{
+  "expected": ["case_001", "case_003", "case_005", "case_007"],
+  "negative_controls": ["case_002", "case_004", "case_006", "case_008"],
+  "labels": [
+    {"id": "case_001", "category": "object-authorization", "vulnerable": true, "cwe": "639", "source_path": "api.py", "dimensions": ["cross-file", "principal-boundary"]},
+    {"id": "case_002", "category": "object-authorization", "vulnerable": false, "cwe": "639", "source_path": "api.py", "dimensions": ["cross-file", "principal-boundary", "centralized-guard"]},
+    {"id": "case_003", "category": "tenant-isolation", "vulnerable": true, "cwe": "863", "source_path": "api.py", "dimensions": ["cross-file", "tenant-boundary"]},
+    {"id": "case_004", "category": "tenant-isolation", "vulnerable": false, "cwe": "863", "source_path": "api.py", "dimensions": ["cross-file", "tenant-boundary", "centralized-guard"]},
+    {"id": "case_005", "category": "business-price", "vulnerable": true, "cwe": "841", "source_path": "api.py", "dimensions": ["business-invariant", "untrusted-price"]},
+    {"id": "case_006", "category": "business-price", "vulnerable": false, "cwe": "841", "source_path": "api.py", "dimensions": ["business-invariant", "server-owned-price"]},
+    {"id": "case_007", "category": "concurrency", "vulnerable": true, "cwe": "362", "source_path": "api.py", "dimensions": ["concurrent-calls", "state-invariant"]},
+    {"id": "case_008", "category": "concurrency", "vulnerable": false, "cwe": "362", "source_path": "api.py", "dimensions": ["concurrent-calls", "state-invariant", "atomic-guard"]}
+  ]
+}

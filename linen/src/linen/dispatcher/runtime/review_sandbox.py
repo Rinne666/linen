@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -12,13 +13,46 @@ from linen.dispatcher.config import ReviewSandboxConfig
 from linen.dispatcher.runtime.process import LocalProcess, ProcessResult
 
 
+def isolated_review_argv(argv: list[str]) -> list[str]:
+    """Prepare a CLI for DockerReviewProcess, never for host execution.
+
+    Docker supplies the isolation boundary: non-root, read-only root/source,
+    dropped capabilities and no host mounts beyond the declared inputs.
+    Codex's nested bubblewrap sandbox cannot create namespaces under that
+    policy. Use the outer sandbox without relaxing any Docker restrictions.
+    """
+    if argv and argv[0] == "codex" and "exec" in argv:
+        separator = argv.index("--") if "--" in argv else len(argv)
+        options, prompt = argv[:separator], argv[separator:]
+        prepared = []
+        index = 0
+        while index < len(options):
+            option = options[index]
+            if option in {"--sandbox", "-s"}:
+                index += 2
+                continue
+            if option in {"-c", "--config"} and index + 1 < len(options):
+                if options[index + 1].split("=", 1)[0].strip() == "sandbox_mode":
+                    index += 2
+                    continue
+            prepared.append(option)
+            index += 1
+        if "--skip-git-repo-check" not in prepared:
+            prepared.append("--skip-git-repo-check")
+        return [*prepared, "-c", 'sandbox_mode="danger-full-access"', *prompt]
+    if argv and argv[0] == "claude":
+        separator = argv.index("--") if "--" in argv else len(argv)
+        return [*argv[:separator], "--add-dir", "/repo", "--add-dir", "/input", *argv[separator:]]
+    return list(argv)
+
+
 class DockerReviewProcess:
     """ExecProcess adapter that also destroys daemon-side processes on exit."""
 
     def __init__(self, config: ReviewSandboxConfig, source: Path, snapshot: dict,
                  run_dir: Path, argv: list[str], env: dict[str, str], timeout: int,
                  inputs: dict[str, bytes] | None = None, *, writable_workdir: bool = False,
-                 persistent_workdir: Path | None = None):
+                 persistent_workdir: Path | None = None, network_container: str | None = None):
         self.config = config
         self.source = source
         self.snapshot = snapshot
@@ -29,13 +63,19 @@ class DockerReviewProcess:
         self.inputs = inputs or {}
         self.writable_workdir = writable_workdir
         self.persistent_workdir = persistent_workdir
+        self.network_container = network_container
         self.name = "linen-review-" + uuid.uuid4().hex
         self.process: LocalProcess | None = None
         self.executable = shutil.which(config.executable)
         self.created = False
         self.image_id: str | None = None
+        self.auth_seed: tempfile.TemporaryDirectory | None = None
 
     def start(self) -> None:
+        if self.network_container is not None:
+            import re
+            if self.config.network != "none" or not re.fullmatch(r"linen-review-[a-f0-9]{32}", self.network_container):
+                raise ValueError("Oracle observer may only join its dispatcher-owned offline target namespace")
         if self.executable is None:
             raise RuntimeError("Review sandbox requires Docker; refusing host fallback")
         if not self.argv or not self.argv[0] or self.argv[0].startswith("-"):
@@ -60,6 +100,8 @@ class DockerReviewProcess:
                 "routes.json", "guards.json", "semantic_recipe.json",
                 "semantic_recipe_runner.py",
                 "poc.py", "case.json",
+                "oracle_observer.py", "oracle_target.py", "oracle_case.json",
+                "response-schema.json",
             }:
                 raise ValueError("Unknown isolated review input")
             (input_dir / name).write_bytes(data)
@@ -78,7 +120,7 @@ class DockerReviewProcess:
             "XDG_CONFIG_HOME": "/work/home/.config", "XDG_CACHE_HOME": "/work/home/.cache",
         }
         for name in self.config.env_allowlist:
-            value = self.worker_env.get(name, os.environ.get(name))
+            value = self.config.env.get(name, self.worker_env.get(name, os.environ.get(name)))
             if value is not None:
                 container_env[name] = value
         # --env NAME reads values from the Docker client's environment; secrets
@@ -90,7 +132,7 @@ class DockerReviewProcess:
         command = [
             self.executable, "create", "--name", self.name, "--pull=never",
             "--read-only", "--init", "--user", self.config.user,
-            "--network", self.config.network, "--cap-drop=ALL",
+            "--network", f"container:{self.network_container}" if self.network_container else self.config.network, "--cap-drop=ALL",
             "--security-opt=no-new-privileges", "--pids-limit", str(self.config.pids_limit),
             "--memory", self.config.memory, "--cpus", str(self.config.cpus),
             "--workdir", "/work", "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
@@ -127,13 +169,31 @@ class DockerReviewProcess:
             ])
         for name, value in container_env.items():
             command.extend(["--env", name if name in self.config.env_allowlist else f"{name}={value}"])
+        argv = self.argv
+        if argv[0] == "codex" and self.config.codex_auth_file is not None:
+            # Only the explicitly selected login cache crosses this boundary.
+            # Keep the seed outside persisted run artifacts and remove it on
+            # every exit. Token refresh stays in the disposable /work HOME.
+            import json
+            with Path(self.config.codex_auth_file).open("rb") as auth_file:
+                auth = auth_file.read(100_001)
+            if len(auth) > 100_000 or not isinstance(json.loads(auth), dict):
+                raise ValueError("Invalid Codex auth cache")
+            self.auth_seed = tempfile.TemporaryDirectory(prefix="linen-codex-auth-")
+            seed = Path(self.auth_seed.name) / "auth.json"
+            seed.write_bytes(auth)
+            seed.chmod(0o444)
+            command.extend(["--mount", f"type=bind,source={seed},target=/auth-seed.json,readonly"])
+            argv = ["sh", "-c", 'umask 077; mkdir -p "$CODEX_HOME" && cp /auth-seed.json "$CODEX_HOME/auth.json" && exec "$@"',
+                    "linen-codex-auth", *argv]
         # Override image entrypoints; no image startup script is needed to
         # mount credentials or discover host state.
-        command.extend(["--entrypoint", self.argv[0], self.image_id, *self.argv[1:]])
+        command.extend(["--entrypoint", argv[0], self.image_id, *argv[1:]])
         metadata = {"backend": "docker", "container": self.name, "image_id": self.image_id,
-                    "snapshot": self.snapshot["id"], "network": self.config.network,
+                    "snapshot": self.snapshot["id"], "network": f"container:{self.network_container}" if self.network_container else self.config.network,
                     "user": self.config.user, "environment_names": sorted(container_env),
-                    "source_mount": "/repo", "source_read_only": True}
+                    "source_mount": "/repo", "source_read_only": True,
+                    "codex_auth_seeded": self.auth_seed is not None}
         write_json(self.run_dir / "execution.json", metadata)
         try:
             created = subprocess.run(command, env=create_env, capture_output=True, text=True, timeout=30)
@@ -163,8 +223,13 @@ class DockerReviewProcess:
     def _remove(self) -> None:
         if self.executable is None:
             return
-        result = subprocess.run([self.executable, "rm", "--force", "--volumes", self.name],
-                                capture_output=True, text=True, timeout=15)
+        try:
+            result = subprocess.run([self.executable, "rm", "--force", "--volumes", self.name],
+                                    capture_output=True, text=True, timeout=15)
+        finally:
+            if self.auth_seed is not None:
+                self.auth_seed.cleanup()
+                self.auth_seed = None
         if result.returncode and "No such container" not in result.stderr:
             raise RuntimeError(f"Review container cleanup failed for {self.name}: {result.stderr[:500]}")
         self.created = False

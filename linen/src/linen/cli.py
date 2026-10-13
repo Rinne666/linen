@@ -1,6 +1,8 @@
 from pathlib import Path
+import hashlib
 import json
 import sqlite3
+import tempfile
 from urllib.parse import quote
 
 import click
@@ -29,6 +31,8 @@ def main():
 )
 @click.option("--log-level", default="info", show_default=True, help="Uvicorn log level")
 @click.option("--access-log/--no-access-log", default=True, show_default=True, help="Enable Uvicorn access log")
+@click.option("--oracle-catalog", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None,
+              help="Operator-approved independent oracle definitions and candidate bindings")
 @click.option(
     "--workspace-root",
     type=click.Path(path_type=Path),
@@ -43,12 +47,15 @@ def serve(
     log_level: str,
     access_log: bool,
     workspace_root: Path | None,
+    oracle_catalog: Path | None,
 ):
     """Start the linen API server."""
     db.configure(Path(db_path))
     from linen.server.routers import executions
 
     executions.configure_workspace_root(workspace_root)
+    from linen.server.oracle_registry import configure_oracle_catalog
+    configure_oracle_catalog(oracle_catalog)
     from linen.server.app import app
 
     uvicorn.run(
@@ -86,6 +93,122 @@ def dispatch(config_path: Path, once: bool, startup_healthcheck_only: bool, log_
         loop.run(once=once)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
+
+
+@main.command("audit-export")
+@click.option("--project-id", required=True)
+@click.option("--server", "server_url", default="http://127.0.0.1:9000", show_default=True)
+@click.option("--output", type=click.Path(dir_okay=False, path_type=Path), required=True,
+              help="ZIP containing reports, SVG graph, snapshot, SARIF and integrity manifest")
+def audit_export(project_id: str, server_url: str, output: Path):
+    """Export a consistent audit snapshot, including unfinished or stopped work."""
+    import io
+    import zipfile
+
+    temporary = None
+    try:
+        response = requests.get(
+            f"{server_url.rstrip('/')}/projects/{quote(project_id, safe='')}/export",
+            params={"format": "bundle"}, timeout=60,
+        )
+        response.raise_for_status()
+        content = response.content
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            if manifest["project"]["id"] != project_id:
+                raise ValueError("Bundle project does not match the requested project")
+            for name in ("report.md", "summary.md", "graph.svg", "snapshot.json", "findings.sarif"):
+                body = archive.read(name)
+                expected = manifest["files"][name]
+                if hashlib.sha256(body).hexdigest() != expected["sha256"] or len(body) != expected["bytes"]:
+                    raise ValueError(f"Bundle integrity check failed: {name}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=output.parent, prefix=".linen-export-", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+        temporary.replace(output)
+        click.echo(json.dumps({"output": str(output.resolve()), "project_id": project_id,
+                               "status": manifest["project"]["status"],
+                               "graph_revision": manifest["project"]["graph_revision"],
+                               "completion_ready": manifest["completion_gate"]["ready"]}, indent=2))
+    except (requests.RequestException, OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as exc:
+        raise click.ClickException(f"Audit export failed: {exc}") from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+@main.command("audit-oracle")
+@click.option("--config", "config_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--project-id", required=True)
+@click.option("--candidate-id", required=True)
+def audit_oracle(config_path: Path, project_id: str, candidate_id: str):
+    """Run both controls of an operator-bound oracle through dispatcher protocol."""
+    from linen.contracts.oracle import OracleCatalog
+    from linen.dispatcher.runtime.cancellation import TaskCancellation
+    from linen.dispatcher.tasks.oracle import run_oracle_task
+
+    loop = DispatcherLoop(config_path)
+    try:
+        if not loop.config.audit.oracles.enabled:
+            raise ValueError("audit.oracles.enabled and a trusted catalog_path are required")
+        project = loop.client.get_project(project_id)
+        if project.project.status != "active":
+            raise ValueError("independent observations require an active project")
+        definition = OracleCatalog.model_validate_json(loop.config.audit.oracles.catalog_path.read_bytes()).bound_definition(
+            project_id, candidate_id, project.project.source_generation, project.project.plan_revision,
+        )
+        worker = loop.config.workers[0]
+        outcomes = {}
+        for role in ("positive", "negative"):
+            project = loop.client.get_project(project_id)
+            if loop._audit_project_budget_state(project) is not None:
+                raise ValueError("project audit budget does not allow another oracle run")
+            created = loop.client.create_intent(project_id, [candidate_id], f"@oracle:{definition.id}:{role}", "dispatcher.oracle",
+                                                action="verify", target=f"registered oracle {definition.id} {role} for {candidate_id}",
+                                                intent_type="poc:isolated")
+            if not created.ok or not isinstance(created.data, dict) or "id" not in created.data:
+                raise ValueError(f"could not create the {role} oracle obligation")
+            intent_id = created.data["id"]
+            project = loop.client.get_project(project_id)
+            intent = next(item for item in project.intents if item.id == intent_id)
+            claim = loop.client.heartbeat(project_id, intent_id, worker.name)
+            if not claim.ok:
+                raise ValueError("oracle obligation lease could not be acquired")
+            cancellation = loop._task_cancellation(project)
+            try:
+                outcomes[role] = run_oracle_task(loop.config, loop.client, loop.container_manager, project, intent, worker, cancellation,
+                                                  attempt=loop._next_intent_attempt(project, intent, task_type="explore"))
+            finally:
+                cancellation.close()
+            if outcomes[role] != "success":
+                break
+        click.echo(json.dumps({"project_id": project_id, "candidate_id": candidate_id, "oracle_id": definition.id, "outcomes": outcomes}, indent=2))
+        if set(outcomes) != {"positive", "negative"} or any(value != "success" for value in outcomes.values()):
+            raise click.ClickException("Independent oracle did not complete both controls; recorded attempts are preserved")
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        loop.close()
+
+
+@main.command("audit-single-agent")
+@click.option("--config", "config_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--worker", "worker_name", required=True)
+@click.option("--source-root", type=click.Path(exists=True, file_okay=False, path_type=Path), required=True)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def audit_single_agent(config_path: Path, worker_name: str, source_root: Path, output: Path):
+    """Run one fresh isolated auditor session without graph planning or peers."""
+    from linen.dispatcher.analysis.single_agent import run_single_agent
+    from linen.dispatcher.config import DispatchConfig
+
+    try:
+        record = run_single_agent(DispatchConfig.load(config_path), config_path, worker_name, source_root, output)
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(record, ensure_ascii=False, indent=2))
+    if record["status"] != "completed":
+        raise click.ClickException("Single-agent execution blocked; its recorded attempt is preserved")
 
 
 @main.command("coverage")
@@ -154,6 +277,8 @@ def cost_report(project_id: str, server_url: str):
 )
 @click.option("--min-recall", type=click.FloatRange(0, 1), default=0.0, show_default=True)
 @click.option("--min-stability", type=click.FloatRange(0, 1), default=0.0, show_default=True)
+@click.option("--plan", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Registered case benchmark plan; includes blocked observations and fixed thresholds")
 def audit_benchmark(
     expected_path: Path,
     run_paths: tuple[Path, ...],
@@ -161,11 +286,29 @@ def audit_benchmark(
     trust_boundary_paths: tuple[Path, ...],
     min_recall: float,
     min_stability: float,
+    plan: Path | None,
 ):
     """Compare audit runs against a truth set, optionally in two A/B lanes."""
     from linen.dispatcher.analysis.benchmark import evaluate_files, evaluate_strategy_files
 
     try:
+        if plan:
+            from linen.dispatcher.analysis.benchmark import _load
+            from linen.dispatcher.analysis.case_benchmark import BenchmarkPlan, TruthSet, compare_case_runs
+
+            if file_topic_paths or trust_boundary_paths:
+                raise ValueError("Case plans use three --run observations, not strategy lanes")
+            registered = BenchmarkPlan.model_validate(_load(plan))
+            if ((min_recall and min_recall != registered.min_recall)
+                    or (min_stability and min_stability != registered.min_stability)):
+                raise ValueError("Case thresholds are fixed by --plan; register changes before running")
+            report = compare_case_runs(TruthSet.model_validate(_load(expected_path)), registered,
+                                       [_load(path) for path in run_paths])
+            click.echo(json.dumps(report, ensure_ascii=False, indent=2))
+            if not report["accepted"]:
+                raise click.ClickException("Case benchmark failed: " + ", ".join(
+                    name for name, passed in report["checks"].items() if not passed))
+            return
         if file_topic_paths or trust_boundary_paths:
             if run_paths or not file_topic_paths or not trust_boundary_paths:
                 raise ValueError("A/B mode requires both strategy lanes and no plain --run inputs")
@@ -193,6 +336,120 @@ def audit_benchmark(
         raise click.ClickException(
             f"benchmark thresholds failed: minimum_recall={minimum_recall}, stability={stability}"
         )
+
+
+@main.command("audit-case-plan")
+@click.option("--expected", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--config", "config_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--source-root", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--source-digest", help="Previously frozen source SHA-256; alternative to --source-root")
+@click.option("--suite-id", required=True)
+@click.option("--run-prefix", default="run", show_default=True)
+@click.option("--level", type=click.Choice(["candidate", "confirmed"]), default="confirmed", show_default=True)
+@click.option("--min-recall", type=click.FloatRange(0, 1), default=0.8, show_default=True)
+@click.option("--min-category-recall", type=click.FloatRange(0, 1), default=0.5, show_default=True)
+@click.option("--min-stability", type=click.FloatRange(0, 1), default=0.7, show_default=True)
+@click.option("--max-false-positive-rate", type=click.FloatRange(0, 1), default=0.0, show_default=True)
+@click.option("--min-case-coverage", type=click.FloatRange(0, 1), default=1.0, show_default=True)
+@click.option("--output", type=click.Path(dir_okay=False, path_type=Path), required=True)
+def audit_case_plan(expected: Path, config_path: Path, source_root: Path | None,
+                    source_digest: str | None, suite_id: str, run_prefix: str, level: str,
+                    min_recall: float, min_category_recall: float, min_stability: float,
+                    max_false_positive_rate: float, min_case_coverage: float, output: Path):
+    """Register three runs, their source, configuration, budgets and scoring rules."""
+    from linen.dispatcher.analysis.artifacts import snapshot_source
+    from linen.dispatcher.analysis.benchmark import _load
+    from linen.dispatcher.analysis.case_benchmark import BenchmarkPlan, TruthSet, digest
+    from linen.dispatcher.config import DispatchConfig
+
+    try:
+        if bool(source_root) == bool(source_digest):
+            raise ValueError("Provide exactly one of --source-root and --source-digest")
+        truth = TruthSet.model_validate(_load(expected))
+        config = DispatchConfig.load(config_path)
+        if source_root:
+            with tempfile.TemporaryDirectory(prefix="linen-benchmark-source-") as temporary:
+                snapshot = snapshot_source(source_root.resolve(), Path(temporary) / "source",
+                                           config.audit.recon,
+                                           Path(config.local.workspace_root or temporary).resolve())
+                if not snapshot["files"]:
+                    raise ValueError("Benchmark source contains no readable files")
+                source_digest = snapshot["id"]
+        plan = BenchmarkPlan(
+            suite_id=suite_id, source_digest=source_digest,
+            truth_digest=digest(truth.model_dump()),
+            config_digest=hashlib.sha256(config_path.read_bytes()).hexdigest(),
+            planned_runs=[f"{run_prefix}-{i}" for i in range(1, 4)], detection_level=level,
+            min_recall=min_recall, min_category_recall=min_category_recall,
+            min_stability=min_stability, max_false_positive_rate=max_false_positive_rate,
+            min_case_coverage=min_case_coverage,
+            max_run_records=config.audit.max_runs_per_project,
+            wall_clock_budget_seconds=config.audit.wall_clock_budget_seconds,
+        )
+        with output.open("x", encoding="utf-8") as stream:
+            stream.write(json.dumps(plan.model_dump(), ensure_ascii=False, indent=2) + "\n")
+        click.echo(str(output.resolve()))
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(f"Benchmark plan failed: {exc}") from exc
+
+
+@main.command("audit-case-export")
+@click.option("--project-id", help="Live project ID; optional when reading --snapshot")
+@click.option("--server-url", default="http://127.0.0.1:9000", show_default=True)
+@click.option("--snapshot", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Saved JSON object containing board, gate, cost and runs; performs no API calls")
+@click.option("--expected", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--plan", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--config", "config_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--run-label", required=True)
+@click.option("--case-map", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--case-assessments", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--allow-incomplete", is_flag=True, help="Retain an incomplete run as a failed diagnostic observation")
+@click.option("--output", type=click.Path(dir_okay=False, path_type=Path), required=True)
+def audit_case_export(project_id: str | None, server_url: str, snapshot: Path | None, expected: Path, plan: Path,
+                      config_path: Path, run_label: str, case_map: Path,
+                      case_assessments: Path | None, allow_incomplete: bool, output: Path):
+    """Export reviewed per-case coverage and detections without guessing case IDs."""
+    from linen.dispatcher.analysis.benchmark import _load
+    from linen.dispatcher.analysis.case_benchmark import BenchmarkPlan, TruthSet, case_observation
+
+    base = f"{server_url.rstrip('/')}/projects/{quote(project_id or '', safe='')}"
+
+    def fetch(suffix=""):
+        response = requests.get(base + suffix, timeout=15)
+        response.raise_for_status()
+        return response.json()
+
+    try:
+        truth = TruthSet.model_validate(_load(expected))
+        registered = BenchmarkPlan.model_validate(_load(plan))
+        mapping = _load(case_map)
+        assessments = _load(case_assessments) if case_assessments else {}
+        if snapshot:
+            saved = _load(snapshot)
+            board, gate, cost, runs = (saved[k] for k in ("board", "gate", "cost", "runs"))
+            if project_id and board["project"]["id"] != project_id:
+                raise ValueError("Saved snapshot belongs to another project")
+        else:
+            if not project_id:
+                raise ValueError("Provide --project-id or --snapshot")
+            for _ in range(3):
+                board = fetch()
+                gate, cost, runs = fetch("/completion-gate"), fetch("/cost"), fetch("/runs")
+                if board["project"] == fetch()["project"]:
+                    break
+            else:
+                raise ValueError("Project changed during case export; retry after work has stopped")
+        result = case_observation(
+            board, gate, cost, runs, truth, registered, run_label,
+            hashlib.sha256(config_path.read_bytes()).hexdigest(), mapping, assessments,
+            allow_incomplete=allow_incomplete,
+        )
+        with output.open("x", encoding="utf-8") as stream:
+            stream.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+        click.echo(str(output.resolve()))
+    except (requests.RequestException, ValueError, OSError, KeyError, TypeError) as exc:
+        raise click.ClickException(f"Case export failed: {exc}") from exc
 
 
 @main.command("audit-evaluation-export")

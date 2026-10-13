@@ -73,6 +73,11 @@ Agent 不直接认领 Intent，不直接 heartbeat，不直接调用 linen API�
     或带 lead 的结果才额外触发 Reason，避免每个覆盖单元都支付一次策略推理调用。
     Reason 失败时确认本轮已读取的事件游标，但不确认执行期间新到的事件，防止同一
     失败触发无限重试，同时保留并发产生的新证据唤醒后续分析。
+    若已有可执行任务且无新的具体安全线索，先消费队列。Reason 的 `data.wait`
+    绑定可见 Intent/事件和有限截止时间，释放租约时由服务端持久化；调度器按条件
+    唤醒，等待策略不阻止 Explore/Review。空数据按兼容路径绑定实际待办任务或
+    60 秒新证据等待，不把空结果当作线索处置。Reason 提案核对读取投影中的节点、
+    边和新增复核/反证；无关图更新不使提案作废。完成仍核对全图版本及完成门禁。
 16. 新 Technical Confirmation 要求分别执行 reproduction 和 negative-control
     `poc:isolated` 任务。Intent 只有在 `audit.poc_sandbox.enabled=true` 时可运行；源码以
     只读冻结快照挂载到一次性容器，不挂载 host HOME、图历史或 Docker socket，且

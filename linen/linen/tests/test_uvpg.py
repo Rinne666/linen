@@ -691,22 +691,47 @@ def test_unified_review_digest_is_captured_after_review_status_projection(tmp_pa
 
 def _dynamic_board(tmp_path, monkeypatch, *, include_negative=True, same_capability=False, unsafe=False):
     candidate_id = _strict_board(tmp_path, monkeypatch)
-    repo = tmp_path / "repo"
+    repo = tmp_path / "p"
     repo.mkdir()
     positive_path = repo / "positive.log"
     negative_path = repo / "negative.log"
-    positive_path.write_text("positive", encoding="utf-8")
-    negative_path.write_text("negative", encoding="utf-8")
+    from linen.contracts.oracle import OracleDefinition
+    from linen.dispatcher.runtime.oracle_runner import oracle_checker_digest
+    from linen.server import oracle_registry
+    from linen.server.routers import executions
+    monkeypatch.setattr(executions, "_workspace_root_override", tmp_path)
+    definition = OracleDefinition(id="resource-identity", source_digest="a" * 64, image="registered-test-image",
+                                  target_argv=["python3", "/repo/server.py"], positive={"request": {"path": "/resource"}},
+                                  negative={"request": {"path": "/resource"}},
+                                  predicate={"kind": "json_equals", "json_pointer": "/resource_identity", "expected": "protected:B"},
+                                  rationale="Caller A cannot read resource B in the control.")
+    catalog = tmp_path / "operator-oracles.json"
+    catalog.write_text(json.dumps({"definitions": [definition.model_dump()], "bindings": [{"project_id": "p", "candidate_id": candidate_id,
+                                                                                          "oracle_id": definition.id, "source_generation": 1, "plan_revision": 1}]}))
+    monkeypatch.setattr(oracle_registry, "_catalog_path", catalog)
+    for role, path, value in (("positive", positive_path, "same" if same_capability else "protected:B"),
+                              ("negative", negative_path, "same" if same_capability else "owned:A")):
+        packet = {"schema_version": 1, "kind": "independent-oracle-observation", "project_id": "p", "candidate_id": candidate_id,
+                  "run_id": "run-" + role, "role": role, "source_generation": 1, "plan_revision": 1, "oracle_id": definition.id,
+                  "oracle_definition_sha256": definition.canonical_digest(), "checker_sha256": oracle_checker_digest(), "snapshot_id": definition.source_digest,
+                  "raw_observation": {"status_code": 200, "body": json.dumps({"resource_identity": value}), "truncated": False},
+                  "capability_observed": value == "protected:B",
+                  "isolation": {"target_image_id": "sha256:" + "1" * 64, "observer_image_id": "sha256:" + "1" * 64,
+                                "target_container": "linen-review-" + ("a" if role == "positive" else "c") * 32,
+                                "observer_container": "linen-review-" + ("b" if role == "positive" else "d") * 32,
+                                "target_network": "none", "observer_network": "target-loopback-only", "host_credentials": "not_injected",
+                                "separate_filesystems": True, "separate_pid_namespaces": True, "source_read_only": True}}
+        path.write_text(json.dumps(packet))
     with db.get_conn() as conn:
         conn.execute("UPDATE projects SET repo_root = ? WHERE id = 'p'", (str(repo),))
         generation = conn.execute("SELECT source_generation FROM projects WHERE id = 'p'").fetchone()[0]
         for run_id, artifact_id, path in (("run-positive", "artifact-positive", positive_path), ("run-negative", "artifact-negative", negative_path)):
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             conn.execute(
-                "INSERT INTO artifacts (artifact_id, project_id, kind, workspace_path, sha256, media_type, byte_size, producer_run_id, created_at) VALUES (?, 'p', 'dynamic-log', ?, ?, 'text/plain', ?, ?, 'now')",
+                "INSERT INTO artifacts (artifact_id, project_id, kind, workspace_path, sha256, media_type, byte_size, producer_run_id, created_at) VALUES (?, 'p', 'independent-oracle-observation', ?, ?, 'text/plain', ?, ?, 'now')",
                 (artifact_id, path.name, digest, path.stat().st_size, run_id),
             )
-            task_type = "explore" if unsafe else "poc:isolated"
+            task_type = "explore" if unsafe else "poc:oracle"
             conn.execute(
                 "INSERT INTO runs (run_id, project_id, task_type, attempt, idempotency_key, graph_revision, source_generation, plan_revision, timeout_seconds, status, artifact_ids, created_at, updated_at) VALUES (?, 'p', ?, 1, ?, 1, ?, 1, 30, 'succeeded', ?, 'now', 'now')",
                 (run_id, task_type, run_id, generation, json.dumps([artifact_id])),
@@ -724,6 +749,7 @@ def _dynamic_board(tmp_path, monkeypatch, *, include_negative=True, same_capabil
                     "environment_fingerprint": "env-1", "harness_id": "idor-harness", "target_id": "target-1",
                 },
             })
+        conn.execute("UPDATE runs SET worker_type = ? WHERE project_id = 'p'", ("codex" if unsafe else "builtin-oracle",))
         conn.execute("INSERT INTO facts (id, project_id, description, type, proof) VALUES ('dynamic-positive', 'p', 'positive reproduction', 'reproduction', ?)", (proof("reproduction", "run-positive", "artifact-positive", positive_capability, {"resource_identity": positive_capability}),))
         if include_negative:
             conn.execute("INSERT INTO facts (id, project_id, description, type, proof) VALUES ('dynamic-negative', 'p', 'negative baseline', 'negative_control', ?)", (proof("negative_control", "run-negative", "artifact-negative", negative_capability, {"resource_identity": negative_capability}),))
@@ -800,7 +826,7 @@ def test_dynamic_unisolated_run_cannot_upgrade_static_confirmation(tmp_path, mon
 def test_dynamic_artifact_tampering_invalidates_effective_level(tmp_path, monkeypatch):
     _dynamic_board(tmp_path, monkeypatch)
     finalize_dynamic_verification("p", "candidate")
-    positive_path = tmp_path / "repo" / "positive.log"
+    positive_path = tmp_path / "p" / "positive.log"
     positive_path.write_text("tampered", encoding="utf-8")
     with db.get_conn() as conn:
         confirmed = conn.execute("SELECT id FROM facts WHERE semantic_type = 'confirmed_finding'").fetchone()["id"]

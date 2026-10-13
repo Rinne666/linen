@@ -197,8 +197,17 @@ class LinenClient:
     def get_proof_status(self, project_id: str, fact_id: str) -> ApiResult:
         return self._request_json("GET", f"/projects/{project_id}/facts/{fact_id}/proof-status", json={})
 
+    def get_proof_package(self, project_id: str, fact_id: str) -> ApiResult:
+        return self._request_json("GET", f"/projects/{project_id}/facts/{fact_id}/proof-package", json={})
+
+    def get_candidate_assessment_input(self, project_id: str, fact_id: str) -> ApiResult:
+        return self._request_json("GET", f"/projects/{project_id}/facts/{fact_id}/assessment-input", json={})
+
     def plan_proof_gap(self, project_id: str, fact_id: str) -> ApiResult:
         return self._request_json("POST", f"/projects/{project_id}/facts/{fact_id}/proof-gaps/plan", json={})
+
+    def confirm_technical_finding(self, project_id: str, fact_id: str) -> ApiResult:
+        return self._request_json("POST", f"/projects/{project_id}/facts/{fact_id}/technical-confirmation", json={})
 
     def reconcile_audit_stages(
         self,
@@ -258,11 +267,13 @@ class LinenClient:
             json={"worker": worker, "lease_id": lease_id},
         )
 
-    def release_reason(self, project_id: str, worker: str, lease_id: str, seen_event_seq: int | None = None) -> ApiResult:
+    def release_reason(self, project_id: str, worker: str, lease_id: str, seen_event_seq: int | None = None, *, wait: dict | None = None, wait_basis: tuple[int, int] | None = None) -> ApiResult:
         return self._request_json(
             "POST",
             f"/projects/{project_id}/reason/release",
-            json={"worker": worker, "lease_id": lease_id, "seen_event_seq": seen_event_seq},
+            json={"worker": worker, "lease_id": lease_id, "seen_event_seq": seen_event_seq, "wait": wait,
+                  "source_generation": wait_basis[0] if wait_basis else None,
+                  "plan_revision": wait_basis[1] if wait_basis else None},
         )
 
     def release(self, project_id: str, intent_id: str, worker: str) -> ApiResult:

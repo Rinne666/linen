@@ -158,6 +158,29 @@ def test_native_recon_schema_accepts_partial_and_rejects_wrong_nesting():
         validate(payload, schema)
 
 
+def test_native_configuration_schema_matches_semantic_combinations():
+    from itertools import product
+    from jsonschema import Draft202012Validator
+
+    schema = recon.response_schema()["properties"]["data"]["properties"]["recon_result"]["properties"]["leads"]["items"]["properties"]["security_checks"]
+    validator = Draft202012Validator(schema)
+    for default, enabled, admin in product(
+        ("enabled", "disabled", "conditional", "unknown", "not_applicable"),
+        ("analyzed", "unknown", "not_applicable"),
+        ("yes", "no", "unknown", "not_applicable"),
+    ):
+        checks = _lead()["security_checks"]
+        checks["configuration_analysis"].update(
+            default_mode=default, ordinary_enabled_mode=enabled, requires_admin_misconfiguration=admin,
+        )
+        try:
+            recon._validate_lead_security_checks(checks, {"c1"})
+            valid = True
+        except ValueError:
+            valid = False
+        assert validator.is_valid(checks) == valid, (default, enabled, admin)
+
+
 def test_codex_schema_argument_applies_to_execute_and_resume():
     from linen.dispatcher.config import WorkerConfig
     from linen.dispatcher.workers.adapters.codex import CodexDriver
@@ -248,6 +271,36 @@ def test_recon_output_constraint_inlines_a_parseable_schema_for_claude():
     assert json.loads(inline) == recon.response_schema()
     assert constrained[-1] == "prompt"
     assert len(backend.writes) == 1
+
+
+@pytest.mark.parametrize("driver_type", ["codex", "claude"])
+def test_coverage_review_native_constraint_uses_its_own_schema(driver_type):
+    from linen.dispatcher.tasks.explore import _constrain_recon_output
+    from linen.dispatcher.workers.adapters.codex import CodexDriver
+    from linen.dispatcher.workers.adapters.claudecode import ClaudeCodeDriver
+    from jsonschema import validate
+
+    class Backend:
+        writes = []
+
+        def write_text_file(self, handle, path, text):
+            self.writes.append((path, json.loads(text)))
+
+    backend = Backend()
+    driver = CodexDriver() if driver_type == "codex" else ClaudeCodeDriver()
+    argv = ["codex", "exec", "--", "prompt"] if driver_type == "codex" else ["claude", "-p", "--", "prompt"]
+    constrained = _constrain_recon_output(backend, "handle", driver, argv, coverage_review=True)
+    path, schema = backend.writes[-1]
+    assert schema["properties"]["data"]["properties"]["type"]["enum"] == [recon.COVERAGE_REVIEW_FACT_TYPE]
+    assert "recon_result" not in schema["properties"]["data"]["properties"]
+    example = json.loads(recon.COVERAGE_REVIEW_RESPONSE_EXAMPLE)
+    example["data"]["coverage_review"]["items"] = []
+    validate(example, schema)
+    if driver_type == "codex":
+        assert constrained[constrained.index("--output-schema") + 1] == path
+    else:
+        assert json.loads(constrained[constrained.index("--json-schema") + 1]) == schema
+    assert constrained[-1] == "prompt"
 
 
 def test_recon_output_constraint_skips_drivers_without_schema_support():

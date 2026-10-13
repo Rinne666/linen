@@ -11,6 +11,7 @@ from .component import ComponentKind, ComponentManifest, ComponentRisk
 from .context import ContextProjection, ContextRequest
 from .event import AuditEventEnvelope
 from .run import RunEnvelope, RunStatus
+from .reason import ReasonWait
 from .sandbox import (
     ControlChannel,
     CredentialPolicy,
@@ -45,6 +46,7 @@ __all__ = [
     "NodeEnvelope",
     "ProcessPolicy",
     "RecipeRef",
+    "ReasonWait",
     "RunEnvelope",
     "RunStatus",
     "SandboxProfile",

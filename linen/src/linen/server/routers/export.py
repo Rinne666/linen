@@ -4,7 +4,11 @@ from datetime import datetime
 import hashlib
 import html
 import json
+import io
+import zipfile
 import yaml
+
+from linen.server.graph_export import render_graph_svg
 
 from linen.server.audit_state import (
     completion_gate_from_db,
@@ -45,9 +49,10 @@ def format_export_timestamp(value: str | None) -> str | None:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _load_project_data(conn, project_id: str):
-    expire_workers(conn, project_id)
-    expire_reason_leases(conn, project_id)
+def _load_project_data(conn, project_id: str, *, refresh_leases: bool = True):
+    if refresh_leases:
+        expire_workers(conn, project_id)
+        expire_reason_leases(conn, project_id)
     proj = get_project_or_404(conn, project_id)
 
     facts = conn.execute(
@@ -208,9 +213,9 @@ def _export_json(conn, project_id: str) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
 
 
-def _export_sarif(conn, project_id: str) -> str:
+def _export_sarif(conn, project_id: str, *, refresh_leases: bool = True) -> str:
     """Export candidate and confirmed security findings as SARIF 2.1.0."""
-    proj, facts, _hints, _intents, _sources = _load_project_data(conn, project_id)
+    proj, facts, _hints, _intents, _sources = _load_project_data(conn, project_id, refresh_leases=refresh_leases)
     finding_facts = [
         fact
         for fact in facts
@@ -403,7 +408,19 @@ def _fact_title(fact) -> str:
     )
 
 
-def _export_summary(conn, project_id: str) -> str:
+def _current_audit_summaries(project, facts, intents) -> list:
+    summaries = {fact["id"]: fact for fact in facts
+                 if fact["type"] == "audit_summary" and not fact["legacy"]
+                 and fact["source_generation"] == project["source_generation"]}
+    for intent in reversed(intents):
+        if (intent["to_fact_id"] in summaries
+                and intent["source_generation"] == project["source_generation"]
+                and intent["plan_revision"] == project["plan_revision"]):
+            return [summaries[intent["to_fact_id"]]]
+    return []
+
+
+def _export_summary(conn, project_id: str, *, refresh_leases: bool = True) -> str:
     """Render a short, assessment-focused audit report.
 
     Confirmed findings are created only by Technical Confirmation. Candidate
@@ -411,7 +428,7 @@ def _export_summary(conn, project_id: str) -> str:
     without decisive evidence remains pending.
     """
     proj, facts, _hints, _intents, _sources_by_intent = _load_project_data(
-        conn, project_id
+        conn, project_id, refresh_leases=refresh_leases
     )
     reviews = list_reviews_for_project(conn, project_id)
     reviews_by_fact: dict[str, list] = {}
@@ -622,6 +639,15 @@ def _export_summary(conn, project_id: str) -> str:
             )
         lines.append("")
 
+    summaries = _current_audit_summaries(proj, domain_facts, _intents)
+    if summaries:
+        lines.extend(["## Audit coverage and residual gaps", "",
+                      "A completed workflow can retain unresolved source leads. Zero confirmed findings does not close those gaps.", ""])
+        for fact in summaries:
+            lines.extend([f"### `{_markdown_text(fact['id'])}`", "", _markdown_text(fact["description"]), ""])
+            if fact["evidence"]:
+                lines.extend([_markdown_code_block(fact["evidence"]), ""])
+
     lines.extend(
         [
             "## Scope and limitations",
@@ -633,8 +659,8 @@ def _export_summary(conn, project_id: str) -> str:
     return "\n".join(lines)
 
 
-def _export_report(conn, project_id: str) -> str:
-    proj, facts, hints, intents, sources_by_intent = _load_project_data(conn, project_id)
+def _export_report(conn, project_id: str, *, refresh_leases: bool = True) -> str:
+    proj, facts, hints, intents, sources_by_intent = _load_project_data(conn, project_id, refresh_leases=refresh_leases)
     reviews = list_reviews_for_project(conn, project_id)
     intent_errors = list_intent_errors(conn, project_id)
     open_errors = [error for error in intent_errors if error.resolved_at is None]
@@ -660,7 +686,7 @@ def _export_report(conn, project_id: str) -> str:
         fact for fact in domain_facts
         if fact["type"] == "negative_assurance" or fact["semantic_type"] == "negative_assurance"
     ]
-    audit_summaries = [fact for fact in domain_facts if fact["type"] == "audit_summary"]
+    audit_summaries = _current_audit_summaries(proj, domain_facts, intents)
     scope_gate_facts = [
         fact for fact in domain_facts
         if fact["type"] in {"policy_evidence", "scope_adjudication"}
@@ -682,7 +708,7 @@ def _export_report(conn, project_id: str) -> str:
     }.get(proj["status"], proj["status"])
 
     lines = [
-        f"# {_markdown_text(proj['title'])} — Final Result Report",
+        f"# {_markdown_text(proj['title'])} — " + ("Final Result Report" if proj["status"] == "completed" else "Progress Report"),
         "",
         f"> Generated from the linen blackboard on {generated_at}. Graph revision `{proj['graph_revision']}`.",
         "",
@@ -780,6 +806,8 @@ def _export_report(conn, project_id: str) -> str:
                     "",
                 ]
             )
+            if fact["evidence"]:
+                lines.extend(["Coverage and residual evidence:", "", _markdown_code_block(fact["evidence"]), ""])
 
     lines.extend(["## Security findings", ""])
     if not vulnerability_facts:
@@ -913,13 +941,47 @@ def _export_report(conn, project_id: str) -> str:
     return "\n".join(lines)
 
 
+def _export_bundle(conn, project_id: str) -> bytes:
+    """Capture reports and graph in one SQLite transaction with content hashes."""
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    structured = _export_json(conn, project_id)
+    snapshot = json.loads(structured)
+    files = {
+        "report.md": _export_report(conn, project_id, refresh_leases=False),
+        "summary.md": _export_summary(conn, project_id, refresh_leases=False),
+        "graph.svg": render_graph_svg(snapshot),
+        "snapshot.json": structured,
+        "findings.sarif": _export_sarif(conn, project_id, refresh_leases=False),
+    }
+    manifest = {
+        "schema_version": 1,
+        "project": snapshot["project"],
+        "completion_gate": snapshot["completion_gate"],
+        "files": {name: {"sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                         "bytes": len(content.encode("utf-8"))} for name, content in files.items()},
+    }
+    files["manifest.json"] = json.dumps(manifest, ensure_ascii=False, indent=2)
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in files.items():
+            archive.writestr(name, content.encode("utf-8"))
+    return output.getvalue()
+
+
 @router.get("/projects/{project_id}/export")
 def export_project(project_id: str, format: str = "yaml"):
-    if format not in ("yaml", "timeline", "summary", "report", "json", "sarif"):
-        raise HTTPException(400, "Supported formats: yaml, timeline, summary, report, json, sarif")
+    if format not in ("yaml", "timeline", "summary", "report", "json", "sarif", "svg", "bundle"):
+        raise HTTPException(400, "Supported formats: yaml, timeline, summary, report, json, sarif, svg, bundle")
 
     with get_conn() as conn:
-        if format == "summary":
+        if format == "bundle":
+            text = _export_bundle(conn, project_id)
+            media_type = "application/zip"
+        elif format == "svg":
+            text = render_graph_svg(json.loads(_export_json(conn, project_id)))
+            media_type = "image/svg+xml"
+        elif format == "summary":
             text = _export_summary(conn, project_id)
             media_type = "text/markdown"
         elif format == "report":
@@ -957,6 +1019,10 @@ def export_project(project_id: str, format: str = "yaml"):
             media_type = "application/yaml"
 
         response = Response(content=text, media_type=media_type)
+        if format == "svg":
+            response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        if format == "bundle":
+            response.headers["Content-Disposition"] = 'attachment; filename="audit-bundle.zip"'
         if format == "report" and snapshot is not None:
             response.headers["ETag"] = f'"{snapshot["sha256"]}"'
             response.headers["X-Linen-Report-Snapshot"] = snapshot["sha256"]

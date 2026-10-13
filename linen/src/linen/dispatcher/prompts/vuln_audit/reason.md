@@ -151,7 +151,7 @@ Hypothesis PROVEN:
 
 Hypothesis REFUTED (chain is closed on counter-evidence, no other hypothesis to pursue):
 ```json
-{"accepted": true, "data": {}}
+{"accepted": true, "data": {"wait": {"event_types": ["human_hint_created", "audit_task_concluded"], "reason": "This hypothesis was refuted; await new source evidence", "max_wait_seconds": 60}}}
 ```
 
 Next verification steps proposed (the stable identity is the `action` + `target` pair; `from` only lists evidence sources):
@@ -169,11 +169,20 @@ cannot dispatch it until you choose a control action. Return only this shape:
 ```
 Choose `retry` for a recoverable failure and `abandon` for work that should be
 closed. Use only blocked open Intent IDs visible in the graph.
+Transient errors with `retry_at` are already queued for bounded automatic retry;
+use `wait`, not `resolve`. A blocked `invalid_blackboard_result` exhausted that
+automatic budget and cannot be retried by Reason; preserve its gap until the
+recorded cause is repaired and an operator explicitly requests a manual retry.
 
 No new direction right now (existing open intents already cover the highest-value next steps):
 ```json
-{"accepted": true, "data": {}}
+{"accepted": true, "data": {"wait": {"intent_ids": ["i123"], "reason": "Existing verification task covers the next gap", "max_wait_seconds": 300}}}
 ```
+
+Only reference visible open Intent IDs. Waits wake on a matching new event,
+task conclusion or blocking failure, a human hint, or the deadline. Empty data
+does not dispose of a supplied unresolved lead; propose verification when
+its readable source can answer the question.
 
 # Rules
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from linen.contracts import ContextRequest
+from linen.contracts import ContextRequest, ReasonWait
 from linen.dispatcher.output_parser import extract_json_object
 from linen.server.models import REVIEW_DIAGNOSTIC_FIELDS
 
@@ -90,6 +90,8 @@ def _looks_like_reason_data(payload: dict[str, Any]) -> bool:
         return isinstance(payload["intents"], list)
     if keys == {"resolve"}:
         return isinstance(payload["resolve"], list)
+    if keys == {"wait"}:
+        return isinstance(payload["wait"], dict)
     if keys == {"intent"}:
         intent = payload["intent"]
         return isinstance(intent, dict) and "from" in intent and "description" in intent
@@ -118,6 +120,10 @@ def validate_reason_payload(
         # whenever the queue is empty turns that valid decision into a false
         # task failure and can restart the same blocked audit indefinitely.
         return "noop", None
+    if "wait" in data:
+        if set(data) != {"wait"}:
+            raise ValueError("wait must be supplied by itself")
+        return "wait", ReasonWait.model_validate(data["wait"]).model_dump(mode="json")
     complete = data.get("complete")
     intents = data.get("intents")
     resolve = data.get("resolve")

@@ -11,7 +11,7 @@ import subprocess
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,7 +21,7 @@ from linen.contracts import AuditEventEnvelope
 from linen.dispatcher.analysis import audit_graph, audit_recipes, codeql, coverage, recon, scope_gate, stages
 from linen.dispatcher.analysis.source_preflight import preflight_source_repository
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
-from linen.dispatcher.models import RunningTask
+from linen.dispatcher.models import ReasonFailureState, RunningTask
 from linen.dispatcher.protocol.client import LinenClient
 from linen.dispatcher.runtime.backend import LocalBackend
 from linen.dispatcher.runtime.cancellation import TaskCancellation
@@ -38,6 +38,8 @@ UNHEALTHY_RETRY_AFTER_SECONDS = 5
 REJECTED_RETRY_AFTER_SECONDS = 5
 RATE_LIMIT_RETRY_AFTER_SECONDS = 300
 QUOTA_EXHAUSTED_RETRY_AFTER_SECONDS = 3600
+EXECUTION_FAILURE_LIMIT = 3
+EXECUTION_FAILURE_RETRY_SECONDS = 60
 PROJECT_PAUSING_CLI_ISSUES = {
     "quota_exhausted",
     "cli_model_unsupported",
@@ -73,6 +75,8 @@ class DispatcherLoop:
         self.worker_provider_reason: dict[str, str] = {}
         self.worker_provider_opened_at: dict[str, float] = {}
         self.worker_provider_origin: dict[str, tuple[str, int]] = {}
+        self.worker_transport_failures: dict[str, int] = {}
+        self.reason_failures: dict[str, ReasonFailureState] = {}
         self._manual_provider_retries_seen: set[str] = set()
         self._provider_resume_event_cursors: dict[str, int] = {}
         self._execution_attempt_state_cache: dict[tuple[str, int], dict[str, bool]] = {}
@@ -104,6 +108,10 @@ class DispatcherLoop:
         self.client.close()
 
     def run(self, once: bool = False) -> None:
+        from linen.dispatcher.runtime.awake import IdleSleepGuard
+
+        sleep_guard = IdleSleepGuard(self.config.runtime.prevent_idle_sleep)
+        sleep_guard.start()
         try:
             self.run_startup_healthchecks()
             while True:
@@ -134,7 +142,10 @@ class DispatcherLoop:
                     break
                 time.sleep(self.config.runtime.interval)
         finally:
-            self.close()
+            try:
+                self.close()
+            finally:
+                sleep_guard.close()
 
     def run_startup_healthchecks_only(self) -> None:
         try:
@@ -508,7 +519,11 @@ class DispatcherLoop:
                 self._reason_trigger_events(project, reason_trigger)
                 if reason_trigger is not None else []
             )
-            if reason_trigger is not None and self._reason_may_run(project, trigger_events):
+            if (
+                reason_trigger is not None
+                and self._reason_may_run(project, trigger_events)
+                and self._reason_failure_allows_dispatch(project)
+            ):
                 if self._reason_waits_for_initial_recon(project, trigger_events):
                     self._log_changed(
                         f"project:{summary.id}:reason_wait_initial_recon",
@@ -518,10 +533,10 @@ class DispatcherLoop:
                     )
                     # Do not advance reason_last_seen_event_seq. The first
                     # post-bootstrap Reason pass will receive the whole event batch.
-                    return False
+                    reason_trigger = None
                 self._restore_reason_cooldown(project)
                 cooldown_until = self._reason_cooldown_until.get(summary.id, 0.0)
-                priority_wake = self._reason_has_priority_wake(project, trigger_events)
+                priority_wake = self._reason_has_priority_wake(project, trigger_events) or project.project.reason_wait is not None
                 if time.time() < cooldown_until and not priority_wake:
                     self._log_changed(
                         f"project:{summary.id}:reason_noop_cooldown",
@@ -530,8 +545,8 @@ class DispatcherLoop:
                         summary.id,
                         cooldown_until - time.time(),
                     )
-                    return False
-                if at_capacity:
+                    reason_trigger = None
+                if at_capacity and reason_trigger is not None:
                     self._log_changed(
                         f"{skip_scope}:max_project_workers",
                         logging.INFO,
@@ -540,8 +555,12 @@ class DispatcherLoop:
                         self._project_running_task_summary(summary.id),
                     )
                     return False
-                export_yaml = self.client.export_project(summary.id)
-                return self._dispatch_reason(project, export_yaml, reason_trigger, trigger_events)
+                if reason_trigger is not None:
+                    export_yaml = self.client.export_project(summary.id)
+                    if self._dispatch_reason(project, export_yaml, reason_trigger, trigger_events):
+                        return True
+                # Deferring strategy must still allow queued Explore/Review
+                # work to run and satisfy the condition strategy awaits.
 
         self._observe_audit_idle_health(project)
 
@@ -621,19 +640,7 @@ class DispatcherLoop:
             if scope_evidence_pending or scope_pending:
                 runnable_intents = []
                 for intent in unclaimed_intents:
-                    description = intent.description.strip()
-                    is_recon_work = (
-                        description == recon.SNAPSHOT_INTENT
-                        or description == recon.COVERAGE_REVIEW_INTENT
-                        or recon.category_from_description(description) is not None
-                        or codeql.is_intent(intent)
-                    )
-                    if scope_evidence_pending and scope_gate.is_adjudication_intent(intent):
-                        deferred_by_scope.append(intent)
-                    elif scope_pending and (
-                        is_recon_work
-                        or description == audit_graph.AUDIT_SUMMARY_INTENT
-                    ):
+                    if not self._intent_scope_allows_dispatch(project, intent):
                         deferred_by_scope.append(intent)
                     else:
                         runnable_intents.append(intent)
@@ -1054,6 +1061,89 @@ class DispatcherLoop:
             cache[cache_key] = result_sequence
         return result_sequence
 
+    def _reason_failure_allows_dispatch(self, project: ProjectDetail) -> bool:
+        state = getattr(self, "reason_failures", {}).get(project.project.id)
+        if state is None:
+            return True
+        if (
+            state.source_generation != project.project.source_generation
+            or state.plan_revision != project.project.plan_revision
+        ):
+            self.reason_failures.pop(project.project.id)
+            self._persist_provider_circuits()
+            return True
+        blocked = state.attempts >= EXECUTION_FAILURE_LIMIT
+        if blocked or state.retry_at > time.time():
+            self._log_changed(
+                f"project:{project.project.id}:reason_failure",
+                logging.WARNING,
+                "withhold failed reason project=%s attempts=%s blocked=%s retry_at=%s",
+                project.project.id, state.attempts, blocked, state.retry_at,
+            )
+            return False
+        return True
+
+    def _observe_reason_failure(self, task: RunningTask, outcome: str) -> None:
+        """Bound project-level failures even though Reason has no Intent."""
+        try:
+            project = self.client.get_project(task.project_id)
+        except Exception:
+            LOG.exception("reason failure health lookup failed project=%s", task.project_id)
+            return
+        if project.project.status != "active":
+            return
+        states = getattr(self, "reason_failures", None)
+        if states is None:
+            states = self.reason_failures = {}
+        previous = states.get(task.project_id)
+        if previous is not None and (
+            previous.source_generation != project.project.source_generation
+            or previous.plan_revision != project.project.plan_revision
+        ):
+            previous = None
+        attempts = min(EXECUTION_FAILURE_LIMIT, (previous.attempts if previous else 0) + 1)
+        now = time.time()
+        state = ReasonFailureState(
+            worker_name=task.worker_name,
+            outcome=outcome[:800],
+            attempts=attempts,
+            retry_at=now + EXECUTION_FAILURE_RETRY_SECONDS * 2 ** (attempts - 1),
+            opened_at=now,
+            source_generation=project.project.source_generation,
+            plan_revision=project.project.plan_revision,
+        )
+        states[task.project_id] = state
+        # Persist the strike before the API call so a restart cannot erase it.
+        self._persist_provider_circuits()
+        if attempts >= EXECUTION_FAILURE_LIMIT:
+            state.blocked_event_seq = self._pause_project_for_cli_issue(task, "reason_execution_failed")
+            self._persist_provider_circuits()
+        LOG.warning(
+            "reason execution failed project=%s worker=%s attempts=%s outcome=%s",
+            task.project_id, task.worker_name, attempts, outcome,
+        )
+
+    def _observe_transport_failure(self, task: RunningTask) -> None:
+        counts = getattr(self, "worker_transport_failures", None)
+        if counts is None:
+            counts = self.worker_transport_failures = {}
+        attempts = min(EXECUTION_FAILURE_LIMIT, counts.get(task.worker_name, 0) + 1)
+        counts[task.worker_name] = attempts
+        now = time.time()
+        self.worker_provider_until[task.worker_name] = now + EXECUTION_FAILURE_RETRY_SECONDS * 2 ** (attempts - 1)
+        self.worker_provider_reason[task.worker_name] = "provider_transport_unavailable"
+        if not hasattr(self, "worker_provider_opened_at"):
+            self.worker_provider_opened_at = {}
+        self.worker_provider_opened_at[task.worker_name] = now
+        getattr(self, "worker_provider_origin", {}).pop(task.worker_name, None)
+        self._persist_provider_circuits()
+        if attempts >= EXECUTION_FAILURE_LIMIT:
+            self._pause_project_for_cli_issue(task, "provider_transport_unavailable")
+        LOG.warning(
+            "worker transport circuit opened worker=%s attempts=%s blocked=%s",
+            task.worker_name, attempts, attempts >= EXECUTION_FAILURE_LIMIT,
+        )
+
     def _observe_reason_noop(self, task: RunningTask) -> None:
         project_id = task.project_id
         if not hasattr(self, "_reason_noop_streak"):
@@ -1358,12 +1448,18 @@ class DispatcherLoop:
             proposal_limit = 0
 
         # Proof mode is candidate-centric and bounded: the server derives one
-        # highest-value obligation and suppresses duplicate open Intents. It
-        # never creates a Fact or calls Technical Confirmation here.
+        # highest-value obligation and suppresses duplicate open Intents. Once
+        # both gates pass, ask the enforcing server to promote the candidate;
+        # the dispatcher never manufactures a confirmed Fact itself.
         if hasattr(self.client, "plan_proof_gap") and proposal_limit > 0 and not priority_scope_gate:
             over_budget_candidates = audit_graph.candidate_budget_overflow_ids(
                 project, self.config.audit.max_candidate_findings,
             )
+            confirmed_candidates = {
+                item.proof.attributes.get("candidate_id")
+                for item in project.facts
+                if audit_graph._technical_confirmation(project, item)
+            }
             for fact in sorted(project.facts, key=lambda item: item.id):
                 if (
                     fact.source_generation != project.project.source_generation
@@ -1384,6 +1480,35 @@ class DispatcherLoop:
                     if response.data.get("created_intent"):
                         LOG.info("materialized proof-gap intent project=%s candidate=%s intent=%s", project.project.id, fact.id, response.data.get("intent_id"))
                         return True
+                    dynamic = response.data.get("dynamic_verification")
+                    if (
+                        fact.id not in confirmed_candidates
+                        and response.data.get("confirmation_status") == "eligible"
+                        and response.data.get("gate_status") == "PASS"
+                        and isinstance(dynamic, dict)
+                        and dynamic.get("status") == "PASS"
+                        and hasattr(self.client, "confirm_technical_finding")
+                    ):
+                        confirmation = self.client.confirm_technical_finding(
+                            project.project.id, fact.id,
+                        )
+                        if (
+                            confirmation.ok
+                            and isinstance(confirmation.data, dict)
+                            and confirmation.data.get("status") == "confirmed"
+                        ):
+                            LOG.info(
+                                "technical confirmation committed project=%s candidate=%s fact=%s",
+                                project.project.id, fact.id,
+                                confirmation.data.get("confirmed_fact_id"),
+                            )
+                            return True
+                        if confirmation.status_code not in {403, 409}:
+                            LOG.warning(
+                                "technical confirmation failed project=%s candidate=%s status=%s body=%s",
+                                project.project.id, fact.id,
+                                confirmation.status_code, confirmation.text,
+                            )
                 if response.status_code not in {200, 403, 409}:
                     LOG.warning("proof-gap planning failed project=%s candidate=%s status=%s body=%s", project.project.id, fact.id, response.status_code, response.text)
             if proposal_limit == 0:
@@ -1644,6 +1769,8 @@ class DispatcherLoop:
         trigger: str,
         trigger_events: list[AuditEvent] | None = None,
     ) -> bool:
+        if not self._reason_failure_allows_dispatch(project):
+            return False
         if self._project_has_running_reason(project.project.id):
             self._log_changed(
                 f"project:{project.project.id}:skip:reason_running",
@@ -1732,7 +1859,10 @@ class DispatcherLoop:
         return True
 
     def _dispatch_explore(self, project: ProjectDetail, export_yaml: str, intent: Intent) -> bool:
+        from linen.dispatcher.tasks.oracle import parse_oracle_intent
+
         provider_required = self._explore_requires_provider(project, intent)
+        registered_oracle = self.config.audit.oracles.enabled and parse_oracle_intent(intent) is not None
         codeql_scan = (
             self.config.audit.enabled
             and codeql.active_for_project(project, self.config.audit.codeql)
@@ -1753,7 +1883,7 @@ class DispatcherLoop:
             # including repository-wide reconnaissance.
             worker_preference=project.project.worker_preference,
             provider_required=provider_required,
-            worker_health_required=not (codeql_scan or dynamic_recipe),
+            worker_health_required=not (codeql_scan or dynamic_recipe or registered_oracle),
         )
         worker = self._codex_audit_sandbox(selection.worker, project, intent)
         if worker is None:
@@ -1974,7 +2104,8 @@ class DispatcherLoop:
                 blocked_unhealthy.append(f"{worker.name}({unhealthy_until - now:.1f}s)")
                 continue
             provider_until = getattr(self, "worker_provider_until", {}).get(worker.name, 0)
-            if provider_required and provider_until > now:
+            transport_blocked = getattr(self, "worker_transport_failures", {}).get(worker.name, 0) >= EXECUTION_FAILURE_LIMIT
+            if provider_required and (provider_until > now or transport_blocked):
                 reason = getattr(self, "worker_provider_reason", {}).get(worker.name, "unavailable")
                 # Keep the selection summary stable across polling cycles.
                 # The exact retry window is logged once when the circuit opens;
@@ -2030,6 +2161,10 @@ class DispatcherLoop:
 
     def _explore_requires_provider(self, project: ProjectDetail, intent: Intent) -> bool:
         """Keep deterministic audit work runnable during an LLM outage."""
+        from linen.dispatcher.tasks.oracle import parse_oracle_intent
+
+        if self.config.audit.oracles.enabled and parse_oracle_intent(intent) is not None:
+            return False
         description = intent.description.strip()
         scope_audit = self.config.audit.enabled and project.project.audit_mode == "scope"
         if not scope_audit:
@@ -2116,6 +2251,14 @@ class DispatcherLoop:
             return None
         return Path(root).expanduser() / ".linen-provider-circuits.json"
 
+    def _provider_retry_window(self, worker_name: str, reason: str | None) -> float:
+        if reason == "quota_exhausted":
+            return QUOTA_EXHAUSTED_RETRY_AFTER_SECONDS
+        if reason == "provider_transport_unavailable":
+            attempts = getattr(self, "worker_transport_failures", {}).get(worker_name, 1)
+            return EXECUTION_FAILURE_RETRY_SECONDS * 2 ** (max(1, attempts) - 1)
+        return RATE_LIMIT_RETRY_AFTER_SECONDS
+
     def _honor_manual_provider_retries(self, project: ProjectDetail) -> None:
         """Let an explicit Retry now bypass one persisted provider cooldown."""
         seen = getattr(self, "_manual_provider_retries_seen", None)
@@ -2142,17 +2285,14 @@ class DispatcherLoop:
                     continue
                 until = self.worker_provider_until.get(worker_name, 0)
                 reason = self.worker_provider_reason.get(worker_name)
-                retry_window = (
-                    QUOTA_EXHAUSTED_RETRY_AFTER_SECONDS
-                    if reason == "quota_exhausted"
-                    else RATE_LIMIT_RETRY_AFTER_SECONDS
-                )
+                retry_window = self._provider_retry_window(worker_name, reason)
                 if until <= 0 or resolved_at < until - retry_window:
                     continue
                 self.worker_provider_until.pop(worker_name, None)
                 self.worker_provider_reason.pop(worker_name, None)
                 getattr(self, "worker_provider_opened_at", {}).pop(worker_name, None)
                 getattr(self, "worker_provider_origin", {}).pop(worker_name, None)
+                getattr(self, "worker_transport_failures", {}).pop(worker_name, None)
                 changed = True
                 LOG.info(
                     "manual retry cleared provider circuit project=%s intent=%s worker=%s",
@@ -2214,6 +2354,21 @@ class DispatcherLoop:
                 worker_name = issue.get("worker")
                 if not isinstance(worker_name, str) or not worker_name:
                     continue
+                state = getattr(self, "reason_failures", {}).get(project_id)
+                if (
+                    state is not None
+                    and state.worker_name == worker_name
+                    and issue.get("code") == "reason_execution_failed"
+                ):
+                    resumed_at = self._timestamp_seconds(event.created_at)
+                    follows_block = (
+                        event.sequence > state.blocked_event_seq
+                        if state.blocked_event_seq is not None
+                        else resumed_at is not None and resumed_at >= state.opened_at
+                    )
+                    if follows_block:
+                        self.reason_failures.pop(project_id)
+                        changed = True
                 until = self.worker_provider_until.get(worker_name, 0)
                 if until <= 0:
                     continue
@@ -2241,6 +2396,7 @@ class DispatcherLoop:
                 self.worker_provider_reason.pop(worker_name, None)
                 opened_at.pop(worker_name, None)
                 origins.pop(worker_name, None)
+                getattr(self, "worker_transport_failures", {}).pop(worker_name, None)
                 changed = True
                 LOG.info(
                     "project worker issue resume cleared provider circuit project=%s worker=%s",
@@ -2251,6 +2407,10 @@ class DispatcherLoop:
             self._persist_provider_circuits()
 
     def _restore_provider_circuits(self) -> None:
+        if getattr(self, "worker_transport_failures", None) is None:
+            self.worker_transport_failures = {}
+        if getattr(self, "reason_failures", None) is None:
+            self.reason_failures = {}
         if getattr(self, "worker_provider_opened_at", None) is None:
             self.worker_provider_opened_at = {}
         if getattr(self, "worker_provider_origin", None) is None:
@@ -2268,7 +2428,14 @@ class DispatcherLoop:
                     continue
                 until = float(state.get("until", 0))
                 reason = state.get("reason")
-                if until <= now or reason not in {"rate_limited", "quota_exhausted"}:
+                if reason == "provider_transport_unavailable":
+                    attempts = state.get("failure_count", 0)
+                    if type(attempts) is int and 0 < attempts <= EXECUTION_FAILURE_LIMIT:
+                        self.worker_transport_failures[worker_name] = attempts
+                if (
+                    reason not in {"rate_limited", "quota_exhausted", "provider_transport_unavailable"}
+                    or (until <= now and worker_name not in self.worker_transport_failures)
+                ):
                     continue
                 self.worker_provider_until[worker_name] = until
                 self.worker_provider_reason[worker_name] = reason
@@ -2276,11 +2443,7 @@ class DispatcherLoop:
                 if isinstance(opened_at, (int, float)):
                     self.worker_provider_opened_at[worker_name] = float(opened_at)
                 else:
-                    retry_window = (
-                        QUOTA_EXHAUSTED_RETRY_AFTER_SECONDS
-                        if reason == "quota_exhausted"
-                        else RATE_LIMIT_RETRY_AFTER_SECONDS
-                    )
+                    retry_window = self._provider_retry_window(worker_name, reason)
                     self.worker_provider_opened_at[worker_name] = max(
                         0.0, until - retry_window,
                     )
@@ -2302,6 +2465,23 @@ class DispatcherLoop:
                     reason,
                     until - now,
                 )
+            failures = payload.get("reason_failures", {}) if isinstance(payload, dict) else {}
+            if isinstance(failures, dict):
+                for project_id, state in failures.items():
+                    if not isinstance(project_id, str) or not isinstance(state, dict):
+                        continue
+                    try:
+                        failure = ReasonFailureState(**state)
+                    except TypeError:
+                        continue
+                    if (
+                        failure.worker_name in configured
+                        and type(failure.attempts) is int
+                        and 0 < failure.attempts <= EXECUTION_FAILURE_LIMIT
+                        and isinstance(failure.retry_at, (int, float))
+                        and isinstance(failure.opened_at, (int, float))
+                    ):
+                        self.reason_failures[project_id] = failure
         except (OSError, TypeError, ValueError) as exc:
             LOG.warning("provider circuit restore failed path=%s error=%s", path, exc)
 
@@ -2312,12 +2492,17 @@ class DispatcherLoop:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             origins = getattr(self, "worker_provider_origin", {})
+            transport_failures = getattr(self, "worker_transport_failures", {})
             payload = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "workers": {
                     worker_name: {
-                        "until": until,
-                        "reason": self.worker_provider_reason.get(worker_name, "unavailable"),
+                        "until": self.worker_provider_until.get(worker_name, 0),
+                        "reason": self.worker_provider_reason.get(
+                            worker_name,
+                            "provider_transport_unavailable" if worker_name in transport_failures else "unavailable",
+                        ),
+                        "failure_count": transport_failures.get(worker_name, 0),
                         "opened_at": getattr(self, "worker_provider_opened_at", {}).get(worker_name),
                         "origin_project_id": (
                             origins[worker_name][0] if worker_name in origins else None
@@ -2326,8 +2511,12 @@ class DispatcherLoop:
                             origins[worker_name][1] if worker_name in origins else None
                         ),
                     }
-                    for worker_name, until in self.worker_provider_until.items()
-                    if until > time.time()
+                    for worker_name in self.worker_provider_until.keys() | transport_failures.keys()
+                    if self.worker_provider_until.get(worker_name, 0) > time.time() or worker_name in transport_failures
+                },
+                "reason_failures": {
+                    project_id: asdict(state)
+                    for project_id, state in getattr(self, "reason_failures", {}).items()
                 },
             }
             temporary = path.with_suffix(path.suffix + ".tmp")
@@ -2386,7 +2575,14 @@ class DispatcherLoop:
             if intent.to is None
             and intent.concluded_at is None
             and self._intent_error_allows_dispatch(project, intent)
+            and self._intent_scope_allows_dispatch(project, intent)
         )
+
+    def _intent_scope_allows_dispatch(self, project: ProjectDetail, intent: Intent) -> bool:
+        from linen.dispatcher.analysis.readiness import scope_allows_intent
+
+        config = getattr(self, "config", None)
+        return config is None or scope_allows_intent(project, intent, config.audit)
 
     def _reason_trigger_events(self, project: ProjectDetail, trigger: str) -> list[AuditEvent]:
         match = re.fullmatch(r"events:(\d+)->(\d+)", trigger)
@@ -2413,11 +2609,8 @@ class DispatcherLoop:
         self, project: ProjectDetail, trigger_events: list[AuditEvent] | None = None,
     ) -> bool:
         """Wake strategy for security-significant evidence, not routine coverage churn."""
-        open_intents = [
-            intent for intent in project.intents
-            if intent.to is None and intent.concluded_at is None
-        ]
-        no_open_intents = not open_intents
+        if project.project.reason_wait is not None:
+            return self._reason_wait_ready(project, trigger_events or [])
         facts_by_id = {fact.id: fact for fact in project.facts}
         strategy_fact_types = {
             "candidate_finding", "confirmed_finding", "negative_assurance",
@@ -2425,6 +2618,28 @@ class DispatcherLoop:
             "sanitizer", "validation", "reachability", "recon",
             "scope", "hypothesis",
         }
+        pending = [intent for intent in project.intents if intent.to is None and intent.concluded_at is None and self._intent_error_allows_dispatch(project, intent) and self._intent_scope_allows_dispatch(project, intent)]
+        events = trigger_events or []
+        if pending and events and not any(event.event_type in {
+            "human_hint_created", "proof_strategy_replan_required", "audit_task_failed", "audit_task_abandoned",
+            "technical_confirmation", "dynamic_verification_pass",
+        } for event in events):
+            fact_ids = {event.payload["fact_id"] for event in events if event.event_type in {
+                "audit_task_concluded", "review_created",
+            } and isinstance(event.payload.get("fact_id"), str)
+                and (fact := facts_by_id.get(event.payload["fact_id"])) is not None
+                and (fact.type in strategy_fact_types or fact.semantic_type in strategy_fact_types)}
+            if fact_ids and all(any(fid in intent.from_ for intent in pending) for fid in fact_ids):
+                # Independent review/proof tasks already cover this evidence.
+                # Let them run before buying a duplicate strategy decision.
+                return False
+        if self._dispatchable_open_intent_count(project) and not self._reason_has_non_warmup_priority(project, trigger_events or []):
+            return False
+        open_intents = [
+            intent for intent in project.intents
+            if intent.to is None and intent.concluded_at is None
+        ]
+        no_open_intents = not open_intents
         for event in trigger_events or []:
             if event.event_type in {
                 "audit_task_abandoned", "technical_confirmation",
@@ -2485,7 +2700,34 @@ class DispatcherLoop:
                 f"events:{project.project.reason_last_seen_event_seq}"
                 f"->{project.project.event_seq}"
             )
+        wait = project.project.reason_wait
+        if wait is not None and self._reason_wait_ready(project, []):
+            return f"wait:{wait.after_event_seq}:deadline:{wait.deadline_at}"
         return None
+
+    def _reason_wait_ready(self, project: ProjectDetail, events: list[AuditEvent]) -> bool:
+        wait = project.project.reason_wait
+        if wait is None:
+            return True
+        if (wait.source_generation, wait.plan_revision) != (project.project.source_generation, project.project.plan_revision):
+            return True
+        deadline = self._timestamp_seconds(wait.deadline_at)
+        if deadline is None or time.time() >= deadline:
+            return True
+        intents = {item.id: item for item in project.intents}
+        finished = [identifier not in intents or intents[identifier].to is not None or intents[identifier].concluded_at is not None for identifier in wait.intent_ids]
+        if finished and (all(finished) if wait.intent_policy == "all" else any(finished)):
+            return True
+        if any(error.intent_id in wait.intent_ids and error.resolved_at is None and error.classification in {"blocked", "permanent"} for error in project.errors):
+            return True
+        return any(
+            event.sequence > wait.after_event_seq and (
+                event.event_type in wait.event_types
+                or event.event_type in {"human_hint_created", "proof_strategy_replan_required", "technical_confirmation", "dynamic_verification_pass"}
+                or event.event_type in {"audit_task_failed", "audit_task_abandoned"}
+                and event.entity_id in wait.intent_ids
+            ) for event in events
+        )
 
     @staticmethod
     def _reason_has_priority_wake(
@@ -2635,7 +2877,7 @@ class DispatcherLoop:
             "candidate_finding", "confirmed_finding", "vulnerability",
             "negative_assurance", "candidate_disposition", "source", "sink",
             "dataflow", "sanitizer", "validation", "reachability",
-            "scope_adjudication", "hypothesis_batch", "variant_batch",
+            "hypothesis_batch", "variant_batch",
         }
         return any(
             event.event_type in {"audit_task_concluded", "review_created"}
@@ -2683,7 +2925,7 @@ class DispatcherLoop:
                         task.task_type,
                         task.worker_name,
                     )
-                elif outcome not in {"success", "noop"}:
+                elif outcome not in {"success", "noop", "waiting"}:
                     LOG.warning(
                         "task finished project=%s task=%s worker=%s outcome=%s",
                         task.project_id,
@@ -2702,7 +2944,9 @@ class DispatcherLoop:
                     )
                 else:
                     self.worker_unhealthy_until.pop(task.worker_name, None)
-                if outcome in {"rate_limited", "quota_exhausted"}:
+                if outcome == "provider_transport_unavailable":
+                    self._observe_transport_failure(task)
+                elif outcome in {"rate_limited", "quota_exhausted"}:
                     retry_after_seconds = (
                         QUOTA_EXHAUSTED_RETRY_AFTER_SECONDS
                         if outcome == "quota_exhausted"
@@ -2733,12 +2977,13 @@ class DispatcherLoop:
                         outcome,
                         retry_after_seconds,
                     )
-                elif outcome in {"success", "noop"} and task.provider_required:
+                elif outcome in {"success", "noop", "waiting", "stale"} and task.provider_required:
                     removed = self.worker_provider_until.pop(task.worker_name, None)
+                    transport_removed = getattr(self, "worker_transport_failures", {}).pop(task.worker_name, None)
                     self.worker_provider_reason.pop(task.worker_name, None)
                     getattr(self, "worker_provider_opened_at", {}).pop(task.worker_name, None)
                     getattr(self, "worker_provider_origin", {}).pop(task.worker_name, None)
-                    if removed is not None:
+                    if removed is not None or transport_removed is not None:
                         self._persist_provider_circuits()
                 rejection_key = (task.project_id, task.task_type, task.worker_name)
                 if outcome == "rejected":
@@ -2754,17 +2999,24 @@ class DispatcherLoop:
                 else:
                     self.worker_rejected_until.pop(rejection_key, None)
                 if task.task_type == "reason":
+                    if outcome in {"success", "noop", "waiting", "stale"}:
+                        if getattr(self, "reason_failures", {}).pop(task.project_id, None) is not None:
+                            self._persist_provider_circuits()
+                    elif outcome in {"failed", "rejected", "task_crashed"} or outcome.startswith("invalid_result:"):
+                        self._observe_reason_failure(task, outcome)
                     if outcome == "noop":
                         self._observe_reason_noop(task)
-                    elif outcome == "success":
+                    elif outcome in {"success", "waiting", "stale"}:
                         self._reason_noop_streak.pop(task.project_id, None)
                         self._reason_cooldown_until.pop(task.project_id, None)
                 if outcome in PROJECT_PAUSING_CLI_ISSUES:
                     self._pause_project_for_cli_issue(task, outcome)
-                elif outcome not in {"success", "noop", "cancelled", "blocked"}:
+                elif outcome not in {"success", "noop", "waiting", "stale", "cancelled", "blocked"}:
                     self._record_intent_error(task, outcome)
             except Exception as exc:
                 LOG.exception("task crashed project=%s task=%s worker=%s", task.project_id, task.task_type, task.worker_name)
+                if task.task_type == "reason":
+                    self._observe_reason_failure(task, f"task_crashed:{type(exc).__name__}")
                 self._record_intent_error(task, "task_crashed", detail=str(exc))
             finally:
                 task.cancellation.close()
@@ -2794,6 +3046,13 @@ class DispatcherLoop:
         if reporter is None:
             return
         profiles = {
+            "provider_transport_unavailable": (
+                "provider_transport_unavailable",
+                "The worker CLI could not reach its provider or discover workspace routing.",
+                EXECUTION_FAILURE_RETRY_SECONDS,
+                300,
+                EXECUTION_FAILURE_LIMIT,
+            ),
             "invalid_result": (
                 "invalid_blackboard_result",
                 "Worker output could not be validated into the required result fact.",
@@ -2893,8 +3152,18 @@ class DispatcherLoop:
                 outcome,
             )
 
-    def _pause_project_for_cli_issue(self, task: RunningTask, outcome: str) -> None:
+    def _pause_project_for_cli_issue(self, task: RunningTask, outcome: str) -> int | None:
         profiles = {
+            "provider_transport_unavailable": (
+                "provider_transport_unavailable",
+                f"{task.worker_name} failed to reach its model provider after {EXECUTION_FAILURE_LIMIT} attempts.",
+                "Repair provider connectivity or workspace routing, verify a real worker response, then resume the project.",
+            ),
+            "reason_execution_failed": (
+                "reason_execution_failed",
+                f"Reason failed {EXECUTION_FAILURE_LIMIT} consecutive times on {task.worker_name} without a successful result.",
+                "Inspect the archived Reason errors, correct the execution or result contract, then resume the project.",
+            ),
             "quota_exhausted": (
                 "provider_quota_exhausted",
                 f"{task.worker_name} reported that its model provider quota is exhausted.",
@@ -2949,11 +3218,9 @@ class DispatcherLoop:
                 )
                 self._record_intent_error(task, outcome, detail=message)
                 return
-            if outcome == "quota_exhausted":
-                data = getattr(response, "data", None)
-                blocked_event_seq = (
-                    data.get("event_seq") if isinstance(data, Mapping) else None
-                )
+            data = getattr(response, "data", None)
+            blocked_event_seq = data.get("event_seq") if isinstance(data, Mapping) else None
+            if outcome in {"quota_exhausted", "provider_transport_unavailable"}:
                 origins = getattr(self, "worker_provider_origin", None)
                 if origins is None:
                     origins = self.worker_provider_origin = {}
@@ -2977,6 +3244,8 @@ class DispatcherLoop:
                 code,
                 task.intent_id,
             )
+            if type(blocked_event_seq) is int and blocked_event_seq > 0:
+                return blocked_event_seq
         except Exception:
             LOG.exception(
                 "project CLI issue persistence crashed project=%s task=%s worker=%s",

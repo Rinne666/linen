@@ -40,6 +40,9 @@ from linen.dispatcher.tasks.common import (
     task_healthcheck_enabled,
     write_context_projection_reference,
 )
+from linen.dispatcher.tasks.reason_freshness import reason_basis_is_current
+from linen.contracts.reason import ReasonWait, REASON_WAKE_EVENTS
+from linen.dispatcher.analysis.readiness import scope_allows_intent
 from linen.dispatcher.workers.registry import get_driver
 from linen.server.models import AuditEvent, Intent, ProjectDetail
 
@@ -79,6 +82,8 @@ def _reason_frontier_seed_ids(
 
     def add(identifier: str) -> None:
         identifier = identifier.strip()
+        if identifier in hint_ids and sum(seed in hint_ids for seed in seeds) >= REASON_HINT_SEED_LIMIT:
+            return
         if identifier and identifier in available and identifier not in seeds and len(seeds) < budget:
             seeds.append(identifier)
 
@@ -89,7 +94,7 @@ def _reason_frontier_seed_ids(
     relevant_event_types = {
         "audit_task_concluded", "audit_task_failed", "audit_task_abandoned",
         "audit_task_retry_requested", "review_created", "technical_confirmation",
-        "dynamic_verification_pass", "proof_strategy_replan_required",
+        "dynamic_verification_pass", "proof_strategy_replan_required", "human_hint_created",
     }
     for event in reversed(trigger_events or []):
         if event.event_type not in relevant_event_types:
@@ -275,7 +280,7 @@ def _run_context_continuation(
     request: object,
     timeout_seconds: int,
     attempt: int,
-) -> tuple[str, dict[str, object] | None]:
+) -> tuple[str, dict[str, object] | None, ContextProjection | None]:
     """Run the sole allowed ContextRequest continuation pass.
 
     A continuation is a new cold worker session and a new server-owned run.
@@ -290,7 +295,7 @@ def _run_context_continuation(
             project.project.id,
             initial_run.run_id,
         )
-        return "failed", None
+        return "failed", None, None
     continuation_phase = "reason_context_continuation"
     try:
         context_reference = write_context_projection_reference(
@@ -306,7 +311,7 @@ def _run_context_continuation(
             initial_run.run_id,
             exc,
         )
-        return "failed", None
+        return "failed", None, None
 
     if not hasattr(request, "canonical_digest"):
         LOG.error(
@@ -314,7 +319,7 @@ def _run_context_continuation(
             project.project.id,
             initial_run.run_id,
         )
-        return "failed", None
+        return "failed", None, None
     request_digest = request.canonical_digest()
     logical_scope = (
         f"{continuation_phase}:initial-run-{initial_run.run_id}:request-{request_digest}"
@@ -365,12 +370,12 @@ def _run_context_continuation(
             initial_run.run_id,
             exc,
         )
-        return "failed", None
+        return "failed", None, None
 
     if cancellation.is_cancelled:
-        return "cancelled", None
+        return "cancelled", None, None
     if lease.failure is not None:
-        return "failed", None
+        return "failed", None, None
     if did_timeout(result) or result.returncode != 0:
         LOG.warning(
             "context continuation process failed project=%s initial_run=%s code=%s",
@@ -378,7 +383,7 @@ def _run_context_continuation(
             initial_run.run_id,
             result.returncode,
         )
-        return "failed", None
+        return "failed", None, None
     provider_failure = classify_provider_failure(result)
     if provider_failure is not None:
         LOG.warning(
@@ -387,7 +392,7 @@ def _run_context_continuation(
             initial_run.run_id,
             provider_failure,
         )
-        return provider_failure, None
+        return provider_failure, None, None
     try:
         payload = parse_json_output(driver.extract_response_text(result.stdout, result.stderr))
         if extract_context_request(payload) is not None:
@@ -399,8 +404,8 @@ def _run_context_continuation(
             initial_run.run_id,
             exc,
         )
-        return "failed", None
-    return "success", payload
+        return "failed", None, None
+    return "success", payload, expanded
 
 
 def run_reason_task(
@@ -418,6 +423,8 @@ def run_reason_task(
 ) -> str:
     lease_id = lease_id or uuid.uuid4().hex
     ack_event_seq: int | None = None
+    wait_condition: dict | None = None
+    released = False
     driver = get_driver(worker.type)
     task_started = time.perf_counter()
     healthcheck_timeout = config.runtime.healthcheck_timeout
@@ -670,7 +677,7 @@ def run_reason_task(
             context_request = extract_context_request(payload)
             if context_request is not None:
                 continuation_used = True
-                continuation_status, continuation_payload = _run_context_continuation(
+                continuation_status, continuation_payload, expanded_projection = _run_context_continuation(
                     client=client,
                     backend=backend,
                     project=project,
@@ -685,21 +692,49 @@ def run_reason_task(
                     timeout_seconds=config.tasks.reason.timeout,
                     attempt=attempt,
                 )
-                if continuation_status != "success" or continuation_payload is None:
+                if continuation_status != "success" or continuation_payload is None or expanded_projection is None:
                     return continuation_status
                 payload = continuation_payload
+                projection = expanded_projection
+            kind, data = validate_reason_payload(
+                payload, open_intents_empty=not open_intents, max_intents=config.tasks.reason.max_intents,
+            )
             fresh = client.get_project(project.project.id)
-            if fresh.project.graph_revision != run_envelope.graph_revision:
+            get_snapshot = getattr(client, "get_snapshot", None)
+            fresh_snapshot = get_snapshot(project.project.id) if callable(get_snapshot) else None
+            if not reason_basis_is_current(projection, fresh, complete=kind == "complete", snapshot=fresh_snapshot):
                 LOG.info(
                     "reason output stale project=%s expected_revision=%s current_revision=%s",
                     project.project.id,
                     run_envelope.graph_revision,
                     fresh.project.graph_revision,
                 )
-                return "failed"
-            kind, data = validate_reason_payload(
-                payload, open_intents_empty=not open_intents, max_intents=config.tasks.reason.max_intents,
-            )
+                return "stale"
+            if kind == "wait":
+                wait = ReasonWait.model_validate(data)
+                visible_open_ids = {item["id"] for item in open_intents}
+                if set(wait.intent_ids) - visible_open_ids:
+                    raise ValueError("wait must reference visible open Intent IDs")
+                wait_condition = wait.model_dump(mode="json")
+            elif kind == "noop":
+                # Compatibility for older prompts: bind an empty result to
+                # actual pending work and a finite deadline, never to churn.
+                pending = [item["id"] for item in open_intents]
+                wait_condition = ReasonWait(
+                    intent_ids=pending,
+                    event_types=[] if pending else sorted(REASON_WAKE_EVENTS),
+                    reason="Legacy empty result: await pending work" if pending else "Legacy empty result: no progress; bounded strategy retry",
+                    max_wait_seconds=300 if pending else 60,
+                ).model_dump(mode="json")
+            if wait_condition and any(
+                error.intent_id in wait_condition["intent_ids"] and error.resolved_at is None
+                and error.classification in {"blocked", "permanent"} for error in fresh.errors
+            ):
+                raise ValueError("waiting on a blocked Intent cannot make progress; choose resolve instead")
+            if wait_condition and wait_condition["intent_ids"]:
+                waited = [item for item in fresh.intents if item.id in wait_condition["intent_ids"]]
+                if waited and all(item.to is None and item.concluded_at is None and not scope_allows_intent(fresh, item, config.audit) for item in waited):
+                    raise ValueError("waiting only on scope-gated tasks cannot make progress; address the unresolved scope evidence")
         except Exception as exc:
             LOG.warning(
                 "reason parse failed project=%s worker=%s error=%s execute_ms=%s total_ms=%s stdout_preview=%s stderr_preview=%s",
@@ -723,7 +758,20 @@ def run_reason_task(
             )
             return "rejected"
         if kind == "resolve":
+            scheduled_retry_ids = []
             for resolution in data:
+                # Older model output sometimes requests retry for a transient
+                # error that the scheduler already owns. Preserve that intent
+                # as bounded waiting; never clear or expedite its retry budget.
+                errors = [error for error in fresh.errors if error.intent_id == resolution["intent_id"] and error.resolved_at is None]
+                current_intent = next((item for item in fresh.intents if item.id == resolution["intent_id"]), None)
+                if (
+                    resolution["action"] == "retry" and errors
+                    and all(error.classification == "transient" and error.retry_at is not None for error in errors)
+                    and current_intent is not None and current_intent.to is None and current_intent.concluded_at is None
+                ):
+                    scheduled_retry_ids.append(resolution["intent_id"])
+                    continue
                 response = client.resolve_intent(
                     project.project.id,
                     resolution["intent_id"],
@@ -769,6 +817,18 @@ def run_reason_task(
                     )
                     return "failed"
             ack_event_seq = project.project.event_seq
+            if scheduled_retry_ids:
+                wait_condition = ReasonWait(
+                    intent_ids=scheduled_retry_ids, reason="Requested retries are already scheduled under the bounded transient-error policy",
+                    max_wait_seconds=300,
+                ).model_dump(mode="json")
+                lease.stop()
+                released = best_effort_release_reason(
+                    client, project.project.id, worker.name, lease_id, ack_event_seq,
+                    ack=True, wait=wait_condition,
+                    wait_basis=(projection.source_generation, projection.plan_revision),
+                )
+                return "waiting" if released else "stale"
             return "success"
         if kind == "complete":
             if audit_enabled:
@@ -995,8 +1055,16 @@ def run_reason_task(
             total_ms,
         )
         ack_event_seq = project.project.event_seq
-        if kind == "noop":
-            return "noop"
+        if kind in {"noop", "wait"}:
+            lease.stop()
+            released = best_effort_release_reason(
+                client, project.project.id, worker.name, lease_id, ack_event_seq,
+                ack=True, wait=wait_condition,
+                wait_basis=(projection.source_generation, projection.plan_revision),
+            )
+            if not released:
+                return "stale"
+            return "waiting" if kind == "wait" or wait_condition["intent_ids"] else "noop"
         return "success"
     finally:
         lease.stop()
@@ -1006,7 +1074,8 @@ def run_reason_task(
             # Acknowledge only the snapshot this pass actually saw; meaningful
             # evidence arriving while it ran remains available to wake Reason.
             ack_event_seq = project.project.event_seq
-        best_effort_release_reason(
-            client, project.project.id, worker.name, lease_id, ack_event_seq,
-            ack=True,
-        )
+        if not released:
+            best_effort_release_reason(
+                client, project.project.id, worker.name, lease_id, ack_event_seq,
+                ack=True,
+            )

@@ -598,7 +598,10 @@ def _review_proposals(
                 # that can feed the final summary. They are intentionally not
                 # candidate findings, but the evidence chain still requires an
                 # independent disposition before the summary can be committed.
-                "reachability", "dataflow", "validation",
+                "reachability", "dataflow", "validation", "source", "sink",
+                "principal", "attacker_control", "precondition", "security_invariant", "security_boundary",
+                "security_control_assessment", "capability_before", "capability_after", "capability_delta",
+                "impact_observation", "negative_control", "reproduction", "config_source", "config_resolution", "effective_config",
             }
             or fact.semantic_type in {
                 "candidate_finding", "confirmed_finding", "rejected_finding",
@@ -715,8 +718,11 @@ def _stage_intent_proposal(
     if usable_result_attempts:
         return None
     attempts_without_result = sum(
-        item not in result_attempts
-        or facts_by_id[item.to].status in {"false_positive", "fixed"}
+        item.from_ == from_ids
+        and (
+            item.to not in facts_by_id
+            or facts_by_id[item.to].status in {"false_positive", "fixed"}
+        )
         for item in prior
     )
     if attempts_without_result >= MAX_STAGE_INTENT_ATTEMPTS:

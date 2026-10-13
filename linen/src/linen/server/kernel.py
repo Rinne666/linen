@@ -40,7 +40,7 @@ from linen.server.store import (
     transition_run as store_transition_run,
 )
 from linen.contracts import AuditEventEnvelope, RunEnvelope
-from linen.server.uvpg import UNIFIED_REVIEW_KIND, proof_graph_fingerprint
+from linen.server.uvpg import UNIFIED_REVIEW_KIND, proof_graph_fingerprint, collect_candidate_proof_subgraph
 
 LOG = logging.getLogger(__name__)
 
@@ -184,6 +184,8 @@ def create_review(
     body: CreateReviewRequest,
 ) -> Review:
     """Persist one Review and all server-owned side effects atomically."""
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
     project = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
     if project is None:
         raise KernelNotFound(f"Project {project_id} not found")
@@ -217,6 +219,11 @@ def create_review(
 
     diagnostics = body.model_dump(include=set(REVIEW_DIAGNOSTIC_FIELDS), exclude_none=True)
     verification = diagnostics.get("cold_verification")
+    if isinstance(verification, dict):
+        from linen.server.candidate_assessment import assessment_binding_is_current
+
+        if not assessment_binding_is_current(conn, project_id, fact_id, verification):
+            raise KernelConflict("Candidate assessment input changed since the reviewer received it")
     unified_proof_review = False
     if (
         fact_row["type"] == "vulnerability"
@@ -228,6 +235,13 @@ def create_review(
         verification = dict(verification)
         verification["review_kind"] = UNIFIED_REVIEW_KIND
         verification["candidate_id"] = fact_id
+        input_digest = verification.get("proof_input_sha256")
+        if input_digest is not None:
+            if input_digest != proof_graph_fingerprint(conn, project_id, fact_id) or (
+                verification.get("input_source_generation"), verification.get("input_plan_revision")
+            ) != (project["source_generation"], project["plan_revision"]):
+                raise KernelConflict("Proof package changed since the reviewer received its input")
+            verification["input_fact_ids"] = sorted(collect_candidate_proof_subgraph(conn, project_id, fact_id).proof_fact_ids)
         diagnostics["cold_verification"] = verification
         unified_proof_review = True
 

@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -1011,6 +1012,28 @@ def plan_proof_gap(project_id: str, fact_id: str):
                     "reason": "candidate_assessed_as_non_vulnerability",
                     **status,
                 }
+        # Scope and reportability can be decided from a source-grounded claim
+        # before spending calls on all nine proof atoms. A reportable or
+        # unresolved result continues through the unchanged proof/dynamic gates.
+        if project["audit_mode"] == "scope" and assessment is None:
+            from linen.server.candidate_assessment import ASSESSMENT_PREFIX, candidate_assessment_input
+
+            inputs = candidate_assessment_input(conn, project_id, fact_id)
+            description = f"{ASSESSMENT_PREFIX}{fact_id}:{inputs['assessment_input_sha256']}"
+            existing = conn.execute("SELECT id,to_fact_id,concluded_at FROM intents WHERE project_id = ? AND description = ? ORDER BY id DESC LIMIT 1", (project_id, description)).fetchone()
+            if existing is None:
+                now, intent_id = utcnow(), next_intent_id(conn, project_id)
+                conn.execute(
+                    "INSERT INTO intents (id,project_id,description,display_title,type,semantic_type,relation_type,phase,source_generation,plan_revision,creator,created_at) "
+                    "VALUES (?,?,?,'Assess candidate scope and impact','review:devils-advocate','review_task','reviews','review',?,?,'dispatcher.proof-gap',?)",
+                    (intent_id, project_id, description, project["source_generation"], project["plan_revision"], now),
+                )
+                conn.execute("INSERT INTO intent_sources (intent_id,project_id,fact_id) VALUES (?,?,?)", (intent_id, project_id, fact_id))
+                bump_graph_revision(conn, project_id)
+                append_event(conn, project_id, "candidate_assessment_intent_created", "dispatcher.proof-gap", entity_kind="intent", entity_id=intent_id, payload={"candidate_id": fact_id, "assessment_input_sha256": inputs["assessment_input_sha256"]}, created_at=now)
+                return {"created_intent": True, "intent_id": intent_id, "reason": "early_candidate_assessment", **status}
+            if existing["to_fact_id"] is None and existing["concluded_at"] is None:
+                return {"created_intent": False, "reason": "candidate_assessment_pending", "intent_id": existing["id"], **status}
         strategy_gap = next((
             gap for gap in gaps
             if gap.failure_class in {"wrong_path", "wrong_boundary_assumption"}
@@ -1128,6 +1151,15 @@ def plan_proof_gap(project_id: str, fact_id: str):
         now = utcnow()
         intent_id = next_intent_id(conn, project_id)
         description = f"@uvpg:proof:{selected.key}:{selected.suggested_intent_type}:{selected.expected_fact_type or 'evidence'} {selected.description}"
+        if selected.code in {"MISSING_DYNAMIC_REPRODUCTION", "MISSING_DYNAMIC_NEGATIVE_CONTROL"}:
+            from linen.server.oracle_registry import approved_oracle
+
+            try:
+                definition = approved_oracle(project_id, fact_id, project["source_generation"], project["plan_revision"])
+            except (ValueError, OSError):
+                return {"created_intent": False, "reason": "independent_oracle_unavailable", **status}
+            role = "positive" if selected.code == "MISSING_DYNAMIC_REPRODUCTION" else "negative"
+            description += f" @oracle:{definition.id}:{role}"
         conn.execute(
             "INSERT INTO intents (id, project_id, to_fact_id, description, display_title, type, semantic_type, relation_type, phase, source_generation, plan_revision, creator, worker, last_heartbeat_at, created_at, concluded_at) "
             "VALUES (?, ?, NULL, ?, ?, ?, 'audit_task', ?, 'verification', ?, ?, 'dispatcher.proof-gap', NULL, NULL, ?, NULL)",
@@ -1138,6 +1170,43 @@ def plan_proof_gap(project_id: str, fact_id: str):
         bump_graph_revision(conn, project_id)
         append_event(conn, project_id, "proof_gap_intent_created", "dispatcher.proof-gap", entity_kind="intent", entity_id=intent_id, payload={"candidate_id": fact_id, "gap": selected.as_dict()}, created_at=now)
         return {"created_intent": True, "intent_id": intent_id, "gap": selected.as_dict(), **_proof_status_payload(conn, project_id, fact_id)}
+
+
+@router.get("/projects/{project_id}/facts/{fact_id}/proof-package")
+def get_proof_package(project_id: str, fact_id: str):
+    """Return one atomic package of claims, without Reviews or sibling history."""
+    from linen.server.uvpg import collect_candidate_proof_subgraph
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        project = get_project_or_404(conn, project_id)
+        candidate = conn.execute("SELECT type FROM facts WHERE project_id = ? AND id = ?", (project_id, fact_id)).fetchone()
+        if candidate is None:
+            raise HTTPException(404, "Candidate fact not found")
+        if candidate["type"] != "vulnerability":
+            raise HTTPException(409, "Proof package requires a candidate finding")
+        view = collect_candidate_proof_subgraph(conn, project_id, fact_id)
+        rows = []
+        for identifier in view.proof_fact_ids:
+            row = conn.execute("SELECT id,type,semantic_type,status,description,evidence,proof,source_generation FROM facts WHERE project_id = ? AND id = ?", (project_id, identifier)).fetchone()
+            if row is not None:
+                rows.append(dict(row))
+        return {"candidate_id": fact_id, "source_generation": project["source_generation"],
+                "plan_revision": project["plan_revision"], "proof_input_sha256": proof_graph_fingerprint(conn, project_id, fact_id),
+                "facts": rows, "edges": [edge.model_dump(mode="json") for edge in view.edges]}
+
+
+@router.get("/projects/{project_id}/facts/{fact_id}/assessment-input")
+def get_candidate_assessment_input(project_id: str, fact_id: str):
+    from linen.server.candidate_assessment import candidate_assessment_input
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        get_project_or_404(conn, project_id)
+        try:
+            return candidate_assessment_input(conn, project_id, fact_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
 
 @router.post("/projects/{project_id}/facts/{fact_id}/technical-confirmation")
@@ -1396,6 +1465,7 @@ def claim_project_reason(project_id: str, body: ReasonClaimRequest):
             """
             UPDATE projects
             SET reason_worker = ?,
+                reason_wait = NULL,
                 reason_lease_id = ?,
                 reason_trigger = ?,
                 reason_started_at = ?,
@@ -1411,15 +1481,26 @@ def claim_project_reason(project_id: str, body: ReasonClaimRequest):
 def heartbeat_project_reason(project_id: str, body: ReasonHeartbeatRequest):
     with get_conn() as conn:
         check_project_active(conn, project_id)
+        before = get_project_or_404(conn, project_id)
         expire_reason_leases(conn, project_id)
         row = get_project_or_404(conn, project_id)
         current_worker = row["reason_worker"]
         if current_worker is None:
-            raise HTTPException(409, "Project reason is not currently claimed")
+            expiry = conn.execute(
+                "SELECT payload FROM audit_events WHERE project_id = ? AND event_type = 'reason_lease_expired' ORDER BY sequence DESC LIMIT 1",
+                (project_id,),
+            ).fetchone()
+            expired = json.loads(expiry["payload"]) if expiry else {}
+            matched_expiry = expired.get("lease_sha256") == hashlib.sha256(body.lease_id.encode()).hexdigest()
+            code = "reason_lease_expired" if matched_expiry else "reason_lease_not_claimed"
+            return JSONResponse(status_code=409, content={"detail": {
+                "code": code, "message": "Project reason is not currently claimed",
+                "last_heartbeat_at": expired.get("last_heartbeat_at") if matched_expiry else before["reason_last_heartbeat_at"],
+            }})
         if current_worker != body.worker:
-            raise HTTPException(409, f"Project reason is currently claimed by {current_worker}")
+            raise HTTPException(409, {"code": "reason_worker_mismatch", "message": f"Project reason is currently claimed by {current_worker}"})
         if row["reason_lease_id"] != body.lease_id:
-            raise HTTPException(409, "Project reason lease token does not match")
+            raise HTTPException(409, {"code": "reason_token_mismatch", "message": "Project reason lease token does not match"})
 
         now = utcnow()
         conn.execute(
@@ -1443,6 +1524,23 @@ def release_project_reason(project_id: str, body: ReasonHeartbeatRequest):
         if row["reason_lease_id"] != body.lease_id:
             raise HTTPException(409, "Project reason lease token does not match")
 
+        if body.wait is not None:
+            if (body.source_generation, body.plan_revision) != (row["source_generation"], row["plan_revision"]):
+                raise HTTPException(409, "wait basis no longer matches current source and plan")
+            if body.seen_event_seq is None or body.seen_event_seq > row["latest_event_seq"]:
+                raise HTTPException(422, "wait requires an observed event cursor")
+            known = {item["id"] for item in conn.execute("SELECT id FROM intents WHERE project_id = ?", (project_id,))}
+            if set(body.wait.intent_ids) - known:
+                raise HTTPException(422, "wait references an unknown Intent")
+            state = {
+                **body.wait.model_dump(mode="json"),
+                "after_event_seq": body.seen_event_seq,
+                "source_generation": row["source_generation"], "plan_revision": row["plan_revision"],
+                "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=body.wait.max_wait_seconds)).isoformat().replace("+00:00", "Z"),
+            }
+            conn.execute("UPDATE projects SET reason_wait = ? WHERE id = ?", (json.dumps(state), project_id))
+            append_event(conn, project_id, "reason_wait_started", body.worker,
+                         entity_kind="project", entity_id=project_id, payload=state)
         if body.seen_event_seq is not None:
             conn.execute(
                 "UPDATE projects SET reason_last_seen_event_seq = MAX(reason_last_seen_event_seq, ?) WHERE id = ?",

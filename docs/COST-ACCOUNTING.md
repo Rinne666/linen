@@ -46,3 +46,10 @@ lifecycle status and a missing-result/error code appear in
 
 Execution archive fields are additive. Existing archives without usage or
 attempt metadata remain valid and are interpreted as legacy records.
+
+New archives retain classified provider failures such as
+`provider_transport_unavailable`, `quota_exhausted`, and `rate_limited` instead
+of reducing them to `worker_exit_nonzero`. An explicit terminal provider error
+also marks an attempt failed when its CLI exits zero. Recovered retries in a
+successful stream do not mark the attempt failed. Earlier archives remain
+unchanged.

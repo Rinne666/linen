@@ -4,6 +4,7 @@ import json
 from typing import Any, Literal, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from linen.contracts.reason import ReasonWait
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +451,13 @@ class ProjectWorkerIssue(BaseModel):
     created_at: str
 
 
+class ReasonWaitState(ReasonWait):
+    after_event_seq: int = Field(ge=0)
+    source_generation: int = Field(ge=1)
+    plan_revision: int = Field(ge=1)
+    deadline_at: str
+
+
 class ProjectMeta(BaseModel):
     id: str
     title: str
@@ -468,6 +476,7 @@ class ProjectMeta(BaseModel):
     worker_issues: list[ProjectWorkerIssue] = Field(default_factory=list)
     created_at: str
     reason: ProjectReason | None = None
+    reason_wait: ReasonWaitState | None = None
     # Resolved source-tree path for the project. Set when the project is
     # created with `clone_url` (clone lands here) or `repo_root` (validated
     # local directory). None means no per-project override — the dispatcher
@@ -929,6 +938,9 @@ class ReasonHeartbeatRequest(BaseModel):
     worker: str
     lease_id: str
     seen_event_seq: int | None = Field(default=None, ge=0)
+    wait: ReasonWait | None = None
+    source_generation: int | None = Field(default=None, ge=1)
+    plan_revision: int | None = Field(default=None, ge=1)
 
     @field_validator("worker", "lease_id")
     @classmethod

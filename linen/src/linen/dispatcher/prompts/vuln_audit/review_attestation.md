@@ -12,6 +12,12 @@ record faithfully represents what was executed or classified. A successful
 inventory or a zero-candidate result is not evidence that the repository is
 safe.
 
+When a dispatcher mechanical-integrity record is appended, use its re-read byte
+checks for the named digests. It is produced outside the model for this review,
+does not contain a semantic verdict, and does not grant global completeness.
+Inspect the frozen documents yourself. Do not request shell/hash tools merely
+to repeat a provided valid check, and do not claim to have run a hash command.
+
 Check all of the following:
 
 1. The evidence artifact exists and its declared digest matches.

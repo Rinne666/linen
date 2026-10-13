@@ -15,11 +15,41 @@ from linen.dispatcher.config import CoverageConfig, ReviewSandboxConfig
 from linen.dispatcher.runtime.backend import LocalBackend
 from linen.dispatcher.runtime.cancellation import TaskCancellation
 from linen.dispatcher.runtime.process import ProcessResult
-from linen.dispatcher.runtime.review_sandbox import DockerReviewProcess, ReviewSandboxBackend
+from linen.dispatcher.runtime.review_sandbox import DockerReviewProcess, ReviewSandboxBackend, isolated_review_argv
 from linen.dispatcher.tasks import explore, reason, review
 from linen.dispatcher.scheduler.loop import DispatcherLoop
 from linen.dispatcher.workers.base import DriverResult
 from linen.server.models import AuditStage, Fact, ProjectDetail, ProjectMeta
+
+
+def test_isolated_review_cli_can_read_only_the_declared_mounts():
+    original = ["claude", "--safe-mode", "--restricted", "--tools", "Read,Glob,Grep", "--", "review source"]
+    prepared = isolated_review_argv(original)
+    assert prepared[-6:] == ["--add-dir", "/repo", "--add-dir", "/input", "--", "review source"]
+    assert prepared[:5] == original[:5]
+    assert original[-2:] == ["--", "review source"]
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_codex_container_uses_outer_isolation_without_changing_host_policy(resume):
+    from linen.dispatcher.config import WorkerConfig
+    from linen.dispatcher.workers.adapters.codex import CodexDriver
+
+    worker = WorkerConfig(name="codex", type="codex", task_types=["review"],
+                          max_running=1, sandbox_mode="read-only")
+    driver = CodexDriver(local=True)
+    prompt = 'Keep literal --sandbox read-only and sandbox_mode="read-only" in this prompt.'
+    original = (driver.build_conclude(worker, prompt, "session-id") if resume
+                else driver.build_execute(worker, prompt, None).argv)
+    prepared = isolated_review_argv(original)
+    assert prepared[-2:] == ["--", prompt]
+    assert "--sandbox" not in prepared[:-2]
+    assert 'sandbox_mode="read-only"' not in prepared[:-2]
+    assert prepared.count('sandbox_mode="danger-full-access"') == 1
+    assert prepared.count("--skip-git-repo-check") == 1
+    assert isolated_review_argv(prepared) == prepared
+    assert worker.sandbox_mode == "read-only"
+    assert "--sandbox" in original if not resume else 'sandbox_mode="read-only"' in original
 
 
 def scope_setup(api, tmp_path, *, topics=None):

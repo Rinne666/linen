@@ -149,6 +149,24 @@ def test_proof_obligation_binds_identity_without_relabeling() -> None:
 
     assert fact["proof"]["claim_kind"] == "attacker_control"
     assert fact["proof"]["subject_ids"] == ["f006"]
+    fact_with_server_bound_role = explore._bind_proof_obligation(intent, {
+        "description": "request reaches the handler without an identity gate",
+        "type": "attacker_control",
+        "evidence": "file:Api.java\nline:42",
+        "proof": {"attributes": {"path_signature": "HTTP request -> handler"}},
+    })
+    assert fact_with_server_bound_role["proof"]["claim_kind"] == "attacker_control"
+    assert fact_with_server_bound_role["proof"]["attributes"] == {
+        "path_signature": "HTTP request -> handler",
+    }
+
+    with pytest.raises(explore.ProofContractError, match="proof claim_kind must be attacker_control"):
+        explore._bind_proof_obligation(intent, {
+            "description": "request reaches the handler",
+            "type": "attacker_control",
+            "evidence": "file:Api.java\nline:42",
+            "proof": {"claim_kind": "reachability"},
+        })
     with pytest.raises(explore.ProofContractError, match="requires fact type attacker_control"):
         explore._bind_proof_obligation(intent, {
             "description": "request id is attacker controlled",
