@@ -1342,7 +1342,7 @@ def test_fresh_recon_and_machine_path_facts_wake_reason_with_open_work() -> None
         "to": None,
         "concluded_at": None,
     })])
-    project.facts.append(Fact(id="f-machine", description="machine candidates", type="recon"))
+    project.facts.append(Fact(id="f-machine", description="machine candidates", type="recon", evidence="candidates: 2"))
     event = AuditEvent(
         sequence=31, event_type="audit_task_concluded", actor="codeql",
         entity_kind="intent", entity_id="i-codeql", payload={"fact_id": "f-machine"},
@@ -1383,13 +1383,13 @@ def test_scope_reason_batches_only_warmup_until_initial_categories_return() -> N
     project.facts.append(policy)
     event = _conclusion(40, policy.id)
 
-    assert loop._reason_may_run(project, [event])
+    assert not loop._reason_may_run(project, [event])
     assert loop._reason_waits_for_initial_recon(project, [event])
 
     # Current-generation and current-plan results satisfy the barrier. An open
-    # managed intent remains, so the completed lenses still get one synthesis wake.
+    # managed intent remains. Its concrete leads still get a synthesis wake.
     for index, category in enumerate(("authorization", "input-validation"), start=1):
-        result = Fact(id=f"f-recon-{index}", description=category, type="recon")
+        result = Fact(id=f"f-recon-{index}", description=category, type="recon", evidence="leads: 1")
         producer = make_intent(f"i-recon-{index}").model_copy(update={
             "description": recon.category_description(category),
             "to": result.id,

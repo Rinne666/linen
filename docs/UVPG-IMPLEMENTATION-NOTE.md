@@ -56,6 +56,12 @@ vulnerability Facts remain accepted only for compatibility. Technical
 Confirmation does not inspect bounty scope, CVE eligibility, or reporting
 policy; those remain downstream concerns.
 
+The dispatcher requests the separate Technical Confirmation operation when the
+proof-gap projection reports both static and dynamic gates as PASS. The server
+revalidates all evidence and reportability before writing a promotion. A stale
+projection or failed gate cannot produce a confirmed Fact, and persisted
+promotions prevent repeated scheduler writes after restart.
+
 ## Proof-gap production
 
 This correctness phase hardens the existing projection and planner; it does

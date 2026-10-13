@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS projects (
     reason_last_heartbeat_at TEXT,
     reason_lease_id TEXT,
     reason_last_seen_event_seq INTEGER NOT NULL DEFAULT 0,
+    reason_wait TEXT,
     -- Optional per-project source tree override. When set, the dispatcher
     -- symlinks <workdir>/repo to this path; otherwise it falls back to the
     -- dispatcher's `local.repo_root` config, or no symlink at all. Set by
@@ -406,6 +407,8 @@ def _ensure_project_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE projects ADD COLUMN completion_policy TEXT NOT NULL DEFAULT 'goal_based'")
     if "reason_last_seen_event_seq" not in columns:
         conn.execute("ALTER TABLE projects ADD COLUMN reason_last_seen_event_seq INTEGER NOT NULL DEFAULT 0")
+    if "reason_wait" not in columns:
+        conn.execute("ALTER TABLE projects ADD COLUMN reason_wait TEXT")
     if "audit_mode" not in columns:
         conn.execute("ALTER TABLE projects ADD COLUMN audit_mode TEXT NOT NULL DEFAULT 'none'")
     if "worker_preference" not in columns:

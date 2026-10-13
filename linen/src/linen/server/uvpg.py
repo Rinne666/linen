@@ -352,10 +352,21 @@ def collect_candidate_proof_subgraph(conn: sqlite3.Connection, project_id: str, 
     for ids in view.facts_by_role.values():
         ids.sort()
     view.foreign_fact_ids = sorted(set(view.foreign_fact_ids))
-    for row in conn.execute("SELECT fact_id, verdict, confidence FROM reviews WHERE project_id = ? ORDER BY created_at, id", (project_id,)):
+    for row in conn.execute("SELECT fact_id, verdict, confidence, diagnostics FROM reviews WHERE project_id = ? ORDER BY created_at, id", (project_id,)):
         if row["fact_id"] in seen:
             view.reviews_by_fact.setdefault(row["fact_id"], []).append(dict(row))
     return view
+
+
+def _has_legacy_candidate_review(view: ProofGraphView, candidate_id: str) -> bool:
+    from linen.server.candidate_assessment import ASSESSMENT_KIND
+
+    for review in view.reviews_by_fact.get(candidate_id, []):
+        diagnostics = _review_diagnostics(review)
+        verification = diagnostics.get("cold_verification") if isinstance(diagnostics, dict) else None
+        if not isinstance(verification, dict) or verification.get("review_kind") != ASSESSMENT_KIND:
+            return True
+    return False
 
 
 _REVIEW_ROLE_ORDER = (
@@ -494,6 +505,12 @@ def candidate_proof_review(
         return False, "CONTRADICTED_EVIDENCE", verification
     if verification.get("candidate_id") != candidate_id:
         return False, "CROSS_CANDIDATE_EVIDENCE", verification
+    if verification.get("proof_input_sha256") is not None:
+        basis = conn.execute("SELECT source_generation,plan_revision FROM projects WHERE id = ?", (project_id,)).fetchone()
+        if (verification.get("input_source_generation"), verification.get("input_plan_revision")) != (
+            basis["source_generation"], basis["plan_revision"],
+        ):
+            return False, "PROOF_GRAPH_CHANGED", verification
     if verification.get("proof_evidence_sha256") != current_digest:
         return False, "PROOF_GRAPH_CHANGED", verification
     return True, None, verification
@@ -920,10 +937,7 @@ def evaluate_shadow_gate(conn: sqlite3.Connection, project_id: str, fact_id: str
         # legacy per-Fact semantics until their candidate receives the new
         # proof-package review; all newly planned review work uses the new
         # single candidate review.
-        if any(
-            view.reviews_by_fact.get(identifier)
-            for identifier in view.facts_by_role.get("candidate", [])
-        ):
+        if _has_legacy_candidate_review(view, fact_id):
             for proof_id in unreviewed_required_facts(view):
                 reviews = view.reviews_by_fact.get(proof_id, [])
                 if any(item["verdict"] == "INVALID" for item in reviews):
@@ -993,7 +1007,7 @@ def derive_proof_gaps(conn: sqlite3.Connection, project_id: str, candidate_fact_
             # candidate-local cold-verifier obligation. Legacy candidates
             # that already have a candidate review retain their old targeted
             # obligations until the unified review is recorded.
-            has_candidate_review = bool(view.reviews_by_fact.get(candidate_fact_id))
+            has_candidate_review = _has_legacy_candidate_review(view, candidate_fact_id)
             if stale_unified_review:
                 if package_review_ready:
                     gaps.append(ProofGap(

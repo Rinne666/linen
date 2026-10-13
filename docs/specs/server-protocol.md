@@ -208,7 +208,7 @@ complete 接口原子完成项目并生成最终报告快照。
 - `GET/PUT /projects/{id}/stages/{stage_id}`
 - `GET/POST/PUT /projects/{id}/skill-runs`
 - `GET /projects/{id}/events`
-- `GET /projects/{id}/export?format=report|yaml|timeline|json|sarif`
+- `GET /projects/{id}/export?format=summary|report|yaml|timeline|json|sarif|svg|bundle`
 
 ### Settings
 
@@ -536,6 +536,11 @@ Body：
 
 当前运行对项目级 `reason` lease 续约，更新 `last_heartbeat_at`。请求必须同时匹配当前的 `worker` 与 `lease_id`；若当前无人持有或令牌不匹配，返回 409。该接口属于探索写操作，仅 `active` 项目允许；`stopped` 或 `completed` 返回 403。
 
+409 的 `detail` 为对象，`code` 区分 `reason_lease_expired`、
+`reason_lease_not_claimed`、`reason_worker_mismatch`、`reason_token_mismatch`。
+过期事件保存 worker、租约摘要和最后心跳时间；即使其他读取先清理租约，
+后续心跳仍能通过摘要识别对应的过期记录。Dispatcher 取消失租进程，不自动接管。
+
 Body：
 
 ```json
@@ -550,6 +555,27 @@ Body：
 #### POST /projects/{project_id}/reason/release
 
 当前运行主动释放项目级 `reason` lease，使其立刻回到无人执行 `reason` 的状态。请求必须同时匹配当前的 `worker` 与 `lease_id`；若当前已为空则幂等返回当前状态，若令牌不匹配则返回 409。该接口属于探索写操作，仅 `active` 项目允许；`stopped` 或 `completed` 返回 403。
+
+可附带 `seen_event_seq` 确认本轮实际读取的事件游标。若 Reason 返回 `wait`，
+dispatcher 同时提交 `source_generation`、`plan_revision` 和 `wait`；服务端校验
+租约、当前代次、已观察游标及 Intent 身份后，原子保存 `project.reason_wait`
+和 `reason_wait_started` 事件再释放租约。例如：
+
+```json
+{
+  "worker": "dispatcher-worker-A",
+  "lease_id": "current-run-token",
+  "seen_event_seq": 42,
+  "source_generation": 1,
+  "plan_revision": 1,
+  "wait": {"intent_ids": ["i123"], "reason": "等待可达性验证", "max_wait_seconds": 300}
+}
+```
+
+等待条件可以是 `intent_ids` 或 `event_types`，至少一个非空；时限为 1–900 秒。
+多个 Intent 默认等待全部返回；可用 `intent_policy: "any"` 明确等待首个结果。
+条件满足、关键人工/确认事件、新代次或截止时间会唤醒 Reason；Explore/Review
+继续执行。等待是控制状态，不产生 Fact，也不代表线索已处置。
 
 Body：
 
@@ -932,6 +958,22 @@ intents:
 前端 Export 界面默认对已完成项目打开 Final report，并同时保留 YAML snapshot 与
 Timeline 标签；三种格式均支持复制和下载。
 
+#### GET /projects/{project_id}/export?format=svg|bundle
+
+`svg` 返回无需浏览器布局或外部服务的 SVG 证据图，包含 Fact、Intent、Review
+以及已记录的关系。标签以 XML 文本转义；循环、孤立节点和未完成任务仍可导出。
+Review 的反向确认关系不参与因果层级布局。
+
+`bundle` 返回 ZIP：`report.md`、`summary.md`、`graph.svg`、`snapshot.json`、
+`findings.sarif` 和 `manifest.json`。所有内容来自同一个 SQLite 事务；只在开始时
+清理过期租约，避免文件间因租约过期而发生图版本漂移。manifest 保存项目状态、
+source/plan/graph revision、完成门槛以及各文件的 SHA-256 和字节数。
+未完成或停止的项目同样可导出，报告标记为 Progress Report，保留残余线索和缺口。
+bundle 始终反映当前快照；`format=report` 在完成后仍返回原有不可变完成报告。
+
+`linen audit-export --project-id ... --server ... --output ...zip` 校验 ZIP
+manifest 后原子替换本地文件。前端 Export 提供 Graph SVG 与 Full bundle 下载入口。
+
 ---
 
 ## 消费者典型使用流程
@@ -1009,3 +1051,12 @@ Timeline 标签；三种格式均支持复制和下载。
    b. 项目回到 `active`，图中新增一条 `external_feedback` 结论边和一个纠错 Fact
    c. 回到步骤 1
 ```
+
+
+## 证明包复核输入绑定
+
+`GET /projects/{id}/facts/{candidate}/proof-package` 在同一数据库读取快照中返回候选局部的 Facts、证明 edges、source_generation、plan_revision 和 proof_input_sha256，不返回旧 Reviews、提示或兄弟候选。独立 Reviewer 必须收到所有待复核的证明声明；只给候选描述不能代表已检查整个包。
+
+新的统一包复核由 dispatcher 附加 cold_verification.proof_input_sha256、input_source_generation 和 input_plan_revision。服务器在写入前持有事务锁并检查输入绑定；证明或代次已变化时返回 409，且不保存 Review。服务器随后记录已验证的 input_fact_ids，并在复核自身导致状态变更后计算最终 proof_evidence_sha256。该最终摘要与复核开始时的输入摘要用途不同。
+
+Completion 仅在当前静态证明门槛通过、输入事实集合匹配、代次与计划仍匹配且没有相反的单项复核时认可包内 draft atoms 的统一复核。它不改写 atom 状态、不技术确认候选，也不把旧式的包标记当成实际输入记录。普通未复核证据仍按原门槛拒绝完成。

@@ -142,6 +142,7 @@ class LocalConfig(BaseModel):
 
 
 class RuntimeConfig(BaseModel):
+    prevent_idle_sleep: bool = True
     max_workers: int = Field(gt=0)
     max_running_projects: int = Field(gt=0)
     max_project_workers: int = Field(gt=0)
@@ -222,6 +223,10 @@ class ReviewSandboxConfig(BaseModel):
     pids_limit: int = Field(default=256, gt=0)
     # Only these names cross from worker.env / host env into the container.
     env_allowlist: list[str] = Field(default_factory=list)
+    # Explicit auth-only seed for Codex account login; never mount host HOME.
+    codex_auth_file: str | None = None
+    # Container-specific values, e.g. Docker Desktop's host proxy address.
+    env: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_sandbox(self) -> "ReviewSandboxConfig":
@@ -237,6 +242,12 @@ class ReviewSandboxConfig(BaseModel):
                     or name in {"HOME", "PATH", "TMPDIR", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"}
                     or name.startswith("DOCKER_")):
                 raise ValueError(f"Invalid sandbox environment name: {name}")
+        if self.codex_auth_file is not None:
+            from pathlib import Path
+            if not Path(self.codex_auth_file).is_absolute():
+                raise ValueError("review_sandbox.codex_auth_file must be an absolute path")
+        if self.env.keys() - set(self.env_allowlist):
+            raise ValueError("review_sandbox.env names must be explicitly allowlisted")
         return self
 
 
@@ -472,6 +483,18 @@ class SemanticAuditConfig(BaseModel):
         return value
 
 
+class OracleConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    catalog_path: Path | None = None
+
+    @model_validator(mode="after")
+    def validate_catalog_path(self) -> "OracleConfig":
+        if self.enabled and self.catalog_path is None:
+            raise ValueError("independent oracles require an operator-owned catalog_path")
+        return self
+
+
 class AuditConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     # Opt-in audit policies; generic projects are unchanged.  A source audit
@@ -496,6 +519,7 @@ class AuditConfig(BaseModel):
     coverage: CoverageConfig = Field(default_factory=CoverageConfig)
     review_sandbox: ReviewSandboxConfig = Field(default_factory=ReviewSandboxConfig)
     poc_sandbox: PocSandboxConfig = Field(default_factory=PocSandboxConfig)
+    oracles: OracleConfig = Field(default_factory=OracleConfig)
     recon: ReconConfig = Field(default_factory=ReconConfig)
     codeql: CodeQLConfig = Field(default_factory=CodeQLConfig)
     scope_adjudication: ScopeAdjudicationConfig = Field(
@@ -626,6 +650,10 @@ class DispatchConfig(BaseModel):
             raise ValueError("PoC sandbox requires audit.enabled")
         if self.audit.poc_sandbox.enabled and not any("explore" in worker.task_types for worker in self.workers):
             raise ValueError("PoC sandbox requires at least one explore worker")
+        if self.audit.oracles.enabled and not self.audit.enabled:
+            raise ValueError("independent oracles require audit.enabled")
+        if self.audit.oracles.enabled and not any("explore" in worker.task_types for worker in self.workers):
+            raise ValueError("independent oracles require at least one explore worker")
         if self.runtime.max_project_workers > self.runtime.max_workers:
             raise ValueError("max_project_workers cannot exceed max_workers")
         return self

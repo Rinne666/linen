@@ -169,6 +169,10 @@ are stored in the ignored `.linen-runtime/` directory.
 
 ## Source-code audit mode
 
+For a Codex-only setup and a single ZIP containing the report, evidence graph,
+JSON snapshot and SARIF, see [Codex CLI audit guide](docs/CODEX-AUDIT.md) and
+`dispatch.codex.example.yaml`.
+
 Linen includes a category-driven audit mode for authorized source trees. The
 vulnerability example config freezes the source once and lets Pi dynamically
 search the repository per configured category, without creating per-file
@@ -307,6 +311,18 @@ See [the measured ablation runbook](docs/ABLATION-RUNBOOK.md) for commands,
 attribution rules and acceptance thresholds. Controlled test replays do not
 establish real-model recall.
 
+For per-case coverage, negative controls and capability breakdowns, register
+three runs with `linen audit-case-plan`, export explicit evaluator attribution
+using `linen audit-case-export`, and compare with `linen audit-benchmark --plan`.
+Blocked runs remain in the registered batch. See
+[the case benchmark runbook](docs/CASE-BENCHMARK.md) and the eight-case
+authorization, tenant, pricing and concurrency suite in
+`examples/benchmark-capabilities/`.
+
+Dynamic Technical Confirmation additionally requires a registered independent
+HTTP oracle. See [independent oracles](docs/INDEPENDENT-ORACLES.md) for operator
+bindings, offline Docker execution, supported observations and verification.
+
 For local deployment, `linen ops check --config dispatch.yaml` inspects versions
 and prerequisites without a model call. `linen ops backup` and `linen ops restore`
 produce verified SQLite copies at new paths and refuse overwrites. See
@@ -318,7 +334,8 @@ workspace requirements.
 The portable configuration examples are:
 
 - `dispatch.local.example.yaml` for general exploration;
-- `dispatch.vuln.example.yaml` for source-code auditing.
+- `dispatch.vuln.example.yaml` for source-code auditing;
+- `dispatch.codex.example.yaml` for Codex-only source audits and report/graph exports.
 
 Useful local settings include:
 

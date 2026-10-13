@@ -545,12 +545,21 @@ def classify_provider_failure(result: ProcessResult) -> str | None:
     non-zero exits used by other worker CLIs.
     """
     messages: list[str] = []
+    events: list[dict[str, Any]] = []
     for line in result.stdout.splitlines():
         try:
             event = json.loads(line)
         except (TypeError, ValueError):
             continue
         if isinstance(event, dict):
+            events.append(event)
+    terminal_failure = result.returncode != 0 or any(
+        event.get("type") == "turn.failed"
+        or (event.get("type") == "result" and event.get("is_error") is True)
+        for event in events
+    )
+    for event in events:
+        if event.get("type") != "error" or terminal_failure:
             _collect_provider_errors(event, messages)
     if result.returncode != 0:
         if result.stderr:
@@ -595,6 +604,16 @@ def classify_provider_failure(result: ProcessResult) -> str | None:
     )
     if any(marker in normalized for marker in rate_limit_markers):
         return "rate_limited"
+    if terminal_failure and any(marker in normalized for marker in (
+        "workspace routing discovery failed",
+        "workspace routing discovery timed out",
+        "stream disconnected",
+        "connection reset by peer",
+        "connection refused",
+        "error sending request for url",
+        "failed to connect to",
+    )):
+        return "provider_transport_unavailable"
     # Transient provider pressure can surface even when the process is killed,
     # but a configuration-class outcome must come from a process that exited on
     # its own. A timed-out or signal-killed run leaves only partial diagnostics
@@ -625,6 +644,12 @@ def classify_provider_failure(result: ProcessResult) -> str | None:
 def _collect_provider_errors(value: object, messages: list[str]) -> None:
     if not isinstance(value, dict):
         return
+    # Codex emits terminal transport errors as JSONL error/turn.failed events.
+    # Assistant text and successful result envelopes are not error evidence.
+    if value.get("type") == "error":
+        message = value.get("message")
+        if isinstance(message, str):
+            messages.append(message)
     # Claude Code's JSON result envelope represents provider failures as a
     # ``type=result`` object with ``is_error=true`` and a plain-text ``result``
     # field. The text is safe to inspect only under that explicit CLI error
@@ -1170,7 +1195,7 @@ def _attempt_status(result: ProcessResult, process_started: bool) -> str:
         return "setup_failed"
     if result.timed_out or result.returncode in (124, 137):
         return "timed_out"
-    return "completed" if result.returncode == 0 else "failed"
+    return "completed" if result.returncode == 0 and classify_provider_failure(result) is None else "failed"
 
 
 def _result_failure_code(result: ProcessResult, process_started: bool) -> str | None:
@@ -1178,8 +1203,11 @@ def _result_failure_code(result: ProcessResult, process_started: bool) -> str | 
         return result.cancel_reason or "cancelled"
     if not process_started:
         return "execution_policy_denied" if "ExecutionPolicyDenied:" in result.stderr else "process_setup_failed"
+    provider_failure = classify_provider_failure(result)
     if result.timed_out or result.returncode in (124, 137):
-        return "worker_timeout"
+        return "provider_transport_unavailable" if provider_failure == "provider_transport_unavailable" else "worker_timeout"
+    if provider_failure is not None:
+        return provider_failure
     if result.returncode != 0:
         return "worker_exit_nonzero"
     return None
@@ -1540,14 +1568,22 @@ def best_effort_release_reason(
     seen_event_seq: int | None = None,
     *,
     ack: bool = False,
-) -> None:
+    wait: dict | None = None,
+    wait_basis: tuple[int, int] | None = None,
+) -> bool:
     if not ack:
         seen_event_seq = None
     try:
-        response = client.release_reason(project_id, worker_name, lease_id, seen_event_seq)
+        if wait is not None:
+            response = client.release_reason(project_id, worker_name, lease_id, seen_event_seq, wait=wait, wait_basis=wait_basis)
+        else:
+            response = client.release_reason(project_id, worker_name, lease_id, seen_event_seq)
     except TypeError:
         # Legacy protocol fakes do not expose the additive cursor field.
-        response = client.release_reason(project_id, worker_name, lease_id)
+        try:
+            response = client.release_reason(project_id, worker_name, lease_id, seen_event_seq)
+        except TypeError:
+            response = client.release_reason(project_id, worker_name, lease_id)
     if not response.ok and response.status_code not in (403, 409):
         LOG.warning(
             "reason release failed project=%s worker=%s status=%s",
@@ -1564,6 +1600,7 @@ def best_effort_release_reason(
             worker_name,
             response.status_code,
         )
+    return response.ok
 
 
 def write_conclude_result(

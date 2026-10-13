@@ -335,12 +335,49 @@ def latest_finding_assessment(
         (project_id, fact_id),
     ).fetchone()
     if row is None:
+        # A promotion is a server-authored projection of the reviewed
+        # candidate, not a new claim that needs another model assessment.
+        # Resolve only the recorded, current-generation promotion ancestry.
+        promotion = conn.execute(
+            "SELECT f.proof, c.id AS candidate_id FROM facts f "
+            "JOIN projects p ON p.id = f.project_id "
+            "JOIN graph_edges e ON e.project_id = f.project_id "
+            "AND e.target_kind = 'fact' AND e.target_id = f.id "
+            "AND e.source_kind = 'fact' AND e.relation_type = 'promotes_to' "
+            "JOIN facts c ON c.project_id = e.project_id AND c.id = e.source_id "
+            "WHERE f.project_id = ? AND f.id = ? "
+            "AND f.semantic_type = 'confirmed_finding' "
+            "AND c.semantic_type = 'candidate_finding' "
+            "AND f.source_generation = p.source_generation "
+            "AND c.source_generation = f.source_generation "
+            "AND e.source_generation = f.source_generation",
+            (project_id, fact_id),
+        ).fetchone()
+        if promotion is not None:
+            try:
+                proof = json.loads(promotion["proof"] or "{}")
+                attributes = proof.get("attributes", {})
+                if (
+                    proof.get("claim_kind") == "confirmed_finding"
+                    and attributes.get("gate_version") == "uvpg-proof-v1"
+                    and attributes.get("candidate_id") == promotion["candidate_id"]
+                    and promotion["candidate_id"] in proof.get("subject_ids", [])
+                ):
+                    return latest_finding_assessment(conn, project_id, promotion["candidate_id"])
+            except (ValueError, TypeError, AttributeError):
+                pass
         return None
     try:
         diagnostics = json.loads(row["diagnostics"] or "{}")
     except (json.JSONDecodeError, TypeError):
         diagnostics = {}
     assessment = diagnostics.get("finding_assessment") if isinstance(diagnostics, dict) else None
+    verification = diagnostics.get("cold_verification") if isinstance(diagnostics, dict) else None
+    if isinstance(verification, dict):
+        from linen.server.candidate_assessment import assessment_binding_is_current
+
+        if not assessment_binding_is_current(conn, project_id, fact_id, verification):
+            return None
     return (
         row["verdict"], row["confidence"], assessment
         if isinstance(assessment, dict) else {},

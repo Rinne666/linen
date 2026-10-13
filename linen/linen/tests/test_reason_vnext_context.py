@@ -210,7 +210,7 @@ def test_reason_uses_registered_projection_and_vnext_execution_record(tmp_path, 
         reason.TaskCancellation(), lease_id="lease-1",
     ) == "success"
 
-    assert len(client.snapshots) == 1
+    assert len(client.snapshots) == 2  # Initial projection and post-run basis validation.
     assert len(client.projections) == 1
     projection = client.projections[0]
     assert projection.context["degraded"] is False
@@ -613,7 +613,9 @@ def test_stale_reason_acknowledges_old_trigger_without_writing_stale_intents(tmp
                 "project": self.project.project.model_copy(update={
                     "graph_revision": self.project.project.graph_revision + 1,
                 }),
+                "facts": [fact.model_copy(update={"description": "changed evidence"}) if fact.id == "f001" else fact for fact in self.project.facts],
             })
+            self.project = changed
             return changed
 
         def release_reason(self, _project_id, _worker, _lease_id, seen_event_seq=None):
@@ -639,7 +641,7 @@ def test_stale_reason_acknowledges_old_trigger_without_writing_stale_intents(tmp
     assert reason.run_reason_task(
         make_config(), client, backend, project, "FULL-EXPORT", make_config().workers[0],
         reason.TaskCancellation(), trigger="events:11->12",
-    ) == "failed"
+    ) == "stale"
     assert client.acknowledged == [12]
     assert client.project.project.reason_last_seen_event_seq == 12
     assert client.created_intents == []
@@ -676,7 +678,7 @@ def test_reason_prompt_filters_open_intents_to_projected_frontier(monkeypatch) -
     assert reason.run_reason_task(
         make_config(), client, backend, project, "FULL-EXPORT", make_config().workers[0],
         reason.TaskCancellation(), lease_id="lease-filter",
-    ) == "noop"
+    ) == "waiting"
     prompt = driver.execute_prompts[0]
     assert "i000" in prompt
     assert "i039" not in prompt

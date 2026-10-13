@@ -30,10 +30,14 @@ or abandon it. Return only these control actions in that case:
 Use `retry` only when the recorded error is plausibly recoverable. Use
 `abandon` when the work is no longer valuable or its precondition cannot be
 repaired. Do not invent intent IDs; use IDs shown in the graph.
+Transient errors with `retry_at` are already queued for bounded automatic retry;
+use `wait`, not `resolve`. A blocked `invalid_blackboard_result` exhausted that
+automatic budget and cannot be retried by Reason; preserve its gap until the
+recorded cause is repaired and an operator explicitly requests a manual retry.
 
 If Goal has not been satisfied and no new intent should currently be proposed, return:
 ```json
-{"accepted": true, "data": {}}
+{"accepted": true, "data": {"wait": {"intent_ids": ["i123"], "reason": "Existing task covers the next step", "max_wait_seconds": 300}}}
 ```
 
 ## Rules

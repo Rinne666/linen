@@ -68,7 +68,20 @@ RESPONSE_EXAMPLE = r'''{"accepted":true,"data":{"description":"...","type":"reco
 "summary":"defaults, ordinary enabled behavior, and whether unsafe behavior needs admin misconfiguration","citation_ids":["c1"]}}}]}}}'''
 
 
-def response_schema() -> dict[str, Any]:
+COVERAGE_REVIEW_RESPONSE_EXAMPLE = r'''{"accepted":true,"data":{"type":"recon_coverage_review","description":"...",
+"coverage_review":{"summary":"...","dimensions":{
+"parallel_paths":{"summary":"...","citation_ids":["c1"]},
+"lifecycle":{"summary":"...","citation_ids":["c1"]},
+"uncovered_items":{"summary":"...","citation_ids":["c1"]},
+"exclusion_rationales":{"summary":"...","citation_ids":["c1"]}},
+"citations":[{"id":"c1","file":"path/relative/to/source-root","line":1,"code":"exact excerpt"}],
+"items":[{"id":"gap-1","dimension":"parallel_paths|lifecycle|uncovered_items|exclusion_rationales",
+"description":"concrete omitted path or uncertainty","disposition":"recon|residual_gap",
+"category":"lowercase-id or empty for residual_gap","subject":"short-slug or empty",
+"rationale":"why this disposition is correct","citation_ids":["c1"]}]}}}'''
+
+
+def _response_schema(example: str, fact_type: str) -> dict[str, Any]:
     def shape(value: Any) -> dict[str, Any]:
         if isinstance(value, dict):
             return {"type": "object", "properties": {key: shape(item) for key, item in value.items()},
@@ -84,9 +97,34 @@ def response_schema() -> dict[str, Any]:
             result["enum"] = value.split("|")
         return result
 
-    schema = shape(json.loads(RESPONSE_EXAMPLE))
-    schema["properties"]["data"]["properties"]["type"]["enum"] = ["recon"]
+    schema = shape(json.loads(example))
+    schema["properties"]["data"]["properties"]["type"]["enum"] = [fact_type]
     return schema
+
+
+def response_schema() -> dict[str, Any]:
+    schema = _response_schema(RESPONSE_EXAMPLE, "recon")
+    checks = schema["properties"]["data"]["properties"]["recon_result"]["properties"]["leads"]["items"]["properties"]["security_checks"]["properties"]
+    configuration = checks["configuration_analysis"]
+    # Constrain cross-field combinations before generation, too. These are the
+    # same finite alternatives enforced below; citations still need validation.
+    variants = []
+    for default_modes, enabled_modes, misconfiguration in (
+        (["enabled", "disabled", "conditional"], ["analyzed", "unknown"], ["yes", "no", "unknown"]),
+        (["unknown"], ["unknown"], ["yes", "no", "unknown", "not_applicable"]),
+        (["not_applicable"], ["not_applicable"], ["no", "not_applicable"]),
+    ):
+        properties = dict(configuration["properties"])
+        for key, values in (("default_mode", default_modes), ("ordinary_enabled_mode", enabled_modes),
+                            ("requires_admin_misconfiguration", misconfiguration)):
+            properties[key] = {"type": "string", "enum": values}
+        variants.append({**configuration, "properties": properties})
+    checks["configuration_analysis"] = {"anyOf": variants}
+    return schema
+
+
+def coverage_review_response_schema() -> dict[str, Any]:
+    return _response_schema(COVERAGE_REVIEW_RESPONSE_EXAMPLE, COVERAGE_REVIEW_FACT_TYPE)
 
 
 def _compact_line(value: Any, limit: int) -> str:
@@ -1289,17 +1327,7 @@ filename. Snapshot exclusions/unreadable items (first 200):
 Existing Recon evidence: {json.dumps(evidence, ensure_ascii=False)}
 
 Return exactly one JSON object:
-{{"accepted":true,"data":{{"type":"{COVERAGE_REVIEW_FACT_TYPE}","description":"...",
-"coverage_review":{{"summary":"...","dimensions":{{
-"parallel_paths":{{"summary":"...","citation_ids":["c1"]}},
-"lifecycle":{{"summary":"...","citation_ids":["c1"]}},
-"uncovered_items":{{"summary":"...","citation_ids":["c1"]}},
-"exclusion_rationales":{{"summary":"...","citation_ids":["c1"]}}}},
-"citations":[{{"id":"c1","file":"path/relative/to/source-root","line":1,"code":"exact excerpt"}}],
-"items":[{{"id":"gap-1","dimension":"parallel_paths|lifecycle|uncovered_items|exclusion_rationales",
-"description":"concrete omitted path or uncertainty","disposition":"recon|residual_gap",
-"category":"lowercase-id or empty for residual_gap","subject":"short-slug or empty",
-"rationale":"why this disposition is correct","citation_ids":["c1"]}}]}}}}}}
+{COVERAGE_REVIEW_RESPONSE_EXAMPLE}
 
 Return an empty `items` list only if the independent challenge found no material
 omissions; cite and explain that conclusion in `summary`. Every listed item

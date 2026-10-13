@@ -61,6 +61,7 @@ def _constrain_recon_output(
     project_handle: str,
     driver: WorkerDriver,
     argv: list[str],
+    *, coverage_review: bool = False,
 ) -> list[str]:
     # Both native CLIs can constrain their final response to this schema: codex
     # via a schema file, claude via inline `--json-schema`. Leaving claude
@@ -68,7 +69,7 @@ def _constrain_recon_output(
     # discards an entire correct analysis and repeats the run.
     if not driver.supports_output_schema:
         return argv
-    schema = recon.response_schema()
+    schema = recon.coverage_review_response_schema() if coverage_review else recon.response_schema()
     text = json.dumps(schema, ensure_ascii=False)
     path = f"/tmp/linen-prompts/recon-{canonical_digest(schema)}/response-schema.json"
     backend.write_text_file(project_handle, path, text)
@@ -95,7 +96,9 @@ def _proof_obligation_contract(intent: Intent) -> str:
         "wrong attack route, wrong trust-boundary assumption, unreachable path, or an "
         "unfalsifiable hypothesis, set `proof.attributes.failure_code` to exactly one of "
         "`WRONG_PATH`, `WRONG_BOUNDARY_ASSUMPTION`, `UNREACHABLE`, or `UNFALSIFIABLE`; "
-        "otherwise omit it. The dispatcher binds the "
+        "otherwise omit it. The server derives `proof.claim_kind` from this obligation, so "
+        "you may omit that field; if you include it, it must exactly match the required Fact "
+        "type. The dispatcher also binds the "
         "server-owned proof identity; do not invent candidate or fact identifiers.\n"
         + (
             "For every reachability Fact, include proof.attributes.path_signature: a concise, "
@@ -138,7 +141,13 @@ def _bind_proof_obligation(intent: Intent, fact: dict[str, Any]) -> dict[str, An
         proof = ProofPayload(claim_kind=expected_type)
     else:
         try:
-            proof = ProofPayload.model_validate(supplied)
+            normalized_supplied = supplied
+            if isinstance(supplied, dict) and "claim_kind" not in supplied:
+                # The gap contract is server-owned. Workers may return proof
+                # attributes (for example a path signature) without repeating
+                # the role already bound by this Intent.
+                normalized_supplied = {**supplied, "claim_kind": expected_type}
+            proof = ProofPayload.model_validate(normalized_supplied)
         except Exception as exc:
             raise ProofContractError(f"invalid proof payload: {exc}") from exc
         if proof.claim_kind != expected_type:
@@ -259,6 +268,10 @@ def run_explore_task(
     attempt: int = 1,
     trigger: str | None = None,
 ) -> str:
+    from linen.dispatcher.tasks.oracle import parse_oracle_intent, run_oracle_task
+
+    if parse_oracle_intent(intent) is not None and config.audit.oracles.enabled:
+        return run_oracle_task(config, client, backend, project, intent, worker, cancellation, attempt=attempt)
     driver = get_driver(worker.type)
     task_started = time.perf_counter()
     healthcheck_timeout = config.runtime.healthcheck_timeout
@@ -687,8 +700,8 @@ def run_explore_task(
         )
         session = driver.prepare_session()
         execute = driver.build_execute(worker, prompt, session)
-        if recon_task:
-            execute.argv = _constrain_recon_output(backend, container_name, driver, execute.argv)
+        if recon_task or coverage_review_task:
+            execute.argv = _constrain_recon_output(backend, container_name, driver, execute.argv, coverage_review=coverage_review_task)
         if poc_isolated and execute.argv[:2] == ["codex", "exec"]:
             execute.argv.insert(2, "--skip-git-repo-check")
         session = execute.session
@@ -1326,8 +1339,8 @@ def _try_conclude_fallback(
         recipe_version=recipe_version,
     )
     conclude_argv = driver.build_conclude(worker, prompt, session)
-    if recon_task:
-        conclude_argv = _constrain_recon_output(backend, container_name, driver, conclude_argv)
+    if recon_task or coverage_review_task:
+        conclude_argv = _constrain_recon_output(backend, container_name, driver, conclude_argv, coverage_review=coverage_review_task)
     LOG.info("starting conclude fallback project=%s intent=%s worker=%s", project_id, intent.id, worker.name)
     conclude_started = time.perf_counter()
     result = _run_process(

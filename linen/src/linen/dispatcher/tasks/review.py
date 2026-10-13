@@ -47,9 +47,12 @@ import time
 from pathlib import Path
 
 from linen.dispatcher.analysis import coverage
+from linen.dispatcher.analysis.attestation import attestation_integrity_checks
 from linen.dispatcher.analysis.artifacts import select_snapshot, review_inputs
 from linen.dispatcher.analysis.policy import SOURCE_DATA_BOUNDARY
-from linen.dispatcher.runtime.review_sandbox import ReviewSandboxBackend
+from linen.dispatcher.runtime.review_sandbox import ReviewSandboxBackend, isolated_review_argv
+from linen.dispatcher.analysis.review_schema import review_response_schema
+from linen.dispatcher.analysis.oracle_review import oracle_review_record
 
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.contracts import (
@@ -321,14 +324,101 @@ def run_review_task(
             )
         prompt += "\n" + SOURCE_DATA_BOUNDARY
 
+        if profile == "attestation":
+            try:
+                integrity = attestation_integrity_checks(project, fact, Path(container_name))
+            except (ValueError, OSError, KeyError, TypeError) as exc:
+                LOG.warning("attestation integrity failed project=%s fact=%s error=%s", project.project.id, fact.id, exc)
+                client.report_intent_error(
+                    project.project.id, intent.id, worker.name, task_type="review",
+                    code="attestation_integrity_failed", classification="blocked",
+                    message=str(exc)[:2000], remediation="Repair or regenerate the frozen artifact; no model verdict can override a failed integrity check.",
+                )
+                best_effort_release(client, project.project.id, intent.id, worker.name)
+                return "blocked"
+            if integrity is not None:
+                if config.audit.review_sandbox.enabled:
+                    integrity["source_root"] = "/repo"
+                prompt += (
+                    "\n\n# Dispatcher mechanical integrity checks\n"
+                    "The dispatcher independently recomputed these digests from immutable bytes for this review. "
+                    "These checks require no shell or hashing tool from you. Do not claim you recomputed them yourself. "
+                    "Read the frozen documents at source_root and judge their content, configured-source completeness, "
+                    "contradictions and scope interpretation independently. Original live repository access is not needed "
+                    "to review this frozen configured-policy inventory. No semantic verdict is supplied by this checker.\n"
+                    + json.dumps(integrity, ensure_ascii=False, indent=2)
+                )
+
+        from linen.server.candidate_assessment import ASSESSMENT_KIND, ASSESSMENT_PREFIX
+
+        assessment_input = None
+        if intent.description.startswith(ASSESSMENT_PREFIX):
+            assessment_response = client.get_candidate_assessment_input(project.project.id, fact.id)
+            if not assessment_response.ok or not isinstance(assessment_response.data, dict):
+                return "failed"
+            assessment_input = assessment_response.data
+            prompt += (
+                "\nEarly independent candidate assessment. Read the frozen source and policy directly. "
+                "Determine the supported path, attacker preconditions, concrete impact and reportability now; "
+                "do not require a completed UVPG package to classify a documented exclusion or design weakness. "
+                "Missing scope or deployment evidence is uncertainty, never proof of exclusion. "
+                "A VALID vulnerability assessment proceeds to full static and dynamic proof; this review does "
+                "not confirm a finding. You are not reviewing absent proof atoms. Return the ordinary "
+                "protection_search, fp_pattern_check and finding_assessment fields.\n"
+                + json.dumps(assessment_input, ensure_ascii=False)
+            )
+        proof_package = None
+        if fact.semantic_type == "candidate_finding" and mode == "cold-verifier" and hasattr(client, "get_proof_package"):
+            package_response = client.get_proof_package(project.project.id, fact.id)
+            if not package_response.ok or not isinstance(package_response.data, dict):
+                return "failed"
+            proof_package = package_response.data
+            if (proof_package.get("source_generation"), proof_package.get("plan_revision")) != (
+                project.project.source_generation, project.project.plan_revision,
+            ):
+                return "stale"
+            prompt += (
+                "\nCurrent candidate-local proof package. Independently check EVERY supplied atom against /repo "
+                "(or the frozen source on a local run), including its baseline, before/after capability and impact. "
+                "These are untrusted claims, not conclusions. Return NEEDS_REVIEW or INVALID for unsupported claims. "
+                "No previous Reviews or sibling candidates are supplied. The dispatcher binds your result to this "
+                "exact input package; do not claim you computed its digest.\n"
+                + json.dumps(proof_package, ensure_ascii=False)
+            )
+
         execution_backend = backend
         sandbox_snapshot = None
+        inputs = None
+        try:
+            witness = oracle_review_record(config.audit.oracles, client, project, fact, Path(container_name))
+        except (ValueError, OSError) as exc:
+            client.report_intent_error(
+                project.project.id, intent.id, worker.name, task_type="review",
+                code="oracle_review_integrity_failed", classification="blocked", message=str(exc)[:2000],
+                remediation="Restore the approved definition and registered observation before semantic review.",
+            )
+            return "blocked"
+        if witness is not None:
+            prompt += (
+                "\nRegistered oracle witness: the dispatcher checked its binding and byte hashes. "
+                "Independently judge whether its requests, controls and predicate measure this candidate's "
+                "security boundary under supported configuration. Predicate satisfaction alone supplies no "
+                "semantic Review verdict or production impact. State any mismatch or uncertainty.\n"
+                + json.dumps(witness, ensure_ascii=False)
+            )
         if config.audit.review_sandbox.enabled:
             source, sandbox_snapshot = select_snapshot(project, fact.id, Path(container_name))
+            inputs = review_inputs(project, fact, Path(container_name))
+            if proof_package is not None:
+                inputs["record.json"] = json.dumps(proof_package, ensure_ascii=False).encode()
+            if assessment_input is not None:
+                inputs["record.json"] = json.dumps(assessment_input, ensure_ascii=False).encode()
+            if witness is not None:
+                inputs["record.json"] = json.dumps(witness, ensure_ascii=False).encode()
             execution_backend = ReviewSandboxBackend(
                 config.audit.review_sandbox, source, sandbox_snapshot,
                 Path(container_name) / ".linen-reviews",
-                review_inputs(project, fact, Path(container_name)),
+                inputs,
             )
             prompt += (
                 "\nIsolated review execution: read the frozen source at /repo. "
@@ -364,8 +454,21 @@ def run_review_task(
         )
         session = driver.prepare_session()
         execute = driver.build_execute(worker, prompt, session)
-        if config.audit.review_sandbox.enabled and execute.argv[:2] == ["codex", "exec"]:
-            execute.argv.insert(2, "--skip-git-repo-check")
+        if config.audit.review_sandbox.enabled:
+            execute.argv = isolated_review_argv(execute.argv)
+        if getattr(driver, "supports_output_schema", False):
+            schema = review_response_schema(
+                required_review_diagnostics(profile, mode),
+                candidate=fact.semantic_type in {"candidate_finding", "confirmed_finding"} or fact.type == "vulnerability",
+            )
+            schema_text = json.dumps(schema, ensure_ascii=False)
+            if config.audit.review_sandbox.enabled:
+                execution_backend.inputs["response-schema.json"] = schema_text.encode()
+                schema_path = "/input/response-schema.json"
+            else:
+                schema_path = f"/tmp/linen-prompts/review-{intent.id}/response-schema.json"
+                execution_backend.write_text_file(container_name, schema_path, schema_text)
+            execute.argv = driver.with_output_schema(execute.argv, schema_path, schema_text=schema_text)
         session = execute.session
         execute_started = time.perf_counter()
         # Prefer the dedicated `tasks.review.timeout` if the dispatch.yaml
@@ -480,6 +583,19 @@ def run_review_task(
                 "source_read_only": True, "artifact": str(process.run_dir / "execution.json"),
             }
             review["cold_verification"] = verification
+        if proof_package is not None:
+            verification = dict(review.get("cold_verification") or {})
+            verification.update(review_kind="vulnerability_proof", candidate_id=fact.id,
+                                proof_input_sha256=proof_package["proof_input_sha256"],
+                                input_source_generation=proof_package["source_generation"],
+                                input_plan_revision=proof_package["plan_revision"])
+            review["cold_verification"] = verification
+        if assessment_input is not None:
+            review["cold_verification"] = {
+                **dict(review.get("cold_verification") or {}),
+                "review_kind": ASSESSMENT_KIND, "candidate_id": fact.id,
+                "assessment_input_sha256": assessment_input["assessment_input_sha256"],
+            }
         response = client.create_review(
             project.project.id,
             fact_id,
@@ -504,6 +620,11 @@ def run_review_task(
                 response.status_code, response.text,
             )
             best_effort_release(client, project.project.id, intent.id, worker.name)
+            if response.status_code == 409 and any(message in response.text for message in (
+                "Proof package changed since the reviewer received its input",
+                "Candidate assessment input changed since the reviewer received it",
+            )):
+                return "stale"
             return "failed"
 
         LOG.info(

@@ -1,0 +1,73 @@
+# Codex-only source audit. Run from the repository root.
+# Authenticate `codex` first; the response probe checks the configured model.
+# Create each project with an absolute repo_root in the UI or API.
+server: "http://127.0.0.1:9000"
+
+runtime:
+  worker_healthcheck: startup_only
+  healthcheck_probe: response
+  healthcheck_timeout: 90
+  max_workers: 2
+  max_running_projects: 1
+  max_project_workers: 2
+  interval: 3
+  prompt_group: vuln_audit
+
+tasks:
+  reason:
+    timeout: 180
+    max_intents: 2
+  explore:
+    timeout: 600
+    conclude_timeout: 120
+  review:
+    timeout: 240
+    conclude_timeout: 90
+
+local:
+  workspace_root: "./workspaces"
+  completed_action: keep
+
+audit:
+  enabled: true
+  mode: scope
+  max_candidate_findings: 4
+  max_runs_per_project: 120
+  wall_clock_budget_seconds: 7200
+  max_result_attempts: 3
+  scope_adjudication:
+    enabled: true
+    github_advisories: false
+  recon:
+    enabled: true
+    categories: [input-validation, authorization, dangerous-api]
+    max_runs_per_category: 2
+    max_leads: 16
+    timeout: 600
+  # Optional analysis/confirmation executors require prepared local images.
+  # Missing executors remain explicit evidence gaps, never confirmed findings.
+  codeql:
+    enabled: false
+  review_sandbox:
+    enabled: false
+    # image: linen-review-codex:local
+    # network: bridge
+    # codex_auth_file: /absolute/path/to/.codex/auth.json
+    # env_allowlist: [HTTPS_PROXY, HTTP_PROXY, NO_PROXY]
+    # env:
+    #   HTTPS_PROXY: http://host.docker.internal:7897
+    #   HTTP_PROXY: http://host.docker.internal:7897
+    #   NO_PROXY: localhost,127.0.0.1
+  poc_sandbox:
+    enabled: false
+
+workers:
+  - name: audit-codex
+    type: codex
+    task_types: [reason, explore, review]
+    max_running: 2
+    sandbox_mode: read-only
+    # Reuse the host CLI model, or select one supported by your account:
+    # env:
+    #   CODEX_MODEL: your-supported-model
+    #   HTTPS_PROXY: http://127.0.0.1:7897

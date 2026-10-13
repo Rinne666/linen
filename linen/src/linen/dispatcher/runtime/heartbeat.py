@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import threading
 import time
 from collections.abc import Callable
@@ -18,6 +19,8 @@ HEARTBEAT_FAILURE_GRACE_MULTIPLIER = 2
 class HeartbeatFailure:
     status_code: int | None
     text: str
+    code: str | None = None
+    seconds_since_success: float = 0.0
 
 
 class HeartbeatLease:
@@ -35,6 +38,7 @@ class HeartbeatLease:
         self._process: ExecProcess | None = None
         self._failure: HeartbeatFailure | None = None
         self._last_success_at = time.monotonic()
+        self._last_success_wall = time.time()
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -81,6 +85,9 @@ class HeartbeatLease:
     def attach_process(self, process: ExecProcess | None) -> None:
         with self._lock:
             self._process = process
+            failure = self._failure
+        if process is not None and failure is not None:
+            process.cancel(self._cancel_reason(failure))
 
     @property
     def failure(self) -> HeartbeatFailure | None:
@@ -88,9 +95,14 @@ class HeartbeatLease:
 
     def _run(self) -> None:
         while not self._stop.wait(self._interval):
-            result = self._heartbeat()
+            try:
+                result = self._heartbeat()
+            except Exception as exc:
+                result = ApiResult(503, text=f"heartbeat request failed: {type(exc).__name__}")
+                LOG.warning("heartbeat request raised scope=%s error=%s", self._scope, type(exc).__name__)
             if result.ok:
                 self._last_success_at = time.monotonic()
+                self._last_success_wall = time.time()
                 continue
             if result.status_code in (403, 409):
                 self._fail(result.status_code, result.text)
@@ -111,14 +123,32 @@ class HeartbeatLease:
             return
 
     def _fail(self, status_code: int | None, text: str) -> None:
-        self._failure = HeartbeatFailure(status_code, text)
+        code = None
+        try:
+            detail = json.loads(text).get("detail")
+            if isinstance(detail, dict) and detail.get("code") in {
+                "reason_lease_expired", "reason_lease_not_claimed", "reason_worker_mismatch", "reason_token_mismatch",
+            }:
+                code = detail["code"]
+        except (ValueError, TypeError, AttributeError):
+            pass
+        self._failure = HeartbeatFailure(status_code, text, code, max(0.0, time.time() - self._last_success_wall))
+        detail = " ".join(text.split())[:240]
         LOG.warning(
-            "heartbeat failed scope=%s worker=%s status=%s",
+            "heartbeat failed scope=%s worker=%s status=%s code=%s seconds_since_success=%.1f detail=%s",
             self._scope,
             self._worker_name,
             status_code,
+            code or "unknown",
+            self._failure.seconds_since_success,
+            detail or "-",
         )
         with self._lock:
             process = self._process
         if process is not None:
-            process.cancel(f"heartbeat_lease_lost:{status_code or 'unknown'}")
+            process.cancel(self._cancel_reason(self._failure))
+
+    @staticmethod
+    def _cancel_reason(failure: HeartbeatFailure) -> str:
+        reason = f"heartbeat_lease_lost:{failure.status_code or 'unknown'}"
+        return f"{reason}:{failure.code}" if failure.code else reason

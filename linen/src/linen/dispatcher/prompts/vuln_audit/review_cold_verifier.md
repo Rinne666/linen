@@ -151,7 +151,7 @@ These are NOT valid grounds for CONFIRMED:
     "review_kind": "vulnerability_proof",
     "candidate_id": "<candidate fact id>",
     "proof_evidence_sha256": "<leave blank; server records the current digest>",
-    "sub_claims": {"A": "<attacker controls input X>", "B": "<X reaches Y>", "C": "<Y causes Z>"},
+    "sub_claims": {"items": [{"fact_id": "<candidate or proof fact id>", "claim": "<one supplied claim>", "evidence": "<source evidence independently read>", "status": "supported | refuted | unresolved"}]},
     "sub_claim_failure": "none | <which and why>",
     "static_status": "ok | blocked",
     "poc_status": "theoretical | n/a",

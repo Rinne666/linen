@@ -376,6 +376,7 @@ def project_meta_from_row(row: sqlite3.Row) -> ProjectMeta:
         worker_issues=worker_issues,
         created_at=row["created_at"],
         reason=project_reason_from_row(row),
+        reason_wait=json.loads(row["reason_wait"]) if "reason_wait" in row.keys() and row["reason_wait"] else None,
         repo_root=row["repo_root"] if "repo_root" in row.keys() else None,
     )
 
@@ -459,6 +460,29 @@ def audit_completion_blockers_from_db(
     for review in review_rows:
         reviews.setdefault(review["fact_id"], []).append(review)
 
+    # Proof atoms are reviewed as one candidate-local package. Recognize only
+    # a currently bound, structurally valid package; this does not promote or
+    # alter any atom's stored status or replace a contrary per-Fact review.
+    from linen.server.uvpg import candidate_proof_review, collect_candidate_proof_subgraph, evaluate_proof_gate
+
+    package_reviewed_ids: set[str] = set()
+    for candidate_id, candidate in facts.items():
+        if candidate["semantic_type"] != "candidate_finding":
+            continue
+        bound, _, verification = candidate_proof_review(conn, project_id, candidate_id)
+        if not bound or not verification.get("proof_input_sha256") or evaluate_proof_gate(conn, project_id, candidate_id).status != "PASS":
+            continue
+        view = collect_candidate_proof_subgraph(conn, project_id, candidate_id)
+        if verification.get("input_fact_ids") != sorted(view.proof_fact_ids):
+            continue
+        for proof_id in view.proof_fact_ids:
+            if proof_id == candidate_id:
+                continue
+            prior = reviews.get(proof_id, [])
+            if prior and (prior[-1]["verdict"] != "VALID" or prior[-1]["confidence"] not in {"firm", "certain"}):
+                continue
+            package_reviewed_ids.add(proof_id)
+
     # Reopen feedback is workflow context supplied by an operator, not a
     # code-evidence claim. Keep its source edge in the completion chain, but
     # do not require the request itself to carry source citations or a Review.
@@ -538,9 +562,11 @@ def audit_completion_blockers_from_db(
             active.remove(fact_id)
             return
         review_exhausted = fact_id in exhausted_summary_candidates
+        package_reviewed = fact_id in package_reviewed_ids
         if (
             fact["status"] not in {"triaged", "false_positive", "fixed", "accepted_risk"}
             and not review_exhausted
+            and not package_reviewed
         ):
             blockers.append(f"{fact_id} has unresolved status {fact['status']}.")
         if not fact["evidence"] or not fact["evidence"].strip():
@@ -581,6 +607,7 @@ def audit_completion_blockers_from_db(
             and not deterministic_intermediate
             and not terminal_review_valid
             and not review_exhausted
+            and not package_reviewed
         ):
             blockers.append(
                 f"{fact_id} needs a firm/certain review or an explicit bounded review-exhaustion residual."
@@ -800,12 +827,7 @@ def expire_reason_leases(conn: sqlite3.Connection, project_id: str | None = None
     timeout = get_reason_timeout(conn)
     now = utcnow()
     query = """
-        UPDATE projects
-        SET reason_worker = NULL,
-            reason_lease_id = NULL,
-            reason_trigger = NULL,
-            reason_started_at = NULL,
-            reason_last_heartbeat_at = NULL
+        SELECT id, reason_worker, reason_lease_id, reason_last_heartbeat_at FROM projects
         WHERE reason_worker IS NOT NULL
           AND reason_last_heartbeat_at IS NOT NULL
           AND (julianday(?) - julianday(reason_last_heartbeat_at)) * 86400 > ?
@@ -814,7 +836,17 @@ def expire_reason_leases(conn: sqlite3.Connection, project_id: str | None = None
     if project_id is not None:
         query = query.replace("WHERE ", "WHERE id = ? AND ", 1)
         params = (project_id, now, timeout)
-    conn.execute(query, params)
+    for row in conn.execute(query, params).fetchall():
+        clear_project_reason(conn, row["id"])
+        from linen.server.audit_state import append_event
+        import hashlib
+
+        append_event(conn, row["id"], "reason_lease_expired", "server",
+                     entity_kind="project", entity_id=row["id"], payload={
+                         "worker": row["reason_worker"],
+                         "lease_sha256": hashlib.sha256((row["reason_lease_id"] or "").encode()).hexdigest(),
+                         "last_heartbeat_at": row["reason_last_heartbeat_at"], "timeout_seconds": timeout,
+                     })
 
 
 # ---------------------------------------------------------------------------
