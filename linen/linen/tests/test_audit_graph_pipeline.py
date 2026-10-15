@@ -13,8 +13,10 @@ from linen.cli import main
 from linen.dispatcher.analysis import audit_graph, coverage, recon, scope_gate
 from linen.dispatcher.analysis.benchmark import compare_strategies, evaluate
 from linen.dispatcher.config import (
+    AuditConfig,
     PocSandboxConfig,
     ScopeAdjudicationConfig,
+    SemanticAuditConfig,
 )
 from linen.dispatcher.runtime.backend import LocalBackend
 from linen.dispatcher.runtime.cancellation import TaskCancellation
@@ -601,3 +603,139 @@ def test_coverage_strategy_benchmark_reports_cost_recall_and_completion():
     assert file_topic["mean_metrics"]["confirmed_findings"] == 1
     assert file_topic["mean_metrics"]["rejected_findings"] == 1
     assert file_topic["completion_stability"] is True
+
+
+def _audit_config(tmp_path) -> AuditConfig:
+    return AuditConfig(
+        enabled=True,
+        mode="scope",
+        scope_adjudication=ScopeAdjudicationConfig(enabled=False),
+        semantic=SemanticAuditConfig(enabled=False),
+    )
+
+
+def _chain_board(
+    *,
+    with_reachability: bool = True,
+    promoted: bool = False,
+) -> ProjectDetail:
+    now = "2026-01-01T00:00:00Z"
+    facts = [
+        Fact(id="origin", description="repo"),
+        Fact(id="f-df1", description="cookie reaches file open", type="dataflow"),
+        Fact(id="f-df2", description="path traversal precondition", type="dataflow"),
+    ]
+    intents = [
+        Intent(id="i-df1", from_=["origin"], to="f-df1", description="trace cookie",
+               type="search", creator=audit_graph.CREATOR, created_at=now, concluded_at=now),
+        Intent(id="i-df2", from_=["f-df1"], to="f-df2", description="verify traversal",
+               type="verify", creator=audit_graph.CREATOR, created_at=now, concluded_at=now),
+    ]
+    reviews = [
+        Review(id="r-df1", fact_id="f-df1", verdict="VALID", confidence="firm",
+               summary="checked", created_at=now),
+        Review(id="r-df2", fact_id="f-df2", verdict="VALID", confidence="firm",
+               summary="checked", created_at=now),
+    ]
+    if with_reachability:
+        facts.append(Fact(id="f-reach", description="anonymous route reachable", type="reachability"))
+        intents.append(Intent(
+            id="i-reach", from_=["f-df2"], to="f-reach", description="verify reachability",
+            type="reach", creator=audit_graph.CREATOR, created_at=now, concluded_at=now,
+        ))
+        reviews.append(Review(id="r-reach", fact_id="f-reach", verdict="VALID",
+                              confidence="firm", summary="checked", created_at=now))
+    if promoted:
+        facts.append(Fact(id="f-vuln", description="terminal finding", type="vulnerability",
+                          semantic_type="candidate_finding"))
+        intents.append(Intent(
+            id="i-char", from_=["f-df1", "f-df2"], to="f-vuln",
+            description="characterize the chain", type="characterize",
+            creator=audit_graph.CREATOR, created_at=now, concluded_at=now,
+        ))
+    return ProjectDetail(
+        project=ProjectMeta(
+            id="proj_001", title="audit", status="active", bootstrap_enabled=False,
+            audit_mode="scope", created_at=now,
+        ),
+        facts=facts, intents=intents, hints=[], reviews=reviews,
+    )
+
+
+def test_required_intents_promotes_reviewed_chain_to_characterize(tmp_path):
+    board = _chain_board()
+    proposals = audit_graph.required_intents(board, tmp_path, _audit_config(tmp_path))
+    assert len(proposals) == 1
+    proposal = proposals[0]
+    assert proposal["type"] == "characterize"
+    assert sorted(proposal["from"]) == ["f-df1", "f-df2", "f-reach"]
+    assert "f-df1" in proposal["description"] and "f-reach" in proposal["description"]
+
+
+def test_required_intents_requests_reachability_before_characterize(tmp_path):
+    board = _chain_board(with_reachability=False)
+    proposals = audit_graph.required_intents(board, tmp_path, _audit_config(tmp_path))
+    assert len(proposals) == 1
+    proposal = proposals[0]
+    assert proposal["type"] == "reach"
+    assert sorted(proposal["from"]) == ["f-df1", "f-df2"]
+
+
+def test_promotion_skips_already_promoted_component(tmp_path):
+    board = _chain_board(promoted=True)
+    assert audit_graph.required_intents(board, tmp_path, _audit_config(tmp_path)) == []
+
+
+def test_unreviewed_chain_does_not_promote(tmp_path):
+    board = _chain_board()
+    board.reviews = []
+    assert audit_graph.required_intents(board, tmp_path, _audit_config(tmp_path)) == []
+
+
+def _dynamic_fact(fact_id: str, fact_type: str, candidate: str) -> Fact:
+    return Fact(
+        id=fact_id, description="isolated run", type=fact_type,
+        proof=ProofPayload(
+            claim_kind=fact_type, subject_ids=[candidate],
+            attributes={"mode": "dynamic", "candidate_id": candidate},
+        ),
+    )
+
+
+def test_dynamic_evidence_gate_requires_both_roles_and_reviews():
+    board = _chain_board(promoted=True)
+    assert not audit_graph._dynamic_evidence_complete(board, "f-vuln")
+    board.facts.append(_dynamic_fact("f-pos", "reproduction", "f-vuln"))
+    assert not audit_graph._dynamic_evidence_complete(board, "f-vuln")
+    board.facts.append(_dynamic_fact("f-neg", "negative_control", "f-vuln"))
+    assert not audit_graph._dynamic_evidence_complete(board, "f-vuln")
+    now = "2026-01-01T00:00:00Z"
+    board.reviews.extend([
+        Review(id="r-pos", fact_id="f-pos", verdict="VALID", confidence="firm",
+               summary="checked", created_at=now),
+        Review(id="r-neg", fact_id="f-neg", verdict="VALID", confidence="firm",
+               summary="checked", created_at=now),
+    ])
+    assert audit_graph._dynamic_evidence_complete(board, "f-vuln")
+    # Static-mode evidence does not satisfy the dynamic gate.
+    board.facts = [
+        Fact(
+            id="f-pos", description="static", type="reproduction",
+            proof=ProofPayload(claim_kind="reproduction", subject_ids=["f-vuln"],
+                               attributes={"mode": "static", "candidate_id": "f-vuln"}),
+        ) if fact.id == "f-pos" else fact
+        for fact in board.facts
+    ]
+    assert not audit_graph._dynamic_evidence_complete(board, "f-vuln")
+
+
+def test_audit_summary_blocks_unconfirmed_candidate_without_dynamic_evidence(tmp_path):
+    """The summary gate wiring: the fake-convergence guard returns None for a
+    candidate whose dynamic evidence pair is missing, regardless of the
+    sandbox flag (Recon being inactive also blocks here, which keeps this a
+    deterministic unit-level check of the guard's inputs)."""
+    cfg = _audit_config(tmp_path)
+    cfg.poc_sandbox = PocSandboxConfig(enabled=True, image="poc-test:latest")
+    board = _chain_board(promoted=True)
+    assert not audit_graph._dynamic_evidence_complete(board, "f-vuln")
+    assert audit_graph.audit_summary_inputs(board, tmp_path, cfg) is None

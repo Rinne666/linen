@@ -270,6 +270,125 @@ def _candidate_budget_overflow_records(
     return records
 
 
+# Typed chain facts whose connectivity defines one source-to-sink evidence
+# component. Context facts (recon snapshots, category results) are excluded on
+# purpose: verify intents routinely cite shared recon parents, so unrestricted
+# connectivity would merge unrelated chains through them.
+_CHAIN_FACT_TYPES = frozenset({
+    "source", "sink", "dataflow", "sanitizer", "validation", "reachability",
+})
+
+
+def _chain_components(project: ProjectDetail) -> list[set[str]]:
+    """Return connected components over typed chain facts only."""
+    chain_ids = {
+        fact.id for fact in project.facts if fact.type in _CHAIN_FACT_TYPES
+    }
+    adjacency: dict[str, set[str]] = {fact_id: set() for fact_id in chain_ids}
+    for intent in project.intents:
+        if intent.to not in chain_ids:
+            continue
+        for source_id in intent.from_:
+            if source_id in chain_ids and source_id != intent.to:
+                adjacency[intent.to].add(source_id)
+                adjacency[source_id].add(intent.to)
+    seen: set[str] = set()
+    components: list[set[str]] = []
+    for fact_id in sorted(chain_ids):
+        if fact_id in seen:
+            continue
+        seen.add(fact_id)
+        component = {fact_id}
+        pending = [fact_id]
+        while pending:
+            for neighbor in adjacency[pending.pop()]:
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    component.add(neighbor)
+                    pending.append(neighbor)
+        components.append(component)
+    return components
+
+
+def _promotion_proposals(
+    project: ProjectDetail,
+    workdir: Path,
+    config: AuditConfig,
+) -> list[dict]:
+    """Close the promotion chain deterministically.
+
+    A reviewed dataflow result with independent reviewed reachability is
+    evidence of a closed chain, but nothing downstream can act on it until an
+    explore worker emits a ``type=vulnerability`` fact — and the prompts only
+    permit that for a ``characterize`` intent. The high-level Reason worker
+    failed to derive one on its own (observed on a full benchmark run: every
+    chain fact reviewed VALID, zero characterize intents, zero candidates), so
+    the deterministic gate proposes the missing stage itself. A component
+    without reviewed reachability first gets a bounded ``reach`` stage; only
+    components with reviewed reachability are promoted.
+    """
+    del workdir, config  # graph-only derivation; kept for call-site symmetry
+    reviewed = {
+        fact.id: fact for fact in project.facts
+        if fact.type in _CHAIN_FACT_TYPES and _reviewed(project, fact.id)
+    }
+    if not any(fact.type == "dataflow" for fact in reviewed.values()):
+        return []
+    promoted_facts = [
+        fact for fact in project.facts
+        if fact.type == "vulnerability"
+        or fact.semantic_type in {
+            "candidate_finding", "confirmed_finding", "rejected_finding",
+        }
+    ]
+    promoted_ancestry = (
+        ancestor_ids(project, [fact.id for fact in promoted_facts])
+        if promoted_facts else set()
+    )
+    proposals: list[dict] = []
+    for component in _chain_components(project):
+        reviewed_ids = sorted(fact_id for fact_id in component if fact_id in reviewed)
+        if not any(reviewed[fid].type == "dataflow" for fid in reviewed_ids):
+            continue
+        if component & promoted_ancestry:
+            continue
+        chain_label = ",".join(reviewed_ids)
+        if any(reviewed[fid].type == "reachability" for fid in reviewed_ids):
+            proposal = _stage_intent_proposal(
+                project, reviewed_ids, "characterize",
+                "Characterize the reviewed source-to-sink chain into the final "
+                "type=vulnerability finding with full evidence (file:line, code, "
+                f"taint, severity, fix). Reviewed chain facts: {chain_label}.",
+            )
+        else:
+            proposal = _stage_intent_proposal(
+                project, reviewed_ids, "reach",
+                "Verify that the reviewed source-to-sink chain is reachable by "
+                "the relevant principal and record the entrypoint-to-sink route "
+                "and trust-boundary assumption. Reviewed chain facts: "
+                f"{chain_label}.",
+            )
+        if proposal is not None:
+            proposals.append(proposal)
+    return proposals
+
+
+def _dynamic_evidence_complete(project: ProjectDetail, candidate_id: str) -> bool:
+    """Whether one candidate carries reviewed positive and negative dynamic evidence."""
+    roles: set[str] = set()
+    for fact in project.facts:
+        if fact.type not in {"reproduction", "negative_control"} or fact.proof is None:
+            continue
+        attributes = fact.proof.attributes
+        if (
+            attributes.get("mode") == "dynamic"
+            and attributes.get("candidate_id") == candidate_id
+            and _reviewed(project, fact.id)
+        ):
+            roles.add(fact.type)
+    return {"reproduction", "negative_control"} <= roles
+
+
 def managed_description(description: str) -> bool:
     value = description.strip()
     return (
@@ -966,6 +1085,19 @@ def audit_summary_inputs(
                 # proof review even when another review made the Fact triaged.
                 required_ids.add(fact.id)
                 continue
+            if (
+                fact.type == "vulnerability"
+                and fact.semantic_type != "confirmed_finding"
+                and config.poc_sandbox.enabled
+                and not _dynamic_evidence_complete(project, fact.id)
+            ):
+                # Fake convergence guard: a reviewed candidate without the
+                # mandatory isolated dynamic stage (positive reproduction plus
+                # matched negative control) must block the summary, otherwise
+                # the audit terminates as "0 confirmed" while promotion work
+                # is still legally owed. The UVPG gap projection schedules the
+                # poc:isolated intents that satisfy this gate.
+                return None
             required_ids.add(fact.id)
         required_ids.update(
             fact.id for fact in project.facts
@@ -998,6 +1130,14 @@ def audit_summary_fact(
         if fact.id in inputs
         and (disposition := _review_exhaustion(project, fact)) is not None
     ]
+    unconfirmed_candidates = sorted(
+        fact.id for fact in project.facts
+        if fact.id in inputs
+        and fact.type == "vulnerability"
+        and fact.semantic_type not in {"confirmed_finding", "rejected_finding"}
+        and fact.status not in {"false_positive", "fixed", "accepted_risk"}
+        and _review_exhaustion(project, fact) is None
+    )
     blindspot_fact = recon.coverage_review_fact(project)
     blindspot_record = recon.coverage_review_record(blindspot_fact, workdir) if blindspot_fact else {}
     review_categories = {
@@ -1172,11 +1312,23 @@ def audit_summary_fact(
         }
         for item in unresolved_reviews
     )
+    residual_gaps.extend(
+        {
+            "category": "unconfirmed-candidate",
+            "gap": (
+                f"{fact_id} is an independently reviewed candidate finding that was never "
+                "technically confirmed; it is retained as explicit uncertainty, "
+                "not a confirmed finding"
+            ),
+        }
+        for fact_id in unconfirmed_candidates
+    )
     record = {
         "schema_version": 4,
         "kind": "scope_audit_summary",
         "input_fact_ids": inputs,
         "confirmed_vulnerability_ids": sorted(vulnerabilities),
+        "unconfirmed_candidate_ids": unconfirmed_candidates,
         "unresolved_reviews": unresolved_reviews,
         "unresolved_followups": unresolved_followups,
         "candidate_budget_residual": {
@@ -1248,6 +1400,13 @@ def audit_summary_fact(
                 and item["semantic_type"] == "candidate_finding"
                 for item in unresolved_reviews
             ) else ""
+        )
+        + (
+            "\n" + "\n".join(
+                f"unconfirmed_candidate_id:{fact_id}"
+                for fact_id in unconfirmed_candidates
+            )
+            if unconfirmed_candidates else ""
         )
         + (
             "\n" + "\n".join(
@@ -1368,6 +1527,10 @@ def required_intents(
         # trusted Skill registry. The deterministic gate still requires every
         # configured stage and a validated receipt.
         return []
+
+    promotions = _promotion_proposals(project, workdir, config)
+    if promotions:
+        return promotions[:limit]
 
     if recon.active_for_project(project, config.recon):
         snapshot = recon.snapshot_fact(project)
