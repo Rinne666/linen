@@ -27,6 +27,11 @@ or abandon it. Return only these control actions in that case:
 ```json
 {"accepted": true, "data": {"resolve": [{"intent_id": "i123", "action": "retry"}, {"intent_id": "i456", "action": "abandon"}]}}
 ```
+`resolve` may be combined with follow-up proposals in one response, but only
+with `intents` (never with `complete` or any other key):
+```json
+{"accepted": true, "data": {"resolve": [{"intent_id": "i456", "action": "abandon"}], "intents": [{"from": ["f001"], "action": "verify", "target": "...", "description": "..."}]}}
+```
 Use `retry` only when the recorded error is plausibly recoverable. Use
 `abandon` when the work is no longer valuable or its precondition cannot be
 repaired. Do not invent intent IDs; use IDs shown in the graph.

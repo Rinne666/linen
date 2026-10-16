@@ -75,8 +75,9 @@ Completion:
 For an open Intent with an unresolved blocked execution error, choose one
 control action instead of leaving it permanently blocked:
 `{"accepted":true,"data":{"resolve":[{"intent_id":"i123","action":"retry"}]}}`
-Use `abandon` when the work is no longer valuable. Use only blocked open
-Intent IDs present in the graph.
+`resolve` may be combined with `intents` in one response (never with `complete`
+or any other key). Use `abandon` when the work is no longer valuable. Use only
+blocked open Intent IDs present in the graph.
 Transient errors with `retry_at` are already queued for bounded automatic retry;
 use `wait`, not `resolve`. A blocked `invalid_blackboard_result` exhausted that
 automatic budget and cannot be retried by Reason; preserve its gap until the

@@ -132,7 +132,70 @@ def test_reason_payload_validates_blocked_intent_resolution() -> None:
         max_intents=3,
     )
     assert kind == "resolve"
-    assert actions == [{"intent_id": "i123", "action": "abandon"}]
+    assert actions == {"resolve": [{"intent_id": "i123", "action": "abandon"}], "intents": None}
+
+
+def test_reason_payload_allows_resolve_combined_with_intents() -> None:
+    kind, data = validate_reason_payload(
+        {
+            "accepted": True,
+            "data": {
+                "resolve": [{"intent_id": "i006", "action": "abandon"}],
+                "intents": [
+                    {
+                        "from": ["f003", "f004"],
+                        "action": "verify",
+                        "target": "shell exec path",
+                        "description": "Verify the reachable subprocess call.",
+                    }
+                ],
+            },
+        },
+        open_intents_empty=False,
+        max_intents=3,
+    )
+    assert kind == "resolve"
+    assert data["resolve"] == [{"intent_id": "i006", "action": "abandon"}]
+    assert data["intents"][0]["target"] == "shell exec path"
+
+
+def test_reason_payload_rejects_resolve_with_unrelated_keys() -> None:
+    with pytest.raises(ValueError, match="resolve may only be combined with intents"):
+        validate_reason_payload(
+            {
+                "accepted": True,
+                "data": {
+                    "resolve": [{"intent_id": "i006", "action": "abandon"}],
+                    "notes": "why",
+                },
+            },
+            open_intents_empty=False,
+            max_intents=3,
+        )
+
+
+def test_reason_payload_rejects_resolve_with_complete() -> None:
+    with pytest.raises(ValueError, match="resolve may only be combined with intents"):
+        validate_reason_payload(
+            {
+                "accepted": True,
+                "data": {
+                    "resolve": [{"intent_id": "i006", "action": "abandon"}],
+                    "complete": {"from": ["f001"], "description": "done"},
+                },
+            },
+            open_intents_empty=False,
+            max_intents=3,
+        )
+
+
+def test_reason_payload_rejects_empty_resolve_array_with_guidance() -> None:
+    with pytest.raises(ValueError, match="non-empty array"):
+        validate_reason_payload(
+            {"accepted": True, "data": {"resolve": []}},
+            open_intents_empty=False,
+            max_intents=3,
+        )
 
 
 def test_reason_payload_rejects_unknown_resolution_action() -> None:

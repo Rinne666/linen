@@ -231,7 +231,26 @@ def test_reason_accepts_unrelated_updates_but_rejects_changed_basis_and_completi
 def test_reason_new_review_invalidates_the_read_fact_even_when_status_unchanged():
     project = make_project()
     projection = ContextProjector(max_hops=0).project_frontier(project, ["f001"], degraded=True)
-    project.reviews.append(Review(id="r001", fact_id="f001", reviewer="reviewer", verdict="NEEDS_REVIEW", confidence="tentative", summary="missing guard", created_at="2026-10-08T10:00:00Z"))
+    project.reviews.append(Review(id="r001", fact_id="f001", reviewer="reviewer", verdict="NEEDS_REVIEW", confidence="tentative", summary="missing guard", created_at="2099-01-01T00:00:00Z"))
+    assert not reason_basis_is_current(projection, project)
+
+
+def test_reason_review_predating_projection_does_not_invalidate_read_fact():
+    """Reviews excluded from the projection but created before it are baseline
+    evidence, not new invalidations (the frontier-v1 selection policy never
+    projects review nodes; without this rule every pass is permanently stale)."""
+    project = make_project()
+    projection = ContextProjector(max_hops=0).project_frontier(project, ["f001"], degraded=True)
+    project.reviews.append(Review(id="r001", fact_id="f001", reviewer="reviewer", verdict="VALID", confidence="certain", summary="pre-existing review", created_at="2000-01-01T00:00:00Z"))
+    assert reason_basis_is_current(projection, project)
+
+
+def test_reason_review_with_unknown_timestamp_stays_conservative():
+    project = make_project()
+    projection = ContextProjector(max_hops=0).project_frontier(project, ["f001"], degraded=True)
+    review = Review(id="r001", fact_id="f001", reviewer="reviewer", verdict="VALID", confidence="certain", summary="bad timestamp", created_at="not-a-timestamp")
+    review.created_at = ""
+    project.reviews.append(review)
     assert not reason_basis_is_current(projection, project)
 
 

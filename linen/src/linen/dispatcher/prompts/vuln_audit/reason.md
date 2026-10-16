@@ -167,6 +167,11 @@ cannot dispatch it until you choose a control action. Return only this shape:
 ```json
 {"accepted": true, "data": {"resolve": [{"intent_id": "i123", "action": "retry"}]}}
 ```
+`resolve` may be combined with follow-up proposals in one response, but only
+with `intents` (never with `complete` or any other key):
+```json
+{"accepted": true, "data": {"resolve": [{"intent_id": "i456", "action": "abandon"}], "intents": [{"from": ["f001"], "action": "verify", "target": "...", "description": "..."}]}}
+```
 Choose `retry` for a recoverable failure and `abandon` for work that should be
 closed. Use only blocked open Intent IDs visible in the graph.
 Transient errors with `retry_at` are already queued for bounded automatic retry;

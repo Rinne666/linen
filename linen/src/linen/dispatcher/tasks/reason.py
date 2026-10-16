@@ -408,6 +408,167 @@ def _run_context_continuation(
     return "success", payload, expanded
 
 
+def _register_reason_intents(
+    *,
+    client: LinenClient,
+    project: ProjectDetail,
+    config: DispatchConfig,
+    scope_audit: bool,
+    audit_enabled: bool,
+    container_name: str,
+    worker: WorkerConfig,
+    run_envelope: RunEnvelope,
+    intent_list: list[dict],
+    execute_ms: int,
+    total_ms: int,
+) -> str:
+    """Register Reason-proposed intents; returns the task outcome.
+
+    Shared by the plain "intents" branch and the "resolve + intents"
+    combined branch (dispositions are applied before this helper runs).
+    """
+    created = 0
+    for intent_data in intent_list:
+        intent_type = intent_data.get("type")
+        if audit_enabled:
+            fresh = client.get_project(project.project.id)
+            semantic_method = False
+            recon_method = False
+            if (
+                scope_audit
+                and recon.active_for_project(fresh, config.audit.recon)
+                and isinstance(intent_data.get("description"), str)
+                and intent_data["description"].startswith(recon.CATEGORY_PREFIX)
+            ):
+                try:
+                    recon.validate_intent(
+                        fresh, config.audit.recon, intent_data, Path(container_name),
+                    )
+                    source_ids = intent_data.get("from", [])
+                    recon_sources = {fact.id for fact in fresh.facts if fact.type == "recon"}
+                    recon_method = (
+                        isinstance(source_ids, list)
+                        and any(source_id in recon_sources for source_id in source_ids)
+                    )
+                except (ValueError, TypeError):
+                    recon_method = False
+            if (
+                scope_audit
+                and config.audit.semantic.enabled
+                and audit_recipes.is_dynamic_recipe_proposal(
+                    intent_data.get("description", "")
+                    if isinstance(intent_data.get("description"), str) else ""
+                )
+            ):
+                try:
+                    audit_recipes.store_dynamic_recipe_proposal(
+                        fresh,
+                        intent_data,
+                        Path(container_name),
+                        config.audit,
+                        run_id=run_envelope.run_id,
+                        producer=worker.name,
+                    )
+                    semantic_method = True
+                except (ValueError, OSError, TypeError) as exc:
+                    LOG.info(
+                        "dynamic semantic recipe proposal rejected project=%s worker=%s reason=%s",
+                        project.project.id, worker.name, str(exc)[:500],
+                    )
+            if (
+                scope_audit
+                and config.audit.semantic.enabled
+                and intent_data["description"].startswith(audit_recipes.RECIPE_PREFIX)
+            ):
+                candidate = Intent(
+                    id="reason-method-validation",
+                    from_=intent_data["from"],
+                    description=intent_data["description"],
+                    type=intent_type,
+                    creator=worker.name,
+                    created_at="1970-01-01T00:00:00Z",
+                )
+                try:
+                    parsed_recipe = audit_recipes.parse_recipe_intent(
+                        candidate, config.runtime.prompt_group,
+                    )
+                    semantic_method = bool(
+                        parsed_recipe
+                        and parsed_recipe[0] in audit_recipes.enabled_recipe_ids(
+                            config.audit.semantic,
+                        )
+                    )
+                except ValueError:
+                    semantic_method = False
+            if (audit_graph.managed_description(intent_data["description"])
+                    and not semantic_method and not recon_method):
+                message = (
+                    "Audit intent blocked: reserved managed intents are materialized "
+                    f"from graph state by the dispatcher ({intent_data['description']})"
+                )
+                if not any(h.content == message for h in fresh.hints):
+                    client.create_hint(project.project.id, message, "audit-policy")
+                continue
+        # `type` is optional in the validate_reason_payload contract; the
+        # reason worker may emit a `review`-typed intent to challenge a
+        # draft candidate finding, alongside the canonical search/trace/
+        # validate/reach/characterize intents. Pass it through so the
+        # scheduler can route review intents to the review dispatcher
+        # (loop.py: `if intent.type == "review"`).
+        response = client.create_intent(
+            project.project.id,
+            intent_data["from"],
+            intent_data["description"],
+            worker.name,
+            action=intent_data["action"],
+            target=intent_data["target"],
+            intent_type=intent_type,
+        )
+        if response.status_code == 403:
+            LOG.info("project became inactive during reason intent create project=%s worker=%s created=%s", project.project.id, worker.name, created)
+            return "success"
+        if response.status_code == 409:
+            LOG.info("reason intent lost race project=%s worker=%s from=%s", project.project.id, worker.name, intent_data["from"])
+            continue
+        if not response.ok:
+            LOG.warning(
+                "reason intent write failed project=%s worker=%s status=%s body=%s",
+                project.project.id,
+                worker.name,
+                response.status_code,
+                response.text,
+            )
+            continue
+        created += 1
+        LOG.info(
+            "reason created intent project=%s worker=%s from=%s description=%s",
+            project.project.id,
+            worker.name,
+            intent_data["from"],
+            intent_data["description"],
+        )
+    LOG.info(
+        "reason finished project=%s worker=%s created_intents=%s/%s execute_ms=%s total_ms=%s",
+        project.project.id,
+        worker.name,
+        created,
+        len(intent_list),
+        execute_ms,
+        total_ms,
+    )
+    if created == 0:
+        LOG.warning(
+            "reason created no intents project=%s worker=%s attempted=%s execute_ms=%s total_ms=%s",
+            project.project.id,
+            worker.name,
+            len(intent_list),
+            execute_ms,
+            total_ms,
+        )
+        return "failed"
+    return "success"
+
+
 def run_reason_task(
     config: DispatchConfig,
     client: LinenClient,
@@ -755,8 +916,16 @@ def run_reason_task(
             )
             return "rejected"
         if kind == "resolve":
+            # validate_reason_payload returns either the legacy bare list or
+            # {"resolve": [...], "intents": [...]} when the model combined a
+            # disposition with follow-up proposals.
+            resolutions = data["resolve"] if isinstance(data, dict) else data
+            followup_intents = (
+                data.get("intents") or None
+                if isinstance(data, dict) else None
+            )
             scheduled_retry_ids = []
-            for resolution in data:
+            for resolution in resolutions:
                 # Older model output sometimes requests retry for a transient
                 # error that the scheduler already owns. Preserve that intent
                 # as bounded waiting; never clear or expedite its retry budget.
@@ -826,6 +995,22 @@ def run_reason_task(
                     wait_basis=(projection.source_generation, projection.plan_revision),
                 )
                 return "waiting" if released else "stale"
+            if followup_intents:
+                # Dispositions applied; register the combined follow-up
+                # proposals before declaring success.
+                return _register_reason_intents(
+                    client=client,
+                    project=project,
+                    config=config,
+                    scope_audit=scope_audit,
+                    audit_enabled=audit_enabled,
+                    container_name=container_name,
+                    worker=worker,
+                    run_envelope=run_envelope,
+                    intent_list=followup_intents,
+                    execute_ms=execute_ms,
+                    total_ms=total_ms,
+                )
             return "success"
         if kind == "complete":
             if audit_enabled:
@@ -889,148 +1074,19 @@ def run_reason_task(
             ack_event_seq = project.project.event_seq
             return "success"
         if kind == "intents":
-            created = 0
-            for intent_data in data:
-                intent_type = intent_data.get("type")
-                if audit_enabled:
-                    fresh = client.get_project(project.project.id)
-                    semantic_method = False
-                    recon_method = False
-                    if (
-                        scope_audit
-                        and recon.active_for_project(fresh, config.audit.recon)
-                        and isinstance(intent_data.get("description"), str)
-                        and intent_data["description"].startswith(recon.CATEGORY_PREFIX)
-                    ):
-                        try:
-                            recon.validate_intent(
-                                fresh, config.audit.recon, intent_data, Path(container_name),
-                            )
-                            source_ids = intent_data.get("from", [])
-                            recon_sources = {fact.id for fact in fresh.facts if fact.type == "recon"}
-                            recon_method = (
-                                isinstance(source_ids, list)
-                                and any(source_id in recon_sources for source_id in source_ids)
-                            )
-                        except (ValueError, TypeError):
-                            recon_method = False
-                    if (
-                        scope_audit
-                        and config.audit.semantic.enabled
-                        and audit_recipes.is_dynamic_recipe_proposal(
-                            intent_data.get("description", "")
-                            if isinstance(intent_data.get("description"), str) else ""
-                        )
-                    ):
-                        try:
-                            audit_recipes.store_dynamic_recipe_proposal(
-                                fresh,
-                                intent_data,
-                                Path(container_name),
-                                config.audit,
-                                run_id=run_envelope.run_id,
-                                producer=worker.name,
-                            )
-                            semantic_method = True
-                        except (ValueError, OSError, TypeError) as exc:
-                            LOG.info(
-                                "dynamic semantic recipe proposal rejected project=%s worker=%s reason=%s",
-                                project.project.id, worker.name, str(exc)[:500],
-                            )
-                    if (
-                        scope_audit
-                        and config.audit.semantic.enabled
-                        and intent_data["description"].startswith(audit_recipes.RECIPE_PREFIX)
-                    ):
-                        candidate = Intent(
-                            id="reason-method-validation",
-                            from_=intent_data["from"],
-                            description=intent_data["description"],
-                            type=intent_type,
-                            creator=worker.name,
-                            created_at="1970-01-01T00:00:00Z",
-                        )
-                        try:
-                            parsed_recipe = audit_recipes.parse_recipe_intent(
-                                candidate, config.runtime.prompt_group,
-                            )
-                            semantic_method = bool(
-                                parsed_recipe
-                                and parsed_recipe[0] in audit_recipes.enabled_recipe_ids(
-                                    config.audit.semantic,
-                                )
-                            )
-                        except ValueError:
-                            semantic_method = False
-                    if (audit_graph.managed_description(intent_data["description"])
-                            and not semantic_method and not recon_method):
-                        message = (
-                            "Audit intent blocked: reserved managed intents are materialized "
-                            f"from graph state by the dispatcher ({intent_data['description']})"
-                        )
-                        if not any(h.content == message for h in fresh.hints):
-                            client.create_hint(project.project.id, message, "audit-policy")
-                        continue
-                # `type` is optional in the validate_reason_payload contract; the
-                # reason worker may emit a `review`-typed intent to challenge a
-                # draft candidate finding, alongside the canonical search/trace/
-                # validate/reach/characterize intents. Pass it through so the
-                # scheduler can route review intents to the review dispatcher
-                # (loop.py: `if intent.type == "review"`).
-                response = client.create_intent(
-                    project.project.id,
-                    intent_data["from"],
-                    intent_data["description"],
-                    worker.name,
-                    action=intent_data["action"],
-                    target=intent_data["target"],
-                    intent_type=intent_type,
-                )
-                if response.status_code == 403:
-                    LOG.info("project became inactive during reason intent create project=%s worker=%s created=%s", project.project.id, worker.name, created)
-                    ack_event_seq = project.project.event_seq
-                    return "success"
-                if response.status_code == 409:
-                    LOG.info("reason intent lost race project=%s worker=%s from=%s", project.project.id, worker.name, intent_data["from"])
-                    continue
-                if not response.ok:
-                    LOG.warning(
-                        "reason intent write failed project=%s worker=%s status=%s body=%s",
-                        project.project.id,
-                        worker.name,
-                        response.status_code,
-                        response.text,
-                    )
-                    continue
-                created += 1
-                LOG.info(
-                    "reason created intent project=%s worker=%s from=%s description=%s",
-                    project.project.id,
-                    worker.name,
-                    intent_data["from"],
-                    intent_data["description"],
-                )
-            LOG.info(
-                "reason finished project=%s worker=%s created_intents=%s/%s execute_ms=%s total_ms=%s",
-                project.project.id,
-                worker.name,
-                created,
-                len(data),
-                execute_ms,
-                total_ms,
+            return _register_reason_intents(
+                client=client,
+                project=project,
+                config=config,
+                scope_audit=scope_audit,
+                audit_enabled=audit_enabled,
+                container_name=container_name,
+                worker=worker,
+                run_envelope=run_envelope,
+                intent_list=data,
+                execute_ms=execute_ms,
+                total_ms=total_ms,
             )
-            if created == 0:
-                LOG.warning(
-                    "reason created no intents project=%s worker=%s attempted=%s execute_ms=%s total_ms=%s",
-                    project.project.id,
-                    worker.name,
-                    len(data),
-                    execute_ms,
-                    total_ms,
-                )
-                return "failed"
-            ack_event_seq = project.project.event_seq
-            return "success"
         LOG.info(
             "reason finished without graph change project=%s worker=%s execute_ms=%s total_ms=%s",
             project.project.id,

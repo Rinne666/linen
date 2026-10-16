@@ -2,9 +2,40 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from linen.contracts import BlackboardSnapshot, ContextProjection
 from linen.dispatcher.contract_adapters import project_detail_to_snapshot
 from linen.server.models import ProjectDetail
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    """Parse an ISO-8601 UTC timestamp; returns None when absent/malformed."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _created_after_projection(review_payload: dict, projection_created: datetime | None) -> bool:
+    """True when the review postdates the projection (or timestamp is unknown).
+
+    Selection policies may legitimately exclude reviews from the projected
+    context while still including their reviewed facts. A review that already
+    existed when the projection was built is part of the evidence baseline the
+    worker read around, not a new invalidation; only reviews created after the
+    projection may falsify the pass. Unknown timestamps stay conservative
+    (treated as new) to preserve the old invalidation behavior.
+    """
+    created = _parse_timestamp(review_payload.get("created_at"))
+    if created is None or projection_created is None:
+        return True
+    return created > projection_created
 
 
 def _semantic_payload(kind: str, payload: dict) -> dict:
@@ -47,7 +78,14 @@ def reason_basis_is_current(projection: ContextProjection, fresh: ProjectDetail,
             read_facts.add(identifier)
         elif kind == "review":
             read_reviews.add(identifier)
-    if any(node.kind == "review" and node.payload.get("fact_id") in read_facts and node.id not in read_reviews for node in snapshot.nodes):
+    projection_created = _parse_timestamp(projection.created_at)
+    if any(
+        node.kind == "review"
+        and node.payload.get("fact_id") in read_facts
+        and node.id not in read_reviews
+        and _created_after_projection(node.payload, projection_created)
+        for node in snapshot.nodes
+    ):
         return False
     edges = {edge.id: edge.model_dump(mode="json") for edge in snapshot.edges}
     original_edges = {edge["id"]: edge for edge in projection.context.get("edges", [])}

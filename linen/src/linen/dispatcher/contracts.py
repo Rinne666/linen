@@ -128,16 +128,38 @@ def validate_reason_payload(
     intents = data.get("intents")
     resolve = data.get("resolve")
     if resolve is not None:
-        if set(data) != {"resolve"} or not isinstance(resolve, list) or not resolve:
-            raise ValueError("resolve must be a non-empty array by itself")
+        if not isinstance(resolve, list) or not resolve:
+            raise ValueError(
+                "resolve must be a non-empty array; "
+                'example: {"resolve": [{"intent_id": "i006", "action": "abandon"}]}'
+            )
         for i, item in enumerate(resolve):
             if not isinstance(item, dict) or set(item) != {"intent_id", "action"}:
-                raise ValueError(f"invalid resolve action at index {i}")
+                raise ValueError(
+                    f"invalid resolve action at index {i}; each item must be "
+                    '{"intent_id": "...", "action": "retry" | "abandon"}'
+                )
             if not isinstance(item["intent_id"], str) or not item["intent_id"].strip():
                 raise ValueError(f"resolve intent_id must be non-empty at index {i}")
             if item["action"] not in {"retry", "abandon"}:
-                raise ValueError(f"invalid resolve action at index {i}")
-        return "resolve", resolve
+                raise ValueError(
+                    f"invalid resolve action at index {i}; action must be 'retry' or 'abandon'"
+                )
+        # A resolve disposition may be combined with follow-up intent
+        # proposals in the same response (models routinely emit
+        # {"resolve": [...], "intents": [...]}); dispositions are applied
+        # first, then the proposals are registered.
+        allowed_with_resolve = {"resolve"} | ({"intents"} if intents is not None else set())
+        if not set(data) <= allowed_with_resolve:
+            raise ValueError(
+                "resolve may only be combined with intents; "
+                'example: {"resolve": [{"intent_id": "i006", "action": "abandon"}], '
+                '"intents": [{"from": [...], "action": "...", "target": "...", "description": "..."}]}'
+            )
+        followup_intents = None
+        if intents is not None:
+            followup_intents = _validate_intents_list(intents, open_intents_empty, max_intents)
+        return "resolve", {"resolve": resolve, "intents": followup_intents}
     # backward compat: accept singular "intent" key from LLMs
     if intents is None:
         singular = data.get("intent")
@@ -154,29 +176,38 @@ def validate_reason_payload(
             raise ValueError("complete requires non-empty fact IDs and description")
         return "complete", complete
     if intents is not None:
-        if not isinstance(intents, list):
-            raise ValueError("intents must be an array")
-        for i, intent in enumerate(intents):
-            if (
-                not isinstance(intent, dict)
-                or "from" not in intent
-                or "description" not in intent
-                or "action" not in intent
-                or "target" not in intent
-            ):
-                raise ValueError(f"invalid intent at index {i}")
-            for field in ("action", "target"):
-                if not isinstance(intent[field], str) or not intent[field].strip():
-                    raise ValueError(f"intent {field} must be a non-empty string at index {i}")
-        if not intents and open_intents_empty:
-            raise ValueError("intents must not be empty when open_intents is empty")
-        intents = intents[:max_intents]
-        if not intents:
+        validated = _validate_intents_list(intents, open_intents_empty, max_intents)
+        if not validated:
             return "noop", None
-        return "intents", intents
+        return "intents", validated
     if open_intents_empty:
         raise ValueError("intents is required when open_intents is empty")
     return "noop", None
+
+
+def _validate_intents_list(
+    intents: Any, open_intents_empty: bool, max_intents: int,
+) -> list[dict[str, Any]]:
+    if not isinstance(intents, list):
+        raise ValueError("intents must be an array")
+    for i, intent in enumerate(intents):
+        if (
+            not isinstance(intent, dict)
+            or "from" not in intent
+            or "description" not in intent
+            or "action" not in intent
+            or "target" not in intent
+        ):
+            raise ValueError(f"invalid intent at index {i}")
+        for field in ("action", "target"):
+            if not isinstance(intent[field], str) or not intent[field].strip():
+                raise ValueError(f"intent {field} must be a non-empty string at index {i}")
+    if not intents and open_intents_empty:
+        raise ValueError("intents must not be empty when open_intents is empty")
+    intents = intents[:max_intents]
+    if not intents:
+        return []
+    return intents
 
 
 def _optional_text(value: Any) -> str | None:
