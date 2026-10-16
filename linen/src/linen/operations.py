@@ -260,9 +260,6 @@ def inspect_environment(
     ):
         if sandbox.enabled and sandbox.image:
             images.append({"component": component, **_image_status(sandbox.executable, sandbox.image)})
-    codeql = config.audit.codeql
-    if codeql.enabled and codeql.image:
-        images.append({"component": "codeql", **_image_status(codeql.executable, codeql.image)})
     checks["images"] = images
     for worker_status in checks["workers"]:
         worker_status["ok"] = bool(worker_status.get("available")) and worker_status.get("version") not in {None, "unavailable"}

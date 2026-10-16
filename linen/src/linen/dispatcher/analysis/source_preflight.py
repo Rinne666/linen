@@ -16,7 +16,7 @@ MAX_ENTRIES = 50_000
 MAX_DEPTH = 32
 
 # Common source, infrastructure, and security configuration formats.  This is
-# intentionally broader than the CodeQL language list because audit projects
+# intentionally broader than any static-analysis language list because audit projects
 # can target configuration-only repositories as well.
 SOURCE_SUFFIXES = frozenset({
     ".bash", ".c", ".cc", ".clj", ".cljc", ".cljs", ".cjs", ".cs",

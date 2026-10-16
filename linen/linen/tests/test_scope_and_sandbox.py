@@ -81,7 +81,6 @@ def test_stage_obligations_are_frozen_until_plan_revision_changes(tmp_path):
     cfg = config(tmp_path)
     cfg.audit.mode = "scope"
     cfg.audit.recon.enabled = True
-    cfg.audit.codeql.enabled = True
     board = ProjectDetail(
         project=ProjectMeta(
             id="proj_frozen", title="audit", status="active", bootstrap_enabled=False,
@@ -91,36 +90,34 @@ def test_stage_obligations_are_frozen_until_plan_revision_changes(tmp_path):
         intents=[], hints=[], reviews=[],
     )
     registered = stages.reconcile(cfg.audit, board, tmp_path)
-    codeql_stage = next(row for row in registered if row["stage_id"] == "codeql-candidates")
-    assert codeql_stage["required"] is True
+    snapshot_stage = next(row for row in registered if row["stage_id"] == "recon-snapshot")
+    assert snapshot_stage["required"] is True
     board.stages = [AuditStage(
         **row, source_generation=1, plan_revision=1, updated_at="2026-01-01T00:00:00Z",
     ) for row in registered]
 
-    cfg.audit.codeql.enabled = False
+    cfg.audit.recon.enabled = False
     reconciled = stages.reconcile(cfg.audit, board, tmp_path)
-    codeql_stage = next(row for row in reconciled if row["stage_id"] == "codeql-candidates")
-    assert codeql_stage["required"] is True
-    assert codeql_stage["status"] == "pending"
+    snapshot_stage = next(row for row in reconciled if row["stage_id"] == "recon-snapshot")
+    assert snapshot_stage["required"] is True
+    assert snapshot_stage["status"] == "pending"
 
     replanned = board.model_copy(deep=True)
     replanned.project.plan_revision += 1
     replanned.stages = []
-    codeql_after_replan = next(
+    snapshot_after_replan = next(
         (row for row in stages.reconcile(cfg.audit, replanned, tmp_path)
-        if row["stage_id"] == "codeql-candidates"), None,
+        if row["stage_id"] == "recon-snapshot"), None,
     )
-    assert codeql_after_replan is None
+    assert snapshot_after_replan is None
 
     cfg.audit.recon.enabled = True
-    cfg.audit.codeql.enabled = True
     replanned.project.plan_revision += 1
-    codeql_after_second_replan = next(
+    snapshot_after_second_replan = next(
         row for row in stages.reconcile(cfg.audit, replanned, tmp_path)
-        if row["stage_id"] == "codeql-candidates"
+        if row["stage_id"] == "recon-snapshot"
     )
-    assert codeql_after_second_replan["required"] is True
-
+    assert snapshot_after_second_replan["required"] is True
 
 def approve(client, pid, fid):
     assert client.create_review(

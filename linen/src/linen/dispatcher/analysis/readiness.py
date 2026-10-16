@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from linen.dispatcher.analysis import audit_graph, codeql, coverage, recon, scope_gate
+from linen.dispatcher.analysis import audit_graph, coverage, recon, scope_gate
 from linen.dispatcher.config import AuditConfig
 from linen.server.models import Intent, ProjectDetail
 
@@ -18,6 +18,6 @@ def scope_allows_intent(project: ProjectDetail, intent: Intent, config: AuditCon
     scope_ready = bool(evidence_ready and adjudication and adjudication.type == scope_gate.SCOPE_ADJUDICATION_TYPE and coverage.reviewed(project, adjudication.id))
     needs_scope = (
         intent.description.strip() in {recon.SNAPSHOT_INTENT, recon.COVERAGE_REVIEW_INTENT, audit_graph.AUDIT_SUMMARY_INTENT}
-        or recon.category_from_description(intent.description) is not None or codeql.is_intent(intent)
+        or recon.category_from_description(intent.description) is not None
     )
     return scope_ready or not needs_scope

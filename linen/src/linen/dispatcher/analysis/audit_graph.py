@@ -11,7 +11,7 @@ import re
 import uuid
 from pathlib import Path
 
-from linen.dispatcher.analysis import codeql, coverage, recon, scope_gate
+from linen.dispatcher.analysis import coverage, recon, scope_gate
 from linen.dispatcher.analysis.artifacts import ancestor_ids, digest, write_json
 from linen.dispatcher.config import AuditConfig
 from linen.candidate_attempts import is_candidate_attempt
@@ -70,7 +70,7 @@ def _lead_disposition_ledger(
     workdir: Path,
     config: AuditConfig,
 ) -> list[dict]:
-    """Keep each source-grounded Recon/CodeQL lead visible through synthesis.
+    """Keep each source-grounded Recon lead visible through synthesis.
 
     A lead is dispositioned only when its own source Fact has a descendant
     candidate or an independently reviewed rejection. Mere inclusion in a
@@ -94,37 +94,6 @@ def _lead_disposition_ledger(
         for lead in record.get("leads", []):
             if isinstance(lead, dict):
                 sources.append((fact, category, lead, record))
-    if codeql.active_for_project(project, config.codeql):
-        machine_facts = []
-        initial = codeql.latest_fact(project)
-        initial_intent = next((
-            intent for intent in project.intents if intent.to == initial.id
-        ), None) if initial is not None else None
-        if (
-            initial is not None
-            and initial.source_generation == project.project.source_generation
-            and initial_intent is not None
-            and initial_intent.source_generation == project.project.source_generation
-            and initial_intent.plan_revision == project.project.plan_revision
-        ):
-            machine_facts.append(("codeql", initial))
-        machine_facts.extend(codeql.query_results(project))
-        for category, fact in machine_facts:
-            result_intent = next((
-                intent for intent in project.intents if intent.to == fact.id
-            ), None)
-            if (
-                fact.source_generation != project.project.source_generation
-                or result_intent is None
-                or result_intent.source_generation != project.project.source_generation
-                or result_intent.plan_revision != project.project.plan_revision
-            ):
-                continue
-            record = codeql.result_record(fact, workdir)
-            for lead in record.get("leads", []):
-                if isinstance(lead, dict):
-                    sources.append((fact, f"codeql:{category}", lead, record))
-
     ledger = []
     for source_fact, category, lead, record in sources:
         source_location = _source_location(lead.get("source"))
@@ -895,13 +864,6 @@ def _recon_coverage_ready(project: ProjectDetail, workdir: Path, config: AuditCo
                 and record["gaps"]
             ):
                 return False
-        if codeql.active_for_project(project, config.codeql):
-            machine_fact = codeql.latest_fact(project)
-            if machine_fact is None:
-                return False
-            machine_record = codeql.result_record(machine_fact, workdir)
-            if machine_record.get("status") != "complete":
-                return False
         return True
     except (ValueError, OSError, KeyError, TypeError, json.JSONDecodeError):
         return False
@@ -996,18 +958,6 @@ def audit_summary_inputs(
                 ),
                 blindspot_fact.id,
             ]
-            if codeql.active_for_project(project, config.codeql):
-                machine_fact = codeql.latest_fact(project)
-                if machine_fact is None:
-                    return None
-                machine_record = codeql.result_record(machine_fact, workdir)
-                if (
-                    machine_record.get("status") != "complete"
-                    or machine_record.get("snapshot_id") != snapshot_record["snapshot"]["id"]
-                ):
-                    return None
-                module_ids.append(machine_fact.id)
-                module_ids.extend(fact.id for _category, fact in codeql.query_results(project))
         else:
             return None
         gate_ids = []
@@ -1361,8 +1311,6 @@ def audit_summary_fact(
             + ("Some category coverage remains partial; " if partial_categories else "")
             + ("Residual uncertainty or unexplored paths remain recorded below. "
                if residual_gaps else "")
-            + ("CodeQL machine-path collection also reached its required terminal state. "
-               if codeql.active_for_project(project, config.codeql) else "")
             + " Policy eligibility remains separate from technical exploitability. "
             "This is not evidence that the repository is universally safe."
         ),
@@ -1425,8 +1373,7 @@ def audit_summary_fact(
             f"{len(unresolved_reviews)} exhausted review(s), "
             f"{len(unresolved_followups)} unresolved follow-up fact(s), and "
             f"{sum(len(item['leads']) for item in categories)} reconnaissance lead(s) are retained. "
-            + ("Reconnaissance branches reached their required terminal state. "
-               if not codeql.active_for_project(project, config.codeql) else "Reconnaissance branches and CodeQL collection reached their required terminal state. ")
+            + "Reconnaissance branches reached their required terminal state. "
             + "Closure applies to recorded lenses; threat-class completeness is not proven."
         ),
         "evidence": summary_evidence,
@@ -1539,19 +1486,6 @@ def required_intents(
                 project, [plan_anchor], "search", recon.SNAPSHOT_INTENT,
             )
             return [proposal] if proposal is not None else []
-        if codeql.active_for_project(project, config.codeql) and codeql.latest_fact(project) is None:
-            attempted = any(
-                intent.description.strip() == codeql.INTENT
-                and intent.source_generation == project.project.source_generation
-                and intent.plan_revision == project.project.plan_revision
-                for intent in project.intents
-            )
-            if not attempted:
-                return [{
-                    "from": [snapshot.id],
-                    "type": "search",
-                    "description": codeql.INTENT,
-                }]
         for category in config.recon.categories:
             if recon.latest_category_fact(project, category) is not None:
                 continue
@@ -1581,13 +1515,6 @@ def required_intents(
             )
             if not pending and categories is not None and _recon_coverage_ready(project, workdir, config):
                 review_sources = [snapshot.id, *(fact.id for fact in categories)]
-                if codeql.active_for_project(project, config.codeql):
-                    machine_fact = codeql.latest_fact(project)
-                    if machine_fact is not None:
-                        review_sources.append(machine_fact.id)
-                        review_sources.extend(
-                            fact.id for _category, fact in codeql.query_results(project)
-                        )
                 review_intent = _stage_intent_proposal(
                     project,
                     review_sources,
@@ -1719,45 +1646,6 @@ def scope_blockers(
                 scope_gate.adjudication_record(adjudication, workdir)
             except (ValueError, OSError, KeyError, TypeError) as exc:
                 blockers.append(f"Invalid scope adjudication evidence {adjudication.id}: {exc}")
-    if recon.active_for_project(project, config.recon) and codeql.active_for_project(project, config.codeql):
-        machine_fact = codeql.latest_fact(project)
-        if machine_fact is None:
-            blockers.append("CodeQL machine-path analysis has no completed result Fact.")
-        else:
-            try:
-                machine_record = codeql.result_record(machine_fact, workdir)
-                if machine_record.get("status") != "complete":
-                    blockers.append("CodeQL machine-path analysis did not complete successfully.")
-            except (ValueError, OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
-                blockers.append(f"Invalid CodeQL machine-path evidence {machine_fact.id}: {exc}")
-        snapshot = recon.snapshot_fact(project)
-        for intent in project.intents:
-            category = codeql.query_category(intent.description)
-            if (
-                category is None
-                or intent.source_generation != project.project.source_generation
-                or intent.plan_revision != project.project.plan_revision
-            ):
-                continue
-            fact = next((item for item in project.facts if item.id == intent.to), None)
-            if fact is None:
-                blockers.append(
-                    f"Requested CodeQL query profile {category} did not produce a result Fact; "
-                    "inspect its execution error and retry within the configured attempt limit."
-                )
-                continue
-            try:
-                query_record = codeql.result_record(fact, workdir)
-                if (
-                    query_record.get("status") != "complete"
-                    or snapshot is None
-                    or query_record.get("snapshot_fact_id") != snapshot.id
-                ):
-                    blockers.append(
-                        f"CodeQL query profile {category} did not complete against the current frozen snapshot."
-                    )
-            except (ValueError, OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
-                blockers.append(f"Invalid CodeQL query evidence {fact.id}: {exc}")
     summary = next((fact for fact in project.facts if fact.id in from_ids and fact.type == "audit_summary"), None)
     if summary is None:
         blockers.append("Scope completion must reference a validated audit_summary fact.")

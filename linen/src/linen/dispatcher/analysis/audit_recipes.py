@@ -18,7 +18,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import yaml
 
-from linen.dispatcher.analysis import codeql, coverage, exploitability, recon
+from linen.dispatcher.analysis import coverage, exploitability, recon
 from linen.dispatcher.analysis.artifacts import (
     ancestor_ids,
     canonical_endpoint_id,
@@ -240,32 +240,18 @@ def dynamic_recipe_reason_instructions(
         and not config.review_sandbox.env_allowlist
     ):
         capabilities.append("frozen_grep.literal")
-    if (
-        codeql.active_for_project(project, config.codeql)
-        and config.codeql.query_profiles
-    ):
-        capabilities.append("codeql.profile")
     if not capabilities:
         return ""
     capability_text = " and ".join(f"`{item}`" for item in capabilities)
     operation_example = (
         '{"capability":"frozen_grep.literal","literal":"tenant_id",'
         '"path_globs":["src/**/*.py"],"max_results":40}'
-        if "frozen_grep.literal" in capabilities else
-        '{"capability":"codeql.profile","profile":"<configured-category>","max_results":40}'
     )
-    if len(capabilities) > 1:
-        operation_example += ',\n   {"capability":"codeql.profile","profile":"<configured-category>","max_results":40}'
     capability_descriptions = []
     if "frozen_grep.literal" in capabilities:
         capability_descriptions.append(
             "`frozen_grep.literal` runs literal UTF-8 searches against the frozen source "
             "snapshot in an isolated offline container. `path_globs` stay within that snapshot."
-        )
-    if "codeql.profile" in capabilities:
-        capability_descriptions.append(
-            "`codeql.profile` selects only an operator-configured CodeQL profile ID; "
-            "never provide a query path or query body."
         )
     return """
 
@@ -340,11 +326,6 @@ def dynamic_recipe_reason_context(project: ProjectDetail, workdir: Path) -> str:
                         f"  frozen source {citation['file']}:{citation['line']}: "
                         f"{citation['code'][:500]}"
                     )
-            elif operation.get("capability") == "codeql.profile":
-                rows.append(
-                    f"- CodeQL profile {operation.get('profile')}: "
-                    f"{operation.get('candidate_count', 0)} candidate path(s)"
-                )
                 for lead in operation.get("leads", [])[:4]:
                     if isinstance(lead, dict):
                         rows.append(
@@ -548,7 +529,6 @@ def _normalize_dynamic_operations(raw: Any, config: AuditConfig) -> list[dict[st
     ):
         raise ValueError("Dynamic recipe operations must contain one to six entries")
     result = []
-    seen_profiles: set[str] = set()
     for operation in raw:
         if not isinstance(operation, dict):
             raise ValueError("Dynamic recipe operation must be an object")
@@ -583,25 +563,6 @@ def _normalize_dynamic_operations(raw: Any, config: AuditConfig) -> list[dict[st
                 "path_globs": list(dict.fromkeys(pattern.strip() for pattern in globs)),
                 "max_results": maximum,
             })
-        elif capability == "codeql.profile":
-            if set(operation) != {"capability", "profile", "max_results"}:
-                raise ValueError("CodeQL profile operation has unexpected fields")
-            profile = operation["profile"]
-            if (
-                not isinstance(profile, str)
-                or not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", profile)
-                or not config.codeql.enabled
-            ):
-                raise ValueError("CodeQL recipe must select an enabled configured profile")
-            if profile not in config.codeql.query_profiles:
-                raise ValueError("CodeQL profile is not in the operator allowlist")
-            if profile in seen_profiles:
-                raise ValueError("Dynamic recipe cannot repeat a CodeQL profile")
-            seen_profiles.add(profile)
-            maximum = operation["max_results"]
-            if type(maximum) is not int or not 1 <= maximum <= config.codeql.max_candidates:
-                raise ValueError("CodeQL max_results exceeds the configured candidate bound")
-            result.append({"capability": capability, "profile": profile, "max_results": maximum})
         else:
             raise ValueError("Dynamic recipe capability is not allowlisted")
     return result
@@ -679,14 +640,6 @@ def store_dynamic_recipe_proposal(
                 "frozen_grep.literal requires audit.review_sandbox enabled with network=none "
                 "and an empty environment allowlist"
             )
-    if any(item["capability"] == "codeql.profile" for item in operations):
-        if not codeql.active_for_project(project, config.codeql):
-            raise ValueError("Dynamic CodeQL recipes require the configured active CodeQL stage")
-        for operation in operations:
-            if operation["capability"] == "codeql.profile":
-                attempts = _profile_attempts(project, workdir, operation["profile"])
-                if attempts >= config.codeql.max_query_attempts_per_profile:
-                    raise ValueError("Dynamic CodeQL profile reached its configured attempt limit")
     data = {
         "schema_version": 1,
         "kind": "dispatcher_dynamic_semantic_recipe",
@@ -736,38 +689,6 @@ def store_dynamic_recipe_proposal(
     intent_data["target"] = "semantic-recipe:" + artifact_hash
     intent_data.pop("semantic_recipe", None)
     return artifact_hash
-
-
-def _profile_attempts(project: ProjectDetail, workdir: Path, profile: str) -> int:
-    count = sum(
-        1 for item in project.intents
-        if codeql.query_category(item.description) == profile
-        and item.source_generation == project.project.source_generation
-        and item.plan_revision == project.project.plan_revision
-    )
-    for item in project.intents:
-        match = _DYNAMIC_RECIPE_DESCRIPTION.fullmatch(item.description.strip())
-        if (
-            match is None or item.source_generation != project.project.source_generation
-            or item.plan_revision != project.project.plan_revision
-        ):
-            continue
-        try:
-            path = _dynamic_artifact_path(workdir, match.group("digest"))
-            raw = path.read_bytes()
-            if digest(raw) != match.group("digest"):
-                continue
-            record = json.loads(raw)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            continue
-        operations = record.get("recipe", {}).get("operations", [])
-        count += sum(
-            1 for operation in operations
-            if isinstance(operation, dict)
-            and operation.get("capability") == "codeql.profile"
-            and operation.get("profile") == profile
-        )
-    return count
 
 
 def load_dynamic_recipe(
@@ -829,13 +750,6 @@ def load_dynamic_recipe(
     operations = _normalize_dynamic_operations(recipe.get("operations"), config)
     if operations != recipe.get("operations"):
         raise ValueError("Generated semantic recipe operations are not canonical")
-    if any(item["capability"] == "codeql.profile" for item in operations):
-        if not codeql.active_for_project(project, config.codeql):
-            raise ValueError("Generated CodeQL recipe is outside the active CodeQL stage")
-        for operation in operations:
-            if operation["capability"] == "codeql.profile":
-                if _profile_attempts(project, workdir, operation["profile"]) > config.codeql.max_query_attempts_per_profile:
-                    raise ValueError("Generated CodeQL profile exceeds its configured attempt limit")
     return artifact_hash, record, plan_fact, source, plan
 
 
@@ -870,24 +784,6 @@ def dynamic_recipe_outcome_fact(
             lease,
         )
 
-    codeql_results = []
-    for operation in operations:
-        if operation["capability"] != "codeql.profile":
-            continue
-        if cancellation.is_cancelled or lease.failure is not None:
-            raise ValueError("Dynamic CodeQL recipe was cancelled")
-        query_intent = intent.model_copy(update={
-            "description": f"{codeql.QUERY_PREFIX}{operation['profile']}",
-            "from_": list(dict.fromkeys([snapshot_fact.id, *intent.from_])),
-        })
-        query_config = config.codeql.model_copy(update={
-            "max_candidates": operation["max_results"],
-        })
-        record, _snapshot, _citations = codeql._execute(
-            project, query_intent, workdir, query_config, cancellation, lease,
-        )
-        codeql_results.append({"profile": operation["profile"], "record": record})
-
     citations = []
     operation_results = []
     if grep_result is not None:
@@ -920,22 +816,6 @@ def dynamic_recipe_outcome_fact(
     canonical = canonical_source_citations(
         citations, source, plan["snapshot"], label="Dynamic semantic recipe",
     )
-    if codeql_results:
-        for operation_index, result in enumerate(codeql_results):
-            operation_results.append({
-                "capability": "codeql.profile",
-                "operation": next(
-                    index for index, item in enumerate(operations)
-                    if item["capability"] == "codeql.profile"
-                    and item["profile"] == result["profile"]
-                ),
-                "profile": result["profile"],
-                "candidate_count": result["record"].get("candidate_count", 0),
-                "snapshot_id": result["record"].get("snapshot_id"),
-                "leads": result["record"].get("leads", []),
-                "citations": result["record"].get("citations", []),
-                "gaps": result["record"].get("gaps", []),
-            })
     record = {
         "schema_version": 1,
         "kind": _DYNAMIC_RECIPE_FACT_TYPE,
@@ -956,7 +836,6 @@ def dynamic_recipe_outcome_fact(
         },
         "operations": operation_results,
         "citations": canonical,
-        "codeql_profiles": codeql_results,
     }
     directory = _safe_recipe_dir(workdir, create=True)
     result_dir = directory / "results"

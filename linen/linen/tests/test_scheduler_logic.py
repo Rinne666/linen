@@ -1335,7 +1335,7 @@ def test_reason_does_not_wake_for_routine_summary_facts() -> None:
     assert not loop._reason_may_run(project, events)
 
 
-def test_fresh_recon_and_machine_path_facts_wake_reason_with_open_work() -> None:
+def test_fresh_recon_category_facts_wake_reason_with_open_work() -> None:
     loop = _loop()
     project = make_project(intents=[make_intent("i-pending").model_copy(update={
         "description": recon.category_description("authorization"),
@@ -1344,8 +1344,8 @@ def test_fresh_recon_and_machine_path_facts_wake_reason_with_open_work() -> None
     })])
     project.facts.append(Fact(id="f-machine", description="machine candidates", type="recon", evidence="candidates: 2"))
     event = AuditEvent(
-        sequence=31, event_type="audit_task_concluded", actor="codeql",
-        entity_kind="intent", entity_id="i-codeql", payload={"fact_id": "f-machine"},
+        sequence=31, event_type="audit_task_concluded", actor="recon",
+        entity_kind="intent", entity_id="i-recon", payload={"fact_id": "f-machine"},
         created_at="2026-01-01T00:00:00Z",
     )
     assert loop._reason_may_run(project, [event])

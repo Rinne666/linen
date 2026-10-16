@@ -284,94 +284,6 @@ class ReconConfig(BaseModel):
         return value
 
 
-CodeQLLanguage = Literal["csharp", "cpp", "java", "javascript", "python", "ruby"]
-
-
-class CodeQLConfig(ReviewSandboxConfig):
-    """Opt-in CodeQL path-candidate generation in an isolated Docker image."""
-
-    languages: list[CodeQLLanguage] = Field(default_factory=lambda: ["python", "javascript"])
-    cli_path: str = "/opt/codeql/codeql"
-    timeout: int = Field(default=1800, gt=0, le=7200)
-    threads: int = Field(default=2, gt=0, le=8)
-    max_candidates: int = Field(default=100, gt=0, le=1000)
-    max_query_attempts_per_profile: int = Field(default=2, gt=0, le=5)
-    max_sarif_bytes: int = Field(default=20_000_000, gt=0, le=100_000_000)
-    max_work_bytes: int = Field(default=4_000_000_000, gt=0, le=50_000_000_000)
-    terms_acknowledged: bool = False
-    # Every enabled language needs an explicit initial suite. The model may
-    # later choose a named, bounded query profile, but cannot replace the
-    # initial deterministic collection stage with arbitrary queries.
-    query_suites: dict[CodeQLLanguage, list[str]] = Field(default_factory=dict)
-    # Optional per-category query suites baked into the trusted image. Reason
-    # may request one by category; it cannot supply shell commands or paths.
-    query_profiles: dict[str, dict[CodeQLLanguage, list[str]]] = Field(default_factory=dict)
-
-    @field_validator("languages")
-    @classmethod
-    def unique_languages(cls, value: list[str]) -> list[str]:
-        if not value or len(value) != len(set(value)):
-            raise ValueError("codeql.languages must be non-empty and unique")
-        return value
-
-    @model_validator(mode="after")
-    def validate_codeql(self) -> "CodeQLConfig":
-        import re
-        if "\x00" in self.cli_path or "\n" in self.cli_path or not self.cli_path.startswith("/"):
-            raise ValueError("codeql.cli_path must be an absolute path inside the analysis image")
-        if any(
-            self.cli_path == root or self.cli_path.startswith(root + "/")
-            for root in ("/repo", "/input", "/work", "/tmp")
-        ):
-            raise ValueError("codeql.cli_path must be part of the trusted, read-only analysis image")
-        if self.enabled:
-            if not self.image:
-                raise ValueError("codeql.image is required when CodeQL is enabled")
-            if not self.terms_acknowledged:
-                raise ValueError("codeql.terms_acknowledged must be true before enabling CodeQL")
-            if self.network != "none":
-                raise ValueError("CodeQL analysis must run with network=none")
-            if self.env_allowlist:
-                raise ValueError("CodeQL analysis must not receive host or worker environment variables")
-            missing_suites = set(self.languages) - set(self.query_suites)
-            if missing_suites:
-                raise ValueError(
-                    "codeql.query_suites must provide an explicit suite for each enabled "
-                    f"language; missing: {', '.join(sorted(missing_suites))}"
-                )
-        for language, queries in self.query_suites.items():
-            if language not in self.languages:
-                raise ValueError(f"CodeQL query suite uses an unconfigured language: {language}")
-            _validate_codeql_query_refs(queries)
-        for category, language_queries in self.query_profiles.items():
-            if not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", category):
-                raise ValueError("codeql.query_profiles keys must be lowercase category IDs")
-            if not language_queries:
-                raise ValueError("each CodeQL query profile must configure at least one language")
-            for language, queries in language_queries.items():
-                if language not in self.languages:
-                    raise ValueError(f"CodeQL profile {category} uses an unconfigured language: {language}")
-                _validate_codeql_query_refs(queries)
-        return self
-
-
-def _validate_codeql_query_refs(queries: list[str]) -> None:
-    if not queries or len(queries) != len(set(queries)):
-        raise ValueError("CodeQL query suites must contain unique query references")
-    for query in queries:
-        if (
-            not isinstance(query, str) or not query or "\x00" in query
-            or "\n" in query or query.startswith("-")
-            or ".." in query.replace("\\", "/").split("/")
-        ):
-            raise ValueError("CodeQL query references must be safe paths or pack specifiers")
-        if query.startswith("/") and any(
-            query == root or query.startswith(root + "/")
-            for root in ("/repo", "/input", "/work", "/cache", "/tmp")
-        ):
-            raise ValueError("CodeQL query suites must come from the trusted analysis image")
-
-
 class ScopeAdjudicationConfig(BaseModel):
     """Evidence-backed policy gate that precedes scope coverage planning.
 
@@ -521,7 +433,6 @@ class AuditConfig(BaseModel):
     poc_sandbox: PocSandboxConfig = Field(default_factory=PocSandboxConfig)
     oracles: OracleConfig = Field(default_factory=OracleConfig)
     recon: ReconConfig = Field(default_factory=ReconConfig)
-    codeql: CodeQLConfig = Field(default_factory=CodeQLConfig)
     scope_adjudication: ScopeAdjudicationConfig = Field(
         default_factory=ScopeAdjudicationConfig
     )
@@ -608,16 +519,6 @@ class DispatchConfig(BaseModel):
             "explore" in worker.task_types for worker in self.workers
         ):
             raise ValueError("audit.recon requires an explore worker")
-        if self.audit.codeql.enabled and not self.audit.enabled:
-            raise ValueError("audit.codeql requires audit.enabled")
-        if self.audit.codeql.enabled and self.audit.mode != "scope":
-            raise ValueError("audit.codeql requires scope mode")
-        if self.audit.codeql.enabled and not self.audit.recon_active:
-            raise ValueError("audit.codeql requires a frozen reconnaissance snapshot")
-        if self.audit.codeql.enabled and not any(
-            "explore" in worker.task_types for worker in self.workers
-        ):
-            raise ValueError("audit.codeql requires an explore worker for graph scheduling")
         if self.audit.scope_adjudication.enabled and not self.audit.enabled:
             raise ValueError("scope adjudication requires audit.enabled")
         if self.audit.scope_adjudication.enabled and self.audit.mode != "scope":

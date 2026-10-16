@@ -143,7 +143,7 @@ class DockerReviewProcess:
             output_dir = self.run_dir / "work"
             output_dir.mkdir(mode=0o700)
             # The analysis container gets one fresh, dispatcher-owned writable
-            # directory so CodeQL databases can exceed tmpfs limits. Source and
+            # directory so large analysis artifacts can exceed tmpfs limits. Source and
             # input remain separate read-only mounts.
             output_dir.chmod(0o777)
             if "," in str(output_dir):

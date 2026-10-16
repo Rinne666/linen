@@ -461,7 +461,7 @@ def load_artifact(fact: Fact, workdir: Path) -> tuple[Path, dict]:
     path = Path(fields.get("artifact", "")).resolve()
     roots = [
         (workdir / name).resolve()
-        for name in (".linen-analysis", ".linen-coverage", ".linen-recon", ".linen-codeql")
+        for name in (".linen-analysis", ".linen-coverage", ".linen-recon")
     ]
     if not any(path.is_relative_to(root) for root in roots):
         raise ValueError("Artifact must be inside this project's analysis directories")
@@ -550,7 +550,7 @@ def review_inputs(project: ProjectDetail, fact: Fact, workdir: Path) -> dict[str
             "pre_exclusions", "conflicts", "decision_scope",
             "technical_exploitability_unchanged", "evidence_gaps",
             "leads", "snapshot_id", "snapshot_fact_id", "languages",
-            "recipe_artifact_sha256", "operations", "codeql_profiles", "provenance",
+            "recipe_artifact_sha256", "operations", "provenance",
         ) if key in artifact}
         inputs["record.json"] = json.dumps(record, ensure_ascii=False).encode()
     elif fact.type == "coverage_result":

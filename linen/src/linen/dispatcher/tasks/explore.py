@@ -5,7 +5,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Any
-from linen.dispatcher.analysis import audit_graph, audit_recipes, codeql, coverage, recon, scope_gate
+from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, recon, scope_gate
 from linen.dispatcher.analysis.artifacts import review_inputs, select_snapshot
 
 from linen.dispatcher.analysis.policy import SOURCE_DATA_BOUNDARY
@@ -385,44 +385,6 @@ def run_explore_task(
                 fact_type=fact["type"], evidence=fact["evidence"], fact_status="triaged",
             )
 
-        if scope_audit and codeql.active_for_project(project, config.audit.codeql) and codeql.is_intent(intent):
-            try:
-                fact = codeql.outcome_fact(
-                    project, intent, Path(container_name), config.audit.codeql,
-                    cancellation, lease,
-                )
-            except Exception as exc:
-                if cancellation.is_cancelled or lease.failure is not None:
-                    best_effort_release(client, project.project.id, intent.id, worker.name)
-                    return "cancelled" if cancellation.is_cancelled else "failed"
-                message = f"Isolated CodeQL candidate generation failed: {type(exc).__name__}: {exc}"
-                response = client.report_intent_error(
-                    project.project.id,
-                    intent.id,
-                    worker.name,
-                    task_type="explore",
-                    code="codeql_analysis_failed",
-                    classification="blocked",
-                    message=message[:2000],
-                    remediation=(
-                        "Inspect the isolated analysis output and configured image/query packs, "
-                        "then retry this CodeQL candidate task."
-                    ),
-                )
-                if not response.ok:
-                    best_effort_release(client, project.project.id, intent.id, worker.name)
-                    return "failed"
-                return "blocked"
-            if cancellation.is_cancelled or lease.failure is not None:
-                best_effort_release(client, project.project.id, intent.id, worker.name)
-                return "cancelled" if cancellation.is_cancelled else "failed"
-            return write_conclude_result(
-                client, project.project.id, intent.id, worker.name,
-                fact["description"], source="codeql_machine_path_scan",
-                phase_ms=int((time.perf_counter() - task_started) * 1000),
-                fact_type=fact["type"], evidence=fact["evidence"], fact_status="triaged",
-            )
-
         if (
             scope_audit
             and config.audit.semantic.enabled
@@ -450,8 +412,8 @@ def run_explore_task(
                     classification="blocked",
                     message=message[:2000],
                     remediation=(
-                        "Check the stored recipe hash, frozen snapshot, configured offline "
-                        "sandbox image, and selected preconfigured CodeQL profile."
+                        "Check the stored recipe hash, frozen snapshot, and configured "
+                        "offline sandbox image."
                     ),
                 )
                 if not response.ok:

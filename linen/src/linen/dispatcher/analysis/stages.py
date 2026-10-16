@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from linen.dispatcher.analysis.artifacts import load_artifact
-from linen.dispatcher.analysis import codeql, coverage, recon, scope_gate
+from linen.dispatcher.analysis import coverage, recon, scope_gate
 from linen.dispatcher.config import AuditConfig
 from linen.server.models import AuditStage, Fact, Intent, ProjectDetail
 
@@ -40,11 +40,6 @@ def stage_definitions(config: AuditConfig, audit_mode: str) -> list[StageDefinit
         ])
     if audit_mode == "scope" and config.recon_active:
         result.append(StageDefinition("recon-snapshot", "Frozen source snapshot", 30, "recon.snapshot", True))
-        if config.codeql.enabled:
-            result.append(StageDefinition(
-                "codeql-candidates", "CodeQL path candidates", 35,
-                "codeql.paths", True,
-            ))
         result.extend(
             StageDefinition(
                 f"recon-{category}", f"Recon: {category}", 40 + index,
@@ -124,7 +119,6 @@ def _definition_status(
         "audit-summary": "@analysis:audit-summary",
         "recon-snapshot": recon.SNAPSHOT_INTENT,
         "recon-coverage-review": recon.COVERAGE_REVIEW_INTENT,
-        "codeql-candidates": codeql.INTENT,
     }.get(definition.stage_id, None)
     if definition.stage_id.startswith("recon-") and definition.stage_id not in {
         "recon-snapshot", "recon-coverage-review",
@@ -199,18 +193,6 @@ def _definition_status(
                     detail = record.get("summary") or "Recon coverage is partial."
             except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
                 status, detail = "failed", f"Invalid recon artifact: {exc}"
-    if definition.stage_id == "codeql-candidates" and definition.enabled:
-        latest = codeql.latest_fact(project)
-        if latest is not None:
-            try:
-                record = codeql.result_record(latest, workdir)
-                status = "satisfied" if record.get("status") == "complete" else "failed"
-                detail = (
-                    f"{record.get('candidate_count', 0)} machine path candidate(s); "
-                    "all require graph-level verification."
-                )
-            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-                status, detail = "failed", f"Invalid CodeQL artifact: {exc}"
     if intent is not None:
         errors = [
             error for error in project.errors

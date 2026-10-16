@@ -1207,7 +1207,7 @@ def latest_category_fact(project: ProjectDetail, category: str) -> Fact | None:
 def result_record(fact: Fact, workdir: Path) -> dict[str, Any]:
     _path, record = load_artifact(fact, workdir)
     if record.get("kind") not in {
-        "recon_snapshot", "category_reconnaissance", "codeql_path_candidates",
+        "recon_snapshot", "category_reconnaissance",
     }:
         raise ValueError("Unexpected reconnaissance artifact kind")
     return record
@@ -1266,15 +1266,6 @@ def coverage_review_execution_prompt(
             continue
         if fact.type != "recon":
             raise ValueError("Coverage review input contains an unrelated Fact")
-        record = result_record(fact, workdir)
-        if record.get("kind") == "codeql_path_candidates":
-            evidence.append({
-                "fact_id": fact.id,
-                "category": "codeql-machine-paths",
-                "status": record.get("status"),
-                "candidate_count": record.get("candidate_count"),
-                "candidates": record.get("candidates", []),
-            })
     result = f"""# READ-ONLY RECON COVERAGE REVIEW
 
 You are a fresh reviewer. Independently inspect the complete frozen source tree

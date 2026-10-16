@@ -18,7 +18,7 @@ from pathlib import Path
 import requests
 
 from linen.contracts import AuditEventEnvelope
-from linen.dispatcher.analysis import audit_graph, audit_recipes, codeql, coverage, recon, scope_gate, stages
+from linen.dispatcher.analysis import audit_graph, audit_recipes, coverage, recon, scope_gate, stages
 from linen.dispatcher.analysis.source_preflight import preflight_source_repository
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.models import ReasonFailureState, RunningTask
@@ -1863,12 +1863,6 @@ class DispatcherLoop:
 
         provider_required = self._explore_requires_provider(project, intent)
         registered_oracle = self.config.audit.oracles.enabled and parse_oracle_intent(intent) is not None
-        codeql_scan = (
-            self.config.audit.enabled
-            and codeql.active_for_project(project, self.config.audit.codeql)
-            and project.project.audit_mode == "scope"
-            and codeql.is_intent(intent)
-        )
         dynamic_recipe = (
             self.config.audit.enabled
             and self.config.audit.semantic.enabled
@@ -1883,7 +1877,7 @@ class DispatcherLoop:
             # including repository-wide reconnaissance.
             worker_preference=project.project.worker_preference,
             provider_required=provider_required,
-            worker_health_required=not (codeql_scan or dynamic_recipe or registered_oracle),
+            worker_health_required=not (dynamic_recipe or registered_oracle),
         )
         worker = self._codex_audit_sandbox(selection.worker, project, intent)
         if worker is None:
@@ -2175,8 +2169,6 @@ class DispatcherLoop:
         ):
             return False
         if self.config.audit.recon_active and description == "@analysis:recon-snapshot":
-            return False
-        if codeql.active_for_project(project, self.config.audit.codeql) and codeql.is_intent(intent):
             return False
         if (
             self.config.audit.semantic.enabled
@@ -2801,7 +2793,6 @@ class DispatcherLoop:
         ]
         managed_descriptions = {
             recon.SNAPSHOT_INTENT,
-            codeql.INTENT,
             scope_gate.EVIDENCE_INTENT,
             scope_gate.ADJUDICATION_INTENT,
         }
@@ -2810,7 +2801,6 @@ class DispatcherLoop:
             and intent.concluded_at is None
             and (
                 intent.description.strip() in managed_descriptions
-                or intent.description.strip().startswith(codeql.QUERY_PREFIX)
                 or recon.category_from_description(intent.description) is not None
             )
             for intent in current_intents
@@ -2831,7 +2821,7 @@ class DispatcherLoop:
             return False
 
         # Delay only event batches wholly explained by bootstrap/preflight,
-        # policy evidence, or a managed Recon/CodeQL result. A mixed batch may
+        # policy evidence, or a managed Recon result. A mixed batch may
         # contain a fresh reason to act, so let normal evidence gating decide.
         for event in trigger_events:
             if event.event_type not in {"audit_task_concluded", "review_created"}:
@@ -2849,8 +2839,6 @@ class DispatcherLoop:
                 return False
             if fact.type == "recon" and (
                 recon.category_from_description(producer.description) is not None
-                or producer.description.strip() == "@analysis:codeql-path-candidates"
-                or producer.description.strip().startswith("@analysis:codeql-query:")
             ):
                 continue
             return False

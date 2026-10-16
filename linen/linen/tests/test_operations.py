@@ -144,29 +144,6 @@ def test_preflight_fails_when_configured_cli_is_missing(tmp_path, monkeypatch):
     assert any("workers:" in reason for reason in result["failures"])
 
 
-def test_preflight_inspects_enabled_codeql_image(tmp_path, monkeypatch):
-    config = DispatchConfig.model_validate({
-        "server": "http://127.0.0.1:9000",
-        "runtime": {"interval": 60, "max_workers": 1, "max_running_projects": 1,
-                    "max_project_workers": 1, "healthcheck_timeout": 5, "prompt_group": "mock"},
-        "tasks": {"reason": {"timeout": 5}, "explore": {"timeout": 5, "conclude_timeout": 5}},
-        "local": {"workspace_root": str(tmp_path)},
-        "workers": [{"name": "tester", "type": "mock", "task_types": ["explore"],
-                     "max_running": 1}],
-        "audit": {"enabled": False},
-    })
-    codeql = config.audit.codeql.model_copy(update={"enabled": True, "image": "private/image:tag"})
-    audit = config.audit.model_copy(update={"codeql": codeql})
-    config = config.model_copy(update={"audit": audit})
-    monkeypatch.setattr("linen.operations.DispatchConfig.load", lambda _: config)
-    monkeypatch.setattr(
-        "linen.operations._image_status",
-        lambda executable, image: {"available": True, "image_id": "sha256:local"},
-    )
-    result = inspect_environment(tmp_path / "unused.yaml")
-    assert {item["component"] for item in result["images"]} == {"codeql"}
-
-
 def test_destination_connect_failure_closes_open_source_connection(tmp_path, monkeypatch):
     inactive(monkeypatch)
     source = tmp_path / "source.db"

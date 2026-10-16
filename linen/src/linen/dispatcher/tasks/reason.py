@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from linen.dispatcher.analysis import audit_graph, audit_recipes, codeql, recon
+from linen.dispatcher.analysis import audit_graph, audit_recipes, recon
 
 from linen.dispatcher.config import DispatchConfig, WorkerConfig
 from linen.dispatcher.analysis.policy import (
@@ -539,9 +539,6 @@ def run_reason_task(
                     prompt += recon.reason_instructions(
                         project, Path(container_name), config.audit.recon,
                     )
-                    prompt += codeql.reason_instructions(
-                        project, Path(container_name), config.audit.codeql,
-                    )
                 if config.audit.semantic.enabled:
                     bundle = audit_recipes.load_bundle(config.runtime.prompt_group)
                     method_lines = []
@@ -899,7 +896,6 @@ def run_reason_task(
                     fresh = client.get_project(project.project.id)
                     semantic_method = False
                     recon_method = False
-                    codeql_method = False
                     if (
                         scope_audit
                         and recon.active_for_project(fresh, config.audit.recon)
@@ -918,18 +914,6 @@ def run_reason_task(
                             )
                         except (ValueError, TypeError):
                             recon_method = False
-                    if (
-                        scope_audit
-                        and isinstance(intent_data.get("description"), str)
-                        and intent_data["description"].startswith(codeql.QUERY_PREFIX)
-                    ):
-                        try:
-                            codeql.validate_query_intent(
-                                fresh, config.audit.codeql, intent_data,
-                            )
-                            codeql_method = True
-                        except (ValueError, TypeError):
-                            codeql_method = False
                     if (
                         scope_audit
                         and config.audit.semantic.enabled
@@ -979,7 +963,7 @@ def run_reason_task(
                         except ValueError:
                             semantic_method = False
                     if (audit_graph.managed_description(intent_data["description"])
-                            and not semantic_method and not recon_method and not codeql_method):
+                            and not semantic_method and not recon_method):
                         message = (
                             "Audit intent blocked: reserved managed intents are materialized "
                             f"from graph state by the dispatcher ({intent_data['description']})"
