@@ -19,7 +19,7 @@ class ReasonWait(ContractModel):
     intent_ids: list[str] = Field(default_factory=list, max_length=60)
     intent_policy: Literal["all", "any"] = "all"
     event_types: list[str] = Field(default_factory=list, max_length=16)
-    reason: str = Field(min_length=1, max_length=1000)
+    reason: str = Field(min_length=1, max_length=4000)
     max_wait_seconds: int = Field(default=300, ge=1, le=900)
 
     @field_validator("intent_ids", "event_types")

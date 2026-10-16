@@ -112,6 +112,19 @@ recipes:
       Return trust_boundaries, pre_exclusions, conflicts, citations, and a
       coverage record exactly as required by the assignment output contract.
 
+      The result payload must be a JSON object with exactly these four top-level
+      fields and no others:
+      {"description": <one-paragraph summary>, "type": "scope_adjudication",
+       "evidence": <free-form supporting notes>, "scope_adjudication":
+       {"coverage": ..., "citations": [...], "trust_boundaries": [...],
+        "pre_exclusions": [...], "conflicts": [...], "source_assessments": [...]}}
+
+      Citation line rules: "line" is the 1-based line number, in the frozen
+      snapshot file named by "file", of the first line of "quote". Never cite a
+      blank line. Verify every line number against the frozen file (for example
+      with `nl -ba <file>`) before answering; a quote that does not match the
+      frozen content at the cited line is a hard validation error.
+
   architecture_map:
     version: 1
     label: Architecture map

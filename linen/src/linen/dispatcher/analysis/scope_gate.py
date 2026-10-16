@@ -771,12 +771,25 @@ def _canonical_citations(
         excerpt = quote.splitlines()
         if line > len(contents):
             raise ValueError(f"Policy citation does not match frozen source: {filename}:{line}")
+        # Symmetric with audit_recipes citation canonicalization: leading and
+        # trailing whitespace on each line is insignificant; non-whitespace
+        # drift is a hard error.
+        def _canon(value: str) -> str:
+            return value.strip()
         if len(excerpt) == 1:
-            matches = excerpt[0] in contents[line - 1]
+            matches = _canon(excerpt[0]) in _canon(contents[line - 1])
         else:
-            matches = contents[line - 1:line - 1 + len(excerpt)] == excerpt
+            matches = [
+                _canon(value) for value in contents[line - 1:line - 1 + len(excerpt)]
+            ] == [_canon(value) for value in excerpt]
         if not matches:
-            raise ValueError(f"Policy citation does not match frozen source: {filename}:{line}")
+            frozen = contents[line - 1].strip()
+            raise ValueError(
+                f"Policy citation does not match frozen source: {filename}:{line} "
+                f"(frozen line {line} reads: {frozen[:120]!r}); cite the exact "
+                "1-based line number of the first quoted line and copy its text "
+                "byte-for-byte"
+            )
         result.append({
             "id": citation_id,
             "source_id": source_id,
