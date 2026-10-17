@@ -47,6 +47,8 @@ def _needs_validation_record() -> dict:
 # --- prompt assembly ---------------------------------------------------------
 
 def test_ordinary_block_extracted_verbatim() -> None:
+    if not default_skill_dir().exists():
+        pytest.skip("vendored skill not present")
     text = (UPSTREAM / "ATTACK-CLASSES.md").read_text(encoding="utf-8")
     block = extract_ordinary_block(text, "Injection")
     assert block is not None
@@ -57,6 +59,8 @@ def test_ordinary_block_extracted_verbatim() -> None:
 
 
 def test_core_hunting_method_is_the_full_fence() -> None:
+    if not default_skill_dir().exists():
+        pytest.skip("vendored skill not present")
     text = (UPSTREAM / "HUNTING.md").read_text(encoding="utf-8")
     method = extract_core_hunting_method(text)
     assert len(method) > 2000
@@ -65,6 +69,8 @@ def test_core_hunting_method_is_the_full_fence() -> None:
 
 
 def test_missing_block_is_a_hard_error() -> None:
+    if not default_skill_dir().exists():
+        pytest.skip("vendored skill not present")
     text = (UPSTREAM / "ATTACK-CLASSES.md").read_text(encoding="utf-8")
     assert extract_ordinary_block(text, "Nonexistent Class") is None
 
