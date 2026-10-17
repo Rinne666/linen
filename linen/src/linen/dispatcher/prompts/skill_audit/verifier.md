@@ -15,6 +15,13 @@ capability as a needs_validation blocker.
 Your inputs are exactly: this candidate record, its coverage unit's checks,
 architecture facts needed to read the path, the verdict contract below, and the
 current source. You receive no other reviewer's conclusions.
+{architecture_fact}
+
+## Candidate under review ({fact_id})
+
+```json
+{candidate_record_json}
+```
 
 1. Verify every trace, evidence path, line number, scope, and description.
    Confirm the first entry is a real lower-trust entrypoint and the last is the

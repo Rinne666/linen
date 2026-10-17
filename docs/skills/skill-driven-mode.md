@@ -70,3 +70,23 @@ fact 携带：`unit_state`、`owner_run`、`reviewed_paths`、`unresolved_facts[
 2. Dispatcher：`hunt`/`verify_candidate`/`verify_record`/`critic` 任务路由 + 覆盖单元 fact schema + 三裁定 contract。
 3. findings.json 序列化 + 上游校验器接入（`validate-findings.cjs`）。
 4. proj_008 对照跑 → 按判据决定是否替换旧流程。
+
+## 实施状态（2026-10-17）
+
+- ✅ M1 `59f864d`：contracts + prompt pack。
+- ✅ M2/M3（本
+## 实施状态（2026-10-17）
+
+- M1 `59f864d`：contracts + prompt pack。
+- M2/M3（本分支）：全链落地。
+  - `contracts/skill_audit.py`：与上游 report-schema.json 逐字段对齐（trace 用 kind/file/line/scope/description，severity/confidence/execution/remediation 为结构化对象，overall_severity 为字符串枚举且不得超过 impact），`validate-findings.cjs` 实测通过。
+  - `dispatcher/contracts.py`：`validate_hunt_payload` / `validate_skill_verifier_payload` / `validate_critic_payload` / `validate_record_verification_payload`，错误信息均带形状示例。
+  - `analysis/skill_prompts.py`：ATTACK-CLASSES 攻击类块逐字切块（"Do not send block or companion names alone"）+ core hunting method 按 code fence 完整提取。
+  - `analysis/skill_findings.py`：findings.json 序列化（顶层数组）+ 上游校验器调用（失败即 incomplete）+ 替换反弹判定（SUBSTANTIVE_FIELDS）+ 未验证候选诚实降级（blocker 注明 candidate validation never ran）。
+  - `tasks/skill_audit.py`：四个角色共享一个任务骨架（lease/healthcheck/projection/envelope），hunt 产 coverage_unit/candidate_finding/coverage_gap facts 并派生 verify-candidate 与 critic；verify-record 的 replace 经 bounce 预算（ substantive → 新会话复核；超预算 → finding_dropped）。
+  - `scheduler/loop.py`：`_dispatch_skill_audit` + intent 路由（hunt / verify-candidate / coverage-critic / verify-record）。
+  - `analysis/audit_graph.py`：`_skill_driven_proposals` 从覆盖单元状态派生意图（候选验证 > 种子 hunt > critic wave），幂等键 = 开放意图或确定性描述。
+  - `config.py`：`audit.skill_driven`（coverage_seeds/max_bounces/max_candidates_per_wave）+ TaskType 扩展 + skill_audit prompt 组 token 注册。
+  - 配置样例：`.linen-runtime/benchmark-python/dispatch-skill.yaml`（9 个种子单元，wall-clock/run 预算与 run 4 同口径）。
+- 测试：`test_skill_audit_contracts.py`（11）+ `test_skill_audit_wiring.py`（16），全量 818 passed。含上游校验器端到端用例。
+- 待办 M4 运行：pi 配额恢复或 codex 独跑，用 dispatch-skill.yaml 起 dispatcher、建 proj_008、对照 run 4 基线评分。

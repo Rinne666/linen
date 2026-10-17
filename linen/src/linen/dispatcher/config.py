@@ -11,7 +11,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-TaskType = Literal["reason", "explore", "review"]
+TaskType = Literal["reason", "explore", "review", "hunt", "verify_candidate", "critic", "verify_record"]
 WorkerType = Literal["claudecode", "codex", "pi", "mock"]
 WorkerHealthcheckMode = Literal["startup_and_task", "startup_only", "disabled"]
 LocalCompletedAction = Literal["keep", "remove"]
@@ -27,6 +27,16 @@ DEFAULT_PROMPT_REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
 }
 
 PROMPT_REQUIRED_TOKENS_BY_GROUP: dict[str, dict[str, tuple[str, ...]]] = {
+    "skill_audit": {
+        "hunter.md": (
+            "{repo_path}", "{architecture_fact}", "{coverage_units_json}",
+            "{attack_class_blocks}", "{excluded_blocks}", "{peer_coverage_ids}",
+            "{core_hunting_method}",
+        ),
+        "verifier.md": ("{architecture_fact}", "{fact_id}", "{candidate_record_json}"),
+        "critic.md": ("{coverage_units_json}", "{candidates_json}"),
+        "record_verifier.md": ("{bounce_note}", "{fact_id}", "{record_json}"),
+    },
     "mock": {
         "reason.md": ("{fact_ids}", "{open_intents}", "{max_intents}"),
         "explore.md": ("{intent_id}",),
@@ -407,6 +417,45 @@ class OracleConfig(BaseModel):
         return self
 
 
+class CoverageUnitSeed(BaseModel):
+    """Operator-declared initial coverage unit (CF Phase-1 output stand-in)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    coverage_id: str = Field(min_length=4, max_length=64, pattern=r"^cov-[0-9a-z-]+$")
+    surface: str = Field(min_length=1, max_length=300)
+    boundary: str = Field(min_length=1, max_length=300)
+    subsystem: str = Field(min_length=1, max_length=200)
+    attack_class: str = Field(min_length=1, max_length=60)
+    starting_paths: list[str] = Field(default_factory=list, max_length=40)
+
+
+class SkillDrivenAuditConfig(BaseModel):
+    """Cloudflare security-audit-skill method executed on the linen kernel.
+
+    ``coverage_seeds`` are the operator-declared initial coverage units
+    (surface x boundary x attack class) that replace Phase-1 recon output for
+    the pilot; critic waves add units dynamically. See
+    docs/skills/skill-driven-mode.md.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    coverage_seeds: list[CoverageUnitSeed] = Field(default_factory=list, max_length=200)
+    max_bounces: int = Field(default=2, ge=0, le=5)
+    max_candidates_per_wave: int = Field(default=8, gt=0, le=50)
+
+    @model_validator(mode="after")
+    def validate_enabled_has_seeds(self) -> "SkillDrivenAuditConfig":
+        if self.enabled and not self.coverage_seeds:
+            raise ValueError(
+                "skill_driven audits require at least one coverage seed: "
+                "hunting is coverage-led, never coverage-free"
+            )
+        return self
+
+
 class AuditConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     # Opt-in audit policies; generic projects are unchanged.  A source audit
@@ -437,6 +486,7 @@ class AuditConfig(BaseModel):
         default_factory=ScopeAdjudicationConfig
     )
     semantic: SemanticAuditConfig = Field(default_factory=SemanticAuditConfig)
+    skill_driven: "SkillDrivenAuditConfig | None" = None
 
     @model_validator(mode="after")
     def require_repository_recon_for_scope(self) -> "AuditConfig":

@@ -31,6 +31,11 @@ from linen.dispatcher.workers.registry import get_driver
 from linen.dispatcher.tasks.explore import run_explore_task
 from linen.dispatcher.tasks.reason import run_reason_task
 from linen.dispatcher.tasks.review import run_review_task
+from linen.dispatcher.tasks.skill_audit import (
+    INTENT_TO_TASK_TYPE,
+    SKILL_AUDIT_INTENT_TYPES,
+    run_skill_audit_task,
+)
 from linen.server.models import AuditEvent, CompletionGate, Intent, ProjectDetail, ProjectSummary
 
 LOG = logging.getLogger(__name__)
@@ -679,7 +684,22 @@ class DispatcherLoop:
                 export_yaml = self.client.export_project(summary.id)
                 if self._dispatch_review(project, export_yaml, next_intent):
                     return True
-            explore_intents = [intent for intent in unclaimed_intents if intent not in review_intents]
+            skill_intents = [
+                i for i in unclaimed_intents
+                if (i.type or "").strip() in SKILL_AUDIT_INTENT_TYPES
+            ]
+            if skill_intents:
+                next_intent = min(
+                    skill_intents,
+                    key=lambda i: (i.last_heartbeat_at or i.created_at, i.created_at, i.id),
+                )
+                export_yaml = self.client.export_project(summary.id)
+                if self._dispatch_skill_audit(project, export_yaml, next_intent):
+                    return True
+            explore_intents = [
+                intent for intent in unclaimed_intents
+                if intent not in review_intents and intent not in skill_intents
+            ]
             if not explore_intents:
                 return False
             # Pick the least-recently attempted intent. A released intent keeps
@@ -1949,6 +1969,84 @@ class DispatcherLoop:
         self.runtime_project_ids.add(project.project.id)
         self._clear_project_log_state(project.project.id)
         LOG.info("dispatched explore project=%s intent=%s worker=%s", project.project.id, intent.id, worker.name)
+        return True
+
+    def _dispatch_skill_audit(self, project: ProjectDetail, export_yaml: str, intent: Intent) -> bool:
+        """Dispatch a skill-driven audit intent (hunt/verify-candidate/critic/verify-record).
+
+        Mirrors `_dispatch_review`; the task type comes from the intent type.
+        Each run gets a fresh worker session, which is the machine guarantee
+        behind finder != verifier.
+        """
+        intent_type = (intent.type or "").strip()
+        task_type = INTENT_TO_TASK_TYPE[intent_type]
+        selection = self._select_worker(
+            project.project.id,
+            task_type,
+            worker_preference=project.project.worker_preference,
+        )
+        worker = self._codex_audit_sandbox(selection.worker, project, intent)
+        if worker is None:
+            self._log_changed(
+                f"project:{project.project.id}:worker:{task_type}",
+                logging.INFO,
+                "no worker available for %s project=%s intent=%s blocked_busy=%s blocked_unhealthy=%s blocked_rejected=%s",
+                task_type, project.project.id, intent.id,
+                selection.blocked_busy, selection.blocked_unhealthy, selection.blocked_rejected,
+            )
+            return False
+        self._clear_log_state(f"project:{project.project.id}:worker:{task_type}")
+        trigger = f"skill:{task_type}:intent:{intent.id}"
+        attempt = self._intent_attempt(project, intent, task_type=task_type)
+        claim = self.client.heartbeat(project.project.id, intent.id, worker.name)
+        if claim.status_code in (403, 409):
+            LOG.info(
+                "skill_audit claim failed project=%s intent=%s worker=%s status=%s",
+                project.project.id, intent.id, worker.name, claim.status_code,
+            )
+            return False
+        if not claim.ok:
+            LOG.warning(
+                "skill_audit claim failed project=%s intent=%s worker=%s status=%s",
+                project.project.id, intent.id, worker.name, claim.status_code,
+            )
+            return False
+        cancellation = self._task_cancellation(project)
+        try:
+            future = self._submit_task_runner(
+                run_skill_audit_task,
+                self.config,
+                self.client,
+                self.container_manager,
+                project,
+                export_yaml,
+                intent,
+                worker,
+                cancellation,
+                trigger=trigger,
+                attempt=attempt,
+            )
+        except Exception:
+            LOG.exception(
+                "failed to submit skill_audit task project=%s intent=%s worker=%s",
+                project.project.id, intent.id, worker.name,
+            )
+            cancellation.close()
+            self._best_effort_release(project.project.id, intent.id, worker.name)
+            return False
+        self.futures[future] = RunningTask(
+            project.project.id,
+            task_type,
+            worker.name,
+            cancellation,
+            intent_id=intent.id,
+            attempt=attempt,
+            trigger=trigger,
+        )
+        self.runtime_project_ids.add(project.project.id)
+        self._clear_project_log_state(project.project.id)
+        LOG.info("dispatched skill_audit %s project=%s intent=%s worker=%s",
+                 task_type, project.project.id, intent.id, worker.name)
         return True
 
     def _dispatch_review(self, project: ProjectDetail, export_yaml: str, intent: Intent) -> bool:

@@ -9,6 +9,13 @@ You verify a FINAL structured finding record — not a hunter's draft, not a
 candidate. You did not hunt it and did not validate it as a candidate.
 
 Check the record against current source and bounded local evidence only.
+{bounce_note}
+
+## Final record under review ({fact_id})
+
+```json
+{record_json}
+```
 
 For a `confirmed` record, verify:
 1. Every repository-relative trace/evidence path, line number, scope, and stated operation.

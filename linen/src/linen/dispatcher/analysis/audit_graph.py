@@ -769,6 +769,100 @@ def _proposal_exists(project: ProjectDetail, description: str) -> bool:
     return _open(project, description)
 
 
+def _skill_driven_proposals(project: ProjectDetail, config: AuditConfig, limit: int) -> list[dict]:
+    """Derive skill-driven audit intents from coverage-unit state.
+
+    Priority: candidate verification > seed hunting > coverage critic waves.
+    Idempotency keys: an open intent of the same type from the same fact (or
+    with the same deterministic description) owns the obligation; a concluded
+    hunt whose unit facts exist does not re-run.
+    """
+    skill = config.skill_driven
+    if skill is None or not skill.enabled:
+        return []
+    proposals: list[dict] = []
+
+    open_by_from = {
+        tuple(intent.from_): intent
+        for intent in project.intents
+        if intent.concluded_at is None and intent.to is None
+    }
+    open_hunt_descriptions = {
+        intent.description.strip()
+        for intent in project.intents
+        if (intent.type or "").strip() == "hunt"
+        and intent.concluded_at is None
+        and intent.to is None
+    }
+
+    # 1. every unverified candidate gets exactly one verify-candidate intent
+    for fact in project.facts:
+        if fact.type != "candidate_finding" or fact.semantic_type != "candidate_finding":
+            continue
+        if any(
+            intent.from_ == [fact.id]
+            and (intent.type or "").strip() == "verify-candidate"
+            for intent in project.intents
+        ):
+            continue
+        if tuple([fact.id]) in open_by_from:
+            continue
+        proposals.append({
+            "from": [fact.id],
+            "type": "verify-candidate",
+            "description": f"Independently verify candidate {fact.id}",
+            "target": "graph",
+        })
+        if len(proposals) >= limit:
+            return proposals
+
+    # 2. seed coverage units without unit facts get hunt intents
+    unit_ids = set()
+    for fact in project.facts:
+        if fact.type != "coverage_unit" or fact.proof is None:
+            continue
+        attributes = getattr(fact.proof, "attributes", None) or {}
+        unit = attributes.get("coverage_unit")
+        if isinstance(unit, dict) and isinstance(unit.get("coverage_id"), str):
+            unit_ids.add(unit["coverage_id"])
+    for seed in skill.coverage_seeds:
+        if seed.coverage_id in unit_ids:
+            continue
+        description = (
+            f"Skill hunt unit {seed.coverage_id}: surface={seed.surface} "
+            f"boundary={seed.boundary} subsystem={seed.subsystem} "
+            f"attack_class={seed.attack_class} starting_paths={list(seed.starting_paths)}"
+        )
+        if description in open_hunt_descriptions:
+            continue
+        proposals.append({
+            "from": [],
+            "type": "hunt",
+            "description": description,
+            "target": "graph",
+        })
+        if len(proposals) >= limit:
+            return proposals
+
+    # 3. one critic wave per distinct unit-fact census, after any hunt landed
+    if not unit_ids:
+        return proposals
+    critic_description = f"Coverage critic wave over {len(unit_ids)} unit facts"
+    if any(
+        (intent.type or "").strip() == "coverage-critic"
+        and intent.description.strip() == critic_description
+        for intent in project.intents
+    ):
+        return proposals
+    proposals.append({
+        "from": [],
+        "type": "coverage-critic",
+        "description": critic_description,
+        "target": "graph",
+    })
+    return proposals[:limit]
+
+
 def _stage_intent_proposal(
     project: ProjectDetail,
     from_ids: list[str],
@@ -1390,6 +1484,8 @@ def required_intents(
     """Derive missing graph edges in stable priority order."""
     if not config.enabled or project.project.audit_mode == "none":
         return []
+    if config.skill_driven is not None and config.skill_driven.enabled:
+        return _skill_driven_proposals(project, config, limit)
     plan_anchor = "origin"
     # Keep policy collection and adjudication high in the ready window, while
     # allowing independent technical work to proceed if these bounded stages
