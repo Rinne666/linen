@@ -1471,7 +1471,12 @@ class DispatcherLoop:
         # highest-value obligation and suppresses duplicate open Intents. Once
         # both gates pass, ask the enforcing server to promote the candidate;
         # the dispatcher never manufactures a confirmed Fact itself.
-        if hasattr(self.client, "plan_proof_gap") and proposal_limit > 0 and not priority_scope_gate:
+        # Skill-driven audits replace this path with verify-candidate tasks.
+        skill_driven = (
+            self.config.audit.skill_driven is not None
+            and self.config.audit.skill_driven.enabled
+        )
+        if hasattr(self.client, "plan_proof_gap") and proposal_limit > 0 and not priority_scope_gate and not skill_driven:
             over_budget_candidates = audit_graph.candidate_budget_overflow_ids(
                 project, self.config.audit.max_candidate_findings,
             )

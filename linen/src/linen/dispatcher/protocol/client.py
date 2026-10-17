@@ -408,6 +408,42 @@ class LinenClient:
             json=body,
         )
 
+    def append_fact(
+        self,
+        project_id: str,
+        intent_id: str,
+        worker: str,
+        description: str,
+        *,
+        fact_type: str | None = None,
+        evidence: str | None = None,
+        status: str = "draft",
+        display_title: str | None = None,
+        semantic_type: str | None = None,
+        proof: dict[str, Any] | None = None,
+    ) -> ApiResult:
+        """Write one fact against a still-open intent (multi-fact skill tasks)."""
+        body: dict[str, Any] = {
+            "worker": worker,
+            "description": description,
+            "status": status,
+        }
+        if fact_type is not None:
+            body["type"] = fact_type
+        if evidence is not None:
+            body["evidence"] = evidence
+        if display_title is not None:
+            body["display_title"] = display_title
+        if semantic_type is not None:
+            body["semantic_type"] = semantic_type
+        if proof is not None:
+            body["proof"] = proof
+        return self._request_json(
+            "POST",
+            f"/projects/{project_id}/intents/{intent_id}/append-fact",
+            json=body,
+        )
+
     def complete(self, project_id: str, from_ids: list[str], description: str, worker: str) -> ApiResult:
         return self._request_json(
             "POST",

@@ -795,10 +795,20 @@ def _skill_driven_proposals(project: ProjectDetail, config: AuditConfig, limit: 
         and intent.to is None
     }
 
-    # 1. every unverified candidate gets exactly one verify-candidate intent
+    # 1. every unverified candidate gets exactly one verify-candidate intent.
+    #    Duplicate candidate facts (concurrent hunts landing the same
+    #    fingerprint) share one verification keyed by record fingerprint.
+    seen_candidate_fingerprints: set[str] = set()
     for fact in project.facts:
-        if fact.type != "candidate_finding" or fact.semantic_type != "candidate_finding":
+        if fact.type != "vulnerability" or fact.semantic_type != "candidate_finding":
             continue
+        proof_attributes = getattr(fact.proof, "attributes", None) or {}
+        record = proof_attributes.get("finding_record")
+        fingerprint = record.get("fingerprint") if isinstance(record, dict) else None
+        if isinstance(fingerprint, str) and fingerprint:
+            if fingerprint in seen_candidate_fingerprints:
+                continue
+            seen_candidate_fingerprints.add(fingerprint)
         if any(
             intent.from_ == [fact.id]
             and (intent.type or "").strip() == "verify-candidate"
@@ -836,10 +846,9 @@ def _skill_driven_proposals(project: ProjectDetail, config: AuditConfig, limit: 
         if description in open_hunt_descriptions:
             continue
         proposals.append({
-            "from": [],
+            "from": ["origin"],
             "type": "hunt",
             "description": description,
-            "target": "graph",
         })
         if len(proposals) >= limit:
             return proposals
@@ -855,10 +864,9 @@ def _skill_driven_proposals(project: ProjectDetail, config: AuditConfig, limit: 
     ):
         return proposals
     proposals.append({
-        "from": [],
+        "from": ["origin"],
         "type": "coverage-critic",
         "description": critic_description,
-        "target": "graph",
     })
     return proposals[:limit]
 

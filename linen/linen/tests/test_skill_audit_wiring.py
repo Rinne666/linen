@@ -274,7 +274,7 @@ def test_skill_driven_derives_verifier_for_candidates():
     record = _needs_validation_record()
     project = SimpleNamespace(
         facts=[_unit_fact("cov-0001"),
-               _fact("cand1", "candidate_finding", "candidate_finding",
+               _fact("cand1", "vulnerability", "candidate_finding",
                      {"finding_record": record})],
         intents=[],
     )
@@ -288,7 +288,7 @@ def test_skill_driven_derives_verifier_for_candidates():
 def test_skill_driven_never_rederives_open_or_concluded_verification():
     from linen.dispatcher.analysis.audit_graph import _skill_driven_proposals
     record = _needs_validation_record()
-    candidate = _fact("cand1", "candidate_finding", "candidate_finding",
+    candidate = _fact("cand1", "vulnerability", "candidate_finding",
                       {"finding_record": record})
     config = SimpleNamespace(skill_driven=_skill_config([_seed()]))
     open_intent = SimpleNamespace(

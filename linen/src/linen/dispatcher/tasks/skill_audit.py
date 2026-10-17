@@ -111,8 +111,10 @@ def _bounce_count(intent) -> int:
 
 
 def _create_followup(client, project_id: str, from_ids: list[str], description: str, intent_type: str) -> bool:
+    # The intent API requires at least one source fact; graph-level followups
+    # (critic waves, coverage-driven hunts) anchor on the audit target.
     response = client.create_intent(
-        project_id, from_ids, description, creator="dispatcher.skill_audit",
+        project_id, from_ids or ["origin"], description, creator="dispatcher.skill_audit",
         action="analyze", target="graph", intent_type=intent_type,
     )
     if not response.ok:
@@ -134,6 +136,24 @@ def _conclude_fact(client, project_id: str, intent_id: str, worker_name: str, *,
     if not response.ok:
         LOG.warning(
             "skill_audit conclude failed project=%s intent=%s type=%s status=%s body=%s",
+            project_id, intent_id, fact_type, response.status_code, response.text[:200],
+        )
+        return False
+    return True
+
+
+def _append_fact(client, project_id: str, intent_id: str, worker_name: str, *, fact_type: str,
+                 description: str, evidence: str, semantic_type: str, proof: dict,
+                 fact_semantic_type: str | None = None) -> bool:
+    """Write one fact against a still-open intent (hunt emits many facts)."""
+    response = client.append_fact(
+        project_id, intent_id, worker_name,
+        description=description, fact_type=fact_type, evidence=evidence,
+        status="triaged", semantic_type=fact_semantic_type or semantic_type, proof=proof,
+    )
+    if not response.ok:
+        LOG.warning(
+            "skill_audit append failed project=%s intent=%s type=%s status=%s body=%s",
             project_id, intent_id, fact_type, response.status_code, response.text[:200],
         )
         return False
@@ -276,11 +296,24 @@ def _assemble_prompt(config, project, intent, intent_type: str) -> str:
             raise ValueError(
                 "skill_driven hunt requires audit.skill_driven.coverage_seeds in dispatch.yaml"
             )
+        # A per-unit hunt intent owns exactly its named coverage unit; critic
+        # waves or unscoped hunts receive the full seed list.
+        import re as _re
+        requested = None
+        match = _re.search(r"Skill hunt unit (\S+?):", intent.description)
+        if match:
+            requested = match.group(1)
         units = []
         for seed in seeds:
+            if requested is not None and seed.get("coverage_id") != requested:
+                continue
             unit = dict(seed)
             unit.setdefault("disposition", "planned")
             units.append(unit)
+        if not units:
+            raise ValueError(
+                f"hunt intent {intent.id} references unknown coverage unit {requested!r}"
+            )
         skill_dir = vendored_skill_dir()
         blocks: list[str] = []
         seen_classes: set[str] = set()
@@ -349,6 +382,41 @@ def _from_fact(project, intent):
     return fact
 
 
+def _normalize_candidate_record(record: dict) -> dict:
+    """Fold benign worker deviations into the findings contract.
+
+    Only lossless, uncontroversial rewrites happen here; anything structural
+    (missing required fields, string traces) must fail validation so the
+    worker self-corrects on the next hunt attempt.
+    """
+    normalized = {k: v for k, v in record.items() if k != "coverage_ids"}
+    plan = normalized.get("validation_plan")
+    if isinstance(plan, list):
+        folded: dict[str, str] = {}
+        for entry in plan:
+            if isinstance(entry, dict):
+                step_type = str(entry.get("type") or entry.get("kind") or "").strip()
+                text = entry.get("step") or entry.get("description") or entry.get("detail")
+                if step_type in {"local", "deployment"} and isinstance(text, str) and text.strip():
+                    folded[step_type] = text
+        normalized["validation_plan"] = folded
+    # Hunt-phase candidates are grounded in their trace steps; if the worker
+    # omitted the evidence list, derive it from the trace (same file/line/
+    # description triples) instead of failing the whole hunt run.
+    if not normalized.get("evidence"):
+        trace = normalized.get("trace")
+        if isinstance(trace, list) and trace:
+            derived = [
+                {"file": step.get("file"), "line": step.get("line"),
+                 "description": step.get("description")}
+                for step in trace
+                if isinstance(step, dict) and step.get("file") and step.get("line")
+            ]
+            if derived:
+                normalized["evidence"] = derived
+    return normalized
+
+
 def _handle_hunt(client, project, intent, worker, payload, run_id, execute_ms, task_started) -> str:
     kind, data = validate_hunt_payload(payload)
     if kind == "rejected":
@@ -356,7 +424,7 @@ def _handle_hunt(client, project, intent, worker, payload, run_id, execute_ms, t
         return "rejected"
     project_id = project.project.id
     for unit in data["units"]:
-        ok = _conclude_fact(
+        ok = _append_fact(
             client, project_id, intent.id, worker.name,
             fact_type="coverage_unit",
             description=f"Coverage unit {unit['coverage_id']} disposition={unit['disposition']}: "
@@ -377,6 +445,7 @@ def _handle_hunt(client, project, intent, worker, payload, run_id, execute_ms, t
             LOG.warning("hunt candidate is not an object project=%s intent=%s", project_id, intent.id)
             continue
         record.setdefault("verdict", "needs_validation")
+        record = _normalize_candidate_record(record)
         try:
             skill_findings.parse_finding_record(record)
         except Exception as exc:
@@ -385,9 +454,13 @@ def _handle_hunt(client, project, intent, worker, payload, run_id, execute_ms, t
             )
             best_effort_release(client, project_id, intent.id, worker.name)
             return "failed"
-        ok = _conclude_fact(
+        ok = _append_fact(
             client, project_id, intent.id, worker.name,
-            fact_type="candidate_finding",
+            # The audit pipeline (promotion, proof-gaps, scoring) keys
+            # candidates on fact type "vulnerability"; semantic_type marks
+            # them as unconfirmed candidates.
+            fact_type="vulnerability",
+            fact_semantic_type="candidate_finding",
             description=str(record.get("title") or record.get("description") or "proposed finding")[:300],
             evidence=json.dumps(record, ensure_ascii=False),
             semantic_type="candidate_finding",
@@ -397,7 +470,7 @@ def _handle_hunt(client, project, intent, worker, payload, run_id, execute_ms, t
             best_effort_release(client, project_id, intent.id, worker.name)
             return "failed"
     for gap in data["uncovered"]:
-        _conclude_fact(
+        _append_fact(
             client, project_id, intent.id, worker.name,
             fact_type="coverage_gap",
             description=f"Uncovered boundary: {gap.get('boundary', '?')} at {gap.get('surface', '?')}",
@@ -410,6 +483,22 @@ def _handle_hunt(client, project, intent, worker, payload, run_id, execute_ms, t
         f"Coverage critic wave after hunt run {intent.id}",
         CRITIC_INTENT_TYPE,
     )
+    # Terminate the intent with one summary fact; the individual units,
+    # candidates, and gaps were appended while the intent was still open.
+    if not _conclude_fact(
+        client, project_id, intent.id, worker.name,
+        fact_type="recon",
+        description=f"Hunt summary for {intent.id}: units={len(data['units'])} "
+                    f"candidates={len(data['candidates'])} gaps={len(data['uncovered'])}",
+        evidence=json.dumps({
+            "units": len(data["units"]),
+            "candidates": len(data["candidates"]),
+            "gaps": len(data["uncovered"]),
+        }, ensure_ascii=False),
+        semantic_type="observation",
+        proof=_proof(hunt_summary=True, producer_run_id=run_id),
+    ):
+        return "failed"
     LOG.info(
         "skill_audit hunt finished project=%s intent=%s units=%d candidates=%d execute_ms=%s total_ms=%s critic=%s",
         project_id, intent.id, len(data["units"]), len(data["candidates"]), execute_ms,

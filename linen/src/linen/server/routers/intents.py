@@ -827,3 +827,117 @@ def conclude(project_id: str, intent_id: str, body: ConcludeRequest):
             ),
             intent=intent_to_model(conn, updated, project_id),
         )
+
+
+@router.post(
+    "/projects/{project_id}/intents/{intent_id}/append-fact",
+    response_model=ConcludeResponse,
+)
+def append_fact(project_id: str, intent_id: str, body: ConcludeRequest):
+    """Write one fact against a still-open intent without concluding it.
+
+    Skill-driven audit tasks (hunt/critic) produce many facts per intent:
+    coverage units, candidate findings, coverage gaps. The conclude endpoint
+    is single-shot (it terminates the intent), so multi-fact tasks append
+    facts here and finish with one final conclude. Only observational fact
+    types are allowed; terminal decisions (vulnerability promotion,
+    confirmations) must go through their dedicated gated endpoints.
+    """
+    forbidden_types = {"vulnerability", "confirmed_finding", "audit_summary"}
+    if body.type in forbidden_types:
+        raise HTTPException(
+            422,
+            {"code": "APPEND_FACT_TYPE_FORBIDDEN", "allowed": "observational fact types only"},
+        )
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        project = check_project_active(conn, project_id)
+        intent_row = get_claimable_open_intent_or_404(conn, project_id, intent_id, body.worker)
+
+        now = utcnow()
+        fid = next_fact_id(conn, project_id)
+        semantic_type = (
+            fact_semantic_type(fid, body.type, body.status)
+            if body.type == "vulnerability"
+            else body.semantic_type or fact_semantic_type(fid, body.type, body.status)
+        )
+        display_title = body.display_title or fact_display_title(
+            fid, body.type, body.description, status=body.status,
+        )
+        proof_errors = validate_proof_payload(conn, project_id, body.proof)
+        if proof_errors:
+            raise HTTPException(422, {"code": "INVALID_PROVENANCE", "details": proof_errors})
+
+        conn.execute(
+            "INSERT INTO facts (id, project_id, description, display_title, type, semantic_type, "
+            "evidence, proof, source_generation, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                fid,
+                project_id,
+                body.description,
+                display_title,
+                body.type,
+                semantic_type,
+                body.evidence,
+                json.dumps(body.proof.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+                if body.proof is not None else None,
+                project["source_generation"],
+                body.status,
+            ),
+        )
+        conn.execute(
+            "UPDATE intents SET worker = ?, last_heartbeat_at = ? WHERE id = ? AND project_id = ?",
+            (body.worker, now, intent_id, project_id),
+        )
+        bump_graph_revision(conn, project_id)
+        sources = conn.execute(
+            "SELECT fact_id FROM intent_sources WHERE project_id = ? AND intent_id = ? ORDER BY rowid",
+            (project_id, intent_id),
+        ).fetchall()
+        relation_type = intent_row["relation_type"] if "relation_type" in intent_row.keys() else "produces"
+        for source in sources:
+            create_graph_edge(
+                conn,
+                project_id,
+                source_kind="fact",
+                source_id=source["fact_id"],
+                target_kind="fact",
+                target_id=fid,
+                relation_type=relation_type,
+                created_by=body.worker,
+                metadata={"intent_id": intent_id},
+                created_at=now,
+            )
+        append_event(
+            conn,
+            project_id,
+            "audit_fact_appended",
+            body.worker,
+            entity_kind="intent",
+            entity_id=intent_id,
+            payload={
+                "fact_id": fid,
+                "display_title": display_title,
+                "semantic_type": semantic_type,
+                "relation_type": relation_type,
+            },
+            created_at=now,
+        )
+        updated = conn.execute(
+            "SELECT * FROM intents WHERE id = ? AND project_id = ?",
+            (intent_id, project_id),
+        ).fetchone()
+        return ConcludeResponse(
+            fact=Fact(
+                id=fid,
+                description=body.description,
+                display_title=display_title,
+                type=body.type,
+                semantic_type=semantic_type,
+                evidence=body.evidence,
+                proof=body.proof,
+                source_generation=project["source_generation"],
+                status=body.status,
+            ),
+            intent=intent_to_model(conn, updated, project_id),
+        )

@@ -60,13 +60,43 @@ Return exactly one JSON object, no surrounding prose:
 ```
 
 Candidate entries use `proposed_verdict` and must match the verdict branch of the
-findings contract: a `confirmed` proposal requires `root_cause`, `conditions`,
-`execution`, `observed_result`, `severity`, `confidence`; a `needs_validation`
-proposal requires `claimed_root_cause`, `trace`, nonempty `blockers`, and a
-`validation_plan` with at least one applicable `local` or `deployment` step —
-and must NOT include severity. Conditional exploitability ("on systems that treat
-X as a separator", "if feature Y is enabled") whose condition is not established
-on this deployment target MUST be `needs_validation`, never `confirmed`.
+findings contract. Exact shapes (extra fields like `coverage_ids` are forbidden;
+link candidates to units via `candidate_fingerprints` in `units` instead):
+
+```json
+{"proposed_verdict": "needs_validation",
+ "fingerprint": "fp-<8+ chars>",
+ "title": "<short claim>",
+ "description": "<what fails and why it matters>",
+ "verdict": "needs_validation",
+ "claimed_root_cause": "<root cause hypothesis>",
+ "trace": [
+   {"kind": "entrypoint", "file": "repo/relative/path.py", "line": 1,
+    "scope": "<function>", "description": "<attacker-controlled input enters>"},
+   {"kind": "sink", "file": "repo/relative/path.py", "line": 2,
+    "scope": "<function>", "description": "<dangerous operation reached>"}
+ ],
+ "blockers": ["<exact missing evidence>"],
+ "validation_plan": {"local": "<how to validate by reading/running locally>",
+                     "deployment": null}}
+```
+
+A `confirmed` proposal instead requires `root_cause`, `intended_behavior`,
+`evidence` (list of `{"file","line","description"}`), `conditions` (list of
+`{"kind","description"}` with kind from authentication_level|
+authorization_role|user_interaction|system_configuration|network_routing|
+environmental_dependency|data_state|timing_dependency|third_party_dependency),
+`execution` `{"attacker_perspective", "payloads", "instructions",
+"observed_result"}`, `remediation` `{"strategy"}`, `severity`
+`{"likelihood":{"score","reason"}, "impact":{"score","reason"},
+"overall_severity"}` and `confidence` `{"score","reason"}` — and must NOT
+include `blockers` or `validation_plan`. `trace` is always a LIST of step objects
+(never a string), starting at `entrypoint` and ending at `sink`, and every
+record needs nonempty `title`, `description`, and at least one `evidence`
+item `{"file", "line", "description"}`. Conditional exploitability ("on
+systems that treat X as a separator", "if feature Y is enabled") whose
+condition is not established on this deployment target MUST be
+`needs_validation`, never `confirmed`.
 
 Every assigned coverage ID appears exactly once in `units`. A `covered` unit needs
 an owner, nonempty `reviewed_paths` and `checks`, no unresolved fact, and no
