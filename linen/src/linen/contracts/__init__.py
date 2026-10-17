@@ -23,6 +23,19 @@ from .sandbox import (
     SandboxProfile,
     ToolChannel,
 )
+from .skill_audit import (
+    AttackClass,
+    ConfirmedRecord,
+    CoverageUnit,
+    CoverageUnitState,
+    FindingRecord,
+    NeedsValidationRecord,
+    RejectedRecord,
+    TraceStep,
+    ValidationPlan,
+    Verdict,
+    parse_finding_record,
+)
 from .snapshot import BlackboardSnapshot, EdgeEnvelope, NodeEnvelope
 from .worker_manifest import ComponentRef, RecipeRef, WorkerManifest
 
@@ -52,4 +65,15 @@ __all__ = [
     "SandboxProfile",
     "ToolChannel",
     "WorkerManifest",
+    "AttackClass",
+    "ConfirmedRecord",
+    "CoverageUnit",
+    "CoverageUnitState",
+    "FindingRecord",
+    "NeedsValidationRecord",
+    "RejectedRecord",
+    "TraceStep",
+    "ValidationPlan",
+    "Verdict",
+    "parse_finding_record",
 ]
