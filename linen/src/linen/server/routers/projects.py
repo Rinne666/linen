@@ -1331,10 +1331,22 @@ def delete_project(project_id: str):
                     "LIMIT 1",
                     (project_id,),
                 ).fetchone()
+                owns_source_attestations = conn.execute(
+                    "SELECT 1 FROM coverage_source_attestations WHERE project_id = ? "
+                    "LIMIT 1",
+                    (project_id,),
+                ).fetchone()
+                owns_lineage_seals = conn.execute(
+                    "SELECT 1 FROM coverage_lineage_seals WHERE project_id = ? "
+                    "LIMIT 1",
+                    (project_id,),
+                ).fetchone()
                 if (
                     owns_baselines is not None
                     or owns_validations is not None
                     or owns_validation_auths is not None
+                    or owns_source_attestations is not None
+                    or owns_lineage_seals is not None
                 ):
                     raise HTTPException(
                         409,

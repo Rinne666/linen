@@ -312,3 +312,105 @@ def import_validated_historical_run(
             envelope=envelope,
         )
     return candidate
+
+
+def attest_historical_source(
+    *,
+    conn: Any,
+    project_id: str,
+    source_ref: str,
+    observed_at: str,
+    repo_root: Path | str | None = None,
+    commit: str | None = None,
+    frozen_root: Path | str | None = None,
+    notes: str = "",
+    signing_key_id: str | None = None,
+) -> Any:
+    """Verify one source's identity and register the trusted attestation.
+
+    This is the controlled entry point of CF-S2-B2-A.  It verifies the source
+    identity itself, signs the resulting attestation with the key only the
+    controlled flow holds, and lets the server record it - the server verifies
+    the signature, it never makes one (D-058).
+
+    A deployment without a configured key issues no attestation at all, and
+    the source stays unverified.  That is the fail closed case.
+    """
+
+    from linen.server.baseline_proof_auth import issue_proof_auth
+    from linen.server.baseline_proofs import (
+        build_source_attestation,
+        register_source_attestation,
+    )
+
+    attestation = build_source_attestation(
+        conn=conn,
+        project_id=project_id,
+        source_ref=source_ref,
+        observed_at=observed_at,
+        repo_root=repo_root,
+        commit=commit,
+        frozen_root=frozen_root,
+        notes=notes,
+    )
+    envelope = issue_proof_auth(
+        proof_kind="source_attestation",
+        proof_sha256=attestation.attestation_sha256,
+        project_id=project_id,
+        key_id=signing_key_id,
+    )
+    if envelope is None:
+        return None
+    register_source_attestation(
+        conn=conn,
+        project_id=project_id,
+        attestation=attestation,
+        envelope=envelope,
+    )
+    return attestation
+
+
+def seal_historical_scope(
+    *,
+    conn: Any,
+    project_id: str,
+    run_id: str,
+    manifest_ref: str,
+    issuer: str,
+    issued_at: str,
+    signing_key_id: str | None = None,
+) -> Any:
+    """Seal one historical scope for one run - the controlled entry point.
+
+    A seal is the only thing that may carry the weight of a negative
+    conclusion, so it is signed by the controlled flow and verified by the
+    server.  A deployment without a configured key seals nothing, and a
+    complete manifest without a seal stays a manifest (D-052).
+    """
+
+    from linen.server.baseline_proof_auth import issue_proof_auth
+    from linen.server.baseline_proofs import (
+        build_lineage_seal,
+        register_lineage_seal,
+    )
+
+    seal = build_lineage_seal(
+        conn=conn,
+        project_id=project_id,
+        run_id=run_id,
+        manifest_ref=manifest_ref,
+        issuer=issuer,
+        issued_at=issued_at,
+    )
+    envelope = issue_proof_auth(
+        proof_kind="lineage_seal",
+        proof_sha256=seal.seal_sha256,
+        project_id=project_id,
+        key_id=signing_key_id,
+    )
+    if envelope is None:
+        return None
+    register_lineage_seal(
+        conn=conn, project_id=project_id, seal=seal, envelope=envelope
+    )
+    return seal

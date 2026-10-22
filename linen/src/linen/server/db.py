@@ -779,6 +779,79 @@ def _ensure_vnext_columns(conn: sqlite3.Connection) -> None:
         BEGIN
             SELECT RAISE(ABORT, 'coverage_ledger_validation_auths is append-only');
         END;
+
+    -- CF-S2-B2-A source identity attestations (append-only).
+    --
+    -- An attestation says that one registered historical source has a verified
+    -- identity: a git commit that exists in a named repository with a clean
+    -- worktree, or a frozen snapshot whose bytes still are the registered
+    -- ones.  The row carries the attestation body, its digest and the
+    -- authentication envelope that makes it trustworthy (D-054, D-058); the key
+    -- bytes are never stored here, only the identifier of the key that made
+    -- the MAC.
+    --
+    -- The reference to the registered source is checked by the application,
+    -- because the baseline sources table has no unique key on the record ref
+    -- alone.  The row is append-only, and the foreign key stays NO ACTION for
+    -- the same reason as the baseline sources: a stored attestation whose
+    -- project is gone must not be verifiable.
+    CREATE TABLE IF NOT EXISTS coverage_source_attestations (
+        attestation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        source_ref TEXT NOT NULL,
+        verification_method TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        payload_sha256 TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        mac TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (project_id, source_ref, payload_sha256)
+    );
+    CREATE INDEX IF NOT EXISTS coverage_source_attestations_source_idx
+        ON coverage_source_attestations(project_id, source_ref);
+    CREATE TRIGGER IF NOT EXISTS coverage_source_attestations_no_update
+        BEFORE UPDATE ON coverage_source_attestations
+        BEGIN
+            SELECT RAISE(ABORT, 'coverage_source_attestations is append-only');
+        END;
+    CREATE TRIGGER IF NOT EXISTS coverage_source_attestations_no_delete
+        BEFORE DELETE ON coverage_source_attestations
+        BEGIN
+            SELECT RAISE(ABORT, 'coverage_source_attestations is append-only');
+        END;
+
+    -- CF-S2-B2-A trusted lineage seals (append-only).
+    --
+    -- A manifest that is structurally complete only says that a scope looks
+    -- closed.  A seal says more: it names the current run, the manifest it
+    -- seals, every member with the attestation that proved the member's
+    -- identity, and it is signed by the controlled flow.  Only a seal may
+    -- carry the weight of a negative conclusion (D-052).
+    CREATE TABLE IF NOT EXISTS coverage_lineage_seals (
+        seal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        run_id TEXT NOT NULL,
+        lineage_manifest_ref TEXT NOT NULL,
+        scope_kind TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        payload_sha256 TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        mac TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (project_id, run_id, payload_sha256)
+    );
+    CREATE INDEX IF NOT EXISTS coverage_lineage_seals_run_idx
+        ON coverage_lineage_seals(project_id, run_id);
+    CREATE TRIGGER IF NOT EXISTS coverage_lineage_seals_no_update
+        BEFORE UPDATE ON coverage_lineage_seals
+        BEGIN
+            SELECT RAISE(ABORT, 'coverage_lineage_seals is append-only');
+        END;
+    CREATE TRIGGER IF NOT EXISTS coverage_lineage_seals_no_delete
+        BEFORE DELETE ON coverage_lineage_seals
+        BEGIN
+            SELECT RAISE(ABORT, 'coverage_lineage_seals is append-only');
+        END;
     """)
 
 

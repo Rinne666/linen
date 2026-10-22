@@ -485,3 +485,276 @@ class LedgerValidationReceipt(ContractModel):
         payload = {key: value for key, value in fields.items() if key != "receipt_sha256"}
         digest = cf_payload_digest(cls(**payload, receipt_sha256="0" * 64).body())
         return cls(**payload, receipt_sha256=digest)
+
+
+# --- CF-S2-B2-A: the trusted proofs about history ----------------------------
+
+#: The domain separation of the source identity attestation MAC.
+SOURCE_ATTESTATION_DOMAIN = "linen:source-identity-attestation:v1"
+
+#: The domain separation of the lineage seal MAC.
+LINEAGE_SEAL_DOMAIN = "linen:lineage-seal:v1"
+
+#: How a source identity was verified.
+SourceVerificationMethod = Literal["git_commit", "frozen_digest"]
+
+#: The kinds of proof that carry an authentication envelope.
+ProofKind = Literal["source_attestation", "lineage_seal"]
+
+
+class SourceIdentityVerification(ContractModel):
+    """What the trusted verification actually observed.
+
+    This is an *observation*, not a claim: it is written by the verification
+    itself, and the attestation that carries it is only trustworthy because the
+    controlled flow signed it.  A caller that says ``verified = true`` in a
+    request body produces none of this.
+    """
+
+    method: SourceVerificationMethod
+    repository_root: str | None = Field(default=None, max_length=2048)
+    commit: str | None = Field(default=None, max_length=64)
+    tree_sha: str | None = Field(default=None, max_length=64)
+    snapshot_sha256: str | None = Field(default=None)
+    worktree_clean: bool | None = None
+    observed_at: str = Field(min_length=1, max_length=64)
+    notes: str = Field(default="", max_length=4096)
+
+    @field_validator("commit", "tree_sha")
+    @classmethod
+    def _validate_object_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip().lower()
+        if not _GIT_COMMIT_RE.fullmatch(value):
+            raise ValueError("a git object name must be a 40 hex digit name")
+        return value
+
+    @field_validator("snapshot_sha256")
+    @classmethod
+    def _validate_snapshot_digest(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return validate_sha256(value)
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> "SourceIdentityVerification":
+        if self.method == "git_commit":
+            if not self.commit or not self.repository_root:
+                raise ValueError(
+                    "a git commit verification needs the repository and the commit"
+                )
+            if self.worktree_clean is not True:
+                raise ValueError(
+                    "a git commit verification needs a clean worktree; unrecorded "
+                    "changes mean the frozen snapshot is not the commit"
+                )
+        else:
+            if not self.snapshot_sha256:
+                raise ValueError(
+                    "a frozen digest verification needs the frozen digest"
+                )
+        return self
+
+
+class SourceIdentityAttestation(ContractModel):
+    """The trusted proof that one registered source has a verified identity.
+
+    An attestation is *about* one registered historical source: it names the
+    source, the digests of the bytes that were registered, the identity that
+    was verified and the evidence of that verification.  Its own digest only
+    proves that its body was not changed - the trust comes from the
+    authentication envelope that the controlled flow signs (D-058, D-054).
+    """
+
+    schema_version: int = 1
+    project_id: str = Field(min_length=1, max_length=2048)
+    source_ref: str = Field(min_length=1, max_length=1024)
+    ledger_sha256: str
+    metadata_sha256: str
+    identity: BaselineSourceIdentity
+    verification: SourceIdentityVerification
+    evidence_ref: str = Field(min_length=1, max_length=256)
+    attestation_sha256: str
+
+    @field_validator("ledger_sha256", "metadata_sha256", "attestation_sha256")
+    @classmethod
+    def _validate_digests(cls, value: str) -> str:
+        return validate_sha256(value)
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> "SourceIdentityAttestation":
+        if not self.identity.verified:
+            raise ValueError("an attestation may only carry a verified identity")
+        if self.identity.kind != self.verification.method:
+            raise ValueError(
+                "the attested identity and the verification method disagree"
+            )
+        if not self.evidence_ref.startswith(CF_REFERENCE_PREFIX):
+            raise ValueError(
+                f"the evidence reference must start with {CF_REFERENCE_PREFIX!r}"
+            )
+        return self
+
+    def body(self) -> dict[str, Any]:
+        """The content this attestation is sealed by."""
+
+        payload = self.model_dump(mode="json")
+        payload.pop("attestation_sha256", None)
+        return payload
+
+    def sealed(self) -> bool:
+        """Whether the attestation still matches its own digest."""
+
+        return cf_payload_digest(self.body()) == self.attestation_sha256
+
+    @classmethod
+    def issue(cls, **fields: Any) -> "SourceIdentityAttestation":
+        """Seal an attestation over the fields that describe one verification."""
+
+        payload = {key: value for key, value in fields.items() if key != "attestation_sha256"}
+        digest = cf_payload_digest(cls(**payload, attestation_sha256="0" * 64).body())
+        return cls(**payload, attestation_sha256=digest)
+
+
+class LineageSealMember(ContractModel):
+    """One historical member of a sealed scope, with its trusted attestation."""
+
+    source_ref: str = Field(min_length=1, max_length=1024)
+    ledger_sha256: str
+    metadata_sha256: str
+    attestation_sha256: str
+
+    @field_validator(
+        "ledger_sha256", "metadata_sha256", "attestation_sha256"
+    )
+    @classmethod
+    def _validate_digests(cls, value: str) -> str:
+        return validate_sha256(value)
+
+
+class LineageSeal(ContractModel):
+    """The trusted proof that one historical scope was closed and sealed.
+
+    A manifest that is structurally complete only says that the scope *looks*
+    closed.  A seal says more: it names the current run, the manifest it
+    seals, every member with the attestation that proved its identity, and it
+    is signed by the controlled flow.  Only a seal may carry the weight of a
+    negative conclusion (D-052).
+    """
+
+    schema_version: int = 1
+    project_id: str = Field(min_length=1, max_length=2048)
+    run_id: str = Field(min_length=1, max_length=2048)
+    lineage_manifest_ref: str = Field(min_length=1, max_length=256)
+    manifest_sha256: str
+    scope_kind: BaselineScopeKind = "declared_predecessor_lineage"
+    completeness: BaselineCompleteness = "complete"
+    members: list[LineageSealMember] = Field(default_factory=list, max_length=1000)
+    issuer: str = Field(min_length=1, max_length=2048)
+    issued_at: str = Field(min_length=1, max_length=64)
+    seal_sha256: str
+
+    @field_validator("manifest_sha256", "seal_sha256")
+    @classmethod
+    def _validate_digests(cls, value: str) -> str:
+        return validate_sha256(value)
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> "LineageSeal":
+        if not self.lineage_manifest_ref.startswith(CF_REFERENCE_PREFIX):
+            raise ValueError(
+                f"the manifest reference must start with {CF_REFERENCE_PREFIX!r}"
+            )
+        if self.completeness != "complete":
+            raise ValueError("a seal may only close a complete scope")
+        if self.scope_kind == "lineage_root" and self.members:
+            raise ValueError("a lineage root may not carry historical members")
+        seen: set[str] = set()
+        for member in self.members:
+            if member.source_ref in seen:
+                raise ValueError("a seal may not name the same member twice")
+            seen.add(member.source_ref)
+        return self
+
+    def body(self) -> dict[str, Any]:
+        """The content this seal is sealed by."""
+
+        payload = self.model_dump(mode="json")
+        payload.pop("seal_sha256", None)
+        return payload
+
+    def sealed(self) -> bool:
+        """Whether the seal still matches its own digest."""
+
+        return cf_payload_digest(self.body()) == self.seal_sha256
+
+    @classmethod
+    def issue(cls, **fields: Any) -> "LineageSeal":
+        """Seal a scope over the fields that describe it."""
+
+        payload = {key: value for key, value in fields.items() if key != "seal_sha256"}
+        digest = cf_payload_digest(cls(**payload, seal_sha256="0" * 64).body())
+        return cls(**payload, seal_sha256=digest)
+
+
+class ProofAuthentication(ContractModel):
+    """The authentication envelope of one immutable proof.
+
+    The envelope is the same idea as :class:`LedgerValidationAuth`, applied to
+    the two proofs of CF-S2-B2-A: it is a MAC over the proof's digest, made
+    with a key only the controlled flow holds.  The two proofs share the
+    infrastructure but never share a table (D-054), and the MAC input is
+    domain separated per proof kind, so an attestation can never be replayed
+    as a seal.
+    """
+
+    auth_version: int = 1
+    proof_kind: ProofKind
+    key_id: str = Field(min_length=1, max_length=128)
+    proof_sha256: str
+    project_id: str = Field(min_length=1, max_length=2048)
+    mac: str = Field(min_length=64, max_length=64)
+
+    @field_validator("proof_sha256")
+    @classmethod
+    def _validate_digests(cls, value: str) -> str:
+        return validate_sha256(value)
+
+    @field_validator("mac")
+    @classmethod
+    def _validate_mac(cls, value: str) -> str:
+        value = value.strip().lower()
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            raise ValueError("a mac must be a 64 hex digit digest")
+        return value
+
+    def mac_input(self) -> bytes:
+        """The bytes this envelope's mac is made over."""
+
+        return proof_auth_mac_input(
+            proof_kind=self.proof_kind,
+            proof_sha256=self.proof_sha256,
+            project_id=self.project_id,
+        )
+
+
+def proof_auth_mac_input(
+    *, proof_kind: str, proof_sha256: str, project_id: str
+) -> bytes:
+    """The domain separated input of one proof authentication envelope."""
+
+    domain = {
+        "source_attestation": SOURCE_ATTESTATION_DOMAIN,
+        "lineage_seal": LINEAGE_SEAL_DOMAIN,
+    }.get(proof_kind)
+    if domain is None:
+        raise ValueError(f"unknown proof kind {proof_kind!r}")
+    body = cf_canonical_json(
+        {
+            "project_id": project_id,
+            "proof_kind": proof_kind,
+            "proof_sha256": proof_sha256,
+        }
+    )
+    return domain.encode("utf-8") + b"\x00" + body.encode("utf-8")
