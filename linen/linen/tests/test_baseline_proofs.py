@@ -1167,3 +1167,118 @@ def test_r08_old_proofs_are_not_rewritten_and_the_state_replays(board, import_ro
             (PROJECT,),
         ).fetchall()
         assert [tuple(row) for row in before] == [tuple(row) for row in after]
+
+
+# --- D-063: several valid seals of one run ----------------------------------
+
+
+@requires_git
+def test_conflicting_lineage_seals_cannot_yield_trusted_negative(
+    board, import_root, tmp_path, validation_auth_key
+):
+    """D-063: two valid seals of one run that disagree are a conflict.
+
+    A run that is sealed twice - once as a lineage root and once as a
+    declared predecessor lineage - contradicts itself.  The first seal that is
+    read may not win: the scope was not searched, so it may not carry a
+    negative conclusion.  Both seals stay in the registry, and none of them is
+    rewritten or deleted.
+    """
+
+    fixture = _verified_source(board, import_root, tmp_path)
+    record = fixture["record"]
+    with db.get_conn() as conn:
+        attest_historical_source(
+            conn=conn,
+            project_id=PROJECT,
+            source_ref=SOURCE_REF,
+            observed_at="2026-01-01T00:00:00Z",
+            scope="audited_source_identity",
+            repo_root=fixture["repo"],
+            commit=fixture["commit"],
+            source_dir=fixture["snapshot"],
+            source_manifest=fixture["manifest_path"],
+        )
+    with db.get_conn() as conn:
+        _run(conn, RUN_ID)
+        member = BaselineManifestMember(
+            source_ref=record.source_ref,
+            ledger_sha256=record.ledger_sha256,
+            metadata_sha256=record.metadata_sha256,
+        )
+        root_manifest = seal_lineage_manifest(
+            conn, project_id=PROJECT, members=[], scope_kind="lineage_root"
+        )
+        predecessor_manifest = seal_lineage_manifest(
+            conn,
+            project_id=PROJECT,
+            members=[member],
+            scope_kind="declared_predecessor_lineage",
+        )
+        for manifest in (root_manifest, predecessor_manifest):
+            seal = build_lineage_seal(
+                conn=conn,
+                project_id=PROJECT,
+                run_id=RUN_ID,
+                manifest_ref=manifest.reference(),
+                issuer="operator",
+                issued_at="now",
+            )
+            envelope = issue_proof_auth(
+                proof_kind="lineage_seal",
+                proof_sha256=seal.seal_sha256,
+                project_id=PROJECT,
+            )
+            assert envelope is not None
+            register_lineage_seal(
+                conn=conn, project_id=PROJECT, seal=seal, envelope=envelope
+            )
+
+        status = lineage_seal_status(conn, project_id=PROJECT, run_id=RUN_ID)
+        assert status.state == "conflict"
+        assert status.trusted_negative is False
+        assert status.sealed is False
+        assert len(status.seals) == 2
+        assert status.reason
+
+        # nothing was deleted, nothing was rewritten, and no winner was picked
+        rows = conn.execute(
+            "SELECT payload_sha256 FROM coverage_lineage_seals WHERE project_id = ? "
+            "AND run_id = ? ORDER BY seal_id",
+            (PROJECT, RUN_ID),
+        ).fetchall()
+        assert len(rows) == 2
+        assert status.seal is None
+
+
+@requires_git
+def test_two_equivalent_seals_of_one_run_are_idempotent(
+    board, import_root, tmp_path, validation_auth_key
+):
+    """D-063: the same scope sealed twice is the same claim, not a conflict."""
+
+    manifest = _sealed_scope(board, import_root, tmp_path)
+    with db.get_conn() as conn:
+        for issued_at in ("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"):
+            seal = build_lineage_seal(
+                conn=conn,
+                project_id=PROJECT,
+                run_id=RUN_ID,
+                manifest_ref=manifest.reference(),
+                issuer="operator",
+                issued_at=issued_at,
+            )
+            envelope = issue_proof_auth(
+                proof_kind="lineage_seal",
+                proof_sha256=seal.seal_sha256,
+                project_id=PROJECT,
+            )
+            assert envelope is not None
+            register_lineage_seal(
+                conn=conn, project_id=PROJECT, seal=seal, envelope=envelope
+            )
+
+        status = lineage_seal_status(conn, project_id=PROJECT, run_id=RUN_ID)
+        assert status.state == "sealed"
+        assert status.trusted_negative is True
+        assert len(status.seals) == 2
