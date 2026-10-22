@@ -164,3 +164,175 @@ CF-S1-C  PRODUCTION REGISTRATION  BLOCKED — E48
 可信 run 计划只能通过应用依赖注入安装，生产代码里**没有**任何"默认视为无历史"的
 解析器。**CF 工件（coverage-ledger.json / findings.json）的生产仍等待 S2-A/B/C/D。**
 
+### HTTP v1 正式契约（D-029）
+
+`POST /projects/{project_id}/skill-coverage-events` 与
+`GET /projects/{project_id}/skill-coverage-events` 自本节起是**冻结的契约级接口**。
+客户端必须按状态码与**机器原因码**判断，**不得**匹配错误消息的自然语言文本。
+
+**请求体（闭合模型，多带一个字段即 422）**：
+
+```json
+{"run_id": "...", "event_type": "unit_registered", "payload_version": 1,
+ "coverage_id": "...", "canonical_refs": {"surface": "...", "boundary": "...",
+ "subsystem": "...", "attack_class": "..."}}
+```
+
+**响应体**（`event_id` / `project_id` / `run_id` / `coverage_id` / `event_key` /
+`payload_sha256` / `created_at` / `replayed` / `payload`）：
+
+| HTTP | 语义 | 机器原因码 |
+|---|---|---|
+| 201 | 首次成功登记 | — |
+| 200 | 幂等重放，返回原 `event_id`，`replayed=true` | — |
+| 422 | 非法结构或 canonical identity 不成立 | `coverage_event_rejected` |
+| 422 | coverage 不属于可信计划 | `coverage_unit_not_in_plan` |
+| 409 | 同身份不同载荷 | `coverage_event_conflict` |
+| 404 | run 不存在或不属于本 project | `run_not_found` |
+| 403 | 调用者未获授权 | `untrusted_caller` |
+| 503 | 生产写入关闭 | `registration_disabled` |
+| 503 | 可信基线不可用 | `trusted_baseline_unavailable` |
+
+**检查顺序是 v1 行为，不得无意识调整**：同一个 422 可能由不同原因码产生，
+取决于请求是否落在可信计划内——计划不含该 coverage id 时报
+`coverage_unit_not_in_plan`，计划含该 id 但四维派生的 canonical id 对不上时
+才报 `coverage_event_rejected`。完整顺序为：
+
+```text
+1. 503 registration_disabled            生产写入未开启
+2. 403 untrusted_caller                 调用者未被接受
+3. 422 coverage_unit_not_in_plan        无可信计划，或该单元不在计划内
+4. 503 trusted_baseline_unavailable     无可信基线 / 历史未知 / 查询失败
+5. 422 coverage_event_rejected          cov-<n> 旧式 id，或 canonical id 不自洽
+6. 404 run_not_found                    run 不存在或不属本 project
+7. 409 coverage_event_conflict          同事件键、载荷不同
+```
+
+**幂等语义**：事件键为 `unit_registered:<coverage_id>`，唯一范围
+`(project_id, run_id)`。同键同载荷（按规范化 JSON 摘要比对，**不含**
+`created_at`）返回 200 与原事件；同键不同载荷返回 409，**不覆盖**。
+
+**只读端点**：`GET /projects/{project_id}/skill-coverage-events?run_id=...`
+返回该 run 的登记投影，**按 project 隔离**（跨 project 读取返回空列表），
+未知 project 返回 404。该端点只读，但仍会暴露 surface / boundary / prior_status，
+不得被当作"天然无暴露风险"。
+
+**生产开启条件（D-030）**：以下条件**必须全部满足**才允许开启生产写入，
+当前前三项**均未实现**：
+
+| 条件 | 状态 |
+|---|---|
+| 可信调用者证明 | 未实现 |
+| 可信 run 计划解析 | 仅测试注入 |
+| 可信历史基线解析 | 未实现 |
+| canonical ID 验证 | 已实现 |
+| 数据库不可变性 | 已实现 |
+| 幂等与事务 | 已实现 |
+
+回环地址（server 默认监听 `127.0.0.1`）**不构成**可信身份：同机任意进程都能
+向该地址发 HTTP。可信调用者、执行身份与 artifact owner 的绑定机制归 CF-S2-C；
+凭据不得进入 prompt、模型 stdout、审计图或普通日志。
+
+**删除策略（D-028）**：审计事件默认保留。项目一旦拥有不可变覆盖事件，
+`DELETE /projects/{project_id}` 返回 **409 `PROJECT_HAS_COVERAGE_EVENTS`**；
+直接删除被事件引用的 run 会被外键拒绝。**这不是临时限制，而是产品行为**，
+受控清除（归档 / 保留期限）需单独裁定，不得通过改回 CASCADE 绕过事件不可变性。
+
+**实测的删除语义**（SQLite 3.50.4，脚本见取证记录）：
+
+| 场景 | 结果 |
+|---|---|
+| 外键 NO ACTION（当前设计） | `FOREIGN KEY constraint failed` → 409 `PROJECT_HAS_COVERAGE_EVENTS` |
+| 外键 CASCADE | 被 append-only 触发器拦下，消息 `skill_coverage_events is append-only`（**不含** `FOREIGN KEY`）→ 会落到 500 而非 409 |
+| CASCADE 且**去掉**触发器 | 删除成功，账本被抹光 |
+| `PRAGMA foreign_keys=OFF` | 级联不发生，事件行留下但其引用的 run 已消失（孤儿） |
+
+因此外键取 NO ACTION 的理由是**删除失败时给出的错误类别**，不是"级联会绕过触发器"：
+SQLite 执行外键动作时**会**触发子表的 BEFORE DELETE 触发器，且
+`PRAGMA recursive_triggers` **不**影响这一行为（SQLite 官方文档 foreignkeys.html
+第 6 节："The PRAGMA recursive_triggers setting does not affect the operation of
+foreign key actions"）。另外，"级联会触发子表触发器"是 SQLite 3.6.19 起的行为，
+仓库未锁定 SQLite 版本，因此**触发器是第二道防线、不是主防线**；NO ACTION 约束
+不依赖版本。`get_conn()` 每条连接都设 `PRAGMA foreign_keys=ON`，但**裸 `sqlite3`
+打开数据库的维护脚本会绕过该约束**——UPDATE/DELETE 触发器仍然有效。
+
+## CF-S2-A 多轮事件（追加式）
+
+`skill_coverage_events` 除登记外还承载两类**历史**事件，它们记录单元的
+"谁接手了、接手时拿到了什么块、这一轮以什么终态结束"：
+
+```text
+unit_registered
+       |
+       v
+wave_started(wave=1)      owner + 选块来源 + 起始路径
+       |
+       v
+attempt_recorded(wave=1)  终态 + 证据
+       |
+       v
+wave_started(wave=2)      新的 owner + 重新分配理由
+       |
+       v
+attempt_recorded(wave=2)  终态 + 证据
+```
+
+**事件键（幂等范围 `(project_id, run_id)`）**：
+
+```text
+wave_started:<coverage_id>:<wave>
+attempt_recorded:<coverage_id>:<wave>
+```
+
+同键同载荷 → 幂等重放（返回原 `event_id`）；同键不同载荷 → 409 冲突，**不覆盖**。
+
+**服务端状态机**（`server/skill_coverage_waves.py`，顺序判断在**写入的同一事务**内完成，
+客户端不能自称"这是第 3 轮"）：
+
+| 规则 | 拒绝异常 |
+|---|---|
+| 单元未登记 | `CoverageEventRejected` |
+| 单元的首轮不是 wave 1 | `CoverageWaveOrderRejected` |
+| 前一轮没有终态 attempt 就换 owner | `CoverageWaveOrderRejected` |
+| attempt 引用未启动的 wave | `CoverageWaveOrderRejected` |
+| attempt 的 owner 不是该 wave 的 owner | `CoverageWaveOrderRejected` |
+| 新 wave 复用早先 wave 的 owner | `CoverageWaveOrderRejected` |
+| artifact 复用早先 attempt 的产物 | `CoverageWaveOrderRejected` |
+| 同事件键、载荷不同 | `CoverageEventConflict` |
+
+（多轮事件**没有** HTTP 端点，因此这些是服务层异常名，不是 HTTP 状态码。）
+
+**重新分配理由的时序**：上游要求**每个**归档 attempt 都带非空
+`reassignment_reason`，但"为什么换人"往往在派发下一轮时才确定。因此理由
+**随下一次 `wave_started` 记录**，由只读投影关联回被归档的那一轮（PM R4）。
+若没有下一轮，最后一轮仍是当前轮，**不会**被虚构为归档 attempt，也**不会**
+编造理由。
+
+**可信选块来源**：选块是**计划**的决定，不是模型的自述——上游同样把
+"assignment block map"作为父进程写进 hunter prompt 的东西，hunter 的输出契约里
+没有块字段。linen 侧的计算点是 `dispatcher/analysis/coverage_blocks.py`：
+`seed.attack_class` → 从 pinned 快照里逐字切出 `ATTACK-CLASSES.md` 的块 →
+记录为 `ATTACK-CLASSES.md#<类名>`。companion playbook **未 vendored**，因此
+`selected_companion_blocks` 是**显式空集**（"没选 companion"与"没记录选块"语义不同，
+只有前者为真）；`excluded_blocks` 同为空集——当前代码没有推导排除项的逻辑。
+
+**只读投影**（`project_multiwave()`）：纯函数，重放同一事件流必得同一结果。
+投影**不发明**任何未发生的 wave / attempt / finding：只有登记的单元是 `planned`，
+启动但未终结的 wave 是 `in_progress` 且不进入归档。投影可直接产出上游形状的
+coverage ledger（`upstream_coverage_ledger()`），并**已用包内上游校验器实测通过**
+（`test_skill_coverage_waves.py` 跑 `validate-coverage-ledger.cjs`）。
+
+**当前状态**：
+
+```text
+CF-S2-A  EVENT CONTRACT / STATE MACHINE / PROJECTION  PASS
+CF-S2-A  PRODUCTION MULTIWAVE WRITE  BLOCKED — 无可信 owner / 选块提供者
+```
+
+多轮事件的**生产写入仍然关闭**：可信 owner（assignment registry）属 CF-S2-C，
+可信选块提供者尚未安装。`POST /projects/{project_id}/skill-coverage-events`
+**仍然只接受 `unit_registered`**，多轮事件走独立可信写入接口且默认关闭。
+
+
+
+
