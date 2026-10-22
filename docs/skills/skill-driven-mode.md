@@ -596,5 +596,68 @@ macOS/Linux）。Windows 上的相关用例**跳过**而不是假装通过。
 - **D-052**：`closed=True` 仍只表示结构封闭；可信 lineage seal 属 B2-A。
 
 
+## CF-S2-B1 P1-C 可信签发与一致性闭合
+
+**PM v2.6 裁定**：Q45 = A（Windows **永久失败关闭**，不提供开发期 unsafe 旁路，D-057）；
+Q46 = 受控内部入口 + 最小 HMAC 签发认证（D-058）；Q47 = P1-C **只**关闭 D-056 与必要的一致性
+回归，source attestation / lineage seal / prior_status resolver 留给 B2-A/B2-B/B2-C（D-059）。
+
+### 自摘要不等于签发权
+
+【事实】`LedgerValidationReceipt.sealed()` 只能证明**自身内容未被改动**；任何能构造 JSON 的调用者
+都能算出自洽的摘要。因此「已在库中 + 自称来自 operator + 摘要自洽」**不构成可信凭据**（D-058）。
+
+**认证封套（`LedgerValidationAuth`）**把「谁签发」变成可验证的事实：
+
+```text
+{"auth_version": 1, "key_id": "...", "receipt_sha256": "...",
+ "project_id": "...", "source_ref": "...",
+ "ledger_sha256": "...", "metadata_sha256": "...", "mac": "<HMAC-SHA256>"}
+```
+
+- 【事实】MAC 输入是**域分隔 + 规范化 JSON**（`linen:baseline-ledger-validation:v1` + 排序后的
+  五个字段），因此**同一张封套不能跨项目、跨 source_ref、跨 receipt 重放**。
+- 【事实】封套**不改变** `LedgerValidationReceipt.receipt_sha256` 的计算规则；receipt 的业务载荷
+  不变时，其摘要必须不变。
+- 【事实】认证证明存在**独立的追加式表** `coverage_ledger_validation_auths`（唯一键
+  `project_id + receipt_sha256 + key_id`，append-only 触发器），**不 UPDATE 回填旧记录**，
+  也不承担 B2-A 的 source identity attestation 职责（D-059）。
+
+### 密钥从哪来、怎么用
+
+- 【事实】密钥由**运维通过环境变量注入**：`LINEN_BASELINE_VALIDATION_KEYS`，
+  形如 `{"baseline-validator-key-1": "<hex>"}`。**密钥字节不进 Git、不进 SQLite、不进 prompt、
+  不进模型 stdout、不进普通日志、不进错误响应、不进 audit graph**；只记录 `key_id`。
+- 【事实】服务端用 `hmac.compare_digest()` 校验。
+- 【事实】**没有配置可信密钥 → 失败关闭**：受控流程签不出封套，`verify_ledger_validation()` 对
+  该 receipt 报「无可信签发证明」。没有「默认开发密钥」兜底。
+- 【推断】HMAC 证明的是「持有共享密钥的一方在受控流程里签发」，**不证明具体是哪位自然人**；
+  dispatcher 与 server 共享密钥，因此这是**进程间认证**，不是不可抵赖的个人签名。P1-C 范围内足够。
+
+### 三条一致性绑定
+
+| 检查 | 位置 | 说明 |
+|---|---|---|
+| pinned validator 实际摘要 | `server/skill_baseline_sources.py` `pinned_validator_sha256()` | 比较 receipt 的 `validator_sha256` 与**实际读取的 pinned validator 文件摘要**；只比 commit 名称不够 |
+| ledger 三方摘要 | 同上 `verify_ledger_validation()` | `SHA256(actual bytes) == registered_source.ledger_sha256 == receipt.ledger_sha256`，任一不同即不成立 |
+| 凭据自洽 | `register_ledger_validation()` | 登记时即拒绝「validator 摘要不符」的 receipt |
+
+### 两项代码复核加固
+
+- **R-A（登记局部原子性）**：`materialize_baseline_artifacts()` 的 artifact 登记包在
+  **SAVEPOINT** 里——中途失败则本次新增行**全部回退**（不是靠外层事务回滚）。
+  文件写入与 SQLite 仍**不是**跨存储原子事务：写失败清文件，登记失败留完整文件，重试幂等。
+- **R-B（既有文件类型竞态）**：`existing_digest()` 在 `os.open()` 之后用 `os.fstat()` **复核**
+  打开的描述符确实是普通文件，并加 `O_NONBLOCK`，避免被换成 FIFO 时阻塞。
+
+### 本片验收
+
+P1-C-T01–T12（未认证自签 receipt 不得取得权威资格 / 可信签发可登记 / MAC 篡改拒绝 / key_id 未知
+或密钥缺失失败关闭 / 跨项目跨来源重放拒绝 / 重复登记幂等 / 一张封套不能承载另一张 receipt /
+pinned validator 摘要不符拒绝 / 三方摘要一致 / 旧的无认证 receipt 保持可读但不获权威资格 /
+登记部分失败回滚新增行 / 非普通文件安全失败不阻塞），
+加上 CR-T07（自签 receipt 不能绕过可信签发）、CR-T08（pinned validator 摘要）、CR-T09（三方摘要）。
+
+
 
 

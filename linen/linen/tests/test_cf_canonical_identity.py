@@ -275,7 +275,14 @@ def test_canonical_id_matches_upstream(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(_corpus_root() is None, reason="CF corpus is not available")
 def test_real_corpus_coverage_ids_match_upstream() -> None:
-    """The 366 recorded upstream ids must be reproducible from their dimensions."""
+    """Every recorded upstream id must be reproducible from its dimensions.
+
+    The corpus grows: it is the working material of the audit runs, and a new
+    project adds its units to it.  So the count is a floor - it guards
+    against the corpus silently shrinking, which would make the check above
+    pass over less material than it claims - while the property under test
+    is that *every* recorded id is reproducible.
+    """
 
     root = _corpus_root()
     assert root is not None
@@ -301,5 +308,5 @@ def test_real_corpus_coverage_ids_match_upstream() -> None:
                 )
 
     assert not mismatches, mismatches[:5]
-    assert units == 366, units
-    assert matched == 366, matched
+    assert units == matched, f"{units - matched} of {units} ids are not reproducible"
+    assert units >= 366, units
