@@ -443,10 +443,25 @@ commit / commit + 自由文本注释 / 非 Git 发行包）。导入器**从不*
 `git_commit` 身份必须带 40 位 commit；`frozen_digest` 身份（非 Git 发行包）必须带
 冻结源码摘要。
 
-**上游没有先例**：实测表明上游 skill **从不读取任何前次 run 的 ledger**，9 个非平凡
-`prior_*` 字面量在真实语料中**零命中**，且 `source_ref` **从不被任何代码比较**——
-即 same-source / changed-source 的判定机制在上游**未定义**。因此 B1 只登记来源，
-不判定兼容性；兼容性由 CF-S2-B2 的 resolver 依据本清单与可信裁定作出。
+**上游没有可复用的实现，但有规范性的行为原则**：实测表明上游**现成脚本**从不读取任何前次
+run 的 ledger（语料里 `prior_run_paths` 全空，无脚本读他次 `coverage-ledger.json`），9 个
+非平凡 `prior_*` 字面量在真实语料中**零命中**（只存在于 `validate-coverage-ledger.cjs:71-79`
+的集合字面量），且 `source_ref` **从不被任何代码比较**。
+
+但上游的**规范性指令**（`SKILL.md` 与 `RECONNAISSANCE.md`，commit `c1c8a8c`，**未 vendored**）
+明确要求协调者在存在历史运行时读取兼容的 coverage ledger 与 findings，并比较**相关源码、
+条件与证据**；且明确说明**单独的历史 source ref 不能证明源码未变化**。
+
+因此准确的登记是：
+
+> 上游**规定了历史对比的行为原则，但没有提供自动执行该比较的通用代码实现**。
+
+⇒ 上游文档可作为历史状态与证据要求的依据；**不可**声称上游提供了可直接复用的
+source comparison 算法。**比较规则由 linen 自己实现并承担测试责任**；凡上游未定义、
+现有证据又不足以确定的映射，一律失败关闭（`unknown`）。
+
+跨运行可用锚点只有 `coverage_id`（由 `canonical_refs` 派生）与 `result_fingerprints`；
+上游**不存在**「prior unit」这种数据结构。
 
 **当前状态**：
 
