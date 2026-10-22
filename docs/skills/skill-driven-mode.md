@@ -312,15 +312,79 @@ attempt_recorded:<coverage_id>:<wave>
 "assignment block map"作为父进程写进 hunter prompt 的东西，hunter 的输出契约里
 没有块字段。linen 侧的计算点是 `dispatcher/analysis/coverage_blocks.py`：
 `seed.attack_class` → 从 pinned 快照里逐字切出 `ATTACK-CLASSES.md` 的块 →
-记录为 `ATTACK-CLASSES.md#<类名>`。companion playbook **未 vendored**，因此
-`selected_companion_blocks` 是**显式空集**（"没选 companion"与"没记录选块"语义不同，
-只有前者为真）；`excluded_blocks` 同为空集——当前代码没有推导排除项的逻辑。
+记录为 `ATTACK-CLASSES.md#<类名>`。
+
+**D-033：描述性引用与可信选块是两个概念。** `canonical_refs.attack_class` 是
+**描述性身份引用**（四维之一，决定 canonical id），`ordinary_attack_class_block`
+是**可信计划选中的上游块**（必须是快照里九个标题之一）。二者不可假设相等：
+
+| 对象 | 职责 |
+|---|---|
+| `AttackClass`（`contracts/skill_audit.py`） | 仅保留历史公开 API 兼容，**不参与**协议判定 |
+| `canonical_refs.attack_class` | 描述性身份引用 |
+| `ordinary_attack_class_block` | 可信计划明确选择的上游攻击类块 |
+| `ATTACK-CLASSES.md` | ordinary block 标题与内容的权威来源 |
+| `CoverageBlockSelection` | 选块结果、来源及 capability 的可信登记 |
+
+最小过渡策略：当 `attack_class` **精确等于**合法块标题时保留精确匹配；否则
+必须由可信计划显式给出 `ordinary_block`（`dispatch.yaml` 的 seed 字段）。两者都没有
+时抛 `BlockSelectionUnresolved`（`code = "block_selection_unresolved"`）——**禁止**
+模糊匹配、大小写折叠、snake_case 转换或任何自动猜测。生产 prompt 路径
+（`dispatcher/tasks/skill_audit.py`）已按此改为严格解析。
+
+```yaml
+audit:
+  skill_driven:
+    coverage_seeds:
+      # attack_class 恰好是上游块标题：直接精确匹配
+      - surface: "http-public-api"
+        boundary: "anonymous-to-authenticated"
+        subsystem: "authorization"
+        attack_class: "Access control"
+        starting_paths: ["app/authz.py"]
+      # attack_class 是描述性引用：必须由计划显式指定块
+      - surface: "http-public-api"
+        boundary: "anonymous-to-authenticated"
+        subsystem: "authorization"
+        attack_class: "injection"
+        ordinary_block: "Injection"
+        starting_paths: ["app/api.py"]
+```
+
+`ordinary_block` 是可选字段（默认 `null`）；它**不进入** canonical id——新增可信
+选块依据不会改变既有 `coverage_id`（D-033）。
+
+**D-032：companion capability 显式化。** `selected_companion_blocks = []` 本身有歧义
+（"目录在、但没选"与"根本没有目录"是两回事）。`CoverageBlockSelection` 因此带
+`companion_catalog_state ∈ {available, unavailable, unknown}`：
+
+| 取值 | 含义 | 约束 |
+|---|---|---|
+| `available` | 目录存在 | 可合法选择空集，但必须带可信选择记录（`source` 必填） |
+| `unavailable` | 目录不存在 | **必须**对应空选择，否则契约拒绝 |
+| `unknown` | 旧事件未记录该字段 | 不自动转 `unavailable` |
+
+linen 当前产出 `unavailable`（10 个 companion playbook **未 vendored**）。
+该字段**只属于 linen 的可信溯源**：不进 canonical refs、不进 coverage id、
+不进上游 ledger 顶层、不进模型可填的 hunt payload。**受控兼容**：字段为 `None` 时
+`digest_content()` 省略该键，因此该字段出现之前写入的事件**摘要不变**；投影对缺
+字段的旧事件报 `unknown`，**不补造** `unavailable`。
+
+**D-034：登记状态与完整 ledger 导出资格分离。** 只有 `unit_registered` 的单元在
+linen 原生投影里是 `planned`，但**不得**导出为完整上游 ledger——上游要求
+`starting_paths` 非空，编造它等于声称一次从未发生的覆盖。导出资格由
+`CoverageUnitProjection.exportable` / `export_blockers` 表达，
+`upstream_coverage_ledger()` 跳过不合格单元，
+`upstream_ledger_export_report()` **显式列出**被跳过的单元与原因（不静默缺口）。
 
 **只读投影**（`project_multiwave()`）：纯函数，重放同一事件流必得同一结果。
 投影**不发明**任何未发生的 wave / attempt / finding：只有登记的单元是 `planned`，
 启动但未终结的 wave 是 `in_progress` 且不进入归档。投影可直接产出上游形状的
 coverage ledger（`upstream_coverage_ledger()`），并**已用包内上游校验器实测通过**
 （`test_skill_coverage_waves.py` 跑 `validate-coverage-ledger.cjs`）。
+
+**事件顺序合法性由 linen 自有测试保证，静态文档合法性由上游 validator 保证，
+两者不互相替代。**
 
 **当前状态**：
 
