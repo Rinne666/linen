@@ -147,6 +147,31 @@ and `runs` API responses. Offline export uses the same validation rules and does
 not contact the API. The snapshot and annotation digests identify inputs, but
 are not signatures or proof of independent human annotation.
 
+### Publication boundary
+
+The export is validated before it is published. The candidate observation is
+checked against its own real schema: required fields and their types, identity
+consistency across project, run, registered plan, truth set and board digest,
+case and fact reference integrity, and the confirmation authority behind every
+`confirmed` row. A confirmed row must be backed by a `confirmed_finding` fact in
+the same board; a coverage observation can never confirm a finding.
+
+The published artifact carries reviewed case attribution only. It has no local
+artifact, no local check and no coverage identity, and a candidate that grows
+any of those fields is rejected rather than published as if it carried trusted
+local evidence.
+
+Publication is atomic: the content is built in memory, written to a temporary
+file in the target directory and moved into place with an atomic replace. An
+existing output file is never overwritten, and a rejected export leaves neither
+a partial file nor a changed previous artifact.
+
+`--allow-incomplete` relaxes only the completion requirement. It never excuses a
+structural or referential failure: an invalid export is refused with or without
+the flag. A permitted incomplete export stays explicitly marked as incomplete
+(`completed: false` with its lifecycle status, execution status and blockers),
+because completeness of an export says nothing about vulnerability confirmation.
+
 ## Compare the registered batch
 
 ```sh

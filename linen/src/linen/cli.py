@@ -411,7 +411,10 @@ def audit_case_export(project_id: str | None, server_url: str, snapshot: Path | 
                       case_assessments: Path | None, allow_incomplete: bool, output: Path):
     """Export reviewed per-case coverage and detections without guessing case IDs."""
     from linen.dispatcher.analysis.benchmark import _load
-    from linen.dispatcher.analysis.case_benchmark import BenchmarkPlan, TruthSet, case_observation
+    from linen.dispatcher.analysis.case_benchmark import (
+        BenchmarkPlan, TruthSet, case_observation, publish_case_export,
+        validate_case_export,
+    )
 
     base = f"{server_url.rstrip('/')}/projects/{quote(project_id or '', safe='')}"
 
@@ -445,8 +448,9 @@ def audit_case_export(project_id: str | None, server_url: str, snapshot: Path | 
             hashlib.sha256(config_path.read_bytes()).hexdigest(), mapping, assessments,
             allow_incomplete=allow_incomplete,
         )
-        with output.open("x", encoding="utf-8") as stream:
-            stream.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+        validate_case_export(result, truth=truth, registered=registered, board=board,
+                             allow_incomplete=allow_incomplete)
+        publish_case_export(result, output)
         click.echo(str(output.resolve()))
     except (requests.RequestException, ValueError, OSError, KeyError, TypeError) as exc:
         raise click.ClickException(f"Case export failed: {exc}") from exc

@@ -7,9 +7,13 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import math
+import os
+from pathlib import Path
+import tempfile
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
@@ -297,6 +301,350 @@ def case_observation(
                           "Blocked observations are not completed benchmark passes; undetected cases can be unassessed. "
                           "Run span measures first started to last finished run, not summed worker time.",
     }
+
+
+# --- CF-S1-G3: export boundary validation and atomic publication -----------
+# The audit-case-export artifact is a benchmark case observation.  It is not a
+# Cloudflare coverage ledger and not a findings file, so the boundary validates
+# its own real schema instead of forcing an upstream validator onto a different
+# schema (D-020).  The export publishes reviewed case attribution only: it
+# carries no local evidence and no coverage identity, and the checks below
+# keep it that way.
+
+CASE_EXPORT_SCHEMA_VERSION = 1
+CASE_EXPORT_KIND = "audit_case_observation"
+
+CASE_EXPORT_KEYS = frozenset({
+    "schema_version", "kind", "plan_digest", "truth_digest", "config_digest",
+    "source_digest", "source_verified", "run_label", "project_id",
+    "project_instance_id", "project_created_at", "run_id", "source_generation",
+    "plan_revision", "graph_revision", "board_digest", "observed_at",
+    "completed", "lifecycle_status", "execution_status", "blockers", "pipeline",
+    "cases", "unexpected", "scores", "by_category", "by_cwe", "by_dimension",
+    "metrics", "annotation_digest", "interpretation",
+})
+
+CASE_EXPORT_ROW_KEYS = frozenset({
+    "id", "category", "vulnerable", "cwe", "source_path", "dimensions",
+    "fact_ids", "candidate", "confirmed", "candidate_fact_ids",
+    "confirmed_fact_ids", "disposition", "rationale", "assessment_fact_ids",
+    "review_ids",
+})
+
+#: Fields that would carry local evidence or coverage identity.  The export
+#: schema has none of them, so a candidate artifact that grows one is
+#: rejected instead of being published as if it carried trusted local
+#: evidence or a coverage identity.
+CASE_EXPORT_FORBIDDEN_KEYS = frozenset({
+    "agent_id", "agent_ids", "artifact", "artifacts", "checks", "coverage_id",
+    "coverage_ids", "evidence", "local_artifact", "local_checks",
+    "local_evidence",
+})
+
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+#: Errors that mean the filesystem cannot create a hard link at all.  The
+#: publication fails closed there: an atomic exclusive publish is impossible,
+#: and a non-exclusive replace would silently drop the no-clobber guarantee.
+_UNSUPPORTED_LINK_ERRNOS = frozenset({
+    errno.EPERM, errno.ENOSYS, errno.EOPNOTSUPP, errno.EXDEV, errno.EMLINK,
+})
+
+
+class ExportValidationError(ValueError):
+    """An export candidate that must not be published.
+
+    ``classification`` is ``"invalid"`` for a structural or referential
+    failure and ``"incomplete"`` for a run whose evidence is not complete.
+    An invalid export is never publishable, not even with
+    ``--allow-incomplete``.
+    """
+
+    def __init__(self, message: str, *, classification: str = "invalid") -> None:
+        super().__init__(message)
+        self.classification = classification
+
+
+class ExportPublishError(OSError):
+    """The export could not be published atomically on this filesystem."""
+
+
+def _export_fail(message: str, classification: str = "invalid") -> None:
+    raise ExportValidationError(message, classification=classification)
+
+
+def _export_digest(value: Any, where: str) -> None:
+    if (not isinstance(value, str) or len(value) != 64
+            or not set(value) <= _HEX_DIGITS):
+        _export_fail(f"case export {where} must be a sha256 hex digest")
+
+
+def _export_key_set(value: dict[str, Any], allowed: frozenset[str], where: str) -> None:
+    unknown = set(value) - allowed
+    if unknown:
+        _export_fail(f"{where} has unexpected fields: {sorted(unknown)}")
+    missing = allowed - set(value)
+    if missing:
+        _export_fail(f"{where} is missing fields: {sorted(missing)}")
+
+
+def _export_identifiers(value: Any, where: str) -> list[str]:
+    if not isinstance(value, list):
+        _export_fail(f"{where} must be a list")
+    for item in value:
+        if not isinstance(item, str) or not item.strip() or item != item.strip():
+            _export_fail(f"{where} requires non-empty, unpadded identifiers")
+    if len(set(value)) != len(value):
+        _export_fail(f"{where} identifiers must be unique")
+    return value
+
+
+def _reject_local_evidence(value: Any, path: str) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in CASE_EXPORT_FORBIDDEN_KEYS:
+                _export_fail(
+                    "case export must not carry local evidence or coverage "
+                    f"identity: {path}.{key}"
+                )
+            _reject_local_evidence(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _reject_local_evidence(item, f"{path}[{index}]")
+
+
+def validate_case_export(
+    observation: dict[str, Any],
+    *,
+    truth: TruthSet,
+    registered: BenchmarkPlan,
+    board: dict[str, Any],
+    allow_incomplete: bool = False,
+) -> str:
+    """Validate one case export candidate before it is published.
+
+    The first phase is structural and referential.  A failure there is
+    ``invalid`` and ``allow_incomplete`` never excuses it.  The second phase
+    judges evidence completeness: a run that did not complete is
+    ``incomplete`` and becomes publishable only with an explicit
+    ``allow_incomplete``.
+
+    Returns ``"complete"`` or ``"incomplete"``.  Raises
+    :class:`ExportValidationError` when the candidate must not be published.
+    """
+
+    # EX01: the artifact must be the schema this command actually produces.
+    if not isinstance(observation, dict):
+        _export_fail("case export must be a JSON object")
+    _export_key_set(observation, CASE_EXPORT_KEYS, "case export")
+    if observation["schema_version"] != CASE_EXPORT_SCHEMA_VERSION:
+        _export_fail(
+            f"unsupported case export schema_version: {observation['schema_version']!r}"
+        )
+    if observation["kind"] != CASE_EXPORT_KIND:
+        _export_fail(f"unexpected case export kind: {observation['kind']!r}")
+    for key in ("completed", "source_verified"):
+        if type(observation[key]) is not bool:
+            _export_fail(f"case export {key} must be a boolean")
+    for key in ("plan_digest", "truth_digest", "config_digest", "board_digest",
+                "annotation_digest"):
+        _export_digest(observation[key], key)
+    for key in ("project_id", "project_instance_id", "run_id", "run_label",
+                "observed_at", "interpretation"):
+        if not isinstance(observation[key], str) or not observation[key]:
+            _export_fail(f"case export {key} must be a non-empty string")
+    for key in ("lifecycle_status", "execution_status", "project_created_at"):
+        if observation[key] is not None and not isinstance(observation[key], str):
+            _export_fail(f"case export {key} must be a string")
+    for key in ("source_generation", "plan_revision", "graph_revision"):
+        if observation[key] is not None and type(observation[key]) is not int:
+            _export_fail(f"case export {key} must be an integer")
+    if not isinstance(observation["blockers"], list):
+        _export_fail("case export blockers must be a list")
+    for key in ("pipeline", "metrics", "scores", "by_category", "by_cwe",
+                "by_dimension"):
+        if not isinstance(observation[key], dict):
+            _export_fail(f"case export {key} must be an object")
+    if not isinstance(observation["cases"], list):
+        _export_fail("case export cases must be a list")
+    unexpected = observation["unexpected"]
+    if not isinstance(unexpected, dict):
+        _export_fail("case export unexpected must be an object")
+    for level in ("candidate", "confirmed"):
+        _export_identifiers(unexpected.get(level), f"case export unexpected {level}")
+
+    # EX03/EX06: this artifact carries no coverage identity and no local
+    # evidence, and it must not grow a field that would imply either.
+    _reject_local_evidence(observation, "case export")
+
+    # EX02: identity consistency across project, run, plan and board.
+    meta = board.get("project", {})
+    if not isinstance(meta, dict):
+        _export_fail("exported board has no project metadata")
+    if observation["project_id"] != meta.get("id"):
+        _export_fail("case export project_id does not match the exported board")
+    if observation["project_instance_id"] != digest(
+            [observation["project_id"], observation["project_created_at"]]):
+        _export_fail("case export project_instance_id does not match its provenance")
+    if observation["run_id"] != digest([
+            observation["project_instance_id"], observation["source_generation"],
+            observation["plan_revision"]]):
+        _export_fail("case export run_id does not match its provenance")
+    if observation["run_label"] not in registered.planned_runs:
+        _export_fail(
+            f"case export run_label is not preregistered: {observation['run_label']!r}"
+        )
+    if observation["plan_digest"] != digest(registered.model_dump()):
+        _export_fail("case export plan_digest does not match the registered plan")
+    if (observation["truth_digest"] != registered.truth_digest
+            or observation["truth_digest"] != digest(truth.model_dump())):
+        _export_fail("case export truth_digest does not match the registered truth set")
+    if observation["config_digest"] != registered.config_digest:
+        _export_fail("case export config_digest does not match the registered plan")
+    if observation["board_digest"] != digest(board):
+        _export_fail("case export board_digest does not match the exported board")
+    if (observation["source_generation"] != meta.get("source_generation")
+            or observation["plan_revision"] != meta.get("plan_revision")):
+        _export_fail("case export generation does not match the exported board")
+    if observation["source_verified"]:
+        if observation["source_digest"] != registered.source_digest:
+            _export_fail("case export source_digest does not match the registered plan")
+    elif observation["source_digest"] is not None:
+        _export_fail("case export claims a source digest without source verification")
+
+    # EX04: reference integrity of cases, facts, assessments and reviews.
+    labels = {label.id: label.model_dump() for label in truth.labels}
+    rows = observation["cases"]
+    seen: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            _export_fail("case export cases must contain objects")
+        _export_key_set(row, CASE_EXPORT_ROW_KEYS, "case export case")
+        seen.append(row["id"])
+    _export_identifiers(seen, "case export cases")
+    if set(seen) != set(labels):
+        _export_fail("case export must retain every planned case exactly once")
+    for row in rows:
+        for key, value in labels[row["id"]].items():
+            if row.get(key) != value:
+                _export_fail(
+                    f"case export changed a ground-truth case label: {row['id']}"
+                )
+        for key in ("candidate", "confirmed", "vulnerable"):
+            if type(row[key]) is not bool:
+                _export_fail(f"case export {key} must be a boolean: {row['id']}")
+        if row["confirmed"] and not row["candidate"]:
+            _export_fail("confirmed findings must also count as discovered")
+        if row["disposition"] not in {"vulnerable", "protected", "unassessed"}:
+            _export_fail(f"invalid case disposition: {row['disposition']!r}")
+        fact_ids = _export_identifiers(row["fact_ids"], f"case facts for {row['id']}")
+        for key in ("candidate_fact_ids", "confirmed_fact_ids",
+                    "assessment_fact_ids", "review_ids"):
+            _export_identifiers(row[key], f"case {key} for {row['id']}")
+        if not set(row["assessment_fact_ids"]) <= set(fact_ids):
+            _export_fail(
+                f"case assessment facts are not mapped to the case: {row['id']}"
+            )
+        if row["disposition"] != "unassessed" and (
+                not row["assessment_fact_ids"] or not row["review_ids"]):
+            _export_fail(
+                f"conclusive case coverage needs reviewed supporting evidence: {row['id']}"
+            )
+        if row["disposition"] == "protected" and row["confirmed"]:
+            _export_fail(
+                f"protected assessment contradicts a confirmed finding: {row['id']}"
+            )
+
+    # EX05: only the confirmation authority may back a confirmed export.
+    generation = meta.get("source_generation", 1)
+    facts = {
+        fact["id"]: fact for fact in board.get("facts", [])
+        if isinstance(fact, dict) and isinstance(fact.get("id"), str)
+        and fact.get("source_generation", 1) == generation and not fact.get("legacy")
+    }
+    for row in rows:
+        for fid in row["confirmed_fact_ids"]:
+            fact = facts.get(fid)
+            if fact is None or fact.get("semantic_type") != "confirmed_finding":
+                _export_fail(
+                    "case export claims a confirmed finding without the "
+                    f"confirmation authority: {fid}"
+                )
+        for fid in row["candidate_fact_ids"]:
+            fact = facts.get(fid)
+            if fact is None or fact.get("semantic_type") not in {
+                    "candidate_finding", "confirmed_finding"}:
+                _export_fail(
+                    f"case export claims a candidate the board does not record: {fid}"
+                )
+        if row["confirmed"] and not row["confirmed_fact_ids"]:
+            _export_fail(
+                f"case export marks a case confirmed without a confirmed finding: {row['id']}"
+            )
+        if row["candidate"] and not (row["candidate_fact_ids"]
+                                     or row["confirmed_fact_ids"]):
+            _export_fail(
+                f"case export marks a case discovered without a finding: {row['id']}"
+            )
+
+    # EX07: incompleteness is an explicit state, never a structural excuse.
+    if not observation["completed"]:
+        if not allow_incomplete:
+            _export_fail(
+                "case export is incomplete; publish it only with --allow-incomplete",
+                classification="incomplete",
+            )
+        if (observation["lifecycle_status"] is None
+                and observation["execution_status"] is None
+                and not observation["blockers"]):
+            _export_fail(
+                "an incomplete case export must state why it is incomplete"
+            )
+        return "incomplete"
+    return "complete"
+
+
+def publish_case_export(observation: dict[str, Any], output: Path) -> None:
+    """Publish a validated case export atomically, without clobbering.
+
+    The content is built in memory, written to a temporary file in the target
+    directory and flushed to disk.  It is then published with ``os.link``:
+    a hard link puts the already-complete file under the target name in one
+    atomic step and fails with ``FileExistsError`` when the target already
+    exists.  A concurrent writer's artifact is therefore never overwritten,
+    and no partial content is ever visible at the target path.
+
+    A filesystem without hard-link support cannot provide that guarantee, so
+    the publication fails closed instead of silently degrading to a
+    non-exclusive replace.
+    """
+
+    content = json.dumps(observation, ensure_ascii=False, indent=2) + "\n"
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n",
+            dir=output.parent, prefix=f".{output.name}.", suffix=".partial",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, output)
+        except OSError as exc:
+            if exc.errno in _UNSUPPORTED_LINK_ERRNOS:
+                raise ExportPublishError(
+                    f"{output} cannot be published atomically: the target "
+                    "filesystem does not support hard links"
+                ) from exc
+            raise
+        temporary.unlink(missing_ok=True)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def compare_case_runs(truth: TruthSet, plan: BenchmarkPlan, observations: list[dict]) -> dict:

@@ -1,13 +1,19 @@
 from copy import deepcopy
+import errno
 import hashlib
 import json
+from pathlib import Path
+import threading
 
 from click.testing import CliRunner
 import pytest
 
 from linen.cli import main
+from linen.dispatcher.analysis import case_benchmark
 from linen.dispatcher.analysis.case_benchmark import (
-    BenchmarkPlan, TruthSet, case_observation, compare_case_runs, digest,
+    CASE_EXPORT_KEYS, CASE_EXPORT_ROW_KEYS, BenchmarkPlan, ExportPublishError,
+    ExportValidationError, TruthSet, case_observation, compare_case_runs, digest,
+    publish_case_export, validate_case_export,
 )
 
 
@@ -389,3 +395,338 @@ def test_plan_and_three_run_cli_never_overwrite_or_accept_blocked_runs(tmp_path,
     assert result.exit_code == 1
     assert '"completion_rate": 0.666' in result.output
     assert '"accepted": false' in result.output
+
+
+# --- CF-S1-G3: the export boundary validates before it publishes ------------
+# The audit-case-export artifact is a benchmark case observation.  It carries
+# no Cloudflare checks and no coverage identity, so the boundary validates its
+# own real schema, publishes atomically, and never lets --allow-incomplete
+# excuse a structural failure.
+
+
+def export_candidate(data, *, allow_incomplete=False):
+    truth, plan, board, gate, cost, runs, mapping, assessments = data
+    observation = case_observation(board, gate, cost, runs, truth, plan, "trial-1",
+                                   plan.config_digest, mapping, assessments,
+                                   allow_incomplete=allow_incomplete)
+    return observation, truth, plan, board
+
+
+def check_export(observation, truth, plan, board, *, allow_incomplete=False):
+    return validate_case_export(observation, truth=truth, registered=plan, board=board,
+                                 allow_incomplete=allow_incomplete)
+
+
+def blocked_run():
+    data = scenario()
+    data[2]["project"]["status"] = "stopped"
+    data[3].update(ready=False, execution_status="blocked",
+                   blockers=["worker routing failed"])
+    return data
+
+
+def export_documents(tmp_path, data):
+    config = tmp_path / "dispatch.yaml"
+    config.write_text("configuration fingerprint only\n")
+    plan = data[1].model_copy(update={
+        "config_digest": hashlib.sha256(config.read_bytes()).hexdigest()})
+    documents = {
+        "truth.json": data[0].model_dump(), "plan.json": plan.model_dump(),
+        "map.json": data[6], "assessments.json": data[7],
+        "snapshot.json": dict(zip(("board", "gate", "cost", "runs"), data[2:6])),
+    }
+    for name, document in documents.items():
+        (tmp_path / name).write_text(json.dumps(document))
+    return ["audit-case-export", "--snapshot", str(tmp_path / "snapshot.json"),
+            "--expected", str(tmp_path / "truth.json"), "--plan", str(tmp_path / "plan.json"),
+            "--config", str(config), "--case-map", str(tmp_path / "map.json"),
+            "--case-assessments", str(tmp_path / "assessments.json"),
+            "--run-label", "trial-1", "--output", str(tmp_path / "result.json")]
+
+
+def test_g3_t01_a_valid_complete_export_is_accepted():
+    observation, truth, plan, board = export_candidate(scenario())
+    assert check_export(observation, truth, plan, board) == "complete"
+
+
+def test_g3_t02_missing_or_mistyped_fields_are_rejected():
+    observation, truth, plan, board = export_candidate(scenario())
+    del observation["kind"]
+    with pytest.raises(ExportValidationError) as invalid:
+        check_export(observation, truth, plan, board)
+    assert invalid.value.classification == "invalid"
+
+    observation, truth, plan, board = export_candidate(scenario())
+    observation["completed"] = "true"
+    with pytest.raises(ExportValidationError):
+        check_export(observation, truth, plan, board)
+
+
+def test_g3_t03_a_case_may_not_reference_an_unrecorded_fact():
+    observation, truth, plan, board = export_candidate(scenario())
+    observation["cases"][0]["confirmed_fact_ids"] = ["ghost-fact"]
+    with pytest.raises(ExportValidationError, match="confirmation authority"):
+        check_export(observation, truth, plan, board)
+
+    observation, truth, plan, board = export_candidate(scenario())
+    observation["cases"][1]["assessment_fact_ids"] = ["f4"]
+    with pytest.raises(ExportValidationError, match="not mapped to the case"):
+        check_export(observation, truth, plan, board)
+
+
+def test_g3_t04_duplicate_or_conflicting_assessments_are_rejected():
+    observation, truth, plan, board = export_candidate(scenario())
+    observation["cases"].append(dict(observation["cases"][0]))
+    with pytest.raises(ExportValidationError, match="unique"):
+        check_export(observation, truth, plan, board)
+
+    observation, truth, plan, board = export_candidate(scenario())
+    observation["cases"][0]["review_ids"] = []
+    with pytest.raises(ExportValidationError, match="reviewed supporting evidence"):
+        check_export(observation, truth, plan, board)
+
+
+def test_g3_t05_to_t07_coverage_identity_is_not_part_of_this_export():
+    """EX03 is not applicable here: this artifact carries no coverage identity."""
+
+    observation, truth, plan, board = export_candidate(scenario())
+    assert "coverage_id" not in observation
+    assert all("coverage_id" not in row for row in observation["cases"])
+
+    polluted = dict(observation)
+    polluted["coverage_id"] = ["cov-0001"]
+    with pytest.raises(ExportValidationError):
+        check_export(polluted, truth, plan, board)
+
+    polluted = dict(observation)
+    polluted["cases"] = [dict(row) for row in observation["cases"]]
+    polluted["cases"][0]["coverage_id"] = "cov-0001"
+    with pytest.raises(ExportValidationError):
+        check_export(polluted, truth, plan, board)
+
+
+def test_g3_t08_an_incomplete_export_is_refused_without_explicit_permission():
+    observation, truth, plan, board = export_candidate(blocked_run(), allow_incomplete=True)
+    with pytest.raises(ExportValidationError) as refused:
+        check_export(observation, truth, plan, board)
+    assert refused.value.classification == "incomplete"
+
+
+def test_g3_t09_an_explicitly_permitted_incomplete_export_stays_marked_incomplete():
+    observation, truth, plan, board = export_candidate(blocked_run(), allow_incomplete=True)
+    assert check_export(observation, truth, plan, board, allow_incomplete=True) == "incomplete"
+    assert observation["completed"] is False
+    assert observation["execution_status"] == "blocked"
+    assert observation["blockers"] == ["worker routing failed"]
+
+
+def test_g3_t10_allow_incomplete_never_excuses_an_invalid_structure():
+    observation, truth, plan, board = export_candidate(blocked_run(), allow_incomplete=True)
+    del observation["kind"]
+    with pytest.raises(ExportValidationError) as invalid:
+        check_export(observation, truth, plan, board, allow_incomplete=True)
+    assert invalid.value.classification == "invalid"
+
+
+def test_g3_t11_the_export_may_not_claim_unverified_local_evidence():
+    observation, truth, plan, board = export_candidate(scenario())
+    for field in ("artifact", "local_checks", "checks", "agent_id"):
+        polluted = dict(observation)
+        polluted["metrics"] = dict(observation["metrics"])
+        polluted["metrics"][field] = ["agents/ag-1/artifacts/evidence.json"]
+        with pytest.raises(ExportValidationError, match="local evidence"):
+            check_export(polluted, truth, plan, board)
+
+    polluted = dict(observation)
+    polluted["cases"] = [dict(row) for row in observation["cases"]]
+    polluted["cases"][0]["local_checks"] = []
+    with pytest.raises(ExportValidationError):
+        check_export(polluted, truth, plan, board)
+
+
+def test_g3_t12_a_rejected_export_leaves_an_existing_artifact_untouched(tmp_path, monkeypatch):
+    args = export_documents(tmp_path, scenario())
+    output = tmp_path / "result.json"
+    runner = CliRunner()
+    assert runner.invoke(main, args).exit_code == 0
+    original = output.read_bytes()
+
+    builder = case_benchmark.case_observation
+
+    def broken(*positional, **keywords):
+        observation = builder(*positional, **keywords)
+        observation["cases"][0]["confirmed_fact_ids"] = ["ghost-fact"]
+        return observation
+
+    monkeypatch.setattr(case_benchmark, "case_observation", broken)
+    result = runner.invoke(main, args)
+    assert result.exit_code == 1
+    assert output.read_bytes() == original
+    assert [p.name for p in tmp_path.glob("*.partial")] == []
+
+
+def test_g3_t13_a_rejected_export_creates_no_artifact(tmp_path, monkeypatch):
+    args = export_documents(tmp_path, scenario())
+    output = tmp_path / "never.json"
+    args[args.index("--output") + 1] = str(output)
+    builder = case_benchmark.case_observation
+
+    def broken(*positional, **keywords):
+        observation = builder(*positional, **keywords)
+        observation["cases"][0]["confirmed_fact_ids"] = ["ghost-fact"]
+        return observation
+
+    monkeypatch.setattr(case_benchmark, "case_observation", broken)
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code == 1
+    assert not output.exists()
+    assert [p.name for p in tmp_path.glob("*.partial")] == []
+
+
+def test_g3_t14_a_valid_export_is_published_and_readable(tmp_path):
+    args = export_documents(tmp_path, scenario())
+    output = tmp_path / "result.json"
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code == 0, result.output
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["kind"] == "audit_case_observation"
+    assert payload["completed"] is True
+    assert payload["scores"]["candidate"]["recall"] == 1
+
+
+def test_g3_t15_the_command_has_no_stream_mode(tmp_path):
+    args = export_documents(tmp_path, scenario())
+    index = args.index("--output")
+    del args[index:index + 2]
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code != 0
+
+
+def test_g3_t16_the_same_input_produces_the_same_export():
+    first, *_ = export_candidate(scenario())
+    second, *_ = export_candidate(scenario())
+    volatile = {"observed_at"}
+    assert {k: v for k, v in first.items() if k not in volatile} == \
+           {k: v for k, v in second.items() if k not in volatile}
+
+
+def test_g3_t08_cli_refuses_an_incomplete_export_without_permission(tmp_path):
+    args = export_documents(tmp_path, blocked_run())
+    output = tmp_path / "result.json"
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code == 1
+    assert not output.exists()
+
+
+def test_g3_t09_cli_publishes_an_explicitly_permitted_incomplete_export(tmp_path):
+    args = export_documents(tmp_path, blocked_run())
+    args.append("--allow-incomplete")
+    output = tmp_path / "result.json"
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code == 0, result.output
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["completed"] is False
+    assert payload["blockers"] == ["worker routing failed"]
+
+
+def test_audit_case_export_preserves_existing_schema():
+    observation, *_ = export_candidate(scenario())
+    assert set(observation) == CASE_EXPORT_KEYS
+    assert all(set(row) == CASE_EXPORT_ROW_KEYS for row in observation["cases"])
+
+
+def test_g3_ex09_the_export_boundary_needs_no_node_runtime():
+    import inspect
+
+    source = inspect.getsource(case_benchmark)
+    assert "subprocess" not in source
+    server = Path(case_benchmark.__file__).resolve().parents[2] / "server"
+    for path in server.rglob("*.py"):
+        assert "case_benchmark" not in path.read_text(encoding="utf-8")
+
+
+def test_g3_publication_is_atomic_and_never_overwrites(tmp_path):
+    observation, *_ = export_candidate(scenario())
+    output = tmp_path / "result.json"
+    publish_case_export(observation, output)
+    original = output.read_bytes()
+    with pytest.raises(FileExistsError):
+        publish_case_export(observation, output)
+    assert output.read_bytes() == original
+    assert [p.name for p in tmp_path.glob("*.partial")] == []
+
+
+# --- G3-T17..G3-T20: the publication boundary is exclusive, not just atomic ---
+# A replace is atomic but not exclusive: a target created between the check
+# and the publish would be clobbered.  The publication therefore creates the
+# target with an atomic exclusive link.
+
+
+def test_export_concurrent_publish_only_one_succeeds(tmp_path):
+    first, *_ = export_candidate(scenario())
+    second, *_ = export_candidate(scenario())
+    second["observed_at"] = "2026-01-01T00:00:00+00:00"
+    output = tmp_path / "result.json"
+    results: list[str] = []
+    barrier = threading.Barrier(2)
+
+    def publish(observation):
+        barrier.wait()
+        try:
+            publish_case_export(observation, output)
+            results.append("ok")
+        except FileExistsError:
+            results.append("exists")
+
+    workers = [threading.Thread(target=publish, args=(first,)),
+               threading.Thread(target=publish, args=(second,))]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+
+    assert sorted(results) == ["exists", "ok"]
+    published = json.loads(output.read_text(encoding="utf-8"))
+    assert published["observed_at"] in {first["observed_at"], second["observed_at"]}
+    assert [p.name for p in tmp_path.glob("*.partial")] == []
+
+
+def test_export_concurrent_target_creation_is_not_overwritten(tmp_path):
+    observation, *_ = export_candidate(scenario())
+    output = tmp_path / "result.json"
+    output.write_text("written by another writer", encoding="utf-8")
+    original = output.read_bytes()
+    with pytest.raises(FileExistsError):
+        publish_case_export(observation, output)
+    assert output.read_bytes() == original
+    assert [p.name for p in tmp_path.glob("*.partial")] == []
+
+
+def test_export_publish_failure_cleans_up_temporary_files(tmp_path):
+    observation, *_ = export_candidate(scenario())
+    output = tmp_path / "result.json"
+    output.write_text("occupied", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        publish_case_export(observation, output)
+    assert list(tmp_path.glob("*.partial")) == []
+
+
+def test_export_published_content_is_complete(tmp_path):
+    observation, *_ = export_candidate(scenario())
+    output = tmp_path / "result.json"
+    publish_case_export(observation, output)
+    assert json.loads(output.read_text(encoding="utf-8")) == observation
+
+
+def test_export_publication_fails_closed_without_hard_link_support(tmp_path, monkeypatch):
+    observation, *_ = export_candidate(scenario())
+    output = tmp_path / "result.json"
+
+    def unsupported(*args, **kwargs):
+        raise OSError(errno.EPERM, "operation not permitted")
+
+    monkeypatch.setattr("linen.dispatcher.analysis.case_benchmark.os.link", unsupported)
+    with pytest.raises(ExportPublishError):
+        publish_case_export(observation, output)
+    assert not output.exists()
+    assert list(tmp_path.glob("*.partial")) == []
