@@ -52,10 +52,14 @@ def extract_ordinary_block(text: str, class_name: str) -> str | None:
     """Return the verbatim block for one ordinary attack class.
 
     Blocks run from their ``**Name** (`` header to the next ordinary header
-    or the next ``####`` section. Matching is case-insensitive on the name.
+    or the next ``####`` section.  The last block of the file has no
+    following header, so it runs to the end of the file; without that
+    fallback the final ordinary class could never be selected.
+    Matching is case-insensitive on the name.
     """
     pattern = re.compile(
-        r"^\*\*" + re.escape(class_name) + r"\*\* \(.*?(?=^\*\*[A-Z][A-Za-z /-]+\*\* \(|^\#{3,4} )",
+        r"^\*\*" + re.escape(class_name) + r"\*\* \(.*?"
+        r"(?=^\*\*[A-Z][A-Za-z /-]+\*\* \(|^\#{3,4} |\Z)",
         re.MULTILINE | re.DOTALL | re.IGNORECASE,
     )
     match = pattern.search(text)
