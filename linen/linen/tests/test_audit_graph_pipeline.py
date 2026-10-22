@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,7 +11,7 @@ from click.testing import CliRunner
 
 from test_audit_pipeline import FakeDriver, api, config, project
 from linen.cli import main
-from linen.dispatcher.analysis import audit_graph, coverage, recon, scope_gate
+from linen.dispatcher.analysis import audit_graph, coverage, recon, scope_gate, skill_findings
 from linen.dispatcher.analysis.benchmark import compare_strategies, evaluate
 from linen.dispatcher.config import (
     AuditConfig,
@@ -739,3 +740,64 @@ def test_audit_summary_blocks_unconfirmed_candidate_without_dynamic_evidence(tmp
     board = _chain_board(promoted=True)
     assert not audit_graph._dynamic_evidence_complete(board, "f-vuln")
     assert audit_graph.audit_summary_inputs(board, tmp_path, cfg) is None
+
+
+# --- E41: the authority boundary for coverage observations ------------------
+# A structurally valid model coverage unit may claim it covered a boundary.
+# That claim is a non-authoritative audit observation: it must not become a
+# confirmed finding and must not satisfy the coverage-complete attestation.
+
+
+def _covered_coverage_unit_fact() -> Fact:
+    """A model coverage unit that claims the boundary is covered."""
+
+    return Fact(
+        id="f-cov-covered",
+        description="hunter claims POST /x is covered",
+        type="coverage_unit",
+        semantic_type="coverage_unit",
+        proof=ProofPayload(
+            claim_kind="coverage_unit",
+            subject_ids=["f-df1"],
+            attributes={"coverage_unit": {
+                "coverage_id": "POST%20%2Fx::anon%3Edb::api::injection",
+                "state": "covered",
+                "surface": "POST /x",
+                "boundary": "anon->db",
+                "subsystem": "api",
+                "attack_class": "injection",
+            }},
+        ),
+    )
+
+
+def test_coverage_observation_does_not_confirm_finding(tmp_path):
+    """E41: the confirmation authority is unchanged by a coverage observation."""
+
+    cfg = _audit_config(tmp_path)
+    plain = _chain_board(promoted=True)
+    with_coverage = _chain_board(promoted=True)
+    with_coverage.facts.append(_covered_coverage_unit_fact())
+
+    # The attestation gate reacts to the coverage observation in no way.
+    assert audit_graph.audit_summary_inputs(with_coverage, tmp_path, cfg) == \
+           audit_graph.audit_summary_inputs(plain, tmp_path, cfg)
+
+    # The unit never becomes a finding record and never confirms anything.
+    assert skill_findings.collect_finding_records(with_coverage) == []
+    assert not [fact for fact in with_coverage.facts
+                if fact.semantic_type == "confirmed_finding"]
+
+    # The covered unit only removes itself from the hunt queue; the critic
+    # wave remains, because coverage is still a non-authoritative observation.
+    config = SimpleNamespace(
+        skill_driven=SimpleNamespace(
+            enabled=True,
+            coverage_seeds=[SimpleNamespace(
+                coverage_id="POST%20%2Fx::anon%3Edb::api::injection",
+                surface="POST /x", boundary="anon->db", subsystem="api",
+                attack_class="injection", starting_paths=["app.py"])],
+            max_bounces=2, max_candidates_per_wave=8))
+    proposals = audit_graph._skill_driven_proposals(with_coverage, config, limit=8)
+    assert all(proposal["type"] != "hunt" for proposal in proposals)
+    assert any(proposal["type"] == "coverage-critic" for proposal in proposals)

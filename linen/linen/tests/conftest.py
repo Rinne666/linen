@@ -74,6 +74,48 @@ def make_intent(intent_id: str = "i001") -> Intent:
     )
 
 
+def make_cf_check(**overrides: object) -> dict:
+    """Build one structurally valid coverage check (CF-S1-A six-field contract)."""
+
+    check: dict = {
+        "agent_id": "hunter-e",
+        "reviewed_paths": ["src/app.py"],
+        "invariant": "Tenant identity must be checked before access",
+        "method": "source",
+        "result": "The authorization guard rejects mismatched tenants",
+        "artifact": None,
+    }
+    check.update(overrides)
+    return check
+
+
+def make_cf_unit(**overrides: object) -> dict:
+    """Build one coverage unit whose checks satisfy the CF-S1-A contract."""
+
+    unit: dict = {
+        "coverage_id": "cov-0001",
+        "disposition": "covered",
+        "reviewed_paths": ["src/app.py"],
+        "checks": [make_cf_check()],
+    }
+    unit.update(overrides)
+    return unit
+
+
+def make_cf_hunt_payload(*units: dict) -> dict:
+    """Build a hunter payload envelope around the given coverage units."""
+
+    return {
+        "accepted": True,
+        "data": {
+            "units": list(units) if units else [make_cf_unit()],
+            "candidates": [],
+            "hardening": [],
+            "uncovered": [],
+        },
+    }
+
+
 class FakeLease:
     def __init__(self) -> None:
         self.failure = None

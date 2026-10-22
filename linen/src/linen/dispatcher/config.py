@@ -10,6 +10,8 @@ from urllib.parse import urlparse
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from linen.contracts.common import cf_canonical_coverage_id, cf_is_legacy_coverage_id
+
 
 TaskType = Literal["reason", "explore", "review", "hunt", "verify_candidate", "critic", "verify_record"]
 WorkerType = Literal["claudecode", "codex", "pi", "mock"]
@@ -418,16 +420,45 @@ class OracleConfig(BaseModel):
 
 
 class CoverageUnitSeed(BaseModel):
-    """Operator-declared initial coverage unit (CF Phase-1 output stand-in)."""
+    """Operator-declared initial coverage unit (CF Phase-1 output stand-in).
+
+    The four descriptive dimensions are the source of truth; ``coverage_id`` is
+    derived from them (N1).  A hand-written id is accepted only when it equals
+    the derived canonical id, and the retired ``cov-<n>`` scheme is rejected as
+    an active id (D-017).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    coverage_id: str = Field(min_length=4, max_length=64, pattern=r"^cov-[0-9a-z-]+$")
+    coverage_id: str | None = Field(default=None, max_length=2048)
     surface: str = Field(min_length=1, max_length=300)
     boundary: str = Field(min_length=1, max_length=300)
     subsystem: str = Field(min_length=1, max_length=200)
     attack_class: str = Field(min_length=1, max_length=60)
     starting_paths: list[str] = Field(default_factory=list, max_length=40)
+
+    @model_validator(mode="after")
+    def derive_coverage_id(self) -> "CoverageUnitSeed":
+        expected = cf_canonical_coverage_id({
+            "surface": self.surface,
+            "boundary": self.boundary,
+            "subsystem": self.subsystem,
+            "attack_class": self.attack_class,
+        })
+        if self.coverage_id is None:
+            self.coverage_id = expected
+            return self
+        if cf_is_legacy_coverage_id(self.coverage_id):
+            raise ValueError(
+                "coverage_id must be a canonical id; the retired cov-<n> scheme is "
+                "read-only through an explicit alias map (D-017)"
+            )
+        if self.coverage_id != expected:
+            raise ValueError(
+                "coverage_id must equal the canonical id derived from the four "
+                f"dimensions: {expected!r}"
+            )
+        return self
 
 
 class SkillDrivenAuditConfig(BaseModel):

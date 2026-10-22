@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import make_cf_hunt_payload, make_cf_unit
 from linen.contracts.skill_audit import CoverageUnit, NeedsValidationRecord, parse_finding_record
 from linen.dispatcher.analysis import skill_findings
 from linen.dispatcher.analysis.skill_prompts import (
@@ -26,7 +27,7 @@ from linen.dispatcher.contracts import (
     validate_skill_verifier_payload,
 )
 
-UPSTREAM = Path(".linen-runtime/cf-security-audit-skill/skills/security-audit")
+UPSTREAM = default_skill_dir()
 
 
 def _needs_validation_record() -> dict:
@@ -100,20 +101,24 @@ def test_hunter_prompt_carries_verbatim_blocks() -> None:
 # --- payload validators ------------------------------------------------------
 
 def test_hunt_payload_validates_units_and_rejects_duplicate_ids() -> None:
-    payload = {"accepted": True, "data": {
-        "units": [{"coverage_id": "cov-0001", "disposition": "covered",
-                   "reviewed_paths": ["app.py"], "checks": [{"agent_id": "w1"}]}],
-        "candidates": [], "hardening": [], "uncovered": [],
-    }}
+    payload = make_cf_hunt_payload(make_cf_unit())
     kind, data = validate_hunt_payload(payload)
     assert kind == "hunt"
     assert data["units"][0]["coverage_id"] == "cov-0001"
-    dup = {"accepted": True, "data": {"units": [
-        {"coverage_id": "cov-1", "disposition": "covered", "reviewed_paths": ["a"], "checks": [{}]},
-        {"coverage_id": "cov-1", "disposition": "covered", "reviewed_paths": ["a"], "checks": [{}]},
-    ]}}
+    dup = make_cf_hunt_payload(
+        make_cf_unit(coverage_id="cov-1"),
+        make_cf_unit(coverage_id="cov-1"),
+    )
     with pytest.raises(ValueError, match="more than once"):
         validate_hunt_payload(dup)
+
+
+def test_hunt_payload_rejects_malformed_check_elements() -> None:
+    """An empty check object must be rejected, not accepted as evidence."""
+
+    payload = make_cf_hunt_payload(make_cf_unit(checks=[{}]))
+    with pytest.raises(ValueError, match="missing required field"):
+        validate_hunt_payload(payload)
 
 
 def test_verifier_payload_requires_matching_fingerprint() -> None:

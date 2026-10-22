@@ -25,10 +25,13 @@ from linen.contracts.skill_audit import (
     RejectedRecord,
     parse_finding_record,
 )
-
-UPSTREAM_VALIDATOR = Path(
-    ".linen-runtime/cf-security-audit-skill/skills/security-audit/validate-findings.cjs"
+from linen.dispatcher.analysis.cf_skill_assets import (
+    VALIDATE_FINDINGS,
+    cf_skill_file,
+    validator_command,
 )
+
+UPSTREAM_VALIDATOR = cf_skill_file(VALIDATE_FINDINGS)
 
 
 def _trace() -> list[dict]:
@@ -158,7 +161,6 @@ def test_overall_severity_cannot_exceed_impact() -> None:
 
 def test_coverage_unit_deferred_requires_reason() -> None:
     base = {
-        "coverage_id": "cov-0001",
         "surface": "POST /benchmark/sqli-00/BenchmarkTest00099",
         "boundary": "anonymous HTTP -> SQLite",
         "attack_class": "injection",
@@ -177,7 +179,6 @@ def test_coverage_unit_deferred_requires_reason() -> None:
 
 def test_coverage_unit_state_evidence_pairs() -> None:
     base = {
-        "coverage_id": "cov-0002",
         "surface": "GET /x",
         "boundary": "anonymous -> fs",
         "attack_class": "injection",
@@ -203,6 +204,7 @@ def test_records_pass_upstream_validator_unchanged() -> None:
         json.dump(records, handle, ensure_ascii=False)
         path = handle.name
     result = subprocess.run(
-        ["node", str(UPSTREAM_VALIDATOR), path], capture_output=True, text=True, timeout=30,
+        validator_command(UPSTREAM_VALIDATOR, Path(path)),
+        capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr

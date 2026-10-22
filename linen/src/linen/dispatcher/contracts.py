@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Collection, Mapping
 
 from linen.contracts import ContextRequest, ReasonWait
+from linen.contracts import common
 from linen.contracts.skill_audit import parse_finding_record
 from linen.dispatcher.output_parser import extract_json_object
 from linen.server.models import REVIEW_DIAGNOSTIC_FIELDS
@@ -356,6 +357,126 @@ def validate_review_payload(
 # --- skill-driven audit mode (docs/skills/skill-driven-mode.md) -------------
 
 
+# --- upstream-compatible coverage check contract (CF-S1-A) --------------------
+# The upstream-equivalent primitives live in linen.contracts.common, because the
+# coverage identity layer (CF-S1-B) must derive ids with exactly the same rules
+# this contract layer uses to admit model output.  Equivalence here means "same
+# accept / reject decision as the pinned Node validator", including its Unicode
+# handling.
+#
+# These primitives are intentionally *not* the same contract as
+# linen.contracts.common.validate_workspace_relative_path, whose weaker
+# semantics (backslash normalisation, tolerated "." segments, tolerated drive
+# letters) are not upstream-compatible.
+
+CF_MAX_LIST_ITEMS = common.CF_MAX_LIST_ITEMS
+CF_MAX_TEXT_LENGTH = common.CF_MAX_TEXT_LENGTH
+
+CF_ADMISSION_ACCEPTED = "accepted"
+CF_ADMISSION_REJECTED = "rejected"
+CF_ADMISSION_INCOMPLETE = "incomplete"
+
+CF_INCOMPLETE_MISSING_LOCAL_ARTIFACT = "missing_local_artifact"
+CF_INCOMPLETE_ARTIFACT_PROMOTION_FAILED = "artifact_promotion_failed"
+CF_INCOMPLETE_ARTIFACT_NOT_VERIFIED = "artifact_not_verified"
+CF_INCOMPLETE_ASSIGNMENT_UNAVAILABLE = "assignment_unavailable"
+
+CF_ARTIFACT_VERIFIED = "verified"
+CF_ARTIFACT_NOT_VERIFIED = "not_verified"
+CF_ARTIFACT_PROMOTION_FAILED = "promotion_failed"
+
+_cf_js_trim = common.cf_js_trim
+_cf_utf16_length = common.cf_utf16_length
+_cf_has_forbidden_path_character = common.cf_has_forbidden_path_character
+_cf_has_visible_character = common.cf_has_visible_character
+_cf_is_visible_text = common.cf_is_visible_text
+_cf_is_safe_relative_path = common.cf_is_safe_relative_path
+_cf_is_safe_agent_id = common.cf_is_safe_agent_id
+_cf_is_owned_artifact_path = common.cf_is_owned_artifact_path
+
+_CF_CHECK_REQUIRED_FIELDS = (
+    "agent_id",
+    "reviewed_paths",
+    "invariant",
+    "method",
+    "result",
+    "artifact",
+)
+
+
+def _cf_validate_path_array(value: list[Any], *, location: str) -> None:
+    if len(value) > CF_MAX_LIST_ITEMS:
+        raise ValueError(f"{location}: exceeds {CF_MAX_LIST_ITEMS} entries")
+    seen: set[str] = set()
+    for index, entry in enumerate(value):
+        if not _cf_is_safe_relative_path(entry):
+            raise ValueError(f"{location}[{index}]: invalid repository-relative path")
+        if entry in seen:
+            raise ValueError(f"{location}[{index}]: duplicate entry")
+        seen.add(entry)
+
+
+def _cf_validate_check(check: object, *, location: str) -> None:
+    """Validate one coverage check against the pinned upstream contract."""
+
+    if not isinstance(check, dict):
+        raise ValueError(f"{location}: expected object")
+    for field in _CF_CHECK_REQUIRED_FIELDS:
+        if field not in check:
+            raise ValueError(f"{location}: missing required field {field}")
+    agent_id = check["agent_id"]
+    if not _cf_is_safe_agent_id(agent_id):
+        raise ValueError(f"{location}.agent_id: expected a canonical lowercase agent ID")
+    reviewed_paths = check["reviewed_paths"]
+    if not isinstance(reviewed_paths, list):
+        raise ValueError(f"{location}.reviewed_paths: expected array")
+    if not reviewed_paths:
+        raise ValueError(f"{location}.reviewed_paths: must not be empty")
+    _cf_validate_path_array(reviewed_paths, location=f"{location}.reviewed_paths")
+    if not _cf_is_visible_text(check["invariant"]):
+        raise ValueError(f"{location}.invariant: invalid text")
+    method = check["method"]
+    if method not in {"source", "local"}:
+        raise ValueError(f'{location}.method: expected "source" or "local"')
+    if not _cf_is_visible_text(check["result"]):
+        raise ValueError(f"{location}.result: invalid text")
+    artifact = check["artifact"]
+    if method == "source":
+        if artifact is not None:
+            raise ValueError(f"{location}.artifact: source-only check must use null")
+    elif not _cf_is_owned_artifact_path(artifact, agent_id):
+        raise ValueError(
+            f"{location}.artifact: local check requires an artifact owned by agent {agent_id}"
+        )
+
+
+def _cf_validate_reviewed_path_ownership(
+    unit_reviewed_paths: list[Any],
+    checks: list[Any],
+    *,
+    location: str,
+) -> None:
+    """Upstream validateReviewedPathOwnership: unit paths equal the check union."""
+
+    aggregate = {path for path in unit_reviewed_paths if isinstance(path, str)}
+    owned: set[str] = set()
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        reviewed_paths = check.get("reviewed_paths")
+        if not isinstance(reviewed_paths, list):
+            continue
+        for path in reviewed_paths:
+            if isinstance(path, str):
+                owned.add(path)
+    for path in sorted(aggregate - owned):
+        raise ValueError(f"{location}.reviewed_paths: {path!r} has no check owner")
+    for path in sorted(owned - aggregate):
+        raise ValueError(
+            f"{location}.checks: owned path {path!r} is absent from aggregate reviewed_paths"
+        )
+
+
 def validate_hunt_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
     """Validate a hunter's structured result (HUNTING.md contract, linen envelope).
 
@@ -393,8 +514,22 @@ def validate_hunt_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any] 
             )
         if not isinstance(unit.get("reviewed_paths"), list) or not unit["reviewed_paths"]:
             raise ValueError(f"unit {cid}: reviewed_paths must be a non-empty array")
-        if not isinstance(unit.get("checks"), list) or not unit["checks"]:
+        _cf_validate_path_array(
+            unit["reviewed_paths"],
+            location=f"units[{i}].reviewed_paths",
+        )
+        checks = unit.get("checks")
+        if not isinstance(checks, list) or not checks:
             raise ValueError(f"unit {cid}: checks must be a non-empty array")
+        if len(checks) > CF_MAX_LIST_ITEMS:
+            raise ValueError(f"unit {cid}: checks exceeds {CF_MAX_LIST_ITEMS} entries")
+        for index, check in enumerate(checks):
+            _cf_validate_check(check, location=f"units[{i}].checks[{index}]")
+        _cf_validate_reviewed_path_ownership(
+            unit["reviewed_paths"],
+            checks,
+            location=f"units[{i}]",
+        )
     candidates = data.get("candidates", [])
     if not isinstance(candidates, list):
         raise ValueError("hunt data.candidates must be an array when provided")
@@ -410,6 +545,73 @@ def validate_hunt_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any] 
         "hardening": hardening,
         "uncovered": uncovered,
     }
+
+
+def admit_hunt_payload(
+    payload: dict[str, Any],
+    *,
+    verified_artifacts: Mapping[str, str] | None = None,
+    known_agent_ids: Collection[str] | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Trusted admission layer for a hunter payload (CF-S1-A).
+
+    ``validate_hunt_payload`` has already decided that the payload is
+    structurally valid.  This layer judges only whether the recorded evidence
+    is *ready*, and it fails closed:
+
+    * a check whose owner is not bound to a trusted assignment is never
+      treated as trusted evidence (``assignment_unavailable``);
+    * a local check whose artifact is missing, unpromoted or unverified is
+      reported as ``incomplete`` with a machine-readable reason code.
+
+    The model's own ``method`` and ``artifact`` values are never rewritten and
+    ``disposition`` is never extended, so a missing local artifact can never
+    silently downgrade into a source check.
+
+    ``verified_artifacts`` maps an artifact path to one of ``verified``,
+    ``not_verified`` or ``promotion_failed``; ``known_agent_ids`` is the set of
+    agent ids a trusted dispatcher actually assigned.  ``None`` means "no
+    trusted registry is available", which fails closed.
+    """
+
+    kind, data = validate_hunt_payload(payload)
+    if kind != "hunt" or data is None:
+        return CF_ADMISSION_REJECTED, None
+
+    artifacts = verified_artifacts or {}
+    reasons: list[str] = []
+    per_unit: list[dict[str, Any]] = []
+    for unit in data["units"]:
+        unit_reasons: list[str] = []
+        for check in unit.get("checks", []):
+            agent_id = check.get("agent_id")
+            if known_agent_ids is None or agent_id not in known_agent_ids:
+                unit_reasons.append(CF_INCOMPLETE_ASSIGNMENT_UNAVAILABLE)
+            if check.get("method") != "local":
+                continue
+            artifact_state = artifacts.get(check.get("artifact"))
+            if artifact_state is None:
+                unit_reasons.append(CF_INCOMPLETE_MISSING_LOCAL_ARTIFACT)
+            elif artifact_state == CF_ARTIFACT_PROMOTION_FAILED:
+                unit_reasons.append(CF_INCOMPLETE_ARTIFACT_PROMOTION_FAILED)
+            elif artifact_state != CF_ARTIFACT_VERIFIED:
+                unit_reasons.append(CF_INCOMPLETE_ARTIFACT_NOT_VERIFIED)
+        unique = sorted(set(unit_reasons))
+        reasons.extend(unique)
+        per_unit.append({
+            "coverage_id": unit.get("coverage_id"),
+            "state": CF_ADMISSION_INCOMPLETE if unique else CF_ADMISSION_ACCEPTED,
+            "reason_codes": unique,
+        })
+
+    overall = CF_ADMISSION_INCOMPLETE if reasons else CF_ADMISSION_ACCEPTED
+    admitted = dict(data)
+    admitted["admission"] = {
+        "state": overall,
+        "reason_codes": sorted(set(reasons)),
+        "units": per_unit,
+    }
+    return overall, admitted
 
 
 def validate_skill_verifier_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:

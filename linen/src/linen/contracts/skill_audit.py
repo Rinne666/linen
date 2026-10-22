@@ -17,7 +17,11 @@ from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from .common import ContractModel
+from .common import (
+    ContractModel,
+    cf_canonical_coverage_id,
+    cf_is_legacy_coverage_id,
+)
 
 Verdict = Literal["confirmed", "needs_validation", "rejected"]
 AttackClass = Literal[
@@ -226,7 +230,7 @@ def parse_finding_record(data: dict) -> FindingRecord:
 class CoverageUnit(ContractModel):
     """One deterministic audit unit: surface x boundary x attack class."""
 
-    coverage_id: str = Field(min_length=4, max_length=64, pattern=r"^cov-[0-9a-z-]+$")
+    coverage_id: str | None = Field(default=None, max_length=2048)
     state: CoverageUnitState = "planned"
     surface: str = Field(min_length=1, max_length=300)
     boundary: str = Field(min_length=1, max_length=300)
@@ -239,6 +243,40 @@ class CoverageUnit(ContractModel):
     unresolved: list[str] = Field(default_factory=list, max_length=50)
     deferred_reason: str | None = Field(default=None, max_length=1000)
     wave: int = Field(default=1, ge=1, le=50)
+
+    @model_validator(mode="before")
+    @classmethod
+    def derive_coverage_id(cls, data: Any) -> Any:
+        """Derive the canonical coverage id from the four descriptive dimensions.
+
+        The four dimensions are the source of truth (N1): a hand-written id is
+        accepted only when it equals the derived canonical id, and the retired
+        ``cov-<n>`` scheme is rejected as an active id (D-017).
+        """
+
+        if not isinstance(data, dict):
+            return data
+        refs = {
+            field: data.get(field)
+            for field in ("surface", "boundary", "subsystem", "attack_class")
+        }
+        if not all(isinstance(value, str) and value for value in refs.values()):
+            return data
+        expected = cf_canonical_coverage_id(refs)
+        provided = data.get("coverage_id")
+        if provided is None:
+            return {**data, "coverage_id": expected}
+        if cf_is_legacy_coverage_id(provided):
+            raise ValueError(
+                "coverage_id must be a canonical id; the retired cov-<n> scheme is "
+                "read-only through an explicit alias map (D-017)"
+            )
+        if provided != expected:
+            raise ValueError(
+                "coverage_id must equal the canonical id derived from the four "
+                f"dimensions: {expected!r}"
+            )
+        return data
 
     @field_validator("starting_paths", "reviewed_paths")
     @classmethod

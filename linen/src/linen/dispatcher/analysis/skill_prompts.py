@@ -5,10 +5,11 @@ Adapted from cloudflare/security-audit-skill @ c1c8a8c:
   ("Do not send block or companion names alone" — HUNTING.md prompt part 4);
 - the core hunting method is copied verbatim into every hunter prompt.
 
-The vendored skill lives outside the package (see
-``.linen-runtime/cf-security-audit-skill/PROVENANCE``); a missing copy is a
-configuration error for skill_driven audits, not something to silently
-downgrade: the hunter prompt would lose its verbatim blocks.
+The vendored skill ships inside the package
+(``linen/third_party/cloudflare_security_audit_skill``); its location is
+resolved from the installed package, never from the working directory. A
+missing copy is a configuration error for skill_driven audits, not something
+to silently downgrade: the hunter prompt would lose its verbatim blocks.
 """
 
 from __future__ import annotations
@@ -16,10 +17,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from linen.dispatcher.analysis.cf_skill_assets import (
+    ATTACK_CLASSES,
+    HUNTING,
+    cf_skill_dir,
+)
 from linen.dispatcher.prompting import load_prompt, render_prompt
-
-VENDORED_SKILL_ENV = "LINEN_CF_SKILL_DIR"
-DEFAULT_VENDORED_SKILL_DIR = Path(".linen-runtime/cf-security-audit-skill/skills/security-audit")
 
 # Ordinary attack-class block headers in ATTACK-CLASSES.md, e.g.
 # "**Injection** (subagent_type: `general`)". Companion files use
@@ -31,8 +34,14 @@ _CORE_METHOD_HEADER = "#### Core hunting method — include in every hunter prom
 
 
 def vendored_skill_dir(override: str | None = None) -> Path:
-    candidate = override or DEFAULT_VENDORED_SKILL_DIR
-    return Path(candidate)
+    """Return the directory of the pinned upstream snapshot.
+
+    ``override`` is only for tests that need a different copy; the runtime
+    always resolves the snapshot shipped inside the package.
+    """
+    if override:
+        return Path(override)
+    return cf_skill_dir()
 
 
 def _read(path: Path) -> str:
@@ -75,7 +84,7 @@ def extract_core_hunting_method(hunting_text: str) -> str:
 
 
 def load_attack_classes_block(class_name: str, skill_dir: Path) -> str:
-    text = _read(skill_dir / "ATTACK-CLASSES.md")
+    text = _read(skill_dir / ATTACK_CLASSES)
     block = extract_ordinary_block(text, class_name)
     if block is None:
         raise ValueError(
@@ -101,7 +110,7 @@ def assemble_hunter_prompt(
     template = load_prompt(prompt_group, "hunter.md")
     directory = skill_dir or vendored_skill_dir()
     method = core_hunting_method or extract_core_hunting_method(
-        _read(directory / "HUNTING.md")
+        _read(directory / HUNTING)
     )
     return render_prompt(template, {
         "repo_path": repo_path,
