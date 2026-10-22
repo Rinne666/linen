@@ -27,6 +27,7 @@ from linen.dispatcher.config import CoverageUnitSeed
 from linen.server import db
 from linen.server.app import app
 from linen.server.skill_coverage import (
+    DEFAULT_REGISTRATION_POLICY,
     CoverageBaselineResolution,
     CoverageEventConflict,
     CoverageEventRejected,
@@ -1094,3 +1095,343 @@ def test_unit_registered_projection_rejects_invalid_payload(board):
         project_registered_units(
             [{**events[0], "payload": {**events[0]["payload"], "prior_status": "maybe"}}]
         )
+
+
+# --- E63: the audit history is not deletable through the normal paths -------
+
+
+def _plan_accepting_everything():
+    """A trusted plan resolver that trusts every coverage id.
+
+    It exists so the canonical identity check can be exercised on its own:
+    with a narrow plan the plan check answers first, and the reported reason
+    would be the plan instead of the identity.
+    """
+
+    def _resolve(*, project_id: str, run_id: str, coverage_id: str) -> bool:
+        return True
+
+    return _resolve
+
+
+def _install_trusted_policy(install_policy, *coverage_ids: str) -> None:
+    install_policy(
+        CoverageRegistrationPolicy(
+            enabled=True,
+            trusted_caller=True,
+            baseline_resolver=BaselineResolverDouble(),
+            plan_resolver=_plan(*coverage_ids),
+        )
+    )
+
+
+def test_project_with_skill_coverage_events_cannot_be_deleted(board, install_policy):
+    """E63: a project that owns append-only events is not deletable.
+
+    The refusal comes from the foreign key, not from a trigger: the ledger
+    references both the project and the run, and both references are NO
+    ACTION, so the delete is rejected by the database constraint layer.
+    """
+
+    seed = _seed()
+    _install_trusted_policy(install_policy, seed.coverage_id)
+    with TestClient(app) as http:
+        registered = http.post(
+            f"/projects/{PROJECT}/skill-coverage-events", json=_request_body(seed)
+        )
+        assert registered.status_code == 201
+
+        refused = http.delete(f"/projects/{PROJECT}")
+        assert refused.status_code == 409
+        assert refused.json()["detail"]["code"] == "PROJECT_HAS_COVERAGE_EVENTS"
+
+    with db.get_conn() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM projects WHERE id = ?", (PROJECT,)
+        ).fetchone() is not None
+        assert _count(conn) == 1
+
+
+def test_run_with_skill_coverage_events_cannot_be_deleted(board, install_policy):
+    """E63: the run that owns the history is not deletable either."""
+
+    seed = _seed()
+    _install_trusted_policy(install_policy, seed.coverage_id)
+    with TestClient(app) as http:
+        assert http.post(
+            f"/projects/{PROJECT}/skill-coverage-events", json=_request_body(seed)
+        ).status_code == 201
+
+    with db.get_conn() as conn:
+        with pytest.raises(sqlite3.IntegrityError) as excinfo:
+            conn.execute("DELETE FROM runs WHERE run_id = ?", (RUN,))
+        assert "FOREIGN KEY" in str(excinfo.value)
+
+    with db.get_conn() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM runs WHERE run_id = ?", (RUN,)
+        ).fetchone() is not None
+        assert _count(conn) == 1
+
+
+def test_project_without_skill_coverage_events_preserves_delete_behavior(board):
+    """E63: the delete behaviour only changes for projects that own history."""
+
+    with TestClient(app) as http:
+        assert http.delete(f"/projects/{OTHER_PROJECT}").status_code == 204
+        assert http.get(f"/projects/{OTHER_PROJECT}").status_code == 404
+
+    with db.get_conn() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM projects WHERE id = ?", (OTHER_PROJECT,)
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM runs WHERE run_id = ?", (FOREIGN_RUN,)
+        ).fetchone() is None
+
+
+# --- E64: the HTTP v1 contract is a frozen, documented interface -----------
+
+
+def test_skill_coverage_event_http_contract_status_codes(board, install_policy):
+    """E64: every documented status code and reason code is reachable."""
+
+    seed = _seed()
+    body = _request_body(seed)
+
+    # 503: production registration is switched off.
+    with TestClient(app) as http:
+        response = http.post(
+            f"/projects/{PROJECT}/skill-coverage-events", json=body
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "registration_disabled"
+
+    # 403: the caller is not an accepted writer.
+    install_policy(
+        CoverageRegistrationPolicy(
+            enabled=True,
+            trusted_caller=False,
+            baseline_resolver=BaselineResolverDouble(),
+            plan_resolver=_plan(seed.coverage_id),
+        )
+    )
+    with TestClient(app) as http:
+        response = http.post(
+            f"/projects/{PROJECT}/skill-coverage-events", json=body
+        )
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "untrusted_caller"
+
+    # 503: no trusted historical baseline is installed.
+    install_policy(
+        CoverageRegistrationPolicy(
+            enabled=True,
+            trusted_caller=True,
+            plan_resolver=_plan(seed.coverage_id),
+        )
+    )
+    with TestClient(app) as http:
+        response = http.post(
+            f"/projects/{PROJECT}/skill-coverage-events", json=body
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "trusted_baseline_unavailable"
+
+    # 422: the coverage unit is not part of the trusted plan.
+    _install_trusted_policy(install_policy, "some::other::coverage::unit")
+    with TestClient(app) as http:
+        response = http.post(
+            f"/projects/{PROJECT}/skill-coverage-events", json=body
+        )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "coverage_unit_not_in_plan"
+
+    # 404: the run does not belong to the project.
+    _install_trusted_policy(install_policy, seed.coverage_id)
+    with TestClient(app) as http:
+        response = http.post(
+            f"/projects/{PROJECT}/skill-coverage-events",
+            json={**body, "run_id": FOREIGN_RUN},
+        )
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "run_not_found"
+
+    # 422: the canonical identity does not hold.  The check order is frozen
+    # (v1.8 section 3.1): the trusted plan is consulted before the canonical
+    # identity, so the inconsistent id has to be planned for the internal
+    # contradiction to be the reported reason.
+    install_policy(
+        CoverageRegistrationPolicy(
+            enabled=True,
+            trusted_caller=True,
+            baseline_resolver=BaselineResolverDouble(),
+            plan_resolver=_plan_accepting_everything(),
+        )
+    )
+    with TestClient(app) as http:
+        response = http.post(
+            f"/projects/{PROJECT}/skill-coverage-events",
+            json={**body, "coverage_id": "not::the::derived::id"},
+        )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "coverage_event_rejected"
+
+    # 201: the first registration.
+    with TestClient(app) as http:
+        response = http.post(
+            f"/projects/{PROJECT}/skill-coverage-events", json=body
+        )
+    assert response.status_code == 201
+    first_event_id = response.json()["event_id"]
+
+    # 200: the same payload replays onto the original event.
+    with TestClient(app) as http:
+        response = http.post(
+            f"/projects/{PROJECT}/skill-coverage-events", json=body
+        )
+    assert response.status_code == 200
+    assert response.json()["event_id"] == first_event_id
+    assert response.json()["replayed"] is True
+
+    # 409: the same identity with a different payload.  The baseline is a
+    # server-side decision, so the only way to change the payload of the same
+    # coverage unit is to change what the trusted baseline resolves to.
+    install_policy(
+        CoverageRegistrationPolicy(
+            enabled=True,
+            trusted_caller=True,
+            baseline_resolver=BaselineResolverDouble(
+                ledger={seed.coverage_id: "new"}
+            ),
+            plan_resolver=_plan(seed.coverage_id),
+        )
+    )
+    with TestClient(app) as http:
+        response = http.post(
+            f"/projects/{PROJECT}/skill-coverage-events", json=body
+        )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "coverage_event_conflict"
+
+
+def test_skill_coverage_event_http_contract_rejects_extra_fields(board, install_policy):
+    """E64: the request model is closed; authority is never a request field."""
+
+    seed = _seed()
+    _install_trusted_policy(install_policy, seed.coverage_id)
+    body = _request_body(seed)
+
+    for field, value in (
+        ("prior_status", "none"),
+        ("baseline", {"kind": "no_compatible_ledger", "lookup_ref": "forged"}),
+        ("agent_id", "ag-w1-task-abcdef123456"),
+        ("wave", 1),
+        ("payload", {"prior_status": "none"}),
+    ):
+        with TestClient(app) as http:
+            response = http.post(
+                f"/projects/{PROJECT}/skill-coverage-events", json={**body, field: value}
+            )
+        assert response.status_code == 422, field
+
+    with db.get_conn() as conn:
+        assert _count(conn) == 0
+
+
+# --- E65: the production gate and the test injection stay separate ---------
+
+
+def test_skill_event_production_policy_remains_disabled(board):
+    """E65: a stock server has no writer, no plan and no baseline."""
+
+    assert DEFAULT_REGISTRATION_POLICY.enabled is False
+    assert DEFAULT_REGISTRATION_POLICY.trusted_caller is False
+    assert DEFAULT_REGISTRATION_POLICY.baseline_resolver is None
+    assert DEFAULT_REGISTRATION_POLICY.plan_resolver is None
+
+    with TestClient(app) as http:
+        assert not hasattr(app.state, "coverage_registration")
+        response = http.post(
+            f"/projects/{PROJECT}/skill-coverage-events", json=_request_body(_seed())
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "registration_disabled"
+
+
+def test_skill_event_test_provider_is_not_exposed_over_http(board, install_policy):
+    """E65: a test provider is not a public capability and does not persist."""
+
+    seed = _seed()
+    _install_trusted_policy(install_policy, seed.coverage_id)
+
+    with TestClient(app) as http:
+        response = http.post(
+            f"/projects/{PROJECT}/skill-coverage-events", json=_request_body(seed)
+        )
+    assert response.status_code == 201
+    # The provider identity never reaches the client.
+    assert "BaselineResolverDouble" not in response.text
+    assert "baseline_resolver" not in response.text
+    assert "plan_resolver" not in response.text
+    # And the published schema exposes no provider field either.
+    schema = app.openapi()
+    component = schema["components"]["schemas"]["SkillCoverageEventRequest"]
+    assert set(component["properties"]) == {
+        "run_id",
+        "event_type",
+        "payload_version",
+        "coverage_id",
+        "canonical_refs",
+    }
+
+    # A fresh process without the installed policy refuses again: the test
+    # injection cannot survive into a production-shaped process.
+    if hasattr(app.state, "coverage_registration"):
+        del app.state.coverage_registration
+    with TestClient(app) as http:
+        refused = http.post(
+            f"/projects/{PROJECT}/skill-coverage-events", json=_request_body(seed)
+        )
+    assert refused.status_code == 503
+    assert refused.json()["detail"]["code"] == "registration_disabled"
+
+
+# --- E66: the read side is scoped to one project ---------------------------
+
+
+def test_skill_coverage_projection_is_project_scoped(board, install_policy):
+    """E66: one project never sees another project's registration."""
+
+    seed = _seed()
+    _install_trusted_policy(install_policy, seed.coverage_id)
+    with TestClient(app) as http:
+        assert http.post(
+            f"/projects/{PROJECT}/skill-coverage-events", json=_request_body(seed)
+        ).status_code == 201
+
+        listed = http.get(
+            f"/projects/{PROJECT}/skill-coverage-events", params={"run_id": RUN}
+        )
+        assert listed.status_code == 200
+        assert len(listed.json()) == 1
+
+        # The same run id under another project exposes nothing.
+        scoped = http.get(
+            f"/projects/{OTHER_PROJECT}/skill-coverage-events",
+            params={"run_id": RUN},
+        )
+        assert scoped.status_code == 200
+        assert scoped.json() == []
+
+
+def test_skill_coverage_projection_rejects_unknown_project(board, install_policy):
+    """E66: an unknown project is refused instead of returning an empty view."""
+
+    _install_trusted_policy(install_policy, _seed().coverage_id)
+    with TestClient(app) as http:
+        response = http.get(
+            f"/projects/does-not-exist/skill-coverage-events", params={"run_id": RUN}
+        )
+    assert response.status_code == 404
+
