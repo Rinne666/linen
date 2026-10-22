@@ -539,5 +539,62 @@ CF-S2-B1  上游格式验证的生产导入边界       缺口 → 本片修复
 schema 合法不等于来源已核验）。原 30 条 B1 用例保留。
 
 
+## CF-S2-B1 P1-B 安全物化与引用项目隔离
+
+**PM v2.5 裁定**：P1-A 的**格式验证**通过，但**可信签发者准入**仍为 OPEN（D-056）；Q42 用**完整
+64 位 SHA-256** 作目录身份（D-053），Q43 共用不可变证明基础设施但**分表**（D-054），Q44 约定
+P1-B 完成后再统一做 P1-C（D-055）。阶段登记：
+
+```text
+CF-S2-B1  上游格式验证                      PASS
+CF-S2-B1  manifest 成员摘要逐项核对           PASS
+CF-S2-B1  安全物化 + 引用项目隔离             本片修复
+CF-S2-B1  验证凭据的可信签发者准入            OPEN → P1-C
+```
+
+**目录身份是内容摘要，不是名字**（D-053）。物化目录名为
+
+```text
+sha256(b"linen:baseline-materialization:v1\x00" + source_ref.encode("utf-8")).hexdigest()
+```
+
+的**完整 64 位**，取自**未经任何规范化**的 `source_ref`（不 trim、不折叠大小写、不改写路径分隔符）。
+因此 `a/b` 与 `a__b` 落在**两个**不同目录；旧实现用 `source_ref.replace("/", "__")` 会让两者
+落到同一目录。目录名**不承载业务语义**——`source_ref` 本来就存在 `BaselineSourceRecord` 里。
+
+**文件系统步骤全部相对已打开的目录，且从不跟随符号链接**（`server/baseline_materialization.py`）：
+
+- 每层目录用父目录描述符 `mkdir` + `O_DIRECTORY | O_NOFOLLOW` 打开；
+- 每个文件用目录描述符 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建——`O_EXCL` 保证不会覆盖既有
+  文件，也不会穿过一个已存在的符号链接；
+- **先 `resolve()` 再按路径写并不能阻止并发目录替换**，所以不这么做。
+
+**平台不支持时失败关闭，不静默退回弱保护**：没有 `O_NOFOLLOW` / `dir_fd` 的平台（Windows）
+**拒绝物化**并报明确原因，而不是退回到「先检查再写」。这与 D-001 一致（linen 只支持
+macOS/Linux）。Windows 上的相关用例**跳过**而不是假装通过。
+
+**幂等与失败清理**：
+
+| 场景 | 行为 |
+|---|---|
+| 同一来源重复物化 | 文件字节不变、artifact 行数不变（`register_artifact` 本身幂等） |
+| 已存在文件摘要不同 | **拒绝复用**，且**不覆盖**原文件 |
+| 中途写失败 | 删除本次创建的文件，**不登记**任何 artifact 行 |
+| 目标文件是符号链接 | 拒绝，不写入链接目标 |
+| 中间目录是符号链接 | 拒绝，不写入链接目标 |
+
+**引用读取必须带项目**（CR-T06）：`read_reference(conn, *, project_id, reference)` 与
+`referenced_manifest(conn, *, project_id, reference)` 现在**必须**传 `project_id`，查询条件带上
+`project_id`。理由：引用是**记录体**的摘要，而记录体里含 `project_id`，所以两个项目的引用
+本就不同；此前按 `lookup_ref` 全局查询，等于让一个项目读到另一个项目的历史。**没有保留任何
+无项目约束的兼容旁路**（原 4 处调用点已同步迁移）。
+
+**仍然 OPEN，不得当作已关闭**：
+
+- **D-056**：自摘要自洽 + 已在库中 + 自称来自 operator，**都不单独构成可信凭据**；
+  「登记只能经受控签发入口」尚未证明。P1-C 增补 CR-T07/08/09。
+- **D-052**：`closed=True` 仍只表示结构封闭；可信 lineage seal 属 B2-A。
+
+
 
 
