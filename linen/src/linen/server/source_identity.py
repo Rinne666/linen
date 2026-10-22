@@ -1,19 +1,31 @@
 """The trusted verification of a historical source identity (CF-S2-B2-A).
 
-A source identity is the answer to "which code was this coverage ledger
-produced from".  There are two honest ways to answer it, and this module
-implements both:
+There are **three** different things to verify, and this module keeps them
+apart (D-061):
 
-* a **git commit** - the commit has to exist as a commit object in a named
-  repository, the repository has to be the one the frozen snapshot was taken
-  from, and the worktree has to be clean.  A commit name that merely *looks*
-  right is not an answer: ``git rev-parse`` will happily echo a name that does
-  not exist, so the object itself is asked (``cat-file -t``), and unrecorded
-  working tree changes mean the files on disk are not the commit, so the
-  worktree has to be clean;
-* a **frozen snapshot digest** - the bytes are re-read and compared with the
-  digests that were registered, so the proof says "these are still the very
-  bytes that were imported" instead of naming a place that may have moved.
+``audit_artifact_bytes``
+    the bytes of the coverage ledger and of the run metadata are still the
+    bytes that were imported.  This says nothing about the code that produced
+    them, and it is therefore never a source identity.
+
+``audited_source_identity`` (git)
+    the audited code is a known revision: the commit exists as an object, the
+    checked out commit **is** that commit, the worktree carries no unrecorded
+    change, the repository identity (host *and* ``owner/repository``) is the
+    registered one, and the frozen source manifest of the historical run
+    matches that revision file by file.
+
+``audited_source_identity`` (non-git)
+    the audited code is a frozen snapshot: the trusted file manifest of the
+    historical run matches the supplied source tree file by file.
+
+Two things are deliberately **not** accepted any more:
+
+* a commit that merely *exists* in a repository - a clean worktree of another
+  revision proves nothing about the declared one, so the checked out commit
+  has to be the declared commit (D-060);
+* the digest of the ledger and the metadata as a stand-in for the digest of
+  the audited code - the ledger is the *result* of the audit, not its input.
 
 Everything here is an *observation*.  It becomes a trustworthy proof only when
 the controlled flow signs it and the server verifies that signature
@@ -27,18 +39,22 @@ the database.  It only observes the filesystem and the local git repository.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from linen.contracts.common import cf_payload_digest
+from linen.contracts.common import cf_canonical_json, cf_payload_digest
 
 #: A git object name is forty hex digits and nothing else.
 _GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 #: How long a git invocation may take before it is abandoned.
 _GIT_TIMEOUT_SECONDS = 30
+
+#: The file that carries the frozen source manifest of a historical run.
+SOURCE_MANIFEST_NAME = "source-manifest.json"
 
 
 class SourceIdentityVerificationFailed(ValueError):
@@ -50,10 +66,32 @@ class GitSourceIdentity:
     """What the local repository says about one commit."""
 
     repository_root: str
+    repository_host: str | None
+    repository_owner_repo: str | None
     commit: str
+    head_commit: str
     tree_sha: str
-    remote: str | None
     worktree_clean: bool
+
+
+@dataclass(frozen=True)
+class FrozenSourceManifest:
+    """The trusted list of the audited source files of one historical run."""
+
+    files: tuple[tuple[str, str], ...]
+
+    def digest(self) -> str:
+        """The digest of the manifest itself."""
+
+        return cf_payload_digest(
+            {
+                "files": [
+                    {"path": path, "sha256": sha}
+                    for path, sha in self.files
+                ],
+                "kind": "frozen-source-manifest",
+            }
+        )
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -81,23 +119,25 @@ def _git(repo: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
-def remote_owner_repo(remote: str) -> str | None:
-    """The ``owner/repository`` a git remote points at, if it says so.
+def repository_identity(remote: str) -> tuple[str | None, str | None]:
+    """The host and the ``owner/repository`` a git remote points at.
 
     The formats in the wild are ``https://host/owner/repo.git``,
-    ``git@host:owner/repo.git`` and ``ssh://git@host/owner/repo``.  All of them
-    name the same two path segments, which is what a frozen snapshot records
-    as its origin.
+    ``git@host:owner/repo.git`` and ``ssh://git@host/owner/repo``.  The host
+    is part of the identity: the same ``owner/repo`` on two different hosts is
+    two different repositories, and a proof may not pretend otherwise (R04).
     """
 
     text = (remote or "").strip().rstrip("/")
     if not text:
-        return None
+        return (None, None)
     if text.endswith(".git"):
         text = text[:-4]
+    host: str | None = None
     if "@" in text and ":" in text and not text.startswith(("http://", "https://")):
         # scp-like syntax: git@host:owner/repo
-        text = text.split(":", 1)[1]
+        head, _, text = text.partition(":")
+        host = head.split("@", 1)[-1].strip() or None
     else:
         for prefix in ("https://", "http://", "ssh://", "git://"):
             if text.startswith(prefix):
@@ -105,21 +145,25 @@ def remote_owner_repo(remote: str) -> str | None:
                 break
         if "@" in text.split("/", 1)[0]:
             text = text.split("/", 1)[1] if "/" in text else text
-        if "/" in text:
-            text = text.split("/", 1)[1]
-    parts = [part for part in text.split("/") if part]
-    if len(parts) == 2:
-        return f"{parts[0]}/{parts[1]}"
-    return None
+        parts = text.split("/", 1)
+        if len(parts) == 2:
+            host, text = parts[0].strip() or None, parts[1]
+        else:
+            host, text = None, text
+    segments = [part for part in text.split("/") if part]
+    if len(segments) != 2:
+        return (host, None)
+    return (host, f"{segments[0]}/{segments[1]}")
 
 
 def verify_git_source_identity(*, repo_root: Path, commit: str) -> GitSourceIdentity:
-    """Verify that one commit is a real commit of one real repository.
+    """Verify that one commit is the checked out revision of one repository.
 
-    The verification asks the repository four questions and refuses to answer
+    The verification asks the repository five questions and refuses to answer
     unless all of them have a good answer: does the repository exist, does the
-    commit exist *as a commit object*, does the commit resolve to itself, and
-    is the worktree free of changes that were never recorded.
+    commit exist *as a commit object*, is the **checked out** commit that very
+    commit, is the worktree free of changes that were never recorded, and can
+    the repository's identity be named at all.
     """
 
     name = (commit or "").strip().lower()
@@ -151,6 +195,14 @@ def verify_git_source_identity(*, repo_root: Path, commit: str) -> GitSourceIden
             f"{name} does not resolve to itself in {toplevel}"
         )
 
+    head = _git(root, "rev-parse", "HEAD").strip().lower()
+    if head != name:
+        raise SourceIdentityVerificationFailed(
+            f"the checked out revision of {toplevel} is {head}, not the declared "
+            f"commit {name}; a clean worktree of another revision says nothing "
+            "about the declared one"
+        )
+
     tree_sha = _git(root, "rev-parse", f"{name}^{{tree}}").strip().lower()
     if not _GIT_COMMIT_RE.fullmatch(tree_sha):
         raise SourceIdentityVerificationFailed(
@@ -167,27 +219,183 @@ def verify_git_source_identity(*, repo_root: Path, commit: str) -> GitSourceIden
         remote = _git(root, "remote", "get-url", "origin")
     except SourceIdentityVerificationFailed:
         remote = ""
+    host, owner_repo = repository_identity(remote)
 
     return GitSourceIdentity(
         repository_root=toplevel,
+        repository_host=host,
+        repository_owner_repo=owner_repo,
         commit=name,
+        head_commit=head,
         tree_sha=tree_sha,
-        remote=remote or None,
         worktree_clean=True,
     )
 
 
-def verify_frozen_source_digest(
+def _git_tree_entries(repo: Path, commit: str) -> dict[str, str]:
+    """The files of one commit, mapped to their git blob object names."""
+
+    entries: dict[str, str] = {}
+    listing = _git(repo, "ls-tree", "-r", "--full-tree", commit)
+    for line in listing.splitlines():
+        if not line.strip():
+            continue
+        meta, _, path = line.partition("\t")
+        fields = meta.split()
+        if len(fields) < 3 or fields[1] != "blob":
+            continue
+        entries[path.strip()] = fields[2].strip()
+    return entries
+
+
+def verify_git_source_snapshot(
+    *, repo_root: Path, commit: str, source_dir: Path
+) -> FrozenSourceManifest:
+    """Prove that a frozen source tree is exactly the tree of one commit.
+
+    Every file of the commit has to be present in the frozen tree with the
+    same content, and the frozen tree may not carry a file the commit does not
+    have.  The files are compared through their git blob object names, so the
+    comparison is the one git itself would make.
+    """
+
+    repo = Path(repo_root).expanduser()
+    tree = Path(source_dir).expanduser()
+    if not tree.is_dir():
+        raise SourceIdentityVerificationFailed(
+            f"the frozen source directory {tree} is not a directory"
+        )
+    entries = _git_tree_entries(repo, commit)
+    present: dict[str, str] = {}
+    for path in sorted(p for p in tree.rglob("*") if p.is_file()):
+        relative = path.relative_to(tree).as_posix()
+        present[relative] = _git(repo, "hash-object", str(path))
+
+    missing = sorted(set(entries) - set(present))
+    extra = sorted(set(present) - set(entries))
+    if missing:
+        raise SourceIdentityVerificationFailed(
+            f"the frozen source tree does not carry {missing[0]!r}, which the "
+            "commit has"
+        )
+    if extra:
+        raise SourceIdentityVerificationFailed(
+            f"the frozen source tree carries {extra[0]!r}, which the commit does "
+            "not have"
+        )
+    for relative, blob in entries.items():
+        if present[relative] != blob:
+            raise SourceIdentityVerificationFailed(
+                f"the frozen source file {relative!r} does not match the commit"
+            )
+    return FrozenSourceManifest(
+        files=tuple(
+            (relative, hashlib.sha256((tree / relative).read_bytes()).hexdigest())
+            for relative in sorted(entries)
+        )
+    )
+
+
+def read_frozen_source_manifest(path: Path) -> FrozenSourceManifest:
+    """Read the trusted file manifest of a frozen source snapshot."""
+
+    manifest_path = Path(path).expanduser()
+    if not manifest_path.is_file():
+        raise SourceIdentityVerificationFailed(
+            f"the frozen source manifest {manifest_path} is not a readable file"
+        )
+    return read_frozen_source_manifest_bytes(manifest_path.read_bytes())
+
+
+def read_frozen_source_manifest_bytes(raw: bytes) -> FrozenSourceManifest:
+    """Read the trusted file manifest of a frozen source snapshot from bytes."""
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SourceIdentityVerificationFailed(
+            "the frozen source manifest is not readable JSON"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
+        raise SourceIdentityVerificationFailed(
+            "the frozen source manifest does not carry a file list"
+        )
+    files: list[tuple[str, str]] = []
+    for entry in payload["files"]:
+        if not isinstance(entry, dict):
+            raise SourceIdentityVerificationFailed(
+                "the frozen source manifest carries a file that is not an object"
+            )
+        relative = str(entry.get("path") or "").strip().replace("\\", "/")
+        sha256 = str(entry.get("sha256") or "").strip().lower()
+        if not relative or relative.startswith("/") or ".." in relative.split("/"):
+            raise SourceIdentityVerificationFailed(
+                "the frozen source manifest names a file outside the snapshot"
+            )
+        if len(sha256) != 64 or any(char not in "0123456789abcdef" for char in sha256):
+            raise SourceIdentityVerificationFailed(
+                "the frozen source manifest names a file without a sha256 digest"
+            )
+        files.append((relative, sha256))
+    if len({path for path, _ in files}) != len(files):
+        raise SourceIdentityVerificationFailed(
+            "the frozen source manifest names the same file twice"
+        )
+    return FrozenSourceManifest(files=tuple(sorted(files)))
+
+
+def verify_frozen_source_manifest(
+    *, manifest: FrozenSourceManifest, source_dir: Path
+) -> FrozenSourceManifest:
+    """Prove that a source tree is exactly the frozen manifest it claims.
+
+    Every file of the manifest has to be present with the digest the manifest
+    gives it, and the tree may not carry a file the manifest does not name.
+    """
+
+    tree = Path(source_dir).expanduser()
+    if not tree.is_dir():
+        raise SourceIdentityVerificationFailed(
+            f"the frozen source directory {tree} is not a directory"
+        )
+    expected = dict(manifest.files)
+    present: dict[str, str] = {}
+    for path in sorted(p for p in tree.rglob("*") if p.is_file()):
+        relative = path.relative_to(tree).as_posix()
+        present[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    missing = sorted(set(expected) - set(present))
+    extra = sorted(set(present) - set(expected))
+    if missing:
+        raise SourceIdentityVerificationFailed(
+            f"the source tree does not carry {missing[0]!r}, which the frozen "
+            "manifest names"
+        )
+    if extra:
+        raise SourceIdentityVerificationFailed(
+            f"the source tree carries {extra[0]!r}, which the frozen manifest does "
+            "not name"
+        )
+    for relative, sha256 in expected.items():
+        if present[relative] != sha256:
+            raise SourceIdentityVerificationFailed(
+                f"the source file {relative!r} does not match the frozen manifest"
+            )
+    return manifest
+
+
+def verify_audit_artifact_bytes(
     *,
     ledger_path: Path,
     metadata_path: Path,
     ledger_sha256: str,
     metadata_sha256: str,
 ) -> str:
-    """Re-read the frozen bytes and prove that they are the registered ones.
+    """Re-read the audit artifacts and prove that they are the registered ones.
 
-    The returned digest is the identity of the frozen snapshot: it is derived
-    from the two registered digests, so it changes when either of them does.
+    The returned digest is the identity of the **audit artifacts** - the ledger
+    and the run metadata.  It is not the identity of the audited code, and it
+    may never be used as one (D-061).
     """
 
     for path, expected in (

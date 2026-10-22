@@ -55,6 +55,11 @@ from linen.server.baseline_validation_auth import (
     trusted_validation_auth,
 )
 from linen.server.services import utcnow
+from linen.server.source_identity import (
+    SOURCE_MANIFEST_NAME,
+    SourceIdentityVerificationFailed,
+    read_frozen_source_manifest_bytes,
+)
 from linen.server.store import register_artifact
 
 #: The artifact kinds an imported historical source is registered under.
@@ -132,6 +137,12 @@ class HistoricalSourceCandidate:
     metadata_bytes: bytes = b""
     upstream_schema_validated: bool = False
     validation_receipt: LedgerValidationReceipt | None = None
+    #: The canonical digest of the **frozen source manifest** of this run, when
+    #: the run directory carried a usable one.  The manifest lists the audited
+    #: source files and their digests; it is the only thing that binds a
+    #: historical run to a revision of the audited code (D-060).  Without it
+    #: the identity of the audited code stays unknown.
+    source_manifest_sha256: str = ""
 
 
 # --- the controlled import ---------------------------------------------------
@@ -338,6 +349,23 @@ def import_historical_run(
             }
         )
 
+    # The frozen source manifest is optional.  When the run directory carries
+    # one, its canonical digest is registered with the source: it is the only
+    # thing that can later bind this historical run to a revision of the
+    # audited code (D-060).  A manifest that cannot be read is treated as no
+    # manifest at all - the source stays readable, and the identity of the
+    # audited code stays unknown.
+    manifest_digest = ""
+    try:
+        manifest_bytes = _read_under_root(root, f"{source_ref}/{SOURCE_MANIFEST_NAME}")
+    except BaselineImportFailed:
+        manifest_bytes = b""
+    if manifest_bytes:
+        try:
+            manifest_digest = read_frozen_source_manifest_bytes(manifest_bytes).digest()
+        except SourceIdentityVerificationFailed:
+            manifest_digest = ""
+
     return HistoricalSourceCandidate(
         **{
             **candidate.__dict__,
@@ -348,6 +376,7 @@ def import_historical_run(
             "ledger_path": ledger_relative,
             "metadata_path": metadata_relative,
             "metadata_bytes": metadata_bytes,
+            "source_manifest_sha256": manifest_digest,
         }
     )
 
@@ -431,6 +460,7 @@ def register_historical_source(
         prior_status_counts=dict(candidate.prior_status_counts),
         ledger_path=candidate.ledger_path,
         metadata_path=candidate.metadata_path,
+        source_manifest_sha256=candidate.source_manifest_sha256,
     )
     body = record.model_dump(mode="json")
     digest = cf_payload_digest(body)

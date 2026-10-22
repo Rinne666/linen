@@ -320,18 +320,28 @@ def attest_historical_source(
     project_id: str,
     source_ref: str,
     observed_at: str,
+    scope: str = "audited_source_identity",
     repo_root: Path | str | None = None,
     commit: str | None = None,
+    source_dir: Path | str | None = None,
+    source_manifest: Path | str | None = None,
     frozen_root: Path | str | None = None,
     notes: str = "",
     signing_key_id: str | None = None,
 ) -> Any:
-    """Verify one source's identity and register the trusted attestation.
+    """Verify one source and register the trusted attestation.
 
     This is the controlled entry point of CF-S2-B2-A.  It verifies the source
-    identity itself, signs the resulting attestation with the key only the
-    controlled flow holds, and lets the server record it - the server verifies
-    the signature, it never makes one (D-058).
+    itself, signs the resulting attestation with the key only the controlled
+    flow holds, and lets the server record it - the server verifies the
+    signature, it never makes one (D-058).
+
+    The ``scope`` decides what the attestation is about (D-061):
+    ``audit_artifact_bytes`` proves that the ledger and the run metadata are
+    still the registered bytes, ``audited_source_identity`` proves which code
+    the audit ran against.  The second needs the frozen source tree and the
+    manifest that names it; without the registered manifest the identity of
+    the audited code stays unknown and nothing is proven.
 
     A deployment without a configured key issues no attestation at all, and
     the source stays unverified.  That is the fail closed case.
@@ -348,8 +358,11 @@ def attest_historical_source(
         project_id=project_id,
         source_ref=source_ref,
         observed_at=observed_at,
+        scope=scope,
         repo_root=repo_root,
         commit=commit,
+        source_dir=source_dir,
+        source_manifest=source_manifest,
         frozen_root=frozen_root,
         notes=notes,
     )

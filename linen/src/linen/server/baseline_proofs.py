@@ -52,9 +52,12 @@ from .services import utcnow
 from .skill_baseline_sources import referenced_manifest
 from .source_identity import (
     SourceIdentityVerificationFailed,
-    remote_owner_repo,
-    verify_frozen_source_digest,
+    read_frozen_source_manifest,
+    repository_identity,
+    verify_audit_artifact_bytes,
+    verify_frozen_source_manifest,
     verify_git_source_identity,
+    verify_git_source_snapshot,
 )
 
 
@@ -148,35 +151,79 @@ def build_source_attestation(
     project_id: str,
     source_ref: str,
     observed_at: str,
+    scope: str = "audited_source_identity",
     repo_root: Path | str | None = None,
     commit: str | None = None,
+    source_dir: Path | str | None = None,
+    source_manifest: Path | str | None = None,
     frozen_root: Path | str | None = None,
     notes: str = "",
 ) -> SourceIdentityAttestation:
-    """Verify one source's identity and describe what was observed.
+    """Verify one source and describe what was observed.
+
+    Two scopes, and they are not interchangeable (D-061):
+
+    ``audit_artifact_bytes``
+        re-reads the coverage ledger and the run metadata and proves that they
+        are still the registered bytes.  This is *not* a source identity: the
+        ledger is the result of the audit, not its input.
+
+    ``audited_source_identity``
+        proves which code the audit ran against.  It needs the **frozen source
+        manifest** of the historical run - the registered list of the audited
+        files and their digests - and the source tree it names.  Without that
+        manifest the identity of the audited code is unknown, and an unknown
+        identity is not a verified one (D-060).
 
     The verification is done here, by the server, on the machine that holds
     the repository - never by the caller.  A caller may say *which* repository
     and *which* commit it believes the snapshot came from, but it cannot say
-    that the answer is "verified": that is what this function decides, and the
-    two ways it can decide are the two ways that can actually be checked.
-
-    A git attestation additionally has to agree with the frozen snapshot: the
-    commit the source was registered with is the commit the attestation may
-    claim.  Without that agreement the attestation would describe a different
-    history than the one that was imported.
-
-    The frozen snapshot is read through the **import root** the source was
-    imported from, because the registered record stores the paths of the
-    artifacts relative to that root.  The root is declared, the bytes are
-    checked: a root that does not hold the registered bytes fails the
-    verification instead of proving something else.
+    that the answer is "verified".
     """
 
     source = _registered_source(conn, project_id=project_id, source_ref=source_ref)
     identity = source.get("source_identity")
     identity = identity if isinstance(identity, dict) else {}
     origin = str(identity.get("origin") or "").strip()
+
+    if scope == "audit_artifact_bytes":
+        return _build_artifact_attestation(
+            source=source,
+            project_id=project_id,
+            source_ref=source_ref,
+            observed_at=observed_at,
+            frozen_root=frozen_root,
+            notes=notes,
+        )
+
+    if scope != "audited_source_identity":
+        raise BaselineProofRejected(f"unknown proof scope {scope!r}")
+
+    manifest_digest = str(source.get("source_manifest_sha256") or "")
+    if not manifest_digest:
+        raise BaselineProofRejected(
+            "the registered source carries no frozen source manifest, so the "
+            "identity of the audited code cannot be proven"
+        )
+    if source_dir is None or source_manifest is None:
+        raise BaselineProofRejected(
+            "an audited source identity needs the frozen source tree and the "
+            "manifest that names it"
+        )
+
+    manifest = _verification(
+        lambda: read_frozen_source_manifest(Path(source_manifest))
+    )
+    if manifest.digest() != manifest_digest:
+        raise BaselineProofRejected(
+            "the supplied source manifest is not the one that was registered "
+            "with the historical source"
+        )
+    _verification(
+        lambda: verify_frozen_source_manifest(
+            manifest=manifest, source_dir=Path(source_dir)
+        )
+    )
 
     if repo_root is not None or commit is not None:
         if not commit:
@@ -193,57 +240,70 @@ def build_source_attestation(
             raise BaselineProofRejected(
                 "the commit does not match the frozen snapshot of the source"
             )
-        observed = _verification(lambda: verify_git_source_identity(
-            repo_root=Path(repo_root), commit=commit
-        ))
-        remote = remote_owner_repo(observed.remote or "")
-        if remote and origin and "/" in origin and remote != origin:
+        observed = _verification(
+            lambda: verify_git_source_identity(
+                repo_root=Path(repo_root), commit=commit
+            )
+        )
+        # The repository identity has to be *nameable* on both sides: an
+        # unknown or unrecognisable remote fails closed instead of passing
+        # (R03), and the host is part of the identity (R04).
+        registered_host, registered_owner = repository_identity(origin)
+        if not observed.repository_host or not observed.repository_owner_repo:
+            raise BaselineProofRejected(
+                "the repository has no remote whose identity can be named, so "
+                "the source identity cannot be proven"
+            )
+        if not registered_host or not registered_owner:
+            raise BaselineProofRejected(
+                "the registered origin does not name a repository host, so the "
+                "source identity cannot be proven"
+            )
+        if (
+            observed.repository_host != registered_host
+            or observed.repository_owner_repo != registered_owner
+        ):
             raise BaselineProofRejected(
                 "the repository identity does not match the frozen snapshot of "
                 "the source"
             )
+        _verification(
+            lambda: verify_git_source_snapshot(
+                repo_root=Path(repo_root), commit=commit, source_dir=Path(source_dir)
+            )
+        )
         verification = SourceIdentityVerification(
+            scope="audited_source_identity",
             method="git_commit",
             repository_root=observed.repository_root,
+            repository_host=observed.repository_host,
             commit=observed.commit,
+            head_commit=observed.head_commit,
             tree_sha=observed.tree_sha,
+            snapshot_digest=manifest.digest(),
             worktree_clean=observed.worktree_clean,
             observed_at=observed_at,
             notes=notes,
         )
         verified_identity = BaselineSourceIdentity(
             kind="git_commit",
-            origin=origin or observed.repository_root,
+            origin=origin,
             revision=observed.commit,
             verified=True,
             notes=notes,
         )
     else:
-        ledger_relative = str(source.get("ledger_path") or "")
-        metadata_relative = str(source.get("metadata_path") or "")
-        if not ledger_relative or not metadata_relative:
-            raise BaselineProofRejected(
-                "the registered source records no frozen artifacts to verify"
-            )
-        base = Path(frozen_root) if frozen_root is not None else None
-        ledger_path = (base / ledger_relative) if base else Path(ledger_relative)
-        metadata_path = (base / metadata_relative) if base else Path(metadata_relative)
-        snapshot = _verification(lambda: verify_frozen_source_digest(
-            ledger_path=ledger_path,
-            metadata_path=metadata_path,
-            ledger_sha256=str(source.get("ledger_sha256") or ""),
-            metadata_sha256=str(source.get("metadata_sha256") or ""),
-        ))
         verification = SourceIdentityVerification(
-            method="frozen_digest",
-            snapshot_sha256=snapshot,
+            scope="audited_source_identity",
+            method="frozen_manifest",
+            snapshot_digest=manifest.digest(),
             observed_at=observed_at,
             notes=notes,
         )
         verified_identity = BaselineSourceIdentity(
             kind="frozen_digest",
             origin=origin or "frozen-snapshot",
-            digest=snapshot,
+            digest=manifest.digest(),
             verified=True,
             notes=notes,
         )
@@ -254,7 +314,69 @@ def build_source_attestation(
         source_ref=source_ref,
         ledger_sha256=str(source.get("ledger_sha256") or ""),
         metadata_sha256=str(source.get("metadata_sha256") or ""),
+        scope="audited_source_identity",
         identity=verified_identity,
+        verification=verification,
+        evidence_ref=evidence_ref,
+    )
+
+
+def _build_artifact_attestation(
+    *,
+    source: dict[str, Any],
+    project_id: str,
+    source_ref: str,
+    observed_at: str,
+    frozen_root: Path | str | None,
+    notes: str,
+) -> SourceIdentityAttestation:
+    """Prove that the audit artifacts are still the registered bytes.
+
+    This is deliberately **not** a source identity (D-061): the ledger is the
+    output of the audit, and its digest says nothing about the code that
+    produced it.
+    """
+
+    ledger_relative = str(source.get("ledger_path") or "")
+    metadata_relative = str(source.get("metadata_path") or "")
+    if not ledger_relative or not metadata_relative:
+        raise BaselineProofRejected(
+            "the registered source records no frozen artifacts to verify"
+        )
+    base = Path(frozen_root) if frozen_root is not None else None
+    ledger_path = (base / ledger_relative) if base else Path(ledger_relative)
+    metadata_path = (base / metadata_relative) if base else Path(metadata_relative)
+    _verification(
+        lambda: verify_audit_artifact_bytes(
+            ledger_path=ledger_path,
+            metadata_path=metadata_path,
+            ledger_sha256=str(source.get("ledger_sha256") or ""),
+            metadata_sha256=str(source.get("metadata_sha256") or ""),
+        )
+    )
+    identity = source.get("source_identity")
+    identity = identity if isinstance(identity, dict) else {}
+    verification = SourceIdentityVerification(
+        scope="audit_artifact_bytes",
+        method="artifact_bytes",
+        observed_at=observed_at,
+        notes=notes,
+    )
+    evidence_ref = encode_reference(verification.model_dump(mode="json"))
+    return SourceIdentityAttestation.issue(
+        project_id=project_id,
+        source_ref=source_ref,
+        ledger_sha256=str(source.get("ledger_sha256") or ""),
+        metadata_sha256=str(source.get("metadata_sha256") or ""),
+        scope="audit_artifact_bytes",
+        identity=BaselineSourceIdentity(
+            kind="unverified",
+            origin=str(identity.get("origin") or "frozen-artifacts"),
+            revision=identity.get("revision"),
+            raw=str(identity.get("raw") or "the audit artifacts were re-read"),
+            verified=False,
+            notes=notes,
+        ),
         verification=verification,
         evidence_ref=evidence_ref,
     )
@@ -291,7 +413,7 @@ def register_source_attestation(
         raise BaselineProofRejected(
             "the attestation is about other bytes than the registered source"
         )
-    if not attestation.identity.verified:
+    if attestation.scope == "audited_source_identity" and not attestation.identity.verified:
         raise BaselineProofRejected(
             "the attestation carries an identity that was never verified"
         )
@@ -341,32 +463,17 @@ def register_source_attestation(
     return digest
 
 
-def source_attestation_status(
+def _stored_attestations(
     conn: sqlite3.Connection, *, project_id: str, source_ref: str
-) -> SourceAttestationStatus:
-    """What is known about the identity of one historical source.
-
-    The newest attestation does **not** win.  A source that carries two
-    different attestations is in conflict, and a conflict is reported as a
-    conflict until something resolves it - the registry keeps both records
-    (D-045).
-    """
+) -> list[tuple[SourceIdentityAttestation, str, str]]:
+    """The attestations of one source, with their key and their mac."""
 
     rows = conn.execute(
         "SELECT payload_json, payload_sha256, key_id, mac FROM coverage_source_attestations "
         "WHERE project_id = ? AND source_ref = ? ORDER BY attestation_id",
         (project_id, source_ref),
     ).fetchall()
-    if not rows:
-        return SourceAttestationStatus(
-            source_ref=source_ref,
-            state="unverified",
-            reason="no attestation is registered for the source",
-        )
-
-    keys = configured_validation_keys()
-    attestations: list[SourceIdentityAttestation] = []
-    trusted: list[SourceIdentityAttestation] = []
+    found: list[tuple[SourceIdentityAttestation, str, str]] = []
     for row in rows:
         try:
             attestation = SourceIdentityAttestation.model_validate(
@@ -378,19 +485,67 @@ def source_attestation_status(
             continue
         if attestation.attestation_sha256 != str(row["payload_sha256"]):
             continue
-        attestations.append(attestation)
-        key = keys.get(str(row["key_id"]))
+        found.append((attestation, str(row["key_id"]), str(row["mac"])))
+    return found
+
+
+def _trusted_attestations(
+    attestations: list[tuple[SourceIdentityAttestation, str, str]],
+    *,
+    project_id: str,
+) -> list[SourceIdentityAttestation]:
+    """The attestations whose envelope this deployment can verify."""
+
+    keys = configured_validation_keys()
+    trusted: list[SourceIdentityAttestation] = []
+    for attestation, key_id, mac in attestations:
+        key = keys.get(key_id)
         if key is None:
             continue
         envelope = ProofAuthentication(
             proof_kind="source_attestation",
-            key_id=str(row["key_id"]),
+            key_id=key_id,
             proof_sha256=attestation.attestation_sha256,
             project_id=project_id,
-            mac=str(row["mac"]),
+            mac=mac,
         )
         if verify_proof_auth(envelope=envelope, key=key):
             trusted.append(attestation)
+    return trusted
+
+
+def source_attestation_status(
+    conn: sqlite3.Connection, *, project_id: str, source_ref: str
+) -> SourceAttestationStatus:
+    """What is known about the identity of the **audited code** of one source.
+
+    Only attestations of the scope ``audited_source_identity`` count here.  A
+    proof that the audit artifacts are still the registered bytes says nothing
+    about the code that produced them, so it may never be counted as a source
+    identity (D-061).
+
+    The newest attestation does **not** win.  A source that carries two
+    different attestations is in conflict, and a conflict is reported as a
+    conflict until something resolves it - the registry keeps both records
+    (D-045).
+    """
+
+    stored = [
+        item
+        for item in _stored_attestations(
+            conn, project_id=project_id, source_ref=source_ref
+        )
+        if item[0].scope == "audited_source_identity"
+    ]
+    if not stored:
+        return SourceAttestationStatus(
+            source_ref=source_ref,
+            state="unverified",
+            reason="no attestation of the audited source identity is registered",
+        )
+
+    attestations = [item[0] for item in stored]
+    trusted = _trusted_attestations(stored, project_id=project_id)
 
     distinct = {item.attestation_sha256 for item in attestations}
     if len(distinct) > 1:
@@ -406,6 +561,51 @@ def source_attestation_status(
             state="unverified",
             attestations=tuple(attestations),
             reason="no attestation of the source carries a valid mac",
+        )
+    return SourceAttestationStatus(
+        source_ref=source_ref, state="verified", attestations=tuple(attestations)
+    )
+
+
+def audit_artifact_status(
+    conn: sqlite3.Connection, *, project_id: str, source_ref: str
+) -> SourceAttestationStatus:
+    """What is known about the **audit artifacts** of one source.
+
+    This is the ledger and the run metadata, not the code.  It is reported
+    separately on purpose: the two must never be merged into one number
+    (D-061, Q53).
+    """
+
+    stored = [
+        item
+        for item in _stored_attestations(
+            conn, project_id=project_id, source_ref=source_ref
+        )
+        if item[0].scope == "audit_artifact_bytes"
+    ]
+    if not stored:
+        return SourceAttestationStatus(
+            source_ref=source_ref,
+            state="unverified",
+            reason="no attestation of the audit artifacts is registered",
+        )
+    attestations = [item[0] for item in stored]
+    trusted = _trusted_attestations(stored, project_id=project_id)
+    distinct = {item.attestation_sha256 for item in attestations}
+    if len(distinct) > 1:
+        return SourceAttestationStatus(
+            source_ref=source_ref,
+            state="conflict",
+            attestations=tuple(attestations),
+            reason="the source carries contradictory artifact attestations",
+        )
+    if not trusted:
+        return SourceAttestationStatus(
+            source_ref=source_ref,
+            state="unverified",
+            attestations=tuple(attestations),
+            reason="no artifact attestation of the source carries a valid mac",
         )
     return SourceAttestationStatus(
         source_ref=source_ref, state="verified", attestations=tuple(attestations)

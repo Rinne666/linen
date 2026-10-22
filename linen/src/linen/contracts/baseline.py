@@ -206,11 +206,24 @@ class BaselineSourceRecord(ContractModel):
     prior_status_counts: dict[str, int] = Field(default_factory=dict)
     ledger_path: str = Field(default="", max_length=2048)
     metadata_path: str = Field(default="", max_length=2048)
+    #: The digest of the **frozen source manifest** of this run, when the run
+    #: directory carried one.  The manifest lists the audited source files and
+    #: their digests; it is the only thing that can bind a historical run to a
+    #: revision of the audited code (D-060).  Without it the identity of the
+    #: audited code stays unknown.
+    source_manifest_sha256: str = Field(default="", max_length=64)
     notes: str = Field(default="", max_length=4096)
 
     @field_validator("ledger_sha256", "metadata_sha256")
     @classmethod
     def _validate_digests(cls, value: str) -> str:
+        return validate_sha256(value)
+
+    @field_validator("source_manifest_sha256")
+    @classmethod
+    def _validate_manifest_digest(cls, value: str) -> str:
+        if not value:
+            return ""
         return validate_sha256(value)
 
     @field_validator("project_id", "source_ref")
@@ -495,8 +508,18 @@ SOURCE_ATTESTATION_DOMAIN = "linen:source-identity-attestation:v1"
 #: The domain separation of the lineage seal MAC.
 LINEAGE_SEAL_DOMAIN = "linen:lineage-seal:v1"
 
-#: How a source identity was verified.
-SourceVerificationMethod = Literal["git_commit", "frozen_digest"]
+#: What a source proof is about.
+#:
+#: The two scopes are deliberately different things (D-061).  An
+#: ``audit_artifact_bytes`` proof says that the bytes of the coverage ledger
+#: and of the run metadata are still the bytes that were imported.  An
+#: ``audited_source_identity`` proof says something much stronger: that the
+#: *code* the audit ran against is a known revision.  The first never implies
+#: the second, and a proof of the first must never be counted as the second.
+SourceProofScope = Literal["audit_artifact_bytes", "audited_source_identity"]
+
+#: How a verification was made.
+SourceVerificationMethod = Literal["git_commit", "frozen_manifest", "artifact_bytes"]
 
 #: The kinds of proof that carry an authentication envelope.
 ProofKind = Literal["source_attestation", "lineage_seal"]
@@ -511,16 +534,19 @@ class SourceIdentityVerification(ContractModel):
     request body produces none of this.
     """
 
+    scope: SourceProofScope
     method: SourceVerificationMethod
     repository_root: str | None = Field(default=None, max_length=2048)
+    repository_host: str | None = Field(default=None, max_length=256)
     commit: str | None = Field(default=None, max_length=64)
+    head_commit: str | None = Field(default=None, max_length=64)
     tree_sha: str | None = Field(default=None, max_length=64)
-    snapshot_sha256: str | None = Field(default=None)
+    snapshot_digest: str | None = Field(default=None)
     worktree_clean: bool | None = None
     observed_at: str = Field(min_length=1, max_length=64)
     notes: str = Field(default="", max_length=4096)
 
-    @field_validator("commit", "tree_sha")
+    @field_validator("commit", "head_commit", "tree_sha")
     @classmethod
     def _validate_object_name(cls, value: str | None) -> str | None:
         if value is None:
@@ -530,7 +556,7 @@ class SourceIdentityVerification(ContractModel):
             raise ValueError("a git object name must be a 40 hex digit name")
         return value
 
-    @field_validator("snapshot_sha256")
+    @field_validator("snapshot_digest")
     @classmethod
     def _validate_snapshot_digest(cls, value: str | None) -> str | None:
         if value is None:
@@ -539,21 +565,55 @@ class SourceIdentityVerification(ContractModel):
 
     @model_validator(mode="after")
     def _validate_shape(self) -> "SourceIdentityVerification":
+        if self.scope == "audit_artifact_bytes":
+            if self.method != "artifact_bytes":
+                raise ValueError(
+                    "an audit artifact proof is made by the artifact byte check"
+                )
+            if self.snapshot_digest is not None:
+                raise ValueError(
+                    "an audit artifact proof carries no source snapshot digest"
+                )
+            if self.worktree_clean is not None:
+                raise ValueError(
+                    "an audit artifact proof says nothing about a worktree"
+                )
+            return self
+
         if self.method == "git_commit":
             if not self.commit or not self.repository_root:
                 raise ValueError(
                     "a git commit verification needs the repository and the commit"
+                )
+            if not self.repository_host:
+                raise ValueError(
+                    "a git commit verification needs the host of the repository; "
+                    "without it the repository identity cannot be checked"
                 )
             if self.worktree_clean is not True:
                 raise ValueError(
                     "a git commit verification needs a clean worktree; unrecorded "
                     "changes mean the frozen snapshot is not the commit"
                 )
-        else:
-            if not self.snapshot_sha256:
+            if self.head_commit != self.commit:
                 raise ValueError(
-                    "a frozen digest verification needs the frozen digest"
+                    "a git commit verification needs the checked out commit to be "
+                    "the declared commit; a clean worktree of another revision "
+                    "proves nothing about the declared one"
                 )
+            if not self.tree_sha:
+                raise ValueError("a git commit verification needs the commit tree")
+        elif self.method == "frozen_manifest":
+            if not self.snapshot_digest:
+                raise ValueError(
+                    "a frozen manifest verification needs the digest of the "
+                    "frozen source manifest"
+                )
+        else:
+            raise ValueError(
+                "an audited source identity is proven by a commit or by a frozen "
+                "source manifest, never by artifact bytes"
+            )
         return self
 
 
@@ -572,6 +632,7 @@ class SourceIdentityAttestation(ContractModel):
     source_ref: str = Field(min_length=1, max_length=1024)
     ledger_sha256: str
     metadata_sha256: str
+    scope: SourceProofScope
     identity: BaselineSourceIdentity
     verification: SourceIdentityVerification
     evidence_ref: str = Field(min_length=1, max_length=256)
@@ -584,12 +645,32 @@ class SourceIdentityAttestation(ContractModel):
 
     @model_validator(mode="after")
     def _validate_shape(self) -> "SourceIdentityAttestation":
-        if not self.identity.verified:
-            raise ValueError("an attestation may only carry a verified identity")
-        if self.identity.kind != self.verification.method:
+        if self.scope != self.verification.scope:
             raise ValueError(
-                "the attested identity and the verification method disagree"
+                "the attested scope and the verification scope disagree"
             )
+        if self.scope == "audited_source_identity":
+            if not self.identity.verified:
+                raise ValueError(
+                    "an audited source identity attestation may only carry a "
+                    "verified identity"
+                )
+            expected_kind = (
+                "git_commit"
+                if self.verification.method == "git_commit"
+                else "frozen_digest"
+            )
+            if self.identity.kind != expected_kind:
+                raise ValueError(
+                    "the attested identity and the verification method disagree"
+                )
+        else:
+            if self.identity.verified:
+                raise ValueError(
+                    "an audit artifact proof may not claim a verified source "
+                    "identity: the bytes of the ledger say nothing about the "
+                    "code that produced it (D-061)"
+                )
         if not self.evidence_ref.startswith(CF_REFERENCE_PREFIX):
             raise ValueError(
                 f"the evidence reference must start with {CF_REFERENCE_PREFIX!r}"
