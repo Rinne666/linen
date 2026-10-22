@@ -28,6 +28,8 @@ jobs:
         run: |
           node --test linen/src/linen/third_party/cloudflare_security_audit_skill/validate-coverage-ledger.test.cjs
           node --test linen/src/linen/third_party/cloudflare_security_audit_skill/validate-findings.test.cjs
+      - name: Audit the browser UI static sinks
+        run: node linen/linen/tests/ui_static_sink_check.cjs
       - name: Run regression suite
         run: uv run --project linen --locked --group dev pytest linen/linen/tests -ra --junitxml=linen/pytest-junit.xml
       - name: Upload test report
