@@ -89,6 +89,18 @@ class LineageSealStatus:
     nothing to find".  It requires a seal that verifies *and* a scope that
     still verifies member by member - a complete manifest without a seal is
     not a negative conclusion (D-052).
+
+    ``state`` says which of the three situations holds (D-063):
+
+    ``unsealed``
+        no registered seal of the run is verifiable;
+    ``sealed``
+        every verifiable seal of the run declares the *same* historical scope;
+    ``conflict``
+        the run carries several verifiable seals that disagree about the
+        historical scope.  The registry keeps all of them, the conflict is
+        reported, and ``trusted_negative`` is False: a scope that is claimed
+        twice in two different ways was not searched.
     """
 
     run_id: str
@@ -96,6 +108,8 @@ class LineageSealStatus:
     trusted_negative: bool
     seal: LineageSeal | None = None
     reason: str = ""
+    state: str = "unsealed"
+    seals: tuple[LineageSeal, ...] = ()
 
 
 def _verification(observation: Any) -> Any:
@@ -792,31 +806,42 @@ def register_lineage_seal(
     return digest
 
 
-def lineage_seal_status(
-    conn: sqlite3.Connection, *, project_id: str, run_id: str
-) -> LineageSealStatus:
-    """What is known about the sealed scope of one run.
+def _seal_scope_key(seal: LineageSeal) -> tuple[Any, ...]:
+    """The identity of the historical scope one seal declares.
 
-    The scope is trusted for a negative conclusion only when the seal verifies
-    *and* the scope still verifies member by member.  A complete manifest
-    without a seal is not a negative conclusion, and neither is a seal whose
-    members have changed (D-052).
+    Two seals that declare the same scope are the same claim, even when they
+    were issued at different times or by different issuers; two seals that
+    declare different scopes contradict each other (D-063).
     """
+
+    return (
+        seal.scope_kind,
+        seal.lineage_manifest_ref,
+        seal.manifest_sha256,
+        tuple(
+            (
+                member.source_ref,
+                member.ledger_sha256,
+                member.metadata_sha256,
+                member.attestation_sha256,
+            )
+            for member in sorted(seal.members, key=lambda member: member.source_ref)
+        ),
+    )
+
+
+def _verifiable_seals(
+    conn: sqlite3.Connection, *, project_id: str, run_id: str
+) -> list[LineageSeal]:
+    """Every seal of the run that still verifies, member by member."""
 
     rows = conn.execute(
         "SELECT payload_json, payload_sha256, key_id, mac FROM coverage_lineage_seals "
         "WHERE project_id = ? AND run_id = ? ORDER BY seal_id",
         (project_id, run_id),
     ).fetchall()
-    if not rows:
-        return LineageSealStatus(
-            run_id=run_id,
-            sealed=False,
-            trusted_negative=False,
-            reason="no lineage seal is registered for the run",
-        )
-
     keys = configured_validation_keys()
+    verifiable: list[LineageSeal] = []
     for row in rows:
         try:
             seal = LineageSeal.model_validate(json.loads(row["payload_json"]))
@@ -852,17 +877,66 @@ def lineage_seal_status(
             for member in manifest.members
         ):
             continue
+        verifiable.append(seal)
+    return verifiable
+
+
+def lineage_seal_status(
+    conn: sqlite3.Connection, *, project_id: str, run_id: str
+) -> LineageSealStatus:
+    """What is known about the sealed scope of one run.
+
+    The scope is trusted for a negative conclusion only when the seal verifies
+    *and* the scope still verifies member by member.  A complete manifest
+    without a seal is not a negative conclusion, and neither is a seal whose
+    members have changed (D-052).
+
+    All the seals of the run are evaluated **together** (D-063).  The first
+    verifiable seal does not win: a run that carries a lineage root *and* a
+    declared predecessor lineage contradicts itself, and such a run must not
+    produce a trusted negative conclusion.  The contradicting seals are kept -
+    an append-only registry may not forget - and the conflict is reported.
+    """
+
+    verifiable = _verifiable_seals(conn, project_id=project_id, run_id=run_id)
+    if not verifiable:
+        registered = conn.execute(
+            "SELECT 1 FROM coverage_lineage_seals WHERE project_id = ? AND run_id = ? LIMIT 1",
+            (project_id, run_id),
+        ).fetchone()
         return LineageSealStatus(
             run_id=run_id,
-            sealed=True,
-            trusted_negative=True,
-            seal=seal,
-            reason="the scope is sealed and every member still verifies",
+            sealed=False,
+            trusted_negative=False,
+            state="unsealed",
+            reason=(
+                "no registered seal of the run is verifiable"
+                if registered is not None
+                else "no lineage seal is registered for the run"
+            ),
         )
 
+    scopes = {_seal_scope_key(seal) for seal in verifiable}
+    if len(scopes) > 1:
+        return LineageSealStatus(
+            run_id=run_id,
+            sealed=False,
+            trusted_negative=False,
+            state="conflict",
+            seals=tuple(verifiable),
+            reason=(
+                "the run carries several valid seals that disagree about the "
+                "historical scope, so the scope was not searched"
+            ),
+        )
+
+    seal = verifiable[0]
     return LineageSealStatus(
         run_id=run_id,
-        sealed=False,
-        trusted_negative=False,
-        reason="no registered seal of the run is verifiable",
+        sealed=True,
+        trusted_negative=True,
+        seal=seal,
+        state="sealed",
+        seals=tuple(verifiable),
+        reason="the scope is sealed and every member still verifies",
     )
