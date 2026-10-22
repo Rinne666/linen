@@ -398,5 +398,68 @@ CF-S2-A  PRODUCTION MULTIWAVE WRITE  BLOCKED — 无可信 owner / 选块提供�
 **仍然只接受 `unit_registered`**，多轮事件走独立可信写入接口且默认关闭。
 
 
+## CF-S2-B1 不可变历史工件登记
+
+`prior_status` 只有在背后的历史**能被重新找回并重新校验**时才值得存下来。一句自由文本
+的 `lookup_ref` 做不到：路径可以被改写，句子可以被重打。本节描述这条链
+（PM v2.1 的 **D-036**）：
+
+```text
+外部 run 目录
+    -> 受控导入 (import_historical_run)
+    -> 格式与来源验证
+    -> 不可变登记 (coverage_baseline_sources)
+    -> 冻结历史清单 (BaselineLineageManifest)
+    -> 可信 resolver (CF-S2-B2)
+```
+
+**受控导入**（`server/skill_baseline_sources.py`）：导入根目录由运维声明，路径**不是**。
+读取必须留在根目录内、拒绝 `..`、拒绝任何路径分量上的符号链接、拒绝非普通文件；
+读到的每个文件都记 sha256。导入**不因为来源不可信而抛错**——它返回一个说明原因的
+候选，因为「静默丢弃后再宣称历史完整」正是必须避免的事（D-036）。
+
+**不可变登记**（表 `coverage_baseline_sources`，`server/db.py`）：追加式，**不随项目删除
+级联**（外键 NO ACTION + 两个只增不改触发器）。项目若拥有基线来源，`DELETE /projects/{id}`
+返回 **409 `PROJECT_HAS_BASELINE_SOURCES`**（与 `PROJECT_HAS_COVERAGE_EVENTS` 分开）。
+
+**冻结历史清单**（`BaselineLineageManifest`）：声明本次基线可比的历史范围，并说明该范围
+是否**封闭**：
+
+| 状态 | 含义 |
+|---|---|
+| `complete` + 无 `unprocessed` | 范围封闭 → 可以支撑**负证据** |
+| `incomplete` / 有 `unprocessed` | 范围未封闭 → **不得**得出 `none` |
+| `scope_kind = lineage_root` | 显式声明「本项目没有前代」，成员必须为空 |
+
+清单里的每个成员**必须已登记**——清单不能指向没人导入过的来源。
+
+**不可变引用**：`cf-ref-v1:<64 位小写 hex>`，摘要输入是 `cf_canonical_json(structured_ref)`。
+引用**本身不是证据**：读取时必须找回本体并**重算摘要**；本体丢失或摘要不符 → 不可验证
+引用（D-037）。
+
+**source identity 不自动升为 verified**：真实语料的 `source_ref` 有三种形状（纯 40 位
+commit / commit + 自由文本注释 / 非 Git 发行包）。导入器**从不**把正则匹配成功当作验证：
+它只保留原文与候选 commit，`kind = "unverified"`、`verified = false`。
+`git_commit` 身份必须带 40 位 commit；`frozen_digest` 身份（非 Git 发行包）必须带
+冻结源码摘要。
+
+**上游没有先例**：实测表明上游 skill **从不读取任何前次 run 的 ledger**，9 个非平凡
+`prior_*` 字面量在真实语料中**零命中**，且 `source_ref` **从不被任何代码比较**——
+即 same-source / changed-source 的判定机制在上游**未定义**。因此 B1 只登记来源，
+不判定兼容性；兼容性由 CF-S2-B2 的 resolver 依据本清单与可信裁定作出。
+
+**当前状态**：
+
+```text
+CF-S2-B1  可信历史工件登记能力  PASS（本地）
+CF-S2-B2  真实 resolver / prior_status 解析  NOT STARTED
+生产注册与多轮写入                继续关闭
+```
+
+真实语料分级（16 个 run 目录）：结构合法 ledger **11**、metadata 完整 **11**、
+source identity 已记录 **11**、**已核验 0**（导入器不自动核验）、可信负证据 **0**
+（全部 `prior_run_paths` 为空，尚无 lineage root 声明）、导入失败 **5**（无 ledger 文件）。
+
+
 
 
