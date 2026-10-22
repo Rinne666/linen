@@ -712,6 +712,10 @@ Q49 = 接受现有单变量 JSON 密钥环；Q50 = 接受动态语料的性质�
 B2-A 的范围**只**建立两样东西：**可信源码身份证明**与**可信历史范围封存**；
 **不**开始源码差异比较，**不**开始 11 值 prior_status 生产解析（那是 B2-B / B2-C）。
 
+**PM v2.8 裁定**：P1-H1 **PASS**；B2-A 的追加式证明基础设施与可信签发机制 **PASS**，
+但**源码身份核验**存在两处实质语义缺口，整体 **CONDITIONAL PASS**，先关闭
+**D-060 / D-061 / D-062** 再登记 `SOURCE IDENTITY ATTESTATION PASS / TRUSTED LINEAGE SEAL PASS`。
+
 ### 职责边界
 
 ```text
@@ -726,31 +730,54 @@ coverage_baseline_sources          已登记的历史来源与 manifest（结构
 但**分表**（D-054）；没有第三套通用证明框架。
 【事实】外键一律 `NO ACTION`（与既有证明表一致）：项目被删除后，证明行不得仍可被验证。
 
-### 两种核验方式
+### 两种证明范围（D-061）
 
-| 方法 | 核验内容 | 位置 |
+【事实】证明分两种，**不得合并**：
+
+| 范围 | 它证明什么 | 它**不**证明什么 |
 |---|---|---|
-| `git_commit` | 提交对象**真实存在**（`cat-file -t`）、解析回自身、树对象名合法、**工作区干净**（`git status --porcelain` 为空）、仓库 remote 的 `owner/repo` 与登记来源的 origin 一致 | `server/source_identity.py` `verify_git_source_identity()` |
-| `frozen_digest` | 重新读取**冻结的工件字节**，与登记摘要逐字节比对 | `server/source_identity.py` `verify_frozen_source_digest()` |
+| `audit_artifact_bytes` | 导入进来的 **ledger + run-metadata** 字节仍与登记摘要一致 | **不**证明被审计的代码是什么 |
+| `audited_source_identity` | 被审计的**代码**是哪个已知版本 | 不覆盖 ledger 自身的格式有效性（那是 P1 的事） |
 
-【事实】git 核验**不止**检查「40 位十六进制格式合法」：`git rev-parse` 会原样回显一个并不存在的
-提交名，所以真正被问的是**对象本身**；工作区若有未登记改动，磁盘上的文件就不是那个提交，
-因此工作区必须干净。
-【事实】git 证明还必须与**冻结快照**一致：登记来源里记录的提交名就是证明可声明的提交，
-声明别的提交会被拒绝（这正是「证明描述了另一段历史」的防线）。
+【推断】**ledger 是审计的产物，不是审计的输入**；把 ledger+metadata 的组合摘要当成源码摘要，
+就是让「审计结果字节完整」冒充「审计源码身份已核验」（D-061）。
+因此 `source_attestation_status()`（源码身份）与 `audit_artifact_status()`（审计工件）
+是**两个独立的状态函数**，任何汇总都必须分别报告。
+
+### 源码身份是怎么被证明的（D-060）
+
+【事实】git 路径必须同时满足**四**件事，缺一即失败关闭：
+
+1. 提交对象**真实存在**（`cat-file -t` 必须是 `commit`），且解析回自身；
+2. **当前检出的提交就是声明的提交**（`git rev-parse HEAD == declared_commit`）——
+   一个干净的 B 工作区**不能**证明 A（D-060、R01）；
+3. 工作区没有未登记改动（`git status --porcelain` 为空）；
+4. **仓库身份**严格相等：登记的 origin（**含主机**）与实际 remote 规范化后的身份完全相同；
+   remote 缺失、无法识别或主机不同**一律拒绝**（Q52 冻结、R03、R04）。
+
+【事实】此外还要**绑定历史**：证明必须携带该历史 run 的**冻结源码清单**
+（`source-manifest.json`，登记时随来源一起入库），并逐文件核对：
+
+- git 路径：清单里的每个文件用 `git hash-object` 与该提交的 tree 条目比对，
+  文件集合必须完全一致 → 冻结快照**就是**那个提交（R02）；
+- 非 git 路径：清单里的每个文件用 SHA-256 与实际源码树比对 → 冻结快照**就是**那份源码。
+
+【推断】**没有登记在案的冻结源码清单，就无法证明被审计代码的身份**，
+`run-metadata.json` 自称某个 commit **不足以**把任意干净 checkout 提升为历史审计源码的依据。
+这是「缺失证据一律 unknown」的又一个实例。
 
 ### 信任边界
 
-- 【事实】证明由**服务端自己核验**得到（`build_source_attestation()` / `build_lineage_seal()`），
-  调用方只能给出「我认为是哪个仓库、哪个提交」，**不能**给出「结论是已核验」——
-  自称 `verified = true` 的 JSON 得不到任何权威（A-T03）。
+- 【事实】证明由**服务端自己核验**得到（`server/baseline_proofs.py` `build_source_attestation()` /
+  `build_lineage_seal()`），调用方只能给出「我认为是哪个仓库、哪个提交、哪份源码树」，
+  **不能**给出「结论是已核验」——自称 `verified = true` 的 JSON 得不到任何权威（A-T03）。
 - 【事实】证明由**受控流程签名**（`dispatcher/analysis/cf_baseline_validation.py`
   `attest_historical_source()` / `seal_historical_scope()`），服务端只**验证**签名，从不签发（D-058）。
 - 【事实】封套 MAC 输入按证明种类**域分隔**（`linen:source-identity-attestation:v1` /
   `linen:lineage-seal:v1`），所以 attestation 封套**不能**被当作 seal 封套重放。
 - 【事实】**没有配置可信密钥 → 不产生任何证明**，`source_identity_verified` 保持 0。
-- 【推断】**这两张表都不是确认权威**：证明说的是「源码是什么」，不是「本轮发现的漏洞是真的」
-  （D-039）；不得由历史 verified 直接推导本轮 confirmed。
+- 【事实】**这两张表都没有 HTTP 入口**：只有受控流程调用服务端函数。
+- 【推断】**这两张表都不是确认权威**：证明说的是「源码是什么」，不是「本轮发现的漏洞是真的」（D-039）。
 
 ### 冲突不被静默覆盖
 
@@ -759,43 +786,49 @@ coverage_baseline_sources          已登记的历史来源与 manifest（结构
 已注册来源的成员 attestation 变化后，原 seal 在**再验证**时会失配，
 `trusted_negative` 随之降为 false。
 
-### trusted negative 的条件
+### trusted negative 的前提（D-062）
 
 【事实】`lineage_seal_status().trusted_negative` 为 true 需要**同时**满足：
 
 1. 该 run 存在一张**可验证**的 seal（封套 MAC 有效）；
 2. seal 引用的 manifest 仍然**封闭**（complete 且无 unprocessed）；
-3. manifest 的**每个**成员仍有**可信**的 source attestation。
+3. manifest 的**每个**成员都有**真正的被审计源码身份**证明——
+   仅有审计工件证明的成员**不够**（R07）。
 
 【事实】结构 complete 的 manifest **本身不是** seal，也不能承载负证据（A-T11）；
-`lineage_root`（声明本项目没有前代历史）同样必须由可信签发入口产生（A-T12）。
+`lineage_root`（声明本项目没有前代历史）是另一种情况：它依赖受控、可信的历史根声明，
+没有历史成员可供源码核验，因此**不**与「成员核验不完整」混为一谈（A-T12）。
 
 ### 本片验收
 
-B2-A-T01–T14：证明只能关联已登记来源 / 跨项目关联被拒 / JSON 自报 verified 不产生可信身份 /
-git 提交与冻结快照不一致时拒绝（含错误仓库、脏工作区）/ 非 Git 来源可由冻结摘要核验 /
-两张表 UPDATE+DELETE 被数据库拒绝 / 同一证明重复登记幂等 / 矛盾证明不静默覆盖 /
-缺少可信证据时保持 unverified / seal 必须关联明确的 run 与项目 / complete manifest 但无可信封存时
-不可作负证据 / lineage root 来自可信受控声明 / seal 成员可再验证 / 两张证明不自动开放生产注册。
+B2-A-T01–T14（证明只能关联已登记来源 / 跨项目被拒 / JSON 自报 verified 无效 /
+git 提交与冻结快照不一致被拒 / 非 Git 可由冻结清单核验 / 两表 UPDATE+DELETE 被拒 /
+重复登记幂等 / 矛盾证明不静默覆盖 / 缺可信证据保持 unverified / seal 关联明确 run 与项目 /
+complete manifest 无 seal 不可作负证据 / lineage root 来自可信受控声明 /
+seal 成员可再验证 / 两张证明不自动开放生产注册），
+加上 **R01–R08**（HEAD 与声明提交必须一致 / 绑定后可证 / remote 缺失失败关闭 /
+主机不同失败关闭 / 工件摘要不冒充源码身份 / 冻结清单可证非 Git 源码 /
+工件证明的成员不得承载负证据 / 旧证明不回写且状态可确定性重放）。
 
 ### 真实语料的分层（分开报告，不合并）
 
 【事实】对真实对照语料的只读分级：
 
 ```text
-candidate_run_dirs        18
-readable_candidate       12
-upstream_schema_validated 12
-frozen_snapshot_anchored 12   （冻结工件字节仍与登记摘要一致）
-source_identity_verified  0   （审计代码的身份未被证明）
-trusted_negative          0   （没有任何可信封存）
-units_in_readable_candidates 393
+candidate_run_dirs                18
+readable_candidate                12
+upstream_schema_validated         12
+frozen_audit_artifacts_anchored   12   （审计工件字节仍与登记摘要一致）
+sources_with_frozen_manifest       0   （没有 run 携带冻结源码清单）
+source_identity_verified           0   （被审计代码的身份未被证明）
+trusted_negative                   0   （没有任何可信封存）
+units_in_readable_candidates     396
 ```
 
-【推断】`frozen_snapshot_anchored = 12` 与 `source_identity_verified = 0` **不是同一件事**：
-前者证明「导入进来的 ledger 快照字节未变」，后者证明「被审计的**代码**是哪个提交」。
-审计对象的上游仓库在本机不可得，因此真实语料的**代码身份**仍为 0，本片**不**用合成样本抬高它
-（R1）。**维持 0 是正确结果。**
+【推断】`frozen_audit_artifacts_anchored` 与 `source_identity_verified` **不是同一件事**：
+前者证明「导入进来的审计工件字节未变」，后者证明「被审计的**代码**是哪个版本」。
+真实语料里**没有一个 run 携带冻结源码清单**（`sources_with_frozen_manifest = 0`），
+所以代码身份**在原理上**就无法被证明——这是**正确结果**，本片**不**用合成样本抬高它。
 
 ### 本片不做的事
 
@@ -803,9 +836,3 @@ units_in_readable_candidates 393
 - 不开放生产注册与多轮写入（S2-C）；
 - 不恢复 D-014 / I4 的三位语义；
 - 不把 attestation 或 seal 当作任何 finding 的确认权威。
-
-
-
-
-
-
