@@ -609,10 +609,25 @@ def _ensure_vnext_columns(conn: sqlite3.Connection) -> None:
     --
     -- The table is deliberately *not* cascaded away with its project: an
     -- append-only ledger must survive the objects it describes, so a project
-    -- that owns registration events can no longer be deleted.  The foreign
-    -- keys stay NO ACTION on purpose; ON DELETE CASCADE would erase history
-    -- without firing the append-only triggers (SQLite only fires user
-    -- triggers for foreign key actions when recursive_triggers is on).
+    -- that owns registration events can no longer be deleted.
+    --
+    -- The foreign keys stay NO ACTION on purpose, and the reason is the
+    -- *error* a rejected delete produces, not the absence of a cascade.
+    -- Measured on SQLite 3.50.4 (see docs/skills/skill-driven-mode.md,
+    -- "删除策略"): SQLite fires a child table's BEFORE DELETE trigger for
+    -- foreign key actions, and PRAGMA recursive_triggers does not change
+    -- that.  So ON DELETE CASCADE would not silently erase the ledger
+    -- either - the cascade would be aborted by the append-only trigger with
+    -- "skill_coverage_events is append-only".  That message contains no
+    -- "FOREIGN KEY", so it would fall past the 409 PROJECT_HAS_COVERAGE_EVENTS
+    -- branch in delete_project and surface as a server error instead of the
+    -- documented conflict.  NO ACTION keeps the delete failing with the
+    -- foreign key error that branch keys on.
+    --
+    -- The trigger is a second line of defence, not the primary one: relying
+    -- on it to stop a cascade would depend on the SQLite version, because
+    -- child triggers are only fired for foreign key actions since 3.6.19.
+    -- The NO ACTION constraint does not depend on the version.
     CREATE TABLE IF NOT EXISTS skill_coverage_events (
         event_id INTEGER PRIMARY KEY AUTOINCREMENT,
         project_id TEXT NOT NULL REFERENCES projects(id),
