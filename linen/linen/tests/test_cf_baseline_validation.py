@@ -487,6 +487,57 @@ def test_registered_receipt_rejects_wrong_upstream_commit(board) -> None:
             )
 
 
+def test_receipt_rejects_mismatched_metadata_digest(board) -> None:
+    """E143: a receipt about other metadata is not a receipt about this source.
+
+    The ledger bytes match, but the metadata they were read together with
+    does not - so the receipt is about a different import.
+    """
+
+    payload = _ledger_bytes([_unit()])
+    other_metadata_sha = hashlib.sha256(b"{}").hexdigest()
+
+    with db.get_conn() as conn:
+        # The source is registered without a controlled validation, so the
+        # only receipt in the table is the mismatching one.
+        _write_run(board / "root", "run-1", ledger=payload)
+        candidate = import_historical_run(
+            root=board / "root",
+            project_id=PROJECT,
+            source_ref="run-1",
+            origin="offline-import",
+        )
+        register_historical_source(conn, candidate)
+
+        mismatched = issue_ledger_validation_receipt(
+            outcome=LedgerValidationOutcome(
+                valid=True,
+                record_count=1,
+                errors=(),
+                ledger_sha256=hashlib.sha256(payload).hexdigest(),
+                validator_sha256=hashlib.sha256(
+                    cf_skill_file(VALIDATE_COVERAGE_LEDGER).read_bytes()
+                ).hexdigest(),
+                upstream_commit=pinned_upstream_commit(),
+                runner=validator_runner(),
+                platform="linux",
+            ),
+            project_id=PROJECT,
+            source_ref="run-1",
+            metadata_sha256=other_metadata_sha,
+            issued_by="operator",
+            issued_at="2026-01-01T00:00:00Z",
+        )
+        register_ledger_validation(
+            conn, project_id=PROJECT, source_ref="run-1", receipt=mismatched
+        )
+
+        with pytest.raises(BaselineReferenceUnverifiable):
+            verify_ledger_validation(
+                conn, project_id=PROJECT, source_ref="run-1", ledger_bytes=payload
+            )
+
+
 def test_receipt_must_match_registered_source_ledger_digest(board) -> None:
     """CR-T09: the receipt has to be about the registered source's ledger.
 
