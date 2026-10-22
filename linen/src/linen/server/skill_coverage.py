@@ -290,7 +290,7 @@ def register_unit(
             f"dimensions: {expected!r}"
         )
 
-    content = payload.model_dump(mode="json")
+    content = payload.digest_content()
     normalized = cf_canonical_json(content)
     digest = cf_payload_digest(content)
     event_key = unit_registration_event_key(coverage_id)

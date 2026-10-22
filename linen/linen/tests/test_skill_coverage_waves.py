@@ -28,6 +28,7 @@ import subprocess
 import pytest
 from pydantic import ValidationError
 
+from linen.contracts.common import cf_payload_digest
 from linen.contracts.skill_audit import (
     AttemptRecordedPayload,
     CoverageBlockSelection,
@@ -65,6 +66,7 @@ from linen.server.skill_coverage_waves import (
     record_trusted_wave_started,
     record_wave_started,
     upstream_coverage_ledger,
+    upstream_ledger_export_report,
     wave_started_event_key,
 )
 from linen.contracts.skill_audit import CoverageCanonicalRefs, UnitRegisteredPayload
@@ -175,6 +177,7 @@ def _blocks(
     selected: list[str] | None = None,
     excluded: list[dict[str, str]] | None = None,
     source: str = "skill_audit.py:317",
+    companion_catalog_state: str | None = None,
 ) -> CoverageBlockSelection:
     return CoverageBlockSelection(
         ordinary_attack_class_block=ordinary,
@@ -183,6 +186,7 @@ def _blocks(
             CoverageExcludedBlock(block=entry["block"], reason=entry["reason"])
             for entry in (excluded or [])
         ],
+        companion_catalog_state=companion_catalog_state,
         source=source,
     )
 
@@ -218,7 +222,9 @@ def _wave(
         wave=wave,
         agent_id=agent_id,
         block_selection=blocks if blocks is not None else _blocks(),
-        starting_paths=list(starting_paths or ["src/authz.py"]),
+        starting_paths=list(
+            starting_paths if starting_paths is not None else ["src/authz.py"]
+        ),
         reassignment_reason=reason,
     )
 
@@ -1100,3 +1106,188 @@ def test_event_keys_are_deterministic():
     assert wave_started_event_key(COVERAGE_ID, 1) == f"wave_started:{COVERAGE_ID}:1"
     assert attempt_recorded_event_key(COVERAGE_ID, 2) == f"attempt_recorded:{COVERAGE_ID}:2"
     assert os.sep not in wave_started_event_key(COVERAGE_ID, 1)
+
+
+# --- R-T03: a record without the capability state projects as unknown -------
+
+
+def test_rt03_a_record_without_the_capability_state_projects_as_unknown(board):
+    """R-T03: an absent field is not evidence that the catalog was missing.
+
+    A wave that was recorded before the capability state existed does not
+    say whether the companion playbooks were available.  The projection
+    reports that as ``unknown`` instead of backfilling ``unavailable``.
+    """
+
+    with db.get_conn() as conn:
+        _register(conn)
+        record_wave_started(
+            conn,
+            project_id=PROJECT,
+            run_id=RUN,
+            coverage_id=COVERAGE_ID,
+            payload=_wave(1, blocks=_blocks()),
+        )
+        projection = _projection(conn)[0]
+
+    assert projection.block_selection is not None
+    assert projection.block_selection["companion_catalog_state"] == "unknown"
+
+
+def test_rt03_a_recorded_capability_state_is_projected_as_recorded(board):
+    """R-T03: the projection does not second-guess a recorded state."""
+
+    with db.get_conn() as conn:
+        _register(conn)
+        record_wave_started(
+            conn,
+            project_id=PROJECT,
+            run_id=RUN,
+            coverage_id=COVERAGE_ID,
+            payload=_wave(1, blocks=_blocks(companion_catalog_state="unavailable")),
+        )
+        projection = _projection(conn)[0]
+
+    assert projection.block_selection is not None
+    assert projection.block_selection["companion_catalog_state"] == "unavailable"
+
+
+def test_rt03_an_unset_capability_state_does_not_change_the_digest():
+    """R-T03: the extension is compatible, the stored digests stay valid.
+
+    A record written before the field existed keeps the digest it was
+    stored with: the field contributes nothing to the digest while it is
+    unset.  Once it *is* recorded, the digest covers it.
+    """
+
+    unset = _wave(1, blocks=_blocks())
+    legacy_content = unset.model_dump(mode="json")
+    legacy_content["block_selection"].pop("companion_catalog_state")
+    assert cf_payload_digest(unset.digest_content()) == cf_payload_digest(
+        legacy_content
+    )
+
+    recorded = _wave(1, blocks=_blocks(companion_catalog_state="unavailable"))
+    assert cf_payload_digest(recorded.digest_content()) != cf_payload_digest(
+        unset.digest_content()
+    )
+
+
+def test_rt03_the_stored_event_is_not_rewritten(board):
+    """R-T03: the extension never backfills an already written event."""
+
+    with db.get_conn() as conn:
+        _register(conn)
+        record_wave_started(
+            conn,
+            project_id=PROJECT,
+            run_id=RUN,
+            coverage_id=COVERAGE_ID,
+            payload=_wave(1, blocks=_blocks()),
+        )
+        stored = json.loads(_events(conn)[1]["payload_json"])
+
+    assert "companion_catalog_state" not in stored["block_selection"]
+
+
+def test_rt03_the_capability_state_stays_out_of_the_upstream_shape(board):
+    """R-T03: the state is linen's provenance, not the upstream schema."""
+
+    with db.get_conn() as conn:
+        _register(conn)
+        record_wave_started(
+            conn,
+            project_id=PROJECT,
+            run_id=RUN,
+            coverage_id=COVERAGE_ID,
+            payload=_wave(1, blocks=_blocks(companion_catalog_state="unavailable")),
+        )
+        ledger = upstream_coverage_ledger(_projection(conn))
+
+    assert ledger, "the unit started a wave and has to be publishable"
+    assert "companion_catalog_state" not in ledger[0]
+
+
+# --- R-T06: a registered unit stays planned and is not published ------------
+
+
+def test_rt06_a_registered_only_unit_stays_planned(board):
+    """R-T06: registration alone does not make a unit a covered unit."""
+
+    with db.get_conn() as conn:
+        _register(conn)
+        projection = _projection(conn)[0]
+
+    assert projection.status == "planned"
+    assert projection.wave == 1
+    assert projection.starting_paths == []
+
+
+def test_rt06_a_registered_only_unit_is_not_exported(board):
+    """R-T06: it cannot pass the complete-upstream-ledger check.
+
+    A ledger that invented the starting paths of a unit nobody started
+    would claim a coverage that was never run.
+    """
+
+    with db.get_conn() as conn:
+        _register(conn)
+        projection = _projection(conn)[0]
+
+    assert projection.exportable is False
+    assert projection.export_blockers
+    assert upstream_coverage_ledger([projection]) == []
+
+
+def test_rt06_the_export_report_names_the_unit_it_left_out(board):
+    """R-T06: a unit that is left out is named, not silently dropped."""
+
+    with db.get_conn() as conn:
+        _register(conn)
+        projection = _projection(conn)[0]
+        report = upstream_ledger_export_report([projection])
+
+    assert report["units"] == []
+    assert len(report["skipped"]) == 1
+    assert report["skipped"][0]["coverage_id"] == COVERAGE_ID
+    assert report["skipped"][0]["blockers"]
+
+
+def test_rt06_a_unit_with_a_wave_is_exported(board):
+    """R-T06: the export gate opens once a real wave supplied the paths."""
+
+    with db.get_conn() as conn:
+        _register(conn)
+        record_wave_started(
+            conn,
+            project_id=PROJECT,
+            run_id=RUN,
+            coverage_id=COVERAGE_ID,
+            payload=_wave(1),
+        )
+        projection = _projection(conn)[0]
+        report = upstream_ledger_export_report([projection])
+
+    assert projection.exportable is True
+    assert projection.export_blockers == []
+    assert report["skipped"] == []
+    assert [unit["coverage_id"] for unit in report["units"]] == [COVERAGE_ID]
+
+
+def test_rt06_a_wave_without_starting_paths_is_not_exported(board):
+    """R-T06: a wave that recorded no paths still cannot be published."""
+
+    with db.get_conn() as conn:
+        _register(conn)
+        record_wave_started(
+            conn,
+            project_id=PROJECT,
+            run_id=RUN,
+            coverage_id=COVERAGE_ID,
+            payload=_wave(1, starting_paths=[]),
+        )
+        projection = _projection(conn)[0]
+
+    assert projection.exportable is False
+    assert projection.export_blockers
+    assert upstream_coverage_ledger([projection]) == []

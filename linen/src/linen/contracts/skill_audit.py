@@ -34,6 +34,17 @@ from .common import (
 )
 
 Verdict = Literal["confirmed", "needs_validation", "rejected"]
+
+#: Deprecated compatibility alias (D-033).
+#:
+#: The eight values below predate the coverage protocol and never became the
+#: upstream attack-class taxonomy: the pinned snapshot carries nine ordinary
+#: blocks whose titles are title case, and ``canonical_refs.attack_class`` is
+#: a *descriptive* identity reference rather than a classification label.
+#: The alias stays exported so existing importers keep working, but it is no
+#: longer a protocol authority: it must not restrict the canonical refs and
+#: it must not be used to pick an upstream block.  Removing it is only
+#: allowed in an explicitly approved breaking API change.
 AttackClass = Literal[
     "injection", "access_control", "resource_and_file_handling",
     "cryptography_and_secrets", "business_logic", "chained_vulnerabilities",
@@ -402,6 +413,11 @@ class UnitRegisteredPayload(ContractModel):
 
         return self.canonical_refs.derived_coverage_id()
 
+    def digest_content(self) -> dict[str, Any]:
+        """The content the ledger digests for this payload."""
+
+        return self.model_dump(mode="json")
+
 
 # --- CF-S2-A: the multiwave event contracts --------------------------------
 
@@ -451,11 +467,20 @@ class CoverageBlockSelection(ContractModel):
     prompt, and the hunter's own result never carries block fields.  The
     ``source`` reference is therefore mandatory - a block map that cannot be
     traced back to the decision that produced it is not a trusted record.
+
+    ``companion_catalog_state`` says whether the companion playbooks were
+    available to the decision at all.  An empty ``selected_companion_blocks``
+    is ambiguous on its own: it can mean "the catalog was there and nothing
+    was chosen" or "there was no catalog", and an audit system has to tell
+    those apart.  The state is part of linen's trusted provenance only: it is
+    not part of the upstream ledger, the canonical refs, the coverage id, or
+    anything a model may fill in.
     """
 
     ordinary_attack_class_block: str | None = None
     selected_companion_blocks: list[str] = Field(default_factory=list, max_length=1000)
     excluded_blocks: list[CoverageExcludedBlock] = Field(default_factory=list, max_length=1000)
+    companion_catalog_state: Literal["available", "unavailable", "unknown"] | None = None
     source: str = Field(min_length=1, max_length=1024)
 
     @field_validator("ordinary_attack_class_block")
@@ -486,7 +511,25 @@ class CoverageBlockSelection(ContractModel):
                 raise ValueError(
                     f"block {entry.block!r} is both selected and excluded"
                 )
+        if self.companion_catalog_state == "unavailable" and self.selected_companion_blocks:
+            raise ValueError(
+                "an unavailable companion catalog cannot have selected companion blocks"
+            )
         return self
+
+    def digest_content(self) -> dict[str, Any]:
+        """The content the ledger digests for this block selection.
+
+        The capability state is omitted when it was never recorded, so a
+        record written before the field existed keeps the digest it was
+        stored with (D-032).  The projection reports such a record as
+        ``unknown`` rather than backfilling ``unavailable``.
+        """
+
+        content = self.model_dump(mode="json")
+        if self.companion_catalog_state is None:
+            content.pop("companion_catalog_state", None)
+        return content
 
 
 class WaveStartedPayload(ContractModel):
@@ -540,6 +583,18 @@ class WaveStartedPayload(ContractModel):
 
     def derived_coverage_id(self) -> str:
         return self.canonical_refs.derived_coverage_id()
+
+    def digest_content(self) -> dict[str, Any]:
+        """The content the ledger digests for this wave.
+
+        The block selection decides how its own capability state is
+        serialized, so a record written before that field existed keeps the
+        digest it was stored with (D-032).
+        """
+
+        content = self.model_dump(mode="json")
+        content["block_selection"] = self.block_selection.digest_content()
+        return content
 
 
 class AttemptRecordedPayload(ContractModel):
@@ -624,4 +679,9 @@ class AttemptRecordedPayload(ContractModel):
 
     def derived_coverage_id(self) -> str:
         return self.canonical_refs.derived_coverage_id()
+
+    def digest_content(self) -> dict[str, Any]:
+        """The content the ledger digests for this attempt."""
+
+        return self.model_dump(mode="json")
 

@@ -356,7 +356,7 @@ def _record_event(
 ) -> RecordedCoverageEvent:
     """Insert one multiwave event, enforcing the state machine."""
 
-    content = payload.model_dump(mode="json")
+    content = payload.digest_content()
     normalized = cf_canonical_json(content)
     digest = cf_payload_digest(content)
 
@@ -869,6 +869,11 @@ class CoverageUnitProjection:
     block_selection: dict[str, Any] | None
     starting_paths: list[str]
     registration_event_id: int
+    #: Whether this unit may be published as a complete upstream ledger
+    #: (D-034).  A unit that is only registered has no real starting paths,
+    #: and a ledger that invents them would claim a coverage nobody ran.
+    exportable: bool = True
+    export_blockers: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -888,6 +893,8 @@ class CoverageUnitProjection:
             ),
             "starting_paths": list(self.starting_paths),
             "registration_event_id": self.registration_event_id,
+            "exportable": self.exportable,
+            "export_blockers": list(self.export_blockers),
         }
 
     def to_upstream_unit(self) -> dict[str, Any]:
@@ -1038,9 +1045,30 @@ def _project_unit(
         selection = start_payload.get("block_selection")
         if isinstance(selection, Mapping):
             block_selection = dict(selection)
+            # A record written before the capability state existed does not
+            # say whether the companion catalog was there (D-032).  The
+            # projection reports that as ``unknown`` instead of backfilling
+            # ``unavailable``: an absent field is not evidence that the
+            # catalog was missing.
+            block_selection.setdefault("companion_catalog_state", "unknown")
         paths = start_payload.get("starting_paths")
         if isinstance(paths, list):
             starting_paths = [str(path) for path in paths]
+
+    # Export eligibility (D-034): a unit that never started a wave has no
+    # real starting paths, and a ledger that invents them would claim a
+    # coverage nobody ran.
+    export_blockers: list[str] = []
+    if not current_wave:
+        export_blockers.append(
+            "the unit is registered but no wave has started, so its starting paths "
+            "are unknown"
+        )
+    elif not starting_paths:
+        export_blockers.append(
+            f"wave {current_wave} recorded no starting paths, so the unit cannot be "
+            "published as a complete upstream ledger"
+        )
 
     return CoverageUnitProjection(
         coverage_id=coverage_id,
@@ -1057,6 +1085,8 @@ def _project_unit(
         block_selection=block_selection,
         starting_paths=starting_paths,
         registration_event_id=registration_event_id,
+        exportable=not export_blockers,
+        export_blockers=export_blockers,
     )
 
 
@@ -1065,10 +1095,43 @@ def upstream_coverage_ledger(
 ) -> list[dict[str, Any]]:
     """The projected units as an upstream coverage ledger document.
 
+    Only units that are allowed to be published appear here (D-034): a unit
+    that never started a wave is kept in the native projection, where its
+    ``planned`` state is visible, but it is not dressed up as a complete
+    upstream ledger.
+
     The upstream ledger is a top-level array whose units are sorted by
     coverage id, so the projection is sorted the same way.
     """
 
-    units = [projection.to_upstream_unit() for projection in projections]
+    units = [
+        projection.to_upstream_unit()
+        for projection in projections
+        if projection.exportable
+    ]
     units.sort(key=lambda unit: str(unit.get("coverage_id") or ""))
     return units
+
+
+def upstream_ledger_export_report(
+    projections: Iterable[CoverageUnitProjection],
+) -> dict[str, Any]:
+    """The exportable ledger and the units that were left out of it.
+
+    Leaving a unit out silently would be the same kind of gap as inventing
+    its starting paths, so the report names every unit that was not
+    published and why.
+    """
+
+    materialised = list(projections)
+    return {
+        "units": upstream_coverage_ledger(materialised),
+        "skipped": [
+            {
+                "coverage_id": projection.coverage_id,
+                "blockers": list(projection.export_blockers),
+            }
+            for projection in materialised
+            if not projection.exportable
+        ],
+    }
