@@ -114,7 +114,21 @@ def test_upstream_files_match_recorded_sha256sums() -> None:
         f"SHA256SUMS covers {sorted(recorded)}, expected {sorted(UPSTREAM_FILES)}"
     )
     for name, digest in recorded.items():
-        assert _digest(_snapshot() / name) == digest, f"{name} was modified locally"
+        assert _digest(_snapshot() / name) == digest, (
+            f"{name} does not match the digest recorded in SHA256SUMS; the snapshot "
+            f"must keep the canonical upstream bytes (LF line endings, see "
+            f".gitattributes) on every platform"
+        )
+
+
+def test_snapshot_keeps_canonical_lf_line_endings() -> None:
+    """A CRLF checkout must never diverge from the recorded upstream digests."""
+    for name in UPSTREAM_FILES:
+        payload = (_snapshot() / name).read_bytes()
+        assert b"\r\n" not in payload, (
+            f"{name} contains CRLF line endings; the vendored snapshot must keep "
+            f"the upstream LF bytes (see .gitattributes and PROVENANCE.md)"
+        )
 
 
 def test_license_and_attribution_are_preserved() -> None:

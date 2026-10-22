@@ -1,0 +1,5 @@
+# The vendored Cloudflare security-audit-skill snapshot must keep the exact
+# bytes published upstream (upstream stores LF line endings). Pin LF for the
+# whole snapshot directory so the digests recorded in SHA256SUMS verify on
+# every platform and a CRLF checkout can never diverge from the upstream bytes.
+linen/src/linen/third_party/cloudflare_security_audit_skill/* text eol=lf
