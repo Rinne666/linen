@@ -16,8 +16,14 @@ import subprocess
 from pathlib import Path
 
 from linen.contracts.skill_audit import parse_finding_record
+from linen.dispatcher.analysis.cf_skill_assets import (
+    VALIDATE_FINDINGS,
+    cf_skill_dir,
+    validator_command,
+)
 
-VENDORED_SKILL_DIR = Path(".linen-runtime/cf-security-audit-skill/skills/security-audit")
+#: Directory of the pinned upstream snapshot shipped inside the package.
+VENDORED_SKILL_DIR = cf_skill_dir()
 
 SUBSTANTIVE_FIELDS = (
     "root_cause", "claimed_root_cause", "trace", "execution",
@@ -117,20 +123,20 @@ def write_findings_json(project, out_dir: Path, skill_dir: Path | None = None) -
     "validator_output": str | None}. ``ok`` is False when validation fails;
     callers must treat the report as incomplete in that case.
     """
-    directory = skill_dir or VENDORED_SKILL_DIR
+    directory = Path(skill_dir) if skill_dir else VENDORED_SKILL_DIR
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "findings.json"
     records = collect_finding_records(project)
     # upstream validate-findings.cjs expects a top-level array of records
     path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-    validator = directory / "validate-findings.cjs"
+    validator = directory / VALIDATE_FINDINGS
     if not validator.exists():
         return {"ok": False, "path": str(path), "records": len(records),
                 "error": f"upstream validator missing at {validator}", "validator_output": None}
     try:
         result = subprocess.run(
-            ["node", str(validator), str(path)],
+            validator_command(validator, path),
             capture_output=True, text=True, timeout=30,
         )
     except FileNotFoundError:

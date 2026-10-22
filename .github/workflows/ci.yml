@@ -24,7 +24,18 @@ jobs:
           node-version: "22"
       - name: Install locked dependencies
         run: uv sync --project linen --locked --group dev
+      - name: Run upstream validator test suites
+        run: |
+          node --test linen/src/linen/third_party/cloudflare_security_audit_skill/validate-coverage-ledger.test.cjs
+          node --test linen/src/linen/third_party/cloudflare_security_audit_skill/validate-findings.test.cjs
       - name: Run regression suite
-        run: uv run --project linen --locked --group dev pytest linen/linen/tests
+        run: uv run --project linen --locked --group dev pytest linen/linen/tests -ra --junitxml=linen/pytest-junit.xml
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-junit
+          path: linen/pytest-junit.xml
+          if-no-files-found: ignore
       - name: Build distribution
         run: uv build --project linen

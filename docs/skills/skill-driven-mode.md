@@ -4,8 +4,9 @@
 
 ## 上游与版本
 
-- vendored 副本：`.linen-runtime/cf-security-audit-skill/` @ `c1c8a8c1471069fb0e188eeaff69b8e8db6564a8`（见其 `PROVENANCE`，不入 git）。
+- vendored 副本：`linen/src/linen/third_party/cloudflare_security_audit_skill/` @ `c1c8a8c1471069fb0e188eeaff69b8e8db6564a8`（**入 git，随 wheel 分发**；见其 `PROVENANCE.md` 与 `SHA256SUMS`）。运行时从包内路径解析，不依赖工作目录，也不再需要 `.linen-runtime/` 下的副本。
 - 适配产物（入 git）：`linen/src/linen/dispatcher/prompts/skill_audit/`。每个文件头部标注改编自哪个上游文件。
+- 上游校验器：包内 `validate-findings.cjs` 与 `validate-coverage-ledger.cjs`。Linux/macOS 直接调用上游 CLI；Windows 走 `run-validator.windows.cjs`（Node 在 win32 不提供 `O_NOFOLLOW`/`O_NONBLOCK`，上游 CLI 会拒绝一切输入）。
 
 ## 职责分工
 
@@ -73,10 +74,6 @@ fact 携带：`unit_state`、`owner_run`、`reviewed_paths`、`unresolved_facts[
 
 ## 实施状态（2026-10-17）
 
-- ✅ M1 `59f864d`：contracts + prompt pack。
-- ✅ M2/M3（本
-## 实施状态（2026-10-17）
-
 - M1 `59f864d`：contracts + prompt pack。
 - M2/M3（本分支）：全链落地。
   - `contracts/skill_audit.py`：与上游 report-schema.json 逐字段对齐（trace 用 kind/file/line/scope/description，severity/confidence/execution/remediation 为结构化对象，overall_severity 为字符串枚举且不得超过 impact），`validate-findings.cjs` 实测通过。
@@ -88,5 +85,5 @@ fact 携带：`unit_state`、`owner_run`、`reviewed_paths`、`unresolved_facts[
   - `analysis/audit_graph.py`：`_skill_driven_proposals` 从覆盖单元状态派生意图（候选验证 > 种子 hunt > critic wave），幂等键 = 开放意图或确定性描述。
   - `config.py`：`audit.skill_driven`（coverage_seeds/max_bounces/max_candidates_per_wave）+ TaskType 扩展 + skill_audit prompt 组 token 注册。
   - 配置样例：`.linen-runtime/benchmark-python/dispatch-skill.yaml`（9 个种子单元，wall-clock/run 预算与 run 4 同口径）。
-- 测试：`test_skill_audit_contracts.py`（11）+ `test_skill_audit_wiring.py`（16），全量 818 passed。含上游校验器端到端用例。
+- 测试：`test_skill_audit_contracts.py`（11）+ `test_skill_audit_wiring.py`（16）+ `test_cf_vendor_resources.py`（10）。**测试总数以 CI 的实际 run 记录、commit 与测试报告为准**，本文档不再写未经实测的通过数。
 - 待办 M4 运行：pi 配额恢复或 codex 独跑，用 dispatch-skill.yaml 起 dispatcher、建 proj_008、对照 run 4 基线评分。
