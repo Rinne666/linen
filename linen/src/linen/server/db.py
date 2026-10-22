@@ -665,6 +665,42 @@ def _ensure_vnext_columns(conn: sqlite3.Connection) -> None:
     BEGIN
         SELECT RAISE(ABORT, 'skill_coverage_events is append-only');
     END;
+    -- CF-S2-B1 historical baseline sources (append-only).
+    --
+    -- A prior status is only trustworthy when the history behind it can be
+    -- found again, so the *reference body* - not just a digest of it - is
+    -- stored here, and the row is append-only like the coverage ledger.
+    --
+    -- The foreign key stays NO ACTION on purpose, for the same reason the
+    -- coverage ledger uses it: the reference body must not disappear when the
+    -- project is deleted, because a stored lookup_ref whose body is gone
+    -- cannot be verified any more.  A project that owns baseline sources
+    -- therefore cannot be deleted, and delete_project reports that as its
+    -- own conflict code instead of the coverage-event one.
+    CREATE TABLE IF NOT EXISTS coverage_baseline_sources (
+        source_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        record_kind TEXT NOT NULL
+            CHECK (record_kind IN ('historical_source', 'lineage_manifest')),
+        record_ref TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        payload_sha256 TEXT NOT NULL,
+        lookup_ref TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE (project_id, record_kind, record_ref)
+    );
+    CREATE INDEX IF NOT EXISTS coverage_baseline_sources_lookup_idx
+        ON coverage_baseline_sources(project_id, lookup_ref);
+    CREATE TRIGGER IF NOT EXISTS coverage_baseline_sources_no_update
+    BEFORE UPDATE ON coverage_baseline_sources
+    BEGIN
+        SELECT RAISE(ABORT, 'coverage_baseline_sources is append-only');
+    END;
+    CREATE TRIGGER IF NOT EXISTS coverage_baseline_sources_no_delete
+    BEFORE DELETE ON coverage_baseline_sources
+    BEGIN
+        SELECT RAISE(ABORT, 'coverage_baseline_sources is append-only');
+    END;
     """)
 
 

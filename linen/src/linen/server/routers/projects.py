@@ -1309,10 +1309,29 @@ def delete_project(project_id: str):
         try:
             conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
         except sqlite3.IntegrityError as exc:
-            # The coverage event ledger is append-only and deliberately not
-            # cascaded, so a project that owns registration events cannot be
-            # deleted.  Report that as a conflict instead of a server error.
+            # The coverage event ledger and the baseline source registry are
+            # append-only and deliberately not cascaded, so a project that
+            # owns either of them cannot be deleted.  Report that as a
+            # conflict instead of a server error, and tell the two apart:
+            # a baseline reference whose body is gone can no longer be
+            # verified, which is a different problem from a coverage event.
             if "FOREIGN KEY" in str(exc):
+                owns_baselines = conn.execute(
+                    "SELECT 1 FROM coverage_baseline_sources WHERE project_id = ? "
+                    "LIMIT 1",
+                    (project_id,),
+                ).fetchone()
+                if owns_baselines is not None:
+                    raise HTTPException(
+                        409,
+                        {
+                            "code": "PROJECT_HAS_BASELINE_SOURCES",
+                            "detail": (
+                                "the project owns immutable historical baseline "
+                                "sources and cannot be deleted"
+                            ),
+                        },
+                    ) from exc
                 raise HTTPException(
                     409,
                     {

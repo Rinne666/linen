@@ -7,6 +7,14 @@ on a database schema.
 """
 
 from .artifact import ArtifactMetadata
+from .baseline import (
+    BaselineLineageManifest,
+    BaselineManifestMember,
+    BaselineSourceIdentity,
+    BaselineSourceRecord,
+    encode_reference,
+    reference_digest,
+)
 from .component import ComponentKind, ComponentManifest, ComponentRisk
 from .context import ContextProjection, ContextRequest
 from .event import AuditEventEnvelope
@@ -42,6 +50,10 @@ from .worker_manifest import ComponentRef, RecipeRef, WorkerManifest
 __all__ = [
     "ArtifactMetadata",
     "AuditEventEnvelope",
+    "BaselineLineageManifest",
+    "BaselineManifestMember",
+    "BaselineSourceIdentity",
+    "BaselineSourceRecord",
     "BlackboardSnapshot",
     "ComponentKind",
     "ComponentManifest",
@@ -75,5 +87,7 @@ __all__ = [
     "TraceStep",
     "ValidationPlan",
     "Verdict",
+    "encode_reference",
     "parse_finding_record",
+    "reference_digest",
 ]
