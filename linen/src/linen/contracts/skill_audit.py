@@ -18,11 +18,19 @@ from typing import Any, Literal
 from pydantic import Field, field_validator, model_validator
 
 from .common import (
+    CF_ATTEMPT_STATUSES,
     CF_BASELINE_KINDS,
     CF_PRIOR_STATUSES,
     ContractModel,
     cf_canonical_coverage_id,
     cf_is_legacy_coverage_id,
+    cf_is_safe_agent_id,
+    cf_is_visible_text,
+    cf_validate_check,
+    cf_validate_fingerprint_array,
+    cf_validate_path_array,
+    cf_validate_reviewed_path_ownership,
+    cf_validate_text_array,
 )
 
 Verdict = Literal["confirmed", "needs_validation", "rejected"]
@@ -393,3 +401,227 @@ class UnitRegisteredPayload(ContractModel):
         """The canonical id this payload registers."""
 
         return self.canonical_refs.derived_coverage_id()
+
+
+# --- CF-S2-A: the multiwave event contracts --------------------------------
+
+
+class CoverageLocalCheck(ContractModel):
+    """One coverage check, exactly the six upstream fields (S1-A).
+
+    The artifact of a ``local`` check has to live under its own agent, and a
+    ``source`` check must not name an artifact at all.  Reusing an artifact
+    that an earlier attempt already used is rejected by the ledger, not here:
+    the ledger is the only place that sees every attempt of a unit.
+    """
+
+    agent_id: str
+    reviewed_paths: list[str]
+    invariant: str
+    method: Literal["source", "local"]
+    result: str
+    artifact: str | None = None
+
+    @model_validator(mode="after")
+    def validate_check_shape(self) -> "CoverageLocalCheck":
+        cf_validate_check(self.model_dump(), location="local_checks[]")
+        return self
+
+
+class CoverageExcludedBlock(ContractModel):
+    """A block that was deliberately left out, and why."""
+
+    block: str
+    reason: str
+
+    @model_validator(mode="after")
+    def validate_block_text(self) -> "CoverageExcludedBlock":
+        if not cf_is_visible_text(self.block):
+            raise ValueError("excluded block must be visible text")
+        if not cf_is_visible_text(self.reason):
+            raise ValueError("excluded block requires a reason")
+        return self
+
+
+class CoverageBlockSelection(ContractModel):
+    """The block map a wave was assigned, with a traceable source.
+
+    The blocks are the plan's decision, not the model's: upstream treats the
+    assignment block map as something the parent process puts into the hunter
+    prompt, and the hunter's own result never carries block fields.  The
+    ``source`` reference is therefore mandatory - a block map that cannot be
+    traced back to the decision that produced it is not a trusted record.
+    """
+
+    ordinary_attack_class_block: str | None = None
+    selected_companion_blocks: list[str] = Field(default_factory=list, max_length=1000)
+    excluded_blocks: list[CoverageExcludedBlock] = Field(default_factory=list, max_length=1000)
+    source: str = Field(min_length=1, max_length=1024)
+
+    @field_validator("ordinary_attack_class_block")
+    @classmethod
+    def validate_ordinary_block(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not cf_is_visible_text(value):
+            raise ValueError("ordinary_attack_class_block must be null or visible text")
+        return value
+
+    @field_validator("selected_companion_blocks")
+    @classmethod
+    def validate_companion_blocks(cls, values: list[str]) -> list[str]:
+        cf_validate_text_array(values, location="selected_companion_blocks")
+        return values
+
+    @model_validator(mode="after")
+    def validate_exclusions(self) -> "CoverageBlockSelection":
+        seen: set[str] = set()
+        for entry in self.excluded_blocks:
+            if entry.block in seen:
+                raise ValueError(f"excluded block {entry.block!r} appears more than once")
+            seen.add(entry.block)
+        selected = set(self.selected_companion_blocks)
+        for entry in self.excluded_blocks:
+            if entry.block in selected:
+                raise ValueError(
+                    f"block {entry.block!r} is both selected and excluded"
+                )
+        return self
+
+
+class WaveStartedPayload(ContractModel):
+    """The v1 ``wave_started`` event payload (CF-S2-A).
+
+    A wave start records who took the unit over and which blocks they were
+    given.  The ``reassignment_reason`` belongs to the *previous* wave: the
+    reason a hunter was replaced is often only known once the next wave is
+    dispatched, so the ledger stores it here and the projection attaches it to
+    the archived attempt.  Wave 1 has no previous wave and therefore no
+    reason.
+    """
+
+    schema_version: int = 1
+    canonical_refs: CoverageCanonicalRefs
+    wave: int = Field(ge=1, le=50)
+    agent_id: str
+    block_selection: CoverageBlockSelection
+    starting_paths: list[str] = Field(default_factory=list, max_length=1000)
+    reassignment_reason: str | None = Field(default=None, max_length=4096)
+
+    @field_validator("agent_id")
+    @classmethod
+    def validate_agent_id(cls, value: str) -> str:
+        if not cf_is_safe_agent_id(value):
+            raise ValueError("agent_id must be a canonical lowercase agent ID")
+        return value
+
+    @field_validator("starting_paths")
+    @classmethod
+    def validate_starting_paths(cls, values: list[str]) -> list[str]:
+        cf_validate_path_array(values, location="starting_paths")
+        return values
+
+    @model_validator(mode="after")
+    def validate_reassignment(self) -> "WaveStartedPayload":
+        if self.wave == 1:
+            if self.reassignment_reason is not None:
+                raise ValueError(
+                    "the first wave has no previous attempt, so it cannot carry a "
+                    "reassignment reason"
+                )
+        elif self.reassignment_reason is None or not cf_is_visible_text(
+            self.reassignment_reason
+        ):
+            raise ValueError(
+                f"wave {self.wave} must record a visible reassignment reason for the "
+                "attempt it replaces"
+            )
+        return self
+
+    def derived_coverage_id(self) -> str:
+        return self.canonical_refs.derived_coverage_id()
+
+
+class AttemptRecordedPayload(ContractModel):
+    """The v1 ``attempt_recorded`` event payload (CF-S2-A).
+
+    An attempt is a terminal record of one wave: ``covered``, ``candidate``
+    or ``blocked``.  The state invariants mirror the upstream ones exactly, so
+    a projected attempt is accepted by the pinned validator without
+    translation.
+    """
+
+    schema_version: int = 1
+    canonical_refs: CoverageCanonicalRefs
+    wave: int = Field(ge=1, le=50)
+    agent_id: str
+    status: Literal["covered", "candidate", "blocked"]
+    reviewed_paths: list[str] = Field(default_factory=list, max_length=1000)
+    local_checks: list[CoverageLocalCheck] = Field(default_factory=list, max_length=1000)
+    result_fingerprints: list[str] = Field(default_factory=list, max_length=1000)
+    unresolved: list[str] = Field(default_factory=list, max_length=1000)
+
+    @field_validator("agent_id")
+    @classmethod
+    def validate_agent_id(cls, value: str) -> str:
+        if not cf_is_safe_agent_id(value):
+            raise ValueError("agent_id must be a canonical lowercase agent ID")
+        return value
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str) -> str:
+        if value not in CF_ATTEMPT_STATUSES:
+            raise ValueError(
+                "an attempt must record a terminal status: " + ", ".join(CF_ATTEMPT_STATUSES)
+            )
+        return value
+
+    @field_validator("reviewed_paths")
+    @classmethod
+    def validate_reviewed_paths(cls, values: list[str]) -> list[str]:
+        cf_validate_path_array(values, location="reviewed_paths")
+        return values
+
+    @field_validator("result_fingerprints")
+    @classmethod
+    def validate_fingerprints(cls, values: list[str]) -> list[str]:
+        cf_validate_fingerprint_array(values, location="result_fingerprints")
+        return values
+
+    @field_validator("unresolved")
+    @classmethod
+    def validate_unresolved(cls, values: list[str]) -> list[str]:
+        cf_validate_text_array(values, location="unresolved")
+        return values
+
+    @model_validator(mode="after")
+    def validate_state_invariants(self) -> "AttemptRecordedPayload":
+        checks = [check.model_dump() for check in self.local_checks]
+        cf_validate_reviewed_path_ownership(
+            self.reviewed_paths, checks, location="attempt"
+        )
+        if self.status == "covered":
+            if not self.reviewed_paths or not self.local_checks:
+                raise ValueError("a covered attempt requires reviewed paths and checks")
+            if self.unresolved:
+                raise ValueError("a covered attempt must not carry unresolved facts")
+            if self.result_fingerprints:
+                raise ValueError("a covered attempt must not carry result fingerprints")
+        elif self.status == "blocked":
+            if not self.reviewed_paths or not self.local_checks:
+                raise ValueError("a blocked attempt requires reviewed paths and checks")
+            if not self.unresolved:
+                raise ValueError("a blocked attempt requires unresolved facts")
+            if self.result_fingerprints:
+                raise ValueError("a blocked attempt must not carry result fingerprints")
+        else:  # candidate
+            if not self.reviewed_paths or not self.local_checks:
+                raise ValueError("a candidate attempt requires reviewed paths and checks")
+            if not self.result_fingerprints:
+                raise ValueError("a candidate attempt requires result fingerprints")
+        return self
+
+    def derived_coverage_id(self) -> str:
+        return self.canonical_refs.derived_coverage_id()
+

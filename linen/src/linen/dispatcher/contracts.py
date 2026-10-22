@@ -394,87 +394,13 @@ _cf_is_safe_relative_path = common.cf_is_safe_relative_path
 _cf_is_safe_agent_id = common.cf_is_safe_agent_id
 _cf_is_owned_artifact_path = common.cf_is_owned_artifact_path
 
-_CF_CHECK_REQUIRED_FIELDS = (
-    "agent_id",
-    "reviewed_paths",
-    "invariant",
-    "method",
-    "result",
-    "artifact",
-)
-
-
-def _cf_validate_path_array(value: list[Any], *, location: str) -> None:
-    if len(value) > CF_MAX_LIST_ITEMS:
-        raise ValueError(f"{location}: exceeds {CF_MAX_LIST_ITEMS} entries")
-    seen: set[str] = set()
-    for index, entry in enumerate(value):
-        if not _cf_is_safe_relative_path(entry):
-            raise ValueError(f"{location}[{index}]: invalid repository-relative path")
-        if entry in seen:
-            raise ValueError(f"{location}[{index}]: duplicate entry")
-        seen.add(entry)
-
-
-def _cf_validate_check(check: object, *, location: str) -> None:
-    """Validate one coverage check against the pinned upstream contract."""
-
-    if not isinstance(check, dict):
-        raise ValueError(f"{location}: expected object")
-    for field in _CF_CHECK_REQUIRED_FIELDS:
-        if field not in check:
-            raise ValueError(f"{location}: missing required field {field}")
-    agent_id = check["agent_id"]
-    if not _cf_is_safe_agent_id(agent_id):
-        raise ValueError(f"{location}.agent_id: expected a canonical lowercase agent ID")
-    reviewed_paths = check["reviewed_paths"]
-    if not isinstance(reviewed_paths, list):
-        raise ValueError(f"{location}.reviewed_paths: expected array")
-    if not reviewed_paths:
-        raise ValueError(f"{location}.reviewed_paths: must not be empty")
-    _cf_validate_path_array(reviewed_paths, location=f"{location}.reviewed_paths")
-    if not _cf_is_visible_text(check["invariant"]):
-        raise ValueError(f"{location}.invariant: invalid text")
-    method = check["method"]
-    if method not in {"source", "local"}:
-        raise ValueError(f'{location}.method: expected "source" or "local"')
-    if not _cf_is_visible_text(check["result"]):
-        raise ValueError(f"{location}.result: invalid text")
-    artifact = check["artifact"]
-    if method == "source":
-        if artifact is not None:
-            raise ValueError(f"{location}.artifact: source-only check must use null")
-    elif not _cf_is_owned_artifact_path(artifact, agent_id):
-        raise ValueError(
-            f"{location}.artifact: local check requires an artifact owned by agent {agent_id}"
-        )
-
-
-def _cf_validate_reviewed_path_ownership(
-    unit_reviewed_paths: list[Any],
-    checks: list[Any],
-    *,
-    location: str,
-) -> None:
-    """Upstream validateReviewedPathOwnership: unit paths equal the check union."""
-
-    aggregate = {path for path in unit_reviewed_paths if isinstance(path, str)}
-    owned: set[str] = set()
-    for check in checks:
-        if not isinstance(check, dict):
-            continue
-        reviewed_paths = check.get("reviewed_paths")
-        if not isinstance(reviewed_paths, list):
-            continue
-        for path in reviewed_paths:
-            if isinstance(path, str):
-                owned.add(path)
-    for path in sorted(aggregate - owned):
-        raise ValueError(f"{location}.reviewed_paths: {path!r} has no check owner")
-    for path in sorted(owned - aggregate):
-        raise ValueError(
-            f"{location}.checks: owned path {path!r} is absent from aggregate reviewed_paths"
-        )
+# The check, path and owner rules are CF-compatible primitives, so their single
+# implementation lives in contracts/common.py (D-021).  These aliases keep the
+# dispatcher's existing call sites working without a second copy of the rules.
+_CF_CHECK_REQUIRED_FIELDS = common.CF_CHECK_REQUIRED_FIELDS
+_cf_validate_path_array = common.cf_validate_path_array
+_cf_validate_check = common.cf_validate_check
+_cf_validate_reviewed_path_ownership = common.cf_validate_reviewed_path_ownership
 
 
 def validate_hunt_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:

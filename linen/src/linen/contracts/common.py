@@ -543,6 +543,155 @@ def cf_payload_digest(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(cf_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+# --- upstream-compatible attempt and check primitives (CF-S2-A) ------------
+# These mirror the same pinned validator.  They live next to the other CF
+# primitives so the dispatcher contract layer and the server's trusted write
+# layer make the *same* accept/reject decision (D-021): the dispatcher admits
+# model output, the server persists it, and neither may grow its own copy of
+# the rules.
+
+#: Upstream validate-coverage-ledger.cjs ATTEMPT_FIELDS (@ c1c8a8c): the eight
+#: fields every archived attempt must carry.  ``reassignment_reason`` is part
+#: of this set, so an attempt always states why it was handed on.
+CF_ATTEMPT_FIELDS: tuple[str, ...] = (
+    "wave",
+    "status",
+    "agent_id",
+    "reviewed_paths",
+    "local_checks",
+    "result_fingerprints",
+    "unresolved",
+    "reassignment_reason",
+)
+
+#: The terminal statuses an attempt may record.  ``planned``, ``in_progress``
+#: and the other unit states are not terminal and are rejected.
+CF_ATTEMPT_STATUSES: tuple[str, ...] = ("covered", "candidate", "blocked")
+
+#: The six fields every coverage check must carry (S1-A).
+CF_CHECK_REQUIRED_FIELDS: tuple[str, ...] = (
+    "agent_id",
+    "reviewed_paths",
+    "invariant",
+    "method",
+    "result",
+    "artifact",
+)
+
+#: Upstream FINGERPRINT_PATTERN.
+_CF_FINGERPRINT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$")
+
+
+def cf_is_fingerprint(value: object) -> bool:
+    """Upstream fingerprint pattern, used by ``result_fingerprints``."""
+
+    return isinstance(value, str) and _CF_FINGERPRINT_RE.match(value) is not None
+
+
+def cf_validate_path_array(value: list[Any], *, location: str) -> None:
+    """Validate a repository-relative path array the way upstream does."""
+
+    if len(value) > CF_MAX_LIST_ITEMS:
+        raise ValueError(f"{location}: exceeds {CF_MAX_LIST_ITEMS} entries")
+    seen: set[str] = set()
+    for index, entry in enumerate(value):
+        if not cf_is_safe_relative_path(entry):
+            raise ValueError(f"{location}[{index}]: invalid repository-relative path")
+        if entry in seen:
+            raise ValueError(f"{location}[{index}]: duplicate entry")
+        seen.add(entry)
+
+
+def cf_validate_text_array(value: list[Any], *, location: str) -> None:
+    """Validate a visible-text array the way upstream does."""
+
+    if len(value) > CF_MAX_LIST_ITEMS:
+        raise ValueError(f"{location}: exceeds {CF_MAX_LIST_ITEMS} entries")
+    seen: set[str] = set()
+    for index, entry in enumerate(value):
+        if not cf_is_visible_text(entry):
+            raise ValueError(f"{location}[{index}]: invalid text")
+        if entry in seen:
+            raise ValueError(f"{location}[{index}]: duplicate entry")
+        seen.add(entry)
+
+
+def cf_validate_fingerprint_array(value: list[Any], *, location: str) -> None:
+    """Validate a ``result_fingerprints`` array the way upstream does."""
+
+    if len(value) > CF_MAX_LIST_ITEMS:
+        raise ValueError(f"{location}: exceeds {CF_MAX_LIST_ITEMS} entries")
+    seen: set[str] = set()
+    for index, entry in enumerate(value):
+        if not cf_is_fingerprint(entry):
+            raise ValueError(f"{location}[{index}]: invalid fingerprint")
+        if entry in seen:
+            raise ValueError(f"{location}[{index}]: duplicate entry")
+        seen.add(entry)
+
+
+def cf_validate_check(check: object, *, location: str) -> None:
+    """Validate one coverage check against the pinned upstream contract."""
+
+    if not isinstance(check, dict):
+        raise ValueError(f"{location}: expected object")
+    for field in CF_CHECK_REQUIRED_FIELDS:
+        if field not in check:
+            raise ValueError(f"{location}: missing required field {field}")
+    agent_id = check["agent_id"]
+    if not cf_is_safe_agent_id(agent_id):
+        raise ValueError(f"{location}.agent_id: expected a canonical lowercase agent ID")
+    reviewed_paths = check["reviewed_paths"]
+    if not isinstance(reviewed_paths, list):
+        raise ValueError(f"{location}.reviewed_paths: expected array")
+    if not reviewed_paths:
+        raise ValueError(f"{location}.reviewed_paths: must not be empty")
+    cf_validate_path_array(reviewed_paths, location=f"{location}.reviewed_paths")
+    if not cf_is_visible_text(check["invariant"]):
+        raise ValueError(f"{location}.invariant: invalid text")
+    method = check["method"]
+    if method not in {"source", "local"}:
+        raise ValueError(f'{location}.method: expected "source" or "local"')
+    if not cf_is_visible_text(check["result"]):
+        raise ValueError(f"{location}.result: invalid text")
+    artifact = check["artifact"]
+    if method == "source":
+        if artifact is not None:
+            raise ValueError(f"{location}.artifact: source-only check must use null")
+    elif not cf_is_owned_artifact_path(artifact, agent_id):
+        raise ValueError(
+            f"{location}.artifact: local check requires an artifact owned by agent {agent_id}"
+        )
+
+
+def cf_validate_reviewed_path_ownership(
+    unit_reviewed_paths: list[Any],
+    checks: list[Any],
+    *,
+    location: str,
+) -> None:
+    """Upstream validateReviewedPathOwnership: unit paths equal the check union."""
+
+    aggregate = {path for path in unit_reviewed_paths if isinstance(path, str)}
+    owned: set[str] = set()
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        reviewed_paths = check.get("reviewed_paths")
+        if not isinstance(reviewed_paths, list):
+            continue
+        for path in reviewed_paths:
+            if isinstance(path, str):
+                owned.add(path)
+    for path in sorted(aggregate - owned):
+        raise ValueError(f"{location}.reviewed_paths: {path!r} has no check owner")
+    for path in sorted(owned - aggregate):
+        raise ValueError(
+            f"{location}.checks: owned path {path!r} is absent from aggregate reviewed_paths"
+        )
+
+
+
 class ContractModel(BaseModel):
     """Base class for public contracts: closed and assignment-immutable."""
 
