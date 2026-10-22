@@ -311,3 +311,79 @@ def test_skill_driven_never_rederives_open_or_concluded_verification():
         facts=[_unit_fact("cov-0001"), candidate], intents=[open_intent])
     proposals = _skill_driven_proposals(project, config, limit=8)
     assert all(p["type"] != "verify-candidate" for p in proposals)
+
+
+# --- the production block selection is strict (D-033) -----------------------
+
+
+def _seed_dict(attack_class: str, ordinary_block: str | None = None) -> dict:
+    seed = {
+        "coverage_id": (
+            "http-public-api::anonymous-to-authenticated::authorization::injection"
+        ),
+        "surface": "http-public-api",
+        "boundary": "anonymous-to-authenticated",
+        "subsystem": "authorization",
+        "attack_class": attack_class,
+        "starting_paths": ["app.py"],
+    }
+    if ordinary_block is not None:
+        seed["ordinary_block"] = ordinary_block
+    return seed
+
+
+def _hunt_prompt(seeds: list[dict]) -> str:
+    from linen.dispatcher.tasks.skill_audit import HUNT_INTENT_TYPE, _assemble_prompt
+
+    config = SimpleNamespace(
+        audit=SimpleNamespace(
+            skill_driven=SimpleNamespace(coverage_seeds=list(seeds))
+        )
+    )
+    project = SimpleNamespace(facts=[])
+    intent = SimpleNamespace(id="i1", description="Hunt")
+    return _assemble_prompt(config, project, intent, HUNT_INTENT_TYPE)
+
+
+def test_the_hunt_prompt_uses_the_exact_ordinary_block():
+    """D-033: an attack class that *is* a block title is used verbatim."""
+
+    prompt = _hunt_prompt([_seed_dict("Injection")])
+    assert "**Injection** (" in prompt
+
+
+def test_the_hunt_prompt_does_not_guess_a_block():
+    """D-033: a descriptive attack class is never turned into a block title.
+
+    The old path matched the block header case-insensitively, so a seed
+    that said ``injection`` silently received the ``Injection`` block.  A
+    guess puts a hunter in front of a block the plan never chose, so the
+    selection now fails explicitly.
+    """
+
+    from linen.dispatcher.analysis.coverage_blocks import BlockSelectionUnresolved
+
+    with pytest.raises(BlockSelectionUnresolved):
+        _hunt_prompt([_seed_dict("injection")])
+
+
+def test_the_plan_may_name_the_ordinary_block_explicitly():
+    """D-033: the trusted plan selects the block when the reference is descriptive."""
+
+    prompt = _hunt_prompt([_seed_dict("injection", ordinary_block="Injection")])
+    assert "**Injection** (" in prompt
+
+
+def test_the_explicit_block_does_not_change_the_canonical_id():
+    """D-033: the trusted selection is separate from the canonical identity."""
+
+    from linen.dispatcher.config import CoverageUnitSeed
+
+    without = CoverageUnitSeed(
+        surface="s", boundary="b", subsystem="sub", attack_class="injection"
+    )
+    with_block = CoverageUnitSeed(
+        surface="s", boundary="b", subsystem="sub", attack_class="injection",
+        ordinary_block="Injection",
+    )
+    assert without.coverage_id == with_block.coverage_id

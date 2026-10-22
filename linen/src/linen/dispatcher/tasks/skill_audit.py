@@ -25,6 +25,7 @@ import logging
 import time
 
 from linen.dispatcher.analysis import skill_findings
+from linen.dispatcher.analysis.coverage_blocks import resolve_ordinary_block
 from linen.dispatcher.analysis.policy import SOURCE_DATA_BOUNDARY
 from linen.dispatcher.analysis.skill_prompts import (
     assemble_hunter_prompt,
@@ -309,6 +310,10 @@ def _assemble_prompt(config, project, intent, intent_type: str) -> str:
                 continue
             unit = dict(seed)
             unit.setdefault("disposition", "planned")
+            if unit.get("ordinary_block") is None:
+                # A seed that did not name a block keeps the prompt it had
+                # before the explicit selection became available.
+                unit.pop("ordinary_block", None)
             units.append(unit)
         if not units:
             raise ValueError(
@@ -316,12 +321,26 @@ def _assemble_prompt(config, project, intent, intent_type: str) -> str:
             )
         skill_dir = vendored_skill_dir()
         blocks: list[str] = []
-        seen_classes: set[str] = set()
+        seen_blocks: set[str] = set()
         for unit in units:
             class_name = str(unit.get("attack_class", ""))
-            if class_name and class_name not in seen_classes:
-                blocks.append(load_attack_classes_block(class_name, skill_dir))
-                seen_classes.add(class_name)
+            if not class_name:
+                continue
+            # The ordinary block is the *plan's* decision (D-033): a descriptive
+            # attack class is never turned into a block title by case folding or
+            # by a snake_case rewrite.  An unresolvable selection fails
+            # explicitly (``block_selection_unresolved``) instead of guessing,
+            # because a guessed block would put a hunter in front of a block the
+            # plan never chose.
+            block = resolve_ordinary_block(
+                class_name,
+                ordinary_block=unit.get("ordinary_block"),
+                skill_dir=skill_dir,
+            )
+            if block in seen_blocks:
+                continue
+            blocks.append(load_attack_classes_block(block, skill_dir))
+            seen_blocks.add(block)
         architecture = next(
             (fact.description for fact in project.facts if fact.type == "recon_snapshot"),
             "No architecture summary fact yet; read the repository layout directly.",

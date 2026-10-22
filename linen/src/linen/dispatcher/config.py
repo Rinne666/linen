@@ -426,6 +426,15 @@ class CoverageUnitSeed(BaseModel):
     derived from them (N1).  A hand-written id is accepted only when it equals
     the derived canonical id, and the retired ``cov-<n>`` scheme is rejected as
     an active id (D-017).
+
+    ``attack_class`` is a *descriptive* dimension, not a classification label:
+    it is one of the four dimensions the canonical id is derived from, so it
+    must not be narrowed to a fixed list (D-033).  ``ordinary_block`` is the
+    separate, trusted selection of the upstream attack-class block this unit
+    is audited against; it has to be one of the titles the pinned snapshot
+    carries.  When ``attack_class`` already *is* such a title the selection
+    is unambiguous, otherwise the plan has to name the block explicitly -
+    a descriptive reference is never converted into a block title by guessing.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -435,6 +444,7 @@ class CoverageUnitSeed(BaseModel):
     boundary: str = Field(min_length=1, max_length=300)
     subsystem: str = Field(min_length=1, max_length=200)
     attack_class: str = Field(min_length=1, max_length=60)
+    ordinary_block: str | None = Field(default=None, max_length=300)
     starting_paths: list[str] = Field(default_factory=list, max_length=40)
 
     @model_validator(mode="after")
