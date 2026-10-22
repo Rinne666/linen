@@ -660,4 +660,152 @@ pinned validator 摘要不符拒绝 / 三方摘要一致 / 旧的无认证 recei
 
 
 
+## CF-S2-B1 P1 阶段验收与 P1-H1 密钥加固
+
+**PM v2.7 裁定**：Q48 = 批准登记 `CF-S2-B1 P1 TRUSTED IMPORT BOUNDARY PASS`（P1-A/P1-B/P1-C 三个子片
+均可关闭），并授权开工 CF-S2-B2-A；Q49 = **接受**现有单变量 JSON 密钥环，不拆成
+`..._SIGNING_KEYS` / `..._VERIFY_KEYS`（对称密钥下拆变量并不产生密码学隔离，真正的隔离取决于
+进程能否读到密钥）；Q50 = **接受**动态语料的性质断言，不把 366 或 386 固定为协议常量。
+
+### 阶段关闭时的 CI 实测
+
+【事实】Ubuntu CI run `39817241795`（head `323eaca`）conclusion **success**：
+
+```text
+collected 1116 items
+1109 passed, 0 failed, 7 skipped
+```
+
+【事实】七条 skip 的分布是：**2** 条真实 CF 语料测试（CI 机器没有外部对照语料）、**3** 条 Docker
+oracle E2E 测试（`test_oracle_docker_e2e.py` 的一个用例经 `parametrize` 展开成 3 条）、
+**2** 条真实 Docker 隔离测试。
+
+### P1-H1：密钥长度下限
+
+【事实】HMAC-SHA256 不会因为密钥短而变弱，**秘密本身**会：一个字节的密钥可以被枚举，
+因此**短密钥不能承担「可信签发」的重量**。`configured_validation_keys()` 现在只接受
+**不少于 32 字节（256 位）**的密钥材料，短密钥**被排除在密钥环之外**——不是报错，而是
+「不构成可信密钥」，于是依赖它的每一项判定都**失败关闭**。
+
+- 【事实】实现：`server/baseline_validation_auth.py` `MINIMUM_VALIDATION_KEY_BYTES = 32`。
+- 【事实】验收测试：`test_validation_key_shorter_than_32_bytes_is_rejected`
+  （31 字节 → 密钥环为空且 `signing_key()` 为 `None`；32 字节 → 被接受）。
+- 【推断】**在该加固完成之前，不得把任意运维配置的非空密钥都视为具有足够认证强度。**
+
+### 密钥轮换的运维规则
+
+【推断】正式运维应遵守：
+
+- 签发使用**当前活动密钥**；
+- 验证可以使用**仍处于信任期内的旧密钥**；
+- 撤销旧密钥后，对应历史凭据**失去可信资格**（这是**显式**失败，不是静默降级）；
+- **不得**为了维持旧凭据可用性而接受未知密钥或关闭 MAC 验证。
+
+【事实】本片**不建设**新的密钥管理服务：封套只记录 `key_id`，不保存密钥本身。
+
+
+
+## CF-S2-B2-A 可信源码身份证明与可信历史封存
+
+**PM v2.7 裁定**：Q48 = 批准登记 `CF-S2-B1 P1 TRUSTED IMPORT BOUNDARY PASS` 并授权开工 B2-A；
+Q49 = 接受现有单变量 JSON 密钥环；Q50 = 接受动态语料的性质断言，不冻结总数。
+B2-A 的范围**只**建立两样东西：**可信源码身份证明**与**可信历史范围封存**；
+**不**开始源码差异比较，**不**开始 11 值 prior_status 生产解析（那是 B2-B / B2-C）。
+
+### 职责边界
+
+```text
+coverage_baseline_sources          已登记的历史来源与 manifest（结构封闭，不带签名）
+        |
+        +-- coverage_source_attestations   证明历史源码身份
+        |
+        +-- coverage_lineage_seals         证明本轮历史范围被可信封存
+```
+
+【事实】两张表**共用**已有的规范 JSON、载荷摘要、追加式触发器与身份校验原语，
+但**分表**（D-054）；没有第三套通用证明框架。
+【事实】外键一律 `NO ACTION`（与既有证明表一致）：项目被删除后，证明行不得仍可被验证。
+
+### 两种核验方式
+
+| 方法 | 核验内容 | 位置 |
+|---|---|---|
+| `git_commit` | 提交对象**真实存在**（`cat-file -t`）、解析回自身、树对象名合法、**工作区干净**（`git status --porcelain` 为空）、仓库 remote 的 `owner/repo` 与登记来源的 origin 一致 | `server/source_identity.py` `verify_git_source_identity()` |
+| `frozen_digest` | 重新读取**冻结的工件字节**，与登记摘要逐字节比对 | `server/source_identity.py` `verify_frozen_source_digest()` |
+
+【事实】git 核验**不止**检查「40 位十六进制格式合法」：`git rev-parse` 会原样回显一个并不存在的
+提交名，所以真正被问的是**对象本身**；工作区若有未登记改动，磁盘上的文件就不是那个提交，
+因此工作区必须干净。
+【事实】git 证明还必须与**冻结快照**一致：登记来源里记录的提交名就是证明可声明的提交，
+声明别的提交会被拒绝（这正是「证明描述了另一段历史」的防线）。
+
+### 信任边界
+
+- 【事实】证明由**服务端自己核验**得到（`build_source_attestation()` / `build_lineage_seal()`），
+  调用方只能给出「我认为是哪个仓库、哪个提交」，**不能**给出「结论是已核验」——
+  自称 `verified = true` 的 JSON 得不到任何权威（A-T03）。
+- 【事实】证明由**受控流程签名**（`dispatcher/analysis/cf_baseline_validation.py`
+  `attest_historical_source()` / `seal_historical_scope()`），服务端只**验证**签名，从不签发（D-058）。
+- 【事实】封套 MAC 输入按证明种类**域分隔**（`linen:source-identity-attestation:v1` /
+  `linen:lineage-seal:v1`），所以 attestation 封套**不能**被当作 seal 封套重放。
+- 【事实】**没有配置可信密钥 → 不产生任何证明**，`source_identity_verified` 保持 0。
+- 【推断】**这两张表都不是确认权威**：证明说的是「源码是什么」，不是「本轮发现的漏洞是真的」
+  （D-039）；不得由历史 verified 直接推导本轮 confirmed。
+
+### 冲突不被静默覆盖
+
+【事实】同一来源出现**相互矛盾**的两份证明时，两份都保留（追加式，不 UPDATE），
+解析结果是 **conflict**，而不是「取最新一条」（D-045、R4）。
+已注册来源的成员 attestation 变化后，原 seal 在**再验证**时会失配，
+`trusted_negative` 随之降为 false。
+
+### trusted negative 的条件
+
+【事实】`lineage_seal_status().trusted_negative` 为 true 需要**同时**满足：
+
+1. 该 run 存在一张**可验证**的 seal（封套 MAC 有效）；
+2. seal 引用的 manifest 仍然**封闭**（complete 且无 unprocessed）；
+3. manifest 的**每个**成员仍有**可信**的 source attestation。
+
+【事实】结构 complete 的 manifest **本身不是** seal，也不能承载负证据（A-T11）；
+`lineage_root`（声明本项目没有前代历史）同样必须由可信签发入口产生（A-T12）。
+
+### 本片验收
+
+B2-A-T01–T14：证明只能关联已登记来源 / 跨项目关联被拒 / JSON 自报 verified 不产生可信身份 /
+git 提交与冻结快照不一致时拒绝（含错误仓库、脏工作区）/ 非 Git 来源可由冻结摘要核验 /
+两张表 UPDATE+DELETE 被数据库拒绝 / 同一证明重复登记幂等 / 矛盾证明不静默覆盖 /
+缺少可信证据时保持 unverified / seal 必须关联明确的 run 与项目 / complete manifest 但无可信封存时
+不可作负证据 / lineage root 来自可信受控声明 / seal 成员可再验证 / 两张证明不自动开放生产注册。
+
+### 真实语料的分层（分开报告，不合并）
+
+【事实】对真实对照语料的只读分级：
+
+```text
+candidate_run_dirs        18
+readable_candidate       12
+upstream_schema_validated 12
+frozen_snapshot_anchored 12   （冻结工件字节仍与登记摘要一致）
+source_identity_verified  0   （审计代码的身份未被证明）
+trusted_negative          0   （没有任何可信封存）
+units_in_readable_candidates 393
+```
+
+【推断】`frozen_snapshot_anchored = 12` 与 `source_identity_verified = 0` **不是同一件事**：
+前者证明「导入进来的 ledger 快照字节未变」，后者证明「被审计的**代码**是哪个提交」。
+审计对象的上游仓库在本机不可得，因此真实语料的**代码身份**仍为 0，本片**不**用合成样本抬高它
+（R1）。**维持 0 是正确结果。**
+
+### 本片不做的事
+
+- 不做源码差异比较（B2-B）；不做 11 值 prior_status 生产解析（B2-C）；
+- 不开放生产注册与多轮写入（S2-C）；
+- 不恢复 D-014 / I4 的三位语义；
+- 不把 attestation 或 seal 当作任何 finding 的确认权威。
+
+
+
+
+
 
