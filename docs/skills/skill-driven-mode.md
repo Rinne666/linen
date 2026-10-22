@@ -31,6 +31,10 @@
 
 ## 覆盖单元（coverage unit）fact schema
 
+> **历史设计（已被取代）。** 本节的 `cov-<n>` 确定性 ID 方案是早期设计，已被上游兼容
+> schema 取代：现行实现以 `canonical_refs` 派生的 `coverage_id` 作为单元身份
+> （见下方 CF-S1-C / CF-S2 段与 D-033）。本节仅保留为设计沿革记录。
+
 取代"每次图变化重跑 Reason"的驱动方式：单元状态机 `planned → in_progress → covered | candidate | blocked | deferred`，每单元绑定 `(entry surface, trust boundary, attack class)` 三元组，确定性 ID `cov-<n>`。
 
 fact 携带：`unit_state`、`owner_run`、`reviewed_paths`、`unresolved_facts[]`、`fingerprints[]`、`deferred_reason`（必填当 state=deferred）。预算到不了 → 显式 `deferred`，禁止静默省略。
@@ -158,9 +162,10 @@ CF-S1-C  CONTRACT / PERSISTENCE  PASS
 CF-S1-C  PRODUCTION REGISTRATION  BLOCKED — E48
 ```
 
-生产注册被阻塞的原因不是实现缺失，而是**没有可信的历史基线来源**：linen 自身
-不存储任何 Cloudflare coverage ledger，因此无法证明"不存在兼容历史"，而"未知"
-不等于 `none`。默认策略（`CoverageRegistrationPolicy`）是关闭的，可信基线提供者与
+生产注册被阻塞的原因不是实现缺失，而是**没有可信的历史基线来源**：CF-S2-B1 已具备
+Cloudflare coverage 工件的**登记与引用**能力，但尚无任何历史来源通过源码身份核验
+（实测已核验数 = 0），因此仍无法证明"不存在兼容历史"，而"未知"不等于 `none`。
+默认策略（`CoverageRegistrationPolicy`）是关闭的，可信基线提供者与
 可信 run 计划只能通过应用依赖注入安装，生产代码里**没有**任何"默认视为无历史"的
 解析器。**CF 工件（coverage-ledger.json / findings.json）的生产仍等待 S2-A/B/C/D。**
 

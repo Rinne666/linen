@@ -169,6 +169,14 @@ are stored in the ignored `.linen-runtime/` directory.
 
 ## Source-code audit mode
 
+> **Status.** The Cloudflare `security-audit-skill` coverage protocol is being
+> adopted in stages. The coverage event ledger and the historical source
+> registry exist, but **production writes of trusted coverage events are off by
+> default** and the trusted historical resolver is not finished yet: no
+> historical source has passed source-identity verification, so no historical
+> baseline may be used to claim "no compatible history". The ordinary audit
+> mode described below is unaffected and remains fully available.
+
 For a Codex-only setup and a single ZIP containing the report, evidence graph,
 JSON snapshot and SARIF, see [Codex CLI audit guide](docs/CODEX-AUDIT.md) and
 `dispatch.codex.example.yaml`.
