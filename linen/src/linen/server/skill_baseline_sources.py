@@ -37,6 +37,7 @@ from linen.contracts.baseline import (
     BaselineManifestMember,
     BaselineSourceIdentity,
     BaselineSourceRecord,
+    LedgerValidationReceipt,
     encode_reference,
     reference_digest,
 )
@@ -55,6 +56,15 @@ METADATA_FILE_NAME = "run-metadata.json"
 #: The directory the imported files are materialized under, inside the
 #: project workspace.
 BASELINE_WORKSPACE_DIR = "baseline"
+
+#: The vendored upstream snapshot, resolved from the installed package.
+#:
+#: The server resolves it on its own instead of importing the dispatcher
+#: package: a server process must never depend on the code that drives
+#: workers.
+_VENDORED_SNAPSHOT_DIR = (
+    Path(__file__).resolve().parents[1] / "third_party" / "cloudflare_security_audit_skill"
+)
 
 #: The upstream unit statuses that are terminal.
 _UPSTREAM_TERMINAL_STATUSES = frozenset(
@@ -82,6 +92,13 @@ class HistoricalSourceCandidate:
     metadata file, a source identity that cannot be verified.  An ineligible
     candidate is still reported, because dropping it silently and then
     declaring the history complete is exactly what must not happen (D-036).
+
+    ``eligible`` only says that the run was **readable** and that its source
+    identity was recorded.  It is *not* a statement about upstream validity: a
+    ledger can be perfectly readable and violate every upstream rule at the
+    same time.  Upstream validity comes from a controlled validation receipt
+    (``validation_receipt``), and the source identity verification is a
+    separate, later act (CF-S2-B2).  The three must never be merged (D-043).
     """
 
     project_id: str
@@ -97,6 +114,8 @@ class HistoricalSourceCandidate:
     metadata_path: str = ""
     ledger_bytes: bytes = b""
     metadata_bytes: bytes = b""
+    upstream_schema_validated: bool = False
+    validation_receipt: LedgerValidationReceipt | None = None
 
 
 # --- the controlled import ---------------------------------------------------
@@ -147,7 +166,17 @@ def _read_under_root(root: Path, relative: str) -> bytes:
 
 
 def _ledger_units(payload: Any) -> list[Mapping[str, Any]]:
-    """The unit list of an upstream coverage ledger document."""
+    """The unit list of an upstream coverage ledger document.
+
+    This helper only proves that the document is **readable** and carries
+    units.  It does *not* prove that the document is a valid upstream ledger:
+    the upstream contract is far stricter (a top-level array, canonical
+    identities derived from ``canonical_refs``, the full required field set,
+    the upstream status vocabularies), and only the pinned upstream validator
+    decides that.  ``_ledger_units()`` succeeding is therefore not upstream
+    validity, and a candidate built from it does not carry the upstream-valid
+    qualification (D-043).
+    """
 
     if isinstance(payload, list):
         units = payload
@@ -360,6 +389,21 @@ def register_historical_source(
         raise BaselineSourceRejected(
             "the historical source carries no content digest to register"
         )
+    if candidate.upstream_schema_validated and candidate.validation_receipt is None:
+        raise BaselineSourceRejected(
+            "the historical source claims an upstream validation without a "
+            "receipt to back it"
+        )
+    if candidate.validation_receipt is not None:
+        receipt = candidate.validation_receipt
+        if not receipt.sealed():
+            raise BaselineSourceRejected(
+                "the validation receipt does not match its own digest"
+            )
+        if receipt.ledger_sha256 != candidate.ledger_sha256:
+            raise BaselineSourceRejected(
+                "the validation receipt is about different ledger bytes"
+            )
 
     record = BaselineSourceRecord(
         project_id=candidate.project_id,
@@ -403,6 +447,161 @@ def register_historical_source(
         ),
     )
     return record
+
+
+def pinned_upstream_commit() -> str:
+    """The upstream commit the vendored validator snapshot is pinned to."""
+
+    return (_VENDORED_SNAPSHOT_DIR / "UPSTREAM_COMMIT").read_text(encoding="utf-8").strip()
+
+
+def register_ledger_validation(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    source_ref: str,
+    receipt: LedgerValidationReceipt,
+) -> str:
+    """Register one controlled validation receipt, append-only.
+
+    The receipt is the server's copy of a decision that was made offline by
+    the pinned upstream validator.  Registering the same receipt twice is
+    idempotent.  A *different* receipt for the same source is not a conflict:
+    a source may be validated again when its ledger changes - and then the
+    older receipt stops being applicable, because it was made for different
+    bytes.  The older receipt stays, so the history of the validations
+    remains readable.
+    """
+
+    if receipt.project_id != project_id or receipt.source_ref != source_ref:
+        raise BaselineSourceRejected(
+            "the validation receipt is about another source"
+        )
+    if not receipt.sealed():
+        raise BaselineSourceRejected(
+            "the validation receipt does not match its own digest"
+        )
+
+    digest = receipt.receipt_sha256
+    existing = conn.execute(
+        "SELECT payload_sha256 FROM coverage_ledger_validations "
+        "WHERE project_id = ? AND source_ref = ? AND payload_sha256 = ?",
+        (project_id, source_ref, digest),
+    ).fetchone()
+    if existing is not None:
+        return digest
+
+    conn.execute(
+        "INSERT INTO coverage_ledger_validations (project_id, source_ref, "
+        "ledger_sha256, metadata_sha256, payload_json, payload_sha256, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            project_id,
+            source_ref,
+            receipt.ledger_sha256,
+            receipt.metadata_sha256,
+            cf_canonical_json(receipt.model_dump(mode="json")),
+            digest,
+            utcnow(),
+        ),
+    )
+    return digest
+
+
+def verify_ledger_validation(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    source_ref: str,
+    ledger_bytes: bytes,
+    presented_receipt: LedgerValidationReceipt | Mapping[str, Any] | None = None,
+) -> LedgerValidationReceipt:
+    """Verify that one ledger document carries a registered upstream validation.
+
+    The server does not run the validator: it verifies the receipt that the
+    controlled import flow registered.  That is the whole point - a receipt
+    that was merely handed in is not evidence, so a presented receipt has to
+    be the registered one, byte for byte.
+
+    The checks are:
+
+    1. a validation is registered for this project and source;
+    2. every registered receipt still matches its own digest;
+    3. a presented receipt is one of the registered ones;
+    4. the ledger bytes still hash to the digest the receipt was made for;
+    5. the receipt is about the registered historical source;
+    6. the receipt was produced by the pinned upstream validator;
+    7. the validator accepted the document.
+    """
+
+    rows = conn.execute(
+        "SELECT payload_json FROM coverage_ledger_validations "
+        "WHERE project_id = ? AND source_ref = ? ORDER BY validation_id",
+        (project_id, source_ref),
+    ).fetchall()
+    if not rows:
+        raise BaselineReferenceUnverifiable(
+            f"no controlled validation is registered for the source {source_ref!r}"
+        )
+
+    registered: list[LedgerValidationReceipt] = []
+    for row in rows:
+        receipt = LedgerValidationReceipt.model_validate(json.loads(row["payload_json"]))
+        if not receipt.sealed():
+            raise BaselineReferenceUnverifiable(
+                "the stored validation receipt does not match its digest"
+            )
+        registered.append(receipt)
+
+    if presented_receipt is not None:
+        presented = (
+            presented_receipt
+            if isinstance(presented_receipt, LedgerValidationReceipt)
+            else LedgerValidationReceipt.model_validate(presented_receipt)
+        )
+        if not any(
+            presented.model_dump(mode="json") == candidate.model_dump(mode="json")
+            for candidate in registered
+        ):
+            raise BaselineReferenceUnverifiable(
+                "the presented validation receipt is not a registered one"
+            )
+
+    digest = hashlib.sha256(ledger_bytes).hexdigest()
+    source_row = conn.execute(
+        "SELECT payload_json FROM coverage_baseline_sources WHERE project_id = ? "
+        "AND record_kind = 'historical_source' AND record_ref = ?",
+        (project_id, source_ref),
+    ).fetchone()
+    if source_row is None:
+        raise BaselineReferenceUnverifiable(
+            f"the historical source {source_ref!r} is not registered"
+        )
+    source = json.loads(source_row["payload_json"])
+
+    try:
+        expected_commit = pinned_upstream_commit()
+    except OSError as exc:
+        raise BaselineReferenceUnverifiable(
+            "the pinned upstream validator snapshot is not available"
+        ) from exc
+
+    for receipt in registered:
+        if receipt.ledger_sha256 != digest:
+            continue
+        if receipt.metadata_sha256 != str(source.get("metadata_sha256")):
+            continue
+        if receipt.validator.upstream_commit != expected_commit:
+            raise BaselineReferenceUnverifiable(
+                "the validation receipt was produced by a different upstream commit"
+            )
+        if not receipt.result.valid:
+            continue
+        return receipt
+
+    raise BaselineReferenceUnverifiable(
+        f"the ledger of {source_ref!r} has no registered upstream validation"
+    )
 
 
 def materialize_baseline_artifacts(
@@ -489,20 +688,39 @@ def seal_lineage_manifest(
     Every member has to be registered already: a manifest that names a
     source nobody imported is a scope that cannot be searched, and a scope
     that cannot be searched can never support a negative conclusion.
+
+    Every member has to name the digests of the artifacts that were actually
+    registered, too.  A manifest that carries a digest the registered source
+    does not have would describe a history that was never imported, and a
+    scope that describes something else cannot be searched either (D-044).
     """
 
-    registered = {
-        str(row["record_ref"])
-        for row in conn.execute(
-            "SELECT record_ref FROM coverage_baseline_sources WHERE project_id = ? "
-            "AND record_kind = 'historical_source'",
-            (project_id,),
+    registered: dict[str, tuple[str, str]] = {}
+    for row in conn.execute(
+        "SELECT record_ref, payload_json FROM coverage_baseline_sources "
+        "WHERE project_id = ? AND record_kind = 'historical_source'",
+        (project_id,),
+    ):
+        payload = json.loads(row["payload_json"])
+        registered[str(row["record_ref"])] = (
+            str(payload.get("ledger_sha256", "")),
+            str(payload.get("metadata_sha256", "")),
         )
-    }
     for member in members:
         if member.source_ref not in registered:
             raise BaselineSourceRejected(
                 f"the manifest member {member.source_ref!r} is not registered"
+            )
+        ledger_sha256, metadata_sha256 = registered[member.source_ref]
+        if member.ledger_sha256 != ledger_sha256:
+            raise BaselineSourceRejected(
+                f"the manifest member {member.source_ref!r} claims a ledger "
+                "digest that the registered source does not have"
+            )
+        if member.metadata_sha256 != metadata_sha256:
+            raise BaselineSourceRejected(
+                f"the manifest member {member.source_ref!r} claims a metadata "
+                "digest that the registered source does not have"
             )
 
     pending = [str(item) for item in unprocessed if str(item).strip()]

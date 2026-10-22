@@ -511,6 +511,32 @@ def test_e96_a_manifest_may_not_name_an_unregistered_member(board, import_root):
             seal_lineage_manifest(conn, project_id=PROJECT, members=[member])
 
 
+def test_b1_import_rejects_member_digest_mismatch(board, import_root):
+    """CR-T03: a manifest may not claim digests the registered source lacks.
+
+    A manifest that names a registered source but carries a different digest
+    describes a history that was never imported, so the scope it claims was
+    never searched (D-044).
+    """
+
+    record = _register(board, import_root)
+    wrong_ledger = BaselineManifestMember(
+        source_ref=record.source_ref,
+        ledger_sha256="c" * 64,
+        metadata_sha256=record.metadata_sha256,
+    )
+    wrong_metadata = BaselineManifestMember(
+        source_ref=record.source_ref,
+        ledger_sha256=record.ledger_sha256,
+        metadata_sha256="d" * 64,
+    )
+    with db.get_conn() as conn:
+        with pytest.raises(BaselineSourceRejected):
+            seal_lineage_manifest(conn, project_id=PROJECT, members=[wrong_ledger])
+        with pytest.raises(BaselineSourceRejected):
+            seal_lineage_manifest(conn, project_id=PROJECT, members=[wrong_metadata])
+
+
 def test_e96_a_lineage_root_declares_that_there_is_no_predecessor(board):
     """E96: a first generation run declares its scope, it does not guess it."""
 

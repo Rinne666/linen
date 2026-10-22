@@ -481,5 +481,63 @@ source identity 已记录 **11**、**已核验 0**（导入器不自动核验）
 （全部 `prior_run_paths` 为空，尚无 lineage root 声明）、导入失败 **5**（无 ledger 文件）。
 
 
+## CF-S2-B1 P1-A 受控上游格式验证
+
+**PM v2.4 裁定（D-043/D-044/D-050/D-051）**：导入器此前只做**最低限度 JSON 检查**
+（能取出数组 / unit 是 Mapping / 有 `coverage_id`），**没有执行完整上游 schema 校验**；
+`seal_lineage_manifest()` 也只核对成员的 `source_ref` 已登记，**未核对成员声明的
+`ledger_sha256` / `metadata_sha256`**。因此 B1 的阶段登记收窄为：
+
+```text
+CF-S2-B1  不可变登记与引用机制            PASS
+CF-S2-B1  上游格式验证的生产导入边界       缺口 → 本片修复
+```
+
+**三层必须分开，不得合并**（D-043 / D-051）：
+
+| 层 | 含义 | 取得方式 |
+|---|---|---|
+| `readable_candidate` | 文档**可读**且带 unit | `import_historical_run()`（不抛错，说明原因） |
+| `upstream_schema_validated` | 文档**符合上游完整契约** | 受控离线流程跑 pinned 上游 validator 得到的凭据 |
+| `source_identity_verified` | 源码身份**已核验** | 尚未实现（属 CF-S2-B2 的 attestation） |
+
+`_ledger_units()` 成功 **≠** 上游格式验证成功；`HistoricalSourceCandidate.eligible=True`
+**≠** upstream-valid。二者现在在代码与文档里都显式分开。
+
+**受控离线验证**（`dispatcher/analysis/cf_baseline_validation.py`，PM v2.4 Q40）：
+
+- 复用既有 `validator_command()`，**不新建第二套 validator**，**不在 Python 内复制 872 行
+  Node validator**；本片**不新增顶层 CLI**。
+- **防竞态**：验证的是**已经被读取并固定的那份 bytes**，不是运维给的原路径——先安全读取 →
+  受控暂存同一份 bytes → validator 验证暂存文件 → 回读确认摘要一致 → 才签发凭据。
+  暂存目录安全创建（`O_EXCL`）、受控、失败必清理。
+- **凭据（`LedgerValidationReceipt`，版本化）强制四项绑定**：
+  1. 原始 ledger bytes 的 **SHA-256**（不得只比路径或文件名）；
+  2. **validator 身份**：pinned upstream commit + **实际执行的 validator 文件摘要**
+     （不能只写 `"validator": "cloudflare"`）；
+  3. **验证执行本身**：凭据由受控离线流程产生；
+  4. **被登记的历史来源**：`project_id` / `source_ref` / `ledger_sha256` / `metadata_sha256`
+     ——同一来源后来换了 ledger 内容，旧凭据即失效。
+- **server 不执行 Node**（Q40-c），只做**信任验证**：凭据必须来自受控通道、凭据引用的
+  ledger 仍存在、重算 SHA-256 一致、validator 固定版本符合预期、与本项目历史来源记录一致。
+  **`valid=true` 不是可信输入**：即使 JSON 内摘要全对，只要普通 HTTP 客户端能自造完整凭据，
+  就**不能**获得可信提升权限。**本片只做可信来源隔离，不建设公开验证上传服务。**
+- **Windows 边界（D-051）**：上游 CLI 用 `O_NOFOLLOW | O_NONBLOCK` 打开输入，Node on win32
+  不暴露这两个常量，故 Windows 走仓库自有 `run-validator.windows.cjs`。它能给出**同样的
+  schema 判定**，但**不具备**与 Linux 相同的内核级文件打开保证。凭据记录实际 runner，
+  正式 Ubuntu 验收继续用原生 pinned validator。
+
+**可信封存与结构完整必须分开（D-052）**：`seal_lineage_manifest()` 现在**逐项核对**成员声明的
+`ledger_sha256` / `metadata_sha256` 与已登记来源是否一致，不一致直接拒绝——清单不能声明一份
+从未被导入过的历史。但 `closed=True` **仍然只表示结构封闭**；「可信历史范围已封存」还需要
+受控调用者 + 明确项目/lineage scope + 不可变封存凭据，那是 B2-A 的基础设施。
+**在此之前，生产 resolver 继续返回 `unknown`。**
+
+**本片验收**：CR-T01（错误 canonical ID 不得取得 upstream-valid 资格）、CR-T02（上游不允许的
+顶层形状必须拒绝）、CR-T03（manifest 成员摘要与登记不一致必须拒绝），以及 5 项凭据边界
+（绑定精确 bytes / 改动即失效 / 不可信 JSON 不得提升来源 / Windows runner 与上游判定一致 /
+schema 合法不等于来源已核验）。原 30 条 B1 用例保留。
+
+
 
 

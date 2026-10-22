@@ -701,6 +701,42 @@ def _ensure_vnext_columns(conn: sqlite3.Connection) -> None:
     BEGIN
         SELECT RAISE(ABORT, 'coverage_baseline_sources is append-only');
     END;
+    -- CF-S2-B1 controlled ledger validations (append-only).
+    --
+    -- A validation receipt is the proof that one exact ledger document passed
+    -- the pinned upstream validator.  It is a different object from the
+    -- source registration and from the source identity attestation, so it
+    -- lives in its own table: the receipt is *about* a registered source, and
+    -- a source may carry more than one validation over time (a ledger that
+    -- changed invalidates the earlier one).
+    --
+    -- The row is append-only and the foreign key stays NO ACTION for the same
+    -- reason as the baseline sources: a stored receipt whose project is gone
+    -- must not be verifiable, and delete_project reports that conflict
+    -- explicitly instead of failing with a foreign key error.
+    CREATE TABLE IF NOT EXISTS coverage_ledger_validations (
+        validation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        source_ref TEXT NOT NULL,
+        ledger_sha256 TEXT NOT NULL,
+        metadata_sha256 TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        payload_sha256 TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (project_id, source_ref, payload_sha256)
+    );
+    CREATE INDEX IF NOT EXISTS coverage_ledger_validations_source_idx
+        ON coverage_ledger_validations(project_id, source_ref);
+    CREATE TRIGGER IF NOT EXISTS coverage_ledger_validations_no_update
+    BEFORE UPDATE ON coverage_ledger_validations
+    BEGIN
+        SELECT RAISE(ABORT, 'coverage_ledger_validations is append-only');
+    END;
+    CREATE TRIGGER IF NOT EXISTS coverage_ledger_validations_no_delete
+    BEFORE DELETE ON coverage_ledger_validations
+    BEGIN
+        SELECT RAISE(ABORT, 'coverage_ledger_validations is append-only');
+    END;
     """)
 
 

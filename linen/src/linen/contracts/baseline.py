@@ -42,6 +42,17 @@ _GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 #: The kinds of source identity a historical run can claim.
 BaselineIdentityKind = Literal["git_commit", "frozen_digest", "unverified"]
 
+#: The kinds of validation a controlled receipt can carry.
+BaselineValidationKind = Literal["cloudflare_coverage_ledger"]
+
+#: The runner that actually executed the pinned upstream validator.
+#:
+#: ``native`` is the upstream CLI itself.  ``windows_runner`` is the
+#: linen-authored shim that restores the two POSIX open flags Node on win32
+#: does not expose: it reaches the same schema verdict, but it does not have
+#: the same kernel-level file-open guarantee (D-051).
+BaselineValidatorRunner = Literal["native", "windows_runner"]
+
 #: The kinds of lineage scope a manifest can declare.
 BaselineScopeKind = Literal["declared_predecessor_lineage", "lineage_root"]
 
@@ -297,3 +308,89 @@ class BaselineLineageManifest(ContractModel):
         """The immutable reference of this manifest."""
 
         return encode_reference(self.body())
+
+
+class LedgerValidatorIdentity(ContractModel):
+    """Which validator actually ran, and on what.
+
+    The identity is part of the evidence: a receipt produced by a different
+    validator file, or by a different upstream commit, is not the same proof
+    (D-043).
+    """
+
+    upstream_commit: str = Field(min_length=1, max_length=64)
+    validator_sha256: str
+    runner: BaselineValidatorRunner
+    platform: str = Field(min_length=1, max_length=64)
+
+    @field_validator("validator_sha256")
+    @classmethod
+    def _validate_digest(cls, value: str) -> str:
+        return validate_sha256(value)
+
+
+class LedgerValidationResult(ContractModel):
+    """What the pinned validator decided about one document."""
+
+    valid: bool
+    record_count: int = Field(default=0, ge=0)
+    errors: list[str] = Field(default_factory=list, max_length=200)
+
+
+class LedgerValidationReceipt(ContractModel):
+    """A versioned proof that one exact ledger document passed the validator.
+
+    A receipt is only worth what it binds, so it names the bytes it was
+    produced from, the validator that produced it, the result it reached and
+    the source it is about - and it carries a digest of its own body, so a
+    later reader can tell whether it was altered.
+
+    What a receipt proves is a *format* decision.  It says nothing about the
+    source identity of the audited worktree: that is a separate attestation
+    (CF-S2-B2).  The two must never be merged (D-043, D-051).
+    """
+
+    schema_version: int = 1
+    validation_kind: BaselineValidationKind = "cloudflare_coverage_ledger"
+    ledger_sha256: str
+    validator: LedgerValidatorIdentity
+    result: LedgerValidationResult
+    project_id: str = Field(min_length=1, max_length=2048)
+    source_ref: str = Field(min_length=1, max_length=1024)
+    metadata_sha256: str
+    issued_by: str = Field(min_length=1, max_length=2048)
+    issued_at: str = Field(min_length=1, max_length=64)
+    receipt_sha256: str
+
+    @field_validator("ledger_sha256", "metadata_sha256", "receipt_sha256")
+    @classmethod
+    def _validate_digests(cls, value: str) -> str:
+        return validate_sha256(value)
+
+    @field_validator("project_id", "source_ref")
+    @classmethod
+    def _strip_required(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("value must not be empty")
+        return value
+
+    def body(self) -> dict[str, Any]:
+        """The content this receipt is sealed by."""
+
+        payload = self.model_dump(mode="json")
+        payload.pop("receipt_sha256", None)
+        return payload
+
+    def sealed(self) -> bool:
+        """Whether the receipt still matches its own digest."""
+
+        return cf_payload_digest(self.body()) == self.receipt_sha256
+
+    @classmethod
+    def issue(cls, **fields: Any) -> "LedgerValidationReceipt":
+        """Seal a receipt over the fields that describe one validation."""
+
+        payload = {key: value for key, value in fields.items() if key != "receipt_sha256"}
+        digest = cf_payload_digest(cls(**payload, receipt_sha256="0" * 64).body())
+        return cls(**payload, receipt_sha256=digest)
