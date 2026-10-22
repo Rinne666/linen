@@ -20,6 +20,9 @@ What this does and does not prove (D-058):
   non-repudiable signature;
 * the key never reaches the database, the repository, a prompt, a log line,
   an error message or the audit graph - only its identifier is recorded;
+* a key that is shorter than 256 bits is not a trusted key at all and is left
+  out of the key ring (P1-H1), so a deployment that misconfigures one trusts
+  nothing instead of trusting something guessable;
 * a deployment without a configured key fails closed: nothing is trusted,
   because nothing can be proven.
 
@@ -53,6 +56,16 @@ VALIDATION_KEYS_ENV = "LINEN_BASELINE_VALIDATION_KEYS"
 #: The key identifier used when a deployment configured exactly one key.
 DEFAULT_KEY_ID = "baseline-validator-key-1"
 
+#: The least amount of key material a deployment may configure (P1-H1).
+#:
+#: HMAC-SHA256 does not weaken when the key is short, the *secret* does: a key
+#: of one byte can be enumerated in a moment, so a short key cannot carry the
+#: weight of a trusted issuance.  A configured key therefore has to hold at
+#: least 256 bits of random material.  A shorter one is not an error - it is
+#: simply not a trusted key, and it is left out of the key ring so that every
+#: decision that depends on it fails closed.
+MINIMUM_VALIDATION_KEY_BYTES = 32
+
 
 class BaselineAuthRejected(ValueError):
     """The authentication envelope is not acceptable."""
@@ -70,7 +83,10 @@ def configured_validation_keys() -> dict[str, ValidationAuthKey]:
     """The keys the operator configured, keyed by their identifier.
 
     A missing, malformed or empty configuration yields no keys at all, and
-    no keys means every trust decision fails closed.
+    no keys means every trust decision fails closed.  A key that is shorter
+    than :data:`MINIMUM_VALIDATION_KEY_BYTES` is left out for the same reason:
+    a short secret can be guessed, so it must not be able to make anything
+    trustworthy (P1-H1).
     """
 
     raw = os.environ.get(VALIDATION_KEYS_ENV, "").strip()
@@ -92,7 +108,7 @@ def configured_validation_keys() -> dict[str, ValidationAuthKey]:
             material = bytes.fromhex(secret.strip())
         except ValueError:
             continue
-        if not material:
+        if len(material) < MINIMUM_VALIDATION_KEY_BYTES:
             continue
         keys[key_id.strip()] = ValidationAuthKey(key_id=key_id.strip(), secret=material)
     return keys

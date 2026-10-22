@@ -54,6 +54,7 @@ from linen.server.baseline_validation_auth import (
     configured_validation_keys,
     register_validation_auth,
     sign_validation_auth,
+    signing_key,
     trusted_validation_auth,
 )
 from linen.server.skill_baseline_sources import (
@@ -318,6 +319,35 @@ def test_validation_receipt_unknown_key_id_is_rejected(board, validation_auth_ke
             register_validation_auth(
                 conn, project_id=PROJECT, receipt=receipt, envelope=unknown
             )
+
+
+def test_validation_key_shorter_than_32_bytes_is_rejected(monkeypatch) -> None:
+    """P1-H1: a key that can be guessed is not a trusted key.
+
+    HMAC-SHA256 stays sound with a short key; the *secret* does not.  A key of
+    less than 256 bits can be enumerated, so it must not be able to make a
+    validation trustworthy - it is left out of the key ring and every decision
+    that depends on it fails closed.
+    """
+
+    short = "3f" * 31
+    monkeypatch.setenv(
+        VALIDATION_KEYS_ENV,
+        json.dumps({KEY_ID: short}),
+    )
+    assert configured_validation_keys() == {}
+    # ... so the controlled flow cannot even sign with it ...
+    assert signing_key() is None
+
+    # The boundary itself is accepted: 32 bytes is the least that counts.
+    exact = "3f" * 32
+    monkeypatch.setenv(
+        VALIDATION_KEYS_ENV,
+        json.dumps({KEY_ID: exact}),
+    )
+    keys = configured_validation_keys()
+    assert list(keys) == [KEY_ID]
+    assert len(keys[KEY_ID].secret) == 32
 
 
 def test_validation_receipt_missing_key_fails_closed(board, monkeypatch) -> None:
