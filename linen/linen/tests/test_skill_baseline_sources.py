@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from linen.contracts.artifact import ArtifactMetadata
 from linen.contracts.baseline import (
     BaselineLineageManifest,
     BaselineManifestMember,
@@ -33,6 +34,7 @@ from linen.contracts.baseline import (
 )
 from linen.contracts.common import cf_canonical_json, cf_payload_digest
 from linen.server import db
+from linen.server.baseline_materialization import HAS_NO_FOLLOW_OPERATIONS
 from linen.server.skill_baseline_sources import (
     COVERAGE_LEDGER_ARTIFACT_KIND,
     COVERAGE_RUN_METADATA_ARTIFACT_KIND,
@@ -47,8 +49,16 @@ from linen.server.skill_baseline_sources import (
     register_historical_source,
     seal_lineage_manifest,
 )
+from linen.server.store import register_artifact
 
 PROJECT = "p-baseline"
+
+#: The materialization refuses to run where the platform cannot open a file
+#: without following a symbolic link (CF-S2-B1 P1-B).
+requires_materialization = pytest.mark.skipif(
+    not HAS_NO_FOLLOW_OPERATIONS,
+    reason="the baseline materialization needs no-follow directory operations",
+)
 
 REFS = {
     "surface": "http-public-api",
@@ -386,6 +396,7 @@ def test_b1_t14_a_failed_import_leaves_the_registry_unchanged(board, import_root
 # --- E93: the artifact kind ---------------------------------------------------
 
 
+@requires_materialization
 def test_e93_the_coverage_ledger_artifact_kind_works_on_an_existing_database(board, import_root):
     """E93: the new artifact kind needs no migration of the old database.
 
@@ -415,6 +426,42 @@ def test_e93_the_coverage_ledger_artifact_kind_works_on_an_existing_database(boa
                 "SELECT kind FROM artifacts WHERE project_id = ?", (PROJECT,)
             ).fetchall()
         }
+    assert COVERAGE_LEDGER_ARTIFACT_KIND in kinds
+    assert COVERAGE_RUN_METADATA_ARTIFACT_KIND in kinds
+
+
+def test_e93_the_baseline_artifact_kinds_need_no_database_migration(board):
+    """E93: the artifact kinds are stored as they are, on any database.
+
+    The kinds are free text, so a database that predates them accepts them
+    without a migration.  This holds on every platform, including the ones
+    where the materialization itself fails closed.
+    """
+
+    with db.get_conn() as conn:
+        for index, kind in enumerate(
+            (COVERAGE_LEDGER_ARTIFACT_KIND, COVERAGE_RUN_METADATA_ARTIFACT_KIND)
+        ):
+            register_artifact(
+                conn,
+                ArtifactMetadata(
+                    artifact_id=f"a-{index}",
+                    project_id=PROJECT,
+                    kind=kind,
+                    workspace_path=f"baseline/{index}/{kind}.json",
+                    sha256="a" * 64,
+                    media_type="application/json",
+                    byte_size=2,
+                    producer_run_id=None,
+                ),
+            )
+        kinds = {
+            str(row["kind"])
+            for row in conn.execute(
+                "SELECT kind FROM artifacts WHERE project_id = ?", (PROJECT,)
+            ).fetchall()
+        }
+
     assert COVERAGE_LEDGER_ARTIFACT_KIND in kinds
     assert COVERAGE_RUN_METADATA_ARTIFACT_KIND in kinds
 
@@ -585,7 +632,7 @@ def test_b1_t12_a_negative_claim_binds_the_complete_manifest(board, import_root)
     with db.get_conn() as conn:
         manifest = seal_lineage_manifest(conn, project_id=PROJECT, members=[member])
         reference = manifest.reference()
-        body = read_reference(conn, reference)
+        body = read_reference(conn, project_id=PROJECT, reference=reference)
 
     assert reference.startswith("cf-ref-v1:")
     assert body["project_id"] == PROJECT
@@ -632,7 +679,7 @@ def test_e98_a_reference_round_trips_to_its_body(board, import_root):
     with db.get_conn() as conn:
         rows = list_baseline_sources(conn, PROJECT)
         reference = rows[0]["lookup_ref"]
-        body = read_reference(conn, reference)
+        body = read_reference(conn, project_id=PROJECT, reference=reference)
 
     assert body["source_ref"] == record.source_ref
     assert cf_payload_digest(body) == reference_digest(reference)
@@ -644,7 +691,7 @@ def test_e98_a_reference_without_a_body_is_unverifiable(board):
     reference = encode_reference({"project_id": PROJECT, "members": []})
     with db.get_conn() as conn:
         with pytest.raises(BaselineReferenceUnverifiable):
-            read_reference(conn, reference)
+            read_reference(conn, project_id=PROJECT, reference=reference)
 
 
 def test_e98_a_body_that_no_longer_matches_its_digest_is_refused(board, import_root):
@@ -671,7 +718,7 @@ def test_e98_a_body_that_no_longer_matches_its_digest_is_refused(board, import_r
             (json.dumps({"tampered": True}), reference),
         )
         with pytest.raises(BaselineReferenceUnverifiable):
-            read_reference(conn, reference)
+            read_reference(conn, project_id=PROJECT, reference=reference)
 
 
 def test_e98_a_reference_that_is_not_a_reference_is_refused():

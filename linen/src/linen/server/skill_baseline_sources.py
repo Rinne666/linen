@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +41,15 @@ from linen.contracts.baseline import (
     reference_digest,
 )
 from linen.contracts.common import cf_canonical_json, cf_payload_digest
+# ``BaselineMaterializationFailed`` is re-exported here on purpose: it is the
+# failure a caller of the baseline registry has to handle, and the registry
+# is where that failure is raised.
+from linen.server.baseline_materialization import (
+    BASELINE_WORKSPACE_DIR,
+    BaselineMaterializationFailed,
+    materialization_key,
+    open_materialization_directory,
+)
 from linen.server.services import utcnow
 from linen.server.store import register_artifact
 
@@ -54,8 +62,9 @@ LEDGER_FILE_NAME = "coverage-ledger.json"
 METADATA_FILE_NAME = "run-metadata.json"
 
 #: The directory the imported files are materialized under, inside the
-#: project workspace.
-BASELINE_WORKSPACE_DIR = "baseline"
+#: project workspace, is ``baseline_materialization.BASELINE_WORKSPACE_DIR``.
+#: It lives there because the materialization is what has to place files
+#: under it, and that module refuses to do so without no-follow guarantees.
 
 #: The vendored upstream snapshot, resolved from the installed package.
 #:
@@ -616,61 +625,75 @@ def materialize_baseline_artifacts(
     is verified against them before it is registered.  The artifacts are
     ordinary workspace artifacts and carry the same read-time digest check
     every other artifact does.
+
+    The materialization is safe and repeatable (CF-S2-B1 P1-B):
+
+    * the directory is named after the full SHA-256 of the source reference,
+      so two references cannot be made to share a directory by rewriting
+      path characters (D-053);
+    * every file is created relative to an opened directory, without
+      following a symbolic link, so a component that is a link is refused
+      rather than used;
+    * a file that is already there is reused only when its digest is the
+      expected one, and a repeated materialization therefore leaves the
+      bytes and the artifact rows exactly as they were;
+    * a materialization that fails half way removes the files it created,
+      so no half written file is left behind as if it were an artifact.
     """
 
-    project_dir = workspace_root / candidate.project_id
-    safe_ref = candidate.source_ref.replace("\\", "/").replace("/", "__")
-    target_dir = project_dir / BASELINE_WORKSPACE_DIR / safe_ref
-    target_dir.mkdir(parents=True, exist_ok=True)
+    key = materialization_key(candidate.source_ref)
 
-    artifact_ids: list[str] = []
-    for kind, name, payload, digest in (
-        (
-            COVERAGE_LEDGER_ARTIFACT_KIND,
-            LEDGER_FILE_NAME,
-            candidate.ledger_bytes,
-            candidate.ledger_sha256,
-        ),
-        (
-            COVERAGE_RUN_METADATA_ARTIFACT_KIND,
-            METADATA_FILE_NAME,
-            candidate.metadata_bytes,
-            candidate.metadata_sha256,
-        ),
-    ):
-        if not payload or not digest:
-            continue
-        if hashlib.sha256(payload).hexdigest() != digest:
-            raise BaselineSourceRejected(
-                f"the imported {name} does not match its recorded digest"
-            )
-        target = target_dir / name
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(target, flags, 0o644)
+    with open_materialization_directory(
+        workspace_root=workspace_root,
+        project_id=candidate.project_id,
+        source_ref=candidate.source_ref,
+    ) as directory:
+        pending: list[tuple[str, str, str, int]] = []
         try:
-            with os.fdopen(descriptor, "wb") as stream:
-                descriptor = -1
-                stream.write(payload)
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+            for kind, name, payload, digest in (
+                (
+                    COVERAGE_LEDGER_ARTIFACT_KIND,
+                    LEDGER_FILE_NAME,
+                    candidate.ledger_bytes,
+                    candidate.ledger_sha256,
+                ),
+                (
+                    COVERAGE_RUN_METADATA_ARTIFACT_KIND,
+                    METADATA_FILE_NAME,
+                    candidate.metadata_bytes,
+                    candidate.metadata_sha256,
+                ),
+            ):
+                if not payload or not digest:
+                    continue
+                if hashlib.sha256(payload).hexdigest() != digest:
+                    raise BaselineSourceRejected(
+                        f"the imported {name} does not match its recorded digest"
+                    )
+                directory.write(name, payload, digest)
+                pending.append((kind, name, digest, len(payload)))
+        except BaseException:
+            directory.discard_created()
+            raise
 
-        artifact_id = f"{safe_ref}:{name}"
-        workspace_path = f"{BASELINE_WORKSPACE_DIR}/{safe_ref}/{name}"
-        register_artifact(
-            conn,
-            ArtifactMetadata(
-                artifact_id=artifact_id,
-                project_id=candidate.project_id,
-                kind=kind,
-                workspace_path=workspace_path,
-                sha256=digest,
-                media_type="application/json",
-                byte_size=len(payload),
-                producer_run_id=None,
-            ),
-        )
-        artifact_ids.append(artifact_id)
+        artifact_ids: list[str] = []
+        for kind, name, digest, byte_size in pending:
+            artifact_id = f"{key}:{name}"
+            workspace_path = f"{BASELINE_WORKSPACE_DIR}/{key}/{name}"
+            register_artifact(
+                conn,
+                ArtifactMetadata(
+                    artifact_id=artifact_id,
+                    project_id=candidate.project_id,
+                    kind=kind,
+                    workspace_path=workspace_path,
+                    sha256=digest,
+                    media_type="application/json",
+                    byte_size=byte_size,
+                    producer_run_id=None,
+                ),
+            )
+            artifact_ids.append(artifact_id)
     return tuple(artifact_ids)  # type: ignore[return-value]
 
 
@@ -786,19 +809,28 @@ def read_lineage_manifest(
     return BaselineLineageManifest.model_validate(body)
 
 
-def read_reference(conn: sqlite3.Connection, reference: str) -> dict[str, Any]:
+def read_reference(
+    conn: sqlite3.Connection, *, project_id: str, reference: str
+) -> dict[str, Any]:
     """Resolve a reference back to the body it names, and re-verify it.
 
     A reference whose body cannot be found, or whose body no longer matches
     its digest, is not evidence of anything: it is an unverifiable
     reference.
+
+    The lookup is **project scoped**.  A reference is the digest of a body,
+    and two projects may well have registered the same body - the digest
+    says what the body is, not who is allowed to read it.  Without the
+    project in the query, a reference that belongs to one project could be
+    resolved by another, and the history behind a baseline would not be the
+    history of the project the baseline belongs to (CR-T06).
     """
 
     digest = reference_digest(reference)
     row = conn.execute(
         "SELECT payload_json, payload_sha256 FROM coverage_baseline_sources "
-        "WHERE lookup_ref = ?",
-        (reference,),
+        "WHERE project_id = ? AND lookup_ref = ?",
+        (project_id, reference),
     ).fetchone()
     if row is None:
         raise BaselineReferenceUnverifiable(
@@ -814,9 +846,13 @@ def read_reference(conn: sqlite3.Connection, reference: str) -> dict[str, Any]:
 
 
 def referenced_manifest(
-    conn: sqlite3.Connection, reference: str
+    conn: sqlite3.Connection, *, project_id: str, reference: str
 ) -> BaselineLineageManifest:
-    """The manifest a reference names."""
+    """The manifest a reference names.
 
-    body = read_reference(conn, reference)
+    The manifest is read through the same project scoped lookup, so this
+    function cannot be used to reach a manifest of another project either.
+    """
+
+    body = read_reference(conn, project_id=project_id, reference=reference)
     return BaselineLineageManifest.model_validate(body)
