@@ -40,9 +40,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from linen.contracts.common import cf_canonical_json, cf_payload_digest
@@ -55,6 +57,33 @@ _GIT_TIMEOUT_SECONDS = 30
 
 #: The file that carries the frozen source manifest of a historical run.
 SOURCE_MANIFEST_NAME = "source-manifest.json"
+
+#: The kinds a source file can have.  A kind is never guessed: a file that is
+#: neither a regular file nor a symlink is *undecidable*, and an undecidable
+#: file is never silently dropped (D-064).
+SOURCE_KIND_FILE = "file"
+SOURCE_KIND_SYMLINK = "symlink"
+SOURCE_KIND_DIRECTORY = "directory"
+SOURCE_KIND_UNSUPPORTED = "unsupported"
+
+#: The git modes of the kinds a tree entry can have.
+GIT_MODE_FILE = "100644"
+GIT_MODE_EXECUTABLE = "100755"
+GIT_MODE_SYMLINK = "120000"
+GIT_MODE_GITLINK = "160000"
+GIT_MODE_TREE = "040000"
+
+#: The modes a frozen source file may carry.
+SUPPORTED_FILE_MODES = (GIT_MODE_FILE, GIT_MODE_EXECUTABLE, GIT_MODE_SYMLINK)
+
+#: Whether this platform can express the executable bit of a file at all.
+#:
+#: Windows cannot: a file that git records as ``100755`` is a plain file there.
+#: The mode of a file is therefore **not verifiable** on such a platform, and
+#: the check is skipped instead of pretending that the mode matched.  The
+#: declared mode - the mode of the git tree, or the mode of the frozen source
+#: manifest - stays the mode the comparison uses (D-064).
+PLATFORM_EXPRESSES_FILE_MODE = os.name != "nt"
 
 
 class SourceIdentityVerificationFailed(ValueError):
@@ -75,14 +104,105 @@ class GitSourceIdentity:
 
 
 @dataclass(frozen=True)
+class SourceFileEntry:
+    """One file of an audited source tree, with the type and mode it has.
+
+    ``sha256`` is the digest of the file bytes; for a symlink it is the digest
+    of the *link target text*, which is what git stores in its tree (D-064).
+    """
+
+    path: str
+    kind: str
+    mode: str
+    sha256: str
+
+
+@dataclass(frozen=True)
+class SourceTreeState:
+    """The trusted state of one audited source tree.
+
+    ``entries`` are the files and symlinks of the tree.  ``undecidable`` names
+    the paths whose file type could not be determined - a fifo, a socket, a
+    device.  They are reported instead of being skipped, because a file that
+    cannot be classified may not be treated as if it were the same file (D-064).
+    """
+
+    entries: tuple[SourceFileEntry, ...] = ()
+    undecidable: tuple[str, ...] = ()
+
+    def file(self, path: str) -> SourceFileEntry | None:
+        """The entry of one path, if the tree has one."""
+
+        for entry in self.entries:
+            if entry.path == path:
+                return entry
+        return None
+
+    def digest(self) -> str:
+        """The digest of the whole state."""
+
+        return cf_payload_digest(
+            {
+                "entries": [
+                    {
+                        "kind": entry.kind,
+                        "mode": entry.mode,
+                        "path": entry.path,
+                        "sha256": entry.sha256,
+                    }
+                    for entry in self.entries
+                ],
+                "kind": "source-tree-state",
+            }
+        )
+
+
+@dataclass(frozen=True)
+class GitTreeEntry:
+    """One entry of a git tree, with the file type and mode it really has."""
+
+    path: str
+    mode: str
+    kind: str
+    object_name: str
+
+
+@dataclass(frozen=True)
 class FrozenSourceManifest:
-    """The trusted list of the audited source files of one historical run."""
+    """The trusted list of the audited source files of one historical run.
+
+    A **v1** manifest lists the path and the content digest of every audited
+    file.  It says nothing about the file *type* or the file *mode*, so it can
+    never support a source comparison (D-064).
+
+    A **v2** manifest adds the mode and the kind of every file.  It is a
+    different document with a different digest: the digest of a v1 manifest is
+    unchanged, and a v2 manifest can never be mistaken for a v1 one.
+    """
 
     files: tuple[tuple[str, str], ...]
+    entries: tuple[SourceFileEntry, ...] = ()
+    version: int = 1
 
     def digest(self) -> str:
         """The digest of the manifest itself."""
 
+        if self.version == 2:
+            return cf_payload_digest(
+                {
+                    "files": [
+                        {
+                            "kind": entry.kind,
+                            "mode": entry.mode,
+                            "path": entry.path,
+                            "sha256": entry.sha256,
+                        }
+                        for entry in self.entries
+                    ],
+                    "kind": "frozen-source-manifest",
+                    "version": 2,
+                }
+            )
         return cf_payload_digest(
             {
                 "files": [
@@ -92,6 +212,29 @@ class FrozenSourceManifest:
                 "kind": "frozen-source-manifest",
             }
         )
+
+    def file(self, path: str) -> SourceFileEntry | None:
+        """The entry of one path, if the manifest names it."""
+
+        for entry in self.entries:
+            if entry.path == path:
+                return entry
+        return None
+
+    def tree_state(self) -> SourceTreeState:
+        """The source state this manifest describes.
+
+        Only a v2 manifest can describe a state: a v1 manifest carries no file
+        type, and a state without file types would compare a script and a
+        binary as if they were the same thing (D-064).
+        """
+
+        if self.version != 2:
+            raise SourceIdentityVerificationFailed(
+                "the frozen source manifest is a v1 manifest and carries no file "
+                "type, so it cannot describe a comparable source state"
+            )
+        return SourceTreeState(entries=self.entries)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -232,20 +375,175 @@ def verify_git_source_identity(*, repo_root: Path, commit: str) -> GitSourceIden
     )
 
 
-def _git_tree_entries(repo: Path, commit: str) -> dict[str, str]:
-    """The files of one commit, mapped to their git blob object names."""
+def _git_tree_entries(repo: Path, commit: str) -> dict[str, GitTreeEntry]:
+    """Every entry of one commit, with the file type and mode it has.
 
-    entries: dict[str, str] = {}
+    The old implementation kept the blob entries and dropped everything else,
+    which silently excluded submodules and unknown file types from the
+    comparison (D-064).  Every entry is kept now, and the caller decides what
+    to do with the kinds it cannot verify.
+    """
+
+    entries: dict[str, GitTreeEntry] = {}
     listing = _git(repo, "ls-tree", "-r", "--full-tree", commit)
     for line in listing.splitlines():
         if not line.strip():
             continue
         meta, _, path = line.partition("\t")
         fields = meta.split()
-        if len(fields) < 3 or fields[1] != "blob":
+        if len(fields) < 3:
             continue
-        entries[path.strip()] = fields[2].strip()
+        mode, object_type, object_name = fields[0], fields[1], fields[2]
+        relative = path.strip()
+        if object_type == "blob":
+            if mode == GIT_MODE_SYMLINK:
+                kind = SOURCE_KIND_SYMLINK
+            elif mode in (GIT_MODE_FILE, GIT_MODE_EXECUTABLE):
+                kind = SOURCE_KIND_FILE
+            else:
+                kind = SOURCE_KIND_UNSUPPORTED
+        elif object_type == "commit" and mode == GIT_MODE_GITLINK:
+            kind = "gitlink"
+        elif object_type == "tree":
+            kind = SOURCE_KIND_DIRECTORY
+        else:
+            kind = SOURCE_KIND_UNSUPPORTED
+        entries[relative] = GitTreeEntry(
+            path=relative, mode=mode, kind=kind, object_name=object_name.strip()
+        )
     return entries
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    """Whether a path lies inside a directory."""
+
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _walk_source_tree(tree: Path, skip: Sequence[Path] = ()) -> list[Path]:
+    """Every path under the tree, without ever following a symlink.
+
+    ``Path.rglob`` follows symlinked directories on some platforms, which would
+    walk out of the frozen tree; this walk never does.  The directories in
+    ``skip`` - the metadata directory of a repository - are left out: they are
+    not part of the audited source, and git never tracks them.
+    """
+
+    collected: list[Path] = []
+    stack = [tree]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as scanner:
+                children = list(scanner)
+        except OSError as exc:
+            raise SourceIdentityVerificationFailed(
+                f"the frozen source directory {current} cannot be read: {exc}"
+            ) from exc
+        for child in children:
+            path = Path(child.path)
+            if any(_is_within(path, root) for root in skip):
+                continue
+            collected.append(path)
+            if child.is_dir(follow_symlinks=False):
+                stack.append(path)
+    return sorted(collected)
+
+
+def source_tree_state(tree: Path, *, skip: Sequence[Path] = ()) -> SourceTreeState:
+    """The state of a source tree, with the type and mode of every file.
+
+    A symlink is a symlink: it is never followed, and its digest is the digest
+    of the link target text - the same bytes git stores in its tree (D-064).
+    """
+
+    root = Path(tree).expanduser()
+    if not root.is_dir():
+        raise SourceIdentityVerificationFailed(
+            f"the frozen source directory {root} is not a directory"
+        )
+    entries: list[SourceFileEntry] = []
+    undecidable: list[str] = []
+    for path in _walk_source_tree(root, skip):
+        relative = path.relative_to(root).as_posix()
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            target = os.readlink(path)
+            entries.append(
+                SourceFileEntry(
+                    path=relative,
+                    kind=SOURCE_KIND_SYMLINK,
+                    mode=GIT_MODE_SYMLINK,
+                    sha256=hashlib.sha256(target.encode("utf-8")).hexdigest(),
+                )
+            )
+        elif stat.S_ISREG(info.st_mode):
+            mode = GIT_MODE_EXECUTABLE if info.st_mode & 0o111 else GIT_MODE_FILE
+            entries.append(
+                SourceFileEntry(
+                    path=relative,
+                    kind=SOURCE_KIND_FILE,
+                    mode=mode,
+                    sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                )
+            )
+        elif stat.S_ISDIR(info.st_mode):
+            continue
+        else:
+            undecidable.append(relative)
+    return SourceTreeState(
+        entries=tuple(sorted(entries, key=lambda entry: entry.path)),
+        undecidable=tuple(sorted(undecidable)),
+    )
+
+
+def _git_blob(repo: Path, data: bytes) -> str:
+    """The git object name of the given bytes."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), "hash-object", "--stdin"],
+            input=data,
+            capture_output=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SourceIdentityVerificationFailed(
+            f"git could not be executed in {repo}: {exc}"
+        ) from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or b"").decode("utf-8", "replace").strip()
+        raise SourceIdentityVerificationFailed(
+            f"git hash-object failed in {repo}: {detail}"
+        )
+    return completed.stdout.decode("ascii", "replace").strip()
+
+
+def _git_metadata_dirs(repo: Path, tree: Path) -> tuple[Path, ...]:
+    """The metadata directories of a repository that lie inside the tree.
+
+    A source tree that *is* a working copy carries the metadata directory of
+    the repository.  Git never tracks it, so it is not part of the audited
+    source and it is left out of the comparison - but it is left out on
+    purpose, not by accident.
+    """
+
+    try:
+        git_dir = Path(_git(repo, "rev-parse", "--absolute-git-dir"))
+    except SourceIdentityVerificationFailed:
+        return ()
+    if not git_dir.is_dir():
+        return ()
+    root = Path(tree).expanduser().resolve()
+    resolved = git_dir.resolve()
+    if resolved == root or _is_within(resolved, root):
+        return (resolved,)
+    return ()
 
 
 def verify_git_source_snapshot(
@@ -254,9 +552,11 @@ def verify_git_source_snapshot(
     """Prove that a frozen source tree is exactly the tree of one commit.
 
     Every file of the commit has to be present in the frozen tree with the
-    same content, and the frozen tree may not carry a file the commit does not
-    have.  The files are compared through their git blob object names, so the
-    comparison is the one git itself would make.
+    same content, **the same file type and the same mode** (D-064), and the
+    frozen tree may not carry a file the commit does not have.  A submodule or
+    a file type that cannot be classified is refused: it is never dropped
+    from the comparison, because a tree that hides a path cannot prove that
+    the path did not change.
     """
 
     repo = Path(repo_root).expanduser()
@@ -266,10 +566,25 @@ def verify_git_source_snapshot(
             f"the frozen source directory {tree} is not a directory"
         )
     entries = _git_tree_entries(repo, commit)
-    present: dict[str, str] = {}
-    for path in sorted(p for p in tree.rglob("*") if p.is_file()):
-        relative = path.relative_to(tree).as_posix()
-        present[relative] = _git(repo, "hash-object", str(path))
+    for path, entry in sorted(entries.items()):
+        if entry.kind == "gitlink":
+            raise SourceIdentityVerificationFailed(
+                f"the commit carries a submodule at {path!r}; the content of a "
+                "submodule is not part of the tree and cannot be verified"
+            )
+        if entry.kind not in (SOURCE_KIND_FILE, SOURCE_KIND_SYMLINK):
+            raise SourceIdentityVerificationFailed(
+                f"the commit carries {path!r} with the mode {entry.mode}, whose "
+                "file type cannot be verified"
+            )
+
+    state = source_tree_state(tree, skip=_git_metadata_dirs(repo, tree))
+    if state.undecidable:
+        raise SourceIdentityVerificationFailed(
+            f"the frozen source tree carries {state.undecidable[0]!r}, whose "
+            "file type cannot be determined"
+        )
+    present = {entry.path: entry for entry in state.entries}
 
     missing = sorted(set(entries) - set(present))
     extra = sorted(set(present) - set(entries))
@@ -283,16 +598,39 @@ def verify_git_source_snapshot(
             f"the frozen source tree carries {extra[0]!r}, which the commit does "
             "not have"
         )
-    for relative, blob in entries.items():
-        if present[relative] != blob:
+    for relative, entry in sorted(entries.items()):
+        local = present[relative]
+        if local.kind != entry.kind:
+            raise SourceIdentityVerificationFailed(
+                f"the frozen source file {relative!r} is a {local.kind}, but the "
+                f"commit has it as a {entry.kind}"
+            )
+        if PLATFORM_EXPRESSES_FILE_MODE and local.mode != entry.mode:
+            raise SourceIdentityVerificationFailed(
+                f"the frozen source file {relative!r} has the mode {local.mode}, "
+                f"but the commit has it as {entry.mode}"
+            )
+        if entry.kind == SOURCE_KIND_SYMLINK:
+            blob = _git_blob(repo, os.readlink(tree / relative).encode("utf-8"))
+        else:
+            blob = _git(repo, "hash-object", str(tree / relative))
+        if blob != entry.object_name:
             raise SourceIdentityVerificationFailed(
                 f"the frozen source file {relative!r} does not match the commit"
             )
-    return FrozenSourceManifest(
-        files=tuple(
-            (relative, hashlib.sha256((tree / relative).read_bytes()).hexdigest())
-            for relative in sorted(entries)
+    merged = tuple(
+        SourceFileEntry(
+            path=relative,
+            kind=entries[relative].kind,
+            mode=entries[relative].mode,
+            sha256=present[relative].sha256,
         )
+        for relative in sorted(entries)
+    )
+    return FrozenSourceManifest(
+        files=tuple((entry.path, entry.sha256) for entry in merged),
+        entries=merged,
+        version=2,
     )
 
 
@@ -308,7 +646,14 @@ def read_frozen_source_manifest(path: Path) -> FrozenSourceManifest:
 
 
 def read_frozen_source_manifest_bytes(raw: bytes) -> FrozenSourceManifest:
-    """Read the trusted file manifest of a frozen source snapshot from bytes."""
+    """Read the trusted file manifest of a frozen source snapshot from bytes.
+
+    A manifest without a ``version`` is a **v1** manifest: it lists the path
+    and the content digest of every audited file.  A manifest with
+    ``"version": 2`` also lists the mode and the kind of every file, which is
+    what a source comparison needs (D-064).  The two versions have different
+    digests, and the digest of a v1 manifest is unchanged.
+    """
 
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -320,7 +665,15 @@ def read_frozen_source_manifest_bytes(raw: bytes) -> FrozenSourceManifest:
         raise SourceIdentityVerificationFailed(
             "the frozen source manifest does not carry a file list"
         )
+    version = payload.get("version")
+    if version is None:
+        version = 1
+    if version not in (1, 2):
+        raise SourceIdentityVerificationFailed(
+            f"the frozen source manifest has the unsupported version {version!r}"
+        )
     files: list[tuple[str, str]] = []
+    entries: list[SourceFileEntry] = []
     for entry in payload["files"]:
         if not isinstance(entry, dict):
             raise SourceIdentityVerificationFailed(
@@ -337,11 +690,41 @@ def read_frozen_source_manifest_bytes(raw: bytes) -> FrozenSourceManifest:
                 "the frozen source manifest names a file without a sha256 digest"
             )
         files.append((relative, sha256))
+        if version == 2:
+            mode = str(entry.get("mode") or "").strip()
+            kind = str(entry.get("kind") or "").strip()
+            if mode not in SUPPORTED_FILE_MODES:
+                raise SourceIdentityVerificationFailed(
+                    f"the frozen source manifest names {relative!r} with the "
+                    f"unsupported mode {mode!r}"
+                )
+            if kind not in (SOURCE_KIND_FILE, SOURCE_KIND_SYMLINK):
+                raise SourceIdentityVerificationFailed(
+                    f"the frozen source manifest names {relative!r} with the "
+                    f"unsupported file type {kind!r}"
+                )
+            if kind == SOURCE_KIND_SYMLINK and mode != GIT_MODE_SYMLINK:
+                raise SourceIdentityVerificationFailed(
+                    f"the frozen source manifest names the symlink {relative!r} "
+                    f"with the mode {mode!r}"
+                )
+            if kind == SOURCE_KIND_FILE and mode == GIT_MODE_SYMLINK:
+                raise SourceIdentityVerificationFailed(
+                    f"the frozen source manifest names the file {relative!r} with "
+                    "the mode of a symlink"
+                )
+            entries.append(
+                SourceFileEntry(path=relative, kind=kind, mode=mode, sha256=sha256)
+            )
     if len({path for path, _ in files}) != len(files):
         raise SourceIdentityVerificationFailed(
             "the frozen source manifest names the same file twice"
         )
-    return FrozenSourceManifest(files=tuple(sorted(files)))
+    return FrozenSourceManifest(
+        files=tuple(sorted(files)),
+        entries=tuple(sorted(entries, key=lambda entry: entry.path)),
+        version=version,
+    )
 
 
 def verify_frozen_source_manifest(
@@ -350,7 +733,10 @@ def verify_frozen_source_manifest(
     """Prove that a source tree is exactly the frozen manifest it claims.
 
     Every file of the manifest has to be present with the digest the manifest
-    gives it, and the tree may not carry a file the manifest does not name.
+    gives it, and the tree may not carry a file the manifest does not name.  A
+    **v2** manifest also has to match the file type and the mode of every file
+    (D-064); a v1 manifest carries no file type, so it keeps the content-only
+    semantics it was defined with.
     """
 
     tree = Path(source_dir).expanduser()
@@ -359,13 +745,52 @@ def verify_frozen_source_manifest(
             f"the frozen source directory {tree} is not a directory"
         )
     expected = dict(manifest.files)
-    present: dict[str, str] = {}
+
+    if manifest.version == 2:
+        state = source_tree_state(tree)
+        if state.undecidable:
+            raise SourceIdentityVerificationFailed(
+                f"the source tree carries {state.undecidable[0]!r}, whose file "
+                "type cannot be determined"
+            )
+        present = {entry.path: entry for entry in state.entries}
+        missing = sorted(set(expected) - set(present))
+        extra = sorted(set(present) - set(expected))
+        if missing:
+            raise SourceIdentityVerificationFailed(
+                f"the source tree does not carry {missing[0]!r}, which the frozen "
+                "manifest names"
+            )
+        if extra:
+            raise SourceIdentityVerificationFailed(
+                f"the source tree carries {extra[0]!r}, which the frozen manifest "
+                "does not name"
+            )
+        for entry in manifest.entries:
+            local = present[entry.path]
+            if local.sha256 != entry.sha256:
+                raise SourceIdentityVerificationFailed(
+                    f"the source file {entry.path!r} does not match the frozen manifest"
+                )
+            if local.kind != entry.kind:
+                raise SourceIdentityVerificationFailed(
+                    f"the source file {entry.path!r} is a {local.kind}, but the "
+                    f"frozen manifest names a {entry.kind}"
+                )
+            if PLATFORM_EXPRESSES_FILE_MODE and local.mode != entry.mode:
+                raise SourceIdentityVerificationFailed(
+                    f"the source file {entry.path!r} has the mode {local.mode}, "
+                    f"but the frozen manifest names the mode {entry.mode}"
+                )
+        return manifest
+
+    present_files: dict[str, str] = {}
     for path in sorted(p for p in tree.rglob("*") if p.is_file()):
         relative = path.relative_to(tree).as_posix()
-        present[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        present_files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
 
-    missing = sorted(set(expected) - set(present))
-    extra = sorted(set(present) - set(expected))
+    missing = sorted(set(expected) - set(present_files))
+    extra = sorted(set(present_files) - set(expected))
     if missing:
         raise SourceIdentityVerificationFailed(
             f"the source tree does not carry {missing[0]!r}, which the frozen "
@@ -377,7 +802,7 @@ def verify_frozen_source_manifest(
             "not name"
         )
     for relative, sha256 in expected.items():
-        if present[relative] != sha256:
+        if present_files[relative] != sha256:
             raise SourceIdentityVerificationFailed(
                 f"the source file {relative!r} does not match the frozen manifest"
             )
