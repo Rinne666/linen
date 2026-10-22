@@ -836,3 +836,125 @@ units_in_readable_candidates     396
 - 不开放生产注册与多轮写入（S2-C）；
 - 不恢复 D-014 / I4 的三位语义；
 - 不把 attestation 或 seal 当作任何 finding 的确认权威。
+
+## CF-S2-B2-B 可信相关源码比较器
+
+**PM v2.9 裁定**：Q54 = D-060–D-062 正式关闭、R01–R08 8/8 PASS、B2-A 整体 **CONDITIONAL PASS**
+（多 seal 冲突判定 D-063 与 Git 文件类型语义 D-064 两项仍 OPEN）；
+Q55 = 正式接受 `source-manifest.json` 作为 linen-only、版本化、**可选**的冻结源码扩展；
+Q56 = **不**自动补采历史源码清单，真实 `source_identity_verified` 保持 0；
+并**授权立即进入 B2-B**，冻结验收矩阵 B2-B-T01–T10。
+
+### 职责边界
+
+【事实】B2-B **只**实现一件事：比较**相关源码**是否变化，输出只有三种：
+
+```text
+same      每个相关路径在两侧都被证明相同
+changed   至少一个相关路径被证明不同
+unknown   比较做不出来，或有路径判不了
+```
+
+【事实】比较器**不**产出 `prior_status`、**不**新建 finding、**不**修改 coverage event；
+它只是一份**比较凭据**，其价值由 B2-C 的 resolver 决定（D-065）。
+【事实】本片**不新增表、不新增 HTTP 入口**：比较结果不落库，它是可信输入的纯函数。
+
+### 两侧都必须被证明
+
+【事实】比较的两侧各有各的证明方式，缺一即 `unknown`：
+
+- 历史侧：登记来源 + **已签名**的 `audited_source_identity` attestation（B-T01）；
+- 当前侧：由**服务端自己**在本次调用中核验（git 修订或冻结清单），调用方只能给出
+  「我认为是哪个仓库/哪个提交/哪份源码树」，**不能**给出「已核验」（B-T02）。
+
+【推断】两侧都未证明时给出的 `same` 没有任何意义：它会让人以为「历史结论仍然成立」，
+而实际上连「哪份源码被比较过」都不知道。
+
+### 相关路径是保守并集，不是交集（D-065）
+
+【事实】被比较的路径集合是三者的**并集**：
+
+```text
+current trusted plan paths      当前可信计划路径
+    ∪
+historical reviewed paths       历史 run 实际复核过的路径
+    ∪
+historical finding paths        历史 finding 指向的证据路径
+```
+
+【事实】**不用交集**：交集会把「历史检查过、但本轮计划没写」的路径悄悄丢掉，
+从而错误地证明「相关源码没有变化」（B-T06、B-T07）。
+【事实】**不因 commit 不同就判 changed**：commit 变了只说明仓库动了，
+是否影响相关源码取决于**相关路径**（B-T05）。
+
+### 聚合规则：changed 优先于 unknown
+
+【事实】逐路径比较的结果按以下顺序聚合：
+
+1. 只要有一条路径被证明不同 → `changed`（保守方向：历史结论不自动延续）；
+2. 否则只要有一条路径判不了 → `unknown`（宁可不知道，不可假装没变）；
+3. 否则（全部相同且集合非空）→ `same`；
+4. 没有相关路径可比 → `unknown`。
+
+【推断】「无法判定」永远不能被当成「相同」：这是 B-T09 的核心。
+
+### 文件类型语义（D-064）
+
+【事实】源码快照比较**保留文件类型**：普通文件、可执行 mode、符号链接、gitlink、
+以及无法判定的类型。规则：
+
+- **mode** 是文件身份的一部分：`100755` 与 `100644` 不是同一个文件；
+- **符号链接**不跟随，其摘要取**链接目标文本**（与 git tree 存的一致）；
+- **gitlink（submodule）**的内容不属于该 tree，**明确拒绝**，不静默排除；
+- **无法判定的类型**（fifo/socket/设备）**明确拒绝**，不静默跳过。
+
+【事实】为承载这些语义，冻结源码清单引入 **v2**：
+
+| 版本 | 内容 | 摘要语义 |
+|---|---|---|
+| v1 | `{"files": [{"path", "sha256"}]}` | **不变**（`kind = frozen-source-manifest`） |
+| v2 | `{"files": [{"path", "sha256", "mode", "kind"}]}` | 新摘要（`kind = frozen-source-manifest` + `version = 2`） |
+
+【事实】**v1 清单不能支持源码比较**：它没有文件类型，比较器会把「脚本」与「二进制」
+当成同一个文件。v1 清单的历史来源在比较时一律得到 `unknown`（B-T08）。
+【事实】v1 清单的**既有摘要与含义不变**（Q55 冻结），v2 是**另一个文档**。
+
+【推断】**平台边界（诚实记录）**：Windows **无法表达**可执行位，
+因此在 Windows 上「树里的 mode」不可判定；此时比较使用**声明的 mode**
+（git tree 的 mode，或清单里登记的 mode），内容仍然逐字节核对。
+POSIX-only 的用例（可执行位、符号链接、fifo）在 Windows 上**跳过**，不假装一致。
+
+### 多 seal 冲突失败关闭（D-063）
+
+【事实】`lineage_seal_status()` 现在**先统一评估同一 `(project_id, run_id)` 的全部有效 seal**，
+再给结论：
+
+- 全部有效 seal 声明**同一历史范围** → `state = "sealed"`，`trusted_negative = true`
+  （重复签发同一范围是幂等的，不是冲突）；
+- 有效 seal 对历史范围/成员集合**说法不一致** → `state = "conflict"`，
+  `trusted_negative = false`，`sealed = false`，**全部 seal 原样保留**。
+
+【推断】「先读到的那张 seal 赢」是错的：一个 run 同时声明「本项目没有前代历史」
+与「本项目有前代历史」时，这个范围**没有被搜索过**，不能承载负证据。
+【事实】冲突判定**不按创建时间、不按自增 ID 选赢家**，也不删改任何 seal。
+
+### 本片验收
+
+【事实】**B2-B-T01–T10**：历史未核验 → unknown / 当前未核验 → unknown /
+相关路径全同且有可信摘要 → same / 至少一条有可信变化证据 → changed /
+整体 commit 变但相关路径同 → 不误判 changed / 历史 reviewed_paths 不在当前计划内仍纳入 /
+finding 证据路径不因计划遗漏而消失 / 缺少必要路径或可信摘要 → unknown /
+类型或 mode 不可判定不返回虚假 same / 相同可信输入重放得到相同结果与 evidence refs。
+
+【事实】外加 **D-063** 回归 `test_conflicting_lineage_seals_cannot_yield_trusted_negative`
+与「同一范围两次封存是幂等」的对照用例；以及 **D-064** 的文件类型语义用例
+（mode / symlink / gitlink / 不可判定类型 / v1 与 v2 清单的摘要分界）。
+
+### 本片不做的事
+
+- 不做 `prior_status` 生产解析（B2-C）：`trusted_negative` 在 D-063/D-064 收尾前
+  **不得**作为 `none/new` 的唯一权威；
+- 不新增表、不新增 HTTP 入口、不落库比较结果；
+- 不开放生产注册与多轮写入（S2-C）；
+- 不恢复 D-014 / I4 的三位语义（attestation / seal / 比较凭据都**不是** I4 三位）；
+- 不把比较结果当作任何 finding 的确认权威。
