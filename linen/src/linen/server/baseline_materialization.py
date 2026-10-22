@@ -216,7 +216,9 @@ class MaterializationDirectory:
             )
         try:
             descriptor = os.open(
-                name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self._descriptor
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=self._descriptor,
             )
         except OSError as exc:
             raise BaselineMaterializationFailed(
@@ -224,12 +226,28 @@ class MaterializationDirectory:
                 f"symbolic link: {exc}"
             ) from exc
         try:
+            # ``O_NOFOLLOW`` stops a symbolic link from being followed, but it
+            # does not stop another process from replacing the file between
+            # the check above and this open.  The descriptor is therefore
+            # asked what it really is: a file that is not a regular file -
+            # a fifo, a device, a socket - is refused here instead of being
+            # read, and ``O_NONBLOCK`` keeps the open itself from waiting
+            # for one.
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise BaselineMaterializationFailed(
+                    f"the {name!r} file is not a regular file once it is opened"
+                )
             with os.fdopen(descriptor, "rb") as stream:
+                descriptor = -1
                 return hashlib.sha256(stream.read()).hexdigest()
         except OSError as exc:
             raise BaselineMaterializationFailed(
                 f"the {name!r} file could not be read: {exc}"
             ) from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     def write(self, name: str, payload: bytes, digest: str) -> bool:
         """Materialize one file, or reuse a byte identical one.

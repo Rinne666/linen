@@ -1326,7 +1326,16 @@ def delete_project(project_id: str):
                     "LIMIT 1",
                     (project_id,),
                 ).fetchone()
-                if owns_baselines is not None or owns_validations is not None:
+                owns_validation_auths = conn.execute(
+                    "SELECT 1 FROM coverage_ledger_validation_auths WHERE project_id = ? "
+                    "LIMIT 1",
+                    (project_id,),
+                ).fetchone()
+                if (
+                    owns_baselines is not None
+                    or owns_validations is not None
+                    or owns_validation_auths is not None
+                ):
                     raise HTTPException(
                         409,
                         {

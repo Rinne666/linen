@@ -737,6 +737,48 @@ def _ensure_vnext_columns(conn: sqlite3.Connection) -> None:
     BEGIN
         SELECT RAISE(ABORT, 'coverage_ledger_validations is append-only');
     END;
+
+    -- CF-S2-B1 P1-C validation issuance proofs (append-only).
+    --
+    -- A validation receipt proves that the pinned upstream validator accepted
+    -- one document.  It does not prove that anybody was allowed to issue it,
+    -- because its own digest only shows that its body was not changed.  This
+    -- table holds the *authentication envelope* of a receipt - a MAC over the
+    -- receipt and the source it is about - which is what makes a registered
+    -- receipt trustworthy (D-058).
+    --
+    -- It is a separate table on purpose.  An envelope is a proof about a
+    -- receipt, not a receipt; it never changes the receipt, and it is not the
+    -- source identity attestation of CF-S2-B2 (D-059).  The key bytes are
+    -- never stored here - only the identifier of the key that made the MAC.
+    --
+    -- The reference to the receipt is checked by the application, because the
+    -- receipts table has no unique key on the receipt digest alone.  The row
+    -- is append-only, and the foreign key stays NO ACTION for the same reason
+    -- as the baseline sources: a stored envelope whose project is gone must
+    -- not be verifiable.
+    CREATE TABLE IF NOT EXISTS coverage_ledger_validation_auths (
+        auth_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        receipt_sha256 TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        payload_sha256 TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (project_id, receipt_sha256, key_id)
+    );
+    CREATE INDEX IF NOT EXISTS coverage_ledger_validation_auths_receipt_idx
+        ON coverage_ledger_validation_auths(project_id, receipt_sha256);
+    CREATE TRIGGER IF NOT EXISTS coverage_ledger_validation_auths_no_update
+        BEFORE UPDATE ON coverage_ledger_validation_auths
+        BEGIN
+            SELECT RAISE(ABORT, 'coverage_ledger_validation_auths is append-only');
+        END;
+    CREATE TRIGGER IF NOT EXISTS coverage_ledger_validation_auths_no_delete
+        BEFORE DELETE ON coverage_ledger_validation_auths
+        BEGIN
+            SELECT RAISE(ABORT, 'coverage_ledger_validation_auths is append-only');
+        END;
     """)
 
 

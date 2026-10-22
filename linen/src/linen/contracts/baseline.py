@@ -31,10 +31,17 @@ from typing import Any, Literal, Mapping
 
 from pydantic import Field, field_validator, model_validator
 
-from .common import ContractModel, cf_payload_digest, validate_sha256
+from .common import ContractModel, cf_canonical_json, cf_payload_digest, validate_sha256
 
 #: The versioned prefix of an immutable reference (D-031 in PM v2.1).
 CF_REFERENCE_PREFIX = "cf-ref-v1:"
+
+#: The domain separation of a validation authentication envelope (D-058).
+#:
+#: The MAC of one receipt may never be replayed for another purpose, another
+#: project or another source, so the bytes it covers always carry this
+#: prefix.
+VALIDATION_AUTH_DOMAIN = "linen:baseline-ledger-validation:v1"
 
 #: A git object name, in the shape git itself writes.
 _GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -335,6 +342,90 @@ class LedgerValidationResult(ContractModel):
     valid: bool
     record_count: int = Field(default=0, ge=0)
     errors: list[str] = Field(default_factory=list, max_length=200)
+
+
+def validation_auth_mac_input(
+    *,
+    receipt_sha256: str,
+    project_id: str,
+    source_ref: str,
+    ledger_sha256: str,
+    metadata_sha256: str,
+) -> bytes:
+    """The exact bytes a validation authentication MAC covers.
+
+    The input is domain separated and canonical, so the same facts always
+    produce the same bytes - and the MAC of one receipt can never be
+    replayed for another project, another source or another set of bytes
+    (D-058).
+    """
+
+    body = cf_canonical_json(
+        {
+            "ledger_sha256": ledger_sha256,
+            "metadata_sha256": metadata_sha256,
+            "project_id": project_id,
+            "receipt_sha256": receipt_sha256,
+            "source_ref": source_ref,
+        }
+    )
+    return VALIDATION_AUTH_DOMAIN.encode("utf-8") + b"\x00" + body.encode("utf-8")
+
+
+class LedgerValidationAuth(ContractModel):
+    """The authentication envelope of one validation receipt (D-058).
+
+    A receipt's own digest proves that its body was not changed.  It does
+    *not* prove that anybody was allowed to issue it: anybody who can
+    construct JSON can construct a body that matches its own digest.
+
+    This envelope is the second half of the answer.  It carries a MAC over
+    the receipt and the source it is about, made with a key that only the
+    controlled offline flow holds, and it is what makes a registered receipt
+    trustworthy.  The envelope never changes the receipt: the receipt keeps
+    its own digest, and the relationship between the two is recorded
+    separately (D-058, D-059).
+    """
+
+    auth_version: int = 1
+    key_id: str = Field(min_length=1, max_length=128)
+    receipt_sha256: str
+    project_id: str = Field(min_length=1, max_length=2048)
+    source_ref: str = Field(min_length=1, max_length=1024)
+    ledger_sha256: str
+    metadata_sha256: str
+    mac: str = Field(min_length=64, max_length=64)
+
+    @field_validator("receipt_sha256", "ledger_sha256", "metadata_sha256")
+    @classmethod
+    def _validate_digests(cls, value: str) -> str:
+        return validate_sha256(value)
+
+    @field_validator("mac")
+    @classmethod
+    def _validate_mac(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("the mac must be 64 lower case hex digits")
+        return value
+
+    @field_validator("project_id", "source_ref", "key_id")
+    @classmethod
+    def _strip_required(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("value must not be empty")
+        return value
+
+    def mac_input(self) -> bytes:
+        """The bytes this envelope's MAC covers."""
+
+        return validation_auth_mac_input(
+            receipt_sha256=self.receipt_sha256,
+            project_id=self.project_id,
+            source_ref=self.source_ref,
+            ledger_sha256=self.ledger_sha256,
+            metadata_sha256=self.metadata_sha256,
+        )
 
 
 class LedgerValidationReceipt(ContractModel):

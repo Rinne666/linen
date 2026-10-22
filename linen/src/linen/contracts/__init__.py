@@ -12,11 +12,13 @@ from .baseline import (
     BaselineManifestMember,
     BaselineSourceIdentity,
     BaselineSourceRecord,
+    LedgerValidationAuth,
     LedgerValidationReceipt,
     LedgerValidationResult,
     LedgerValidatorIdentity,
     encode_reference,
     reference_digest,
+    validation_auth_mac_input,
 )
 from .component import ComponentKind, ComponentManifest, ComponentRisk
 from .context import ContextProjection, ContextRequest
@@ -70,6 +72,7 @@ __all__ = [
     "ExecutionRequest",
     "FilesystemAccess",
     "FilesystemPolicy",
+    "LedgerValidationAuth",
     "LedgerValidationReceipt",
     "LedgerValidationResult",
     "LedgerValidatorIdentity",
@@ -96,4 +99,5 @@ __all__ = [
     "encode_reference",
     "parse_finding_record",
     "reference_digest",
+    "validation_auth_mac_input",
 ]

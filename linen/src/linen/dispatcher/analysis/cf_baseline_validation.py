@@ -238,6 +238,7 @@ def import_validated_historical_run(
     issued_by: str,
     issued_at: str,
     workspace: Path | None = None,
+    signing_key_id: str | None = None,
 ) -> Any:
     """Read, validate and register one historical run - the controlled flow.
 
@@ -250,8 +251,17 @@ def import_validated_historical_run(
     candidate: dropping it silently and then declaring the history complete is
     exactly what must not happen (D-036).  It simply does not gain the
     upstream-valid qualification.
+
+    The flow also issues the *authentication envelope* of the receipt when
+    the deployment configured a key for it (D-058).  Without a key there is
+    no envelope, and a receipt without an envelope is readable but not
+    trustworthy - the server fails closed on it.
     """
 
+    from linen.server.baseline_validation_auth import (
+        issue_trusted_authentication,
+        register_validation_auth,
+    )
     from linen.server.skill_baseline_sources import (
         import_historical_run,
         register_historical_source,
@@ -293,4 +303,12 @@ def import_validated_historical_run(
         source_ref=source_ref,
         receipt=receipt,
     )
+    envelope = issue_trusted_authentication(receipt=receipt, key_id=signing_key_id)
+    if envelope is not None:
+        register_validation_auth(
+            conn,
+            project_id=project_id,
+            receipt=receipt,
+            envelope=envelope,
+        )
     return candidate

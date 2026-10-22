@@ -50,6 +50,10 @@ from linen.server.baseline_materialization import (
     materialization_key,
     open_materialization_directory,
 )
+from linen.server.baseline_validation_auth import (
+    BaselineAuthRejected,
+    trusted_validation_auth,
+)
 from linen.server.services import utcnow
 from linen.server.store import register_artifact
 
@@ -60,6 +64,9 @@ COVERAGE_RUN_METADATA_ARTIFACT_KIND = "coverage-run-metadata"
 #: The file names an imported historical run is expected to carry.
 LEDGER_FILE_NAME = "coverage-ledger.json"
 METADATA_FILE_NAME = "run-metadata.json"
+
+#: The upstream file that validates a coverage ledger.
+COVERAGE_VALIDATOR_FILE_NAME = "validate-coverage-ledger.cjs"
 
 #: The directory the imported files are materialized under, inside the
 #: project workspace, is ``baseline_materialization.BASELINE_WORKSPACE_DIR``.
@@ -464,6 +471,20 @@ def pinned_upstream_commit() -> str:
     return (_VENDORED_SNAPSHOT_DIR / "UPSTREAM_COMMIT").read_text(encoding="utf-8").strip()
 
 
+def pinned_validator_sha256() -> str:
+    """The digest of the pinned upstream coverage validator, as it is now.
+
+    A receipt says which validator produced it.  The server does not take
+    that sentence for evidence: it reads the pinned validator out of its own
+    snapshot and compares the digest.  A receipt that merely *claims* a
+    validator - with a digest that fits its own body perfectly - does not
+    pass this check (CR-T08).
+    """
+
+    path = _VENDORED_SNAPSHOT_DIR / COVERAGE_VALIDATOR_FILE_NAME
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def register_ledger_validation(
     conn: sqlite3.Connection,
     *,
@@ -489,6 +510,21 @@ def register_ledger_validation(
     if not receipt.sealed():
         raise BaselineSourceRejected(
             "the validation receipt does not match its own digest"
+        )
+    try:
+        expected_commit = pinned_upstream_commit()
+        expected_validator = pinned_validator_sha256()
+    except OSError as exc:
+        raise BaselineSourceRejected(
+            "the pinned upstream coverage validator is not available"
+        ) from exc
+    if receipt.validator.upstream_commit != expected_commit:
+        raise BaselineSourceRejected(
+            "the validation receipt was produced by a different upstream commit"
+        )
+    if receipt.validator.validator_sha256 != expected_validator:
+        raise BaselineSourceRejected(
+            "the validation receipt was produced by a different validator build"
         )
 
     digest = receipt.receipt_sha256
@@ -538,9 +574,15 @@ def verify_ledger_validation(
     2. every registered receipt still matches its own digest;
     3. a presented receipt is one of the registered ones;
     4. the ledger bytes still hash to the digest the receipt was made for;
-    5. the receipt is about the registered historical source;
+    5. the receipt is about the registered historical source - the ledger it
+       was made for is the ledger the source was registered with (CR-T09);
     6. the receipt was produced by the pinned upstream validator;
-    7. the validator accepted the document.
+    7. the validator that produced it is the pinned validator, build for
+       build - the receipt's own digest is not evidence for that (CR-T08);
+    8. the validator accepted the document;
+    9. the receipt carries an authentication envelope this deployment can
+       verify - a receipt that only matches its own digest proves nothing
+       about who issued it (D-058).
     """
 
     rows = conn.execute(
@@ -590,27 +632,77 @@ def verify_ledger_validation(
 
     try:
         expected_commit = pinned_upstream_commit()
+        expected_validator = pinned_validator_sha256()
     except OSError as exc:
         raise BaselineReferenceUnverifiable(
             "the pinned upstream validator snapshot is not available"
         ) from exc
 
+    applicable: list[LedgerValidationReceipt] = []
     for receipt in registered:
         if receipt.ledger_sha256 != digest:
             continue
         if receipt.metadata_sha256 != str(source.get("metadata_sha256")):
             continue
+        if receipt.ledger_sha256 != str(source.get("ledger_sha256")):
+            # The receipt is about bytes that are not the registered source's
+            # ledger.  A source may have been validated again after its
+            # ledger changed, and then the older receipt stops applying -
+            # but it must not pass as the validation of this source (CR-T09).
+            continue
         if receipt.validator.upstream_commit != expected_commit:
             raise BaselineReferenceUnverifiable(
                 "the validation receipt was produced by a different upstream commit"
             )
+        if receipt.validator.validator_sha256 != expected_validator:
+            raise BaselineReferenceUnverifiable(
+                "the validation receipt was produced by a different validator build"
+            )
         if not receipt.result.valid:
+            continue
+        applicable.append(receipt)
+
+    if not applicable:
+        raise BaselineReferenceUnverifiable(
+            f"the ledger of {source_ref!r} has no registered upstream validation"
+        )
+
+    # A receipt that matches is still not trustworthy: it has to carry an
+    # authentication envelope that this deployment can verify (D-058).  A
+    # receipt without one stays readable, but it does not pass here.
+    for receipt in applicable:
+        try:
+            trusted_validation_auth(conn, project_id=project_id, receipt=receipt)
+        except BaselineAuthRejected:
             continue
         return receipt
 
     raise BaselineReferenceUnverifiable(
-        f"the ledger of {source_ref!r} has no registered upstream validation"
+        f"the validation of {source_ref!r} carries no trusted issuance proof"
     )
+
+
+def registered_ledger_validation(
+    conn: sqlite3.Connection, *, project_id: str, receipt_sha256: str
+) -> LedgerValidationReceipt:
+    """The stored validation receipt, whether or not it is trusted.
+
+    A receipt that was registered without an authentication envelope - one
+    from before the trusted issuance existed, or one that was filed by an
+    unauthorised path - stays readable.  What it may not do is confer trust:
+    that is decided by :func:`verify_ledger_validation`.
+    """
+
+    row = conn.execute(
+        "SELECT payload_json FROM coverage_ledger_validations "
+        "WHERE project_id = ? AND payload_sha256 = ?",
+        (project_id, receipt_sha256),
+    ).fetchone()
+    if row is None:
+        raise BaselineReferenceUnverifiable(
+            f"no validation receipt {receipt_sha256!r} is registered for the project"
+        )
+    return LedgerValidationReceipt.model_validate(json.loads(row["payload_json"]))
 
 
 def materialize_baseline_artifacts(
@@ -677,23 +769,36 @@ def materialize_baseline_artifacts(
             raise
 
         artifact_ids: list[str] = []
-        for kind, name, digest, byte_size in pending:
-            artifact_id = f"{key}:{name}"
-            workspace_path = f"{BASELINE_WORKSPACE_DIR}/{key}/{name}"
-            register_artifact(
-                conn,
-                ArtifactMetadata(
-                    artifact_id=artifact_id,
-                    project_id=candidate.project_id,
-                    kind=kind,
-                    workspace_path=workspace_path,
-                    sha256=digest,
-                    media_type="application/json",
-                    byte_size=byte_size,
-                    producer_run_id=None,
-                ),
-            )
-            artifact_ids.append(artifact_id)
+        # The artifact registrations of one materialization are all or
+        # nothing: a failure in the middle must not leave the first artifact
+        # behind while the second one is missing (PM v2.6, R-A).  The files
+        # are still not part of the same transaction - a file that was
+        # written stays written and stays verifiable, and the retry reuses
+        # it.
+        conn.execute("SAVEPOINT baseline_artifact_registration")
+        try:
+            for kind, name, digest, byte_size in pending:
+                artifact_id = f"{key}:{name}"
+                workspace_path = f"{BASELINE_WORKSPACE_DIR}/{key}/{name}"
+                register_artifact(
+                    conn,
+                    ArtifactMetadata(
+                        artifact_id=artifact_id,
+                        project_id=candidate.project_id,
+                        kind=kind,
+                        workspace_path=workspace_path,
+                        sha256=digest,
+                        media_type="application/json",
+                        byte_size=byte_size,
+                        producer_run_id=None,
+                    ),
+                )
+                artifact_ids.append(artifact_id)
+        except BaseException:
+            conn.execute("ROLLBACK TO SAVEPOINT baseline_artifact_registration")
+            conn.execute("RELEASE SAVEPOINT baseline_artifact_registration")
+            raise
+        conn.execute("RELEASE SAVEPOINT baseline_artifact_registration")
     return tuple(artifact_ids)  # type: ignore[return-value]
 
 

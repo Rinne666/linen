@@ -25,6 +25,7 @@ from linen.contracts.baseline import (
     LedgerValidatorIdentity,
 )
 from linen.dispatcher.analysis.cf_baseline_validation import (
+    LedgerValidationOutcome,
     import_validated_historical_run,
     issue_ledger_validation_receipt,
     pinned_upstream_commit,
@@ -39,6 +40,7 @@ from linen.dispatcher.analysis.cf_skill_assets import (
 from linen.server import db
 from linen.server.skill_baseline_sources import (
     BaselineReferenceUnverifiable,
+    BaselineSourceRejected,
     import_historical_run,
     list_baseline_sources,
     register_historical_source,
@@ -147,7 +149,7 @@ def _import_run(conn, root: Path, source_ref: str, *, ledger: bytes):
     )
 
 
-def test_validated_ledger_receipt_binds_exact_bytes(board) -> None:
+def test_validated_ledger_receipt_binds_exact_bytes(board, validation_auth_key) -> None:
     """The receipt is bound to the bytes it was made for, and to nothing else."""
 
     payload = _ledger_bytes([_unit()])
@@ -187,7 +189,7 @@ def test_validated_ledger_receipt_binds_exact_bytes(board) -> None:
     assert verified.ledger_sha256 == hashlib.sha256(payload).hexdigest()
 
 
-def test_ledger_change_invalidates_validation_receipt(board) -> None:
+def test_ledger_change_invalidates_validation_receipt(board, validation_auth_key) -> None:
     """A ledger that changed no longer carries the receipt made for it."""
 
     payload = _ledger_bytes([_unit()])
@@ -204,7 +206,7 @@ def test_ledger_change_invalidates_validation_receipt(board) -> None:
             )
 
 
-def test_untrusted_validation_json_cannot_promote_source(board) -> None:
+def test_untrusted_validation_json_cannot_promote_source(board, validation_auth_key) -> None:
     """A hand-made receipt is not evidence, however well formed it is."""
 
     payload = _ledger_bytes([_unit()])
@@ -400,6 +402,148 @@ def test_staging_directory_is_removed_after_validation(tmp_path) -> None:
     payload = _ledger_bytes([_unit()])
     validate_coverage_ledger_bytes(ledger_bytes=payload, workspace=workspace)
     assert list(workspace.iterdir()) == []
+
+
+def test_registered_receipt_requires_pinned_validator_digest(board) -> None:
+    """CR-T08: a receipt has to name the pinned validator, build for build.
+
+    A receipt that carries a digest of its own is self-consistent whatever
+    validator it claims - the digest it carries is simply the digest of the
+    body that names it.  So the registration compares the claimed validator
+    with the digest of the validator that is actually pinned, and refuses a
+    receipt that names a different build.
+    """
+
+    payload = _ledger_bytes([_unit()])
+    metadata_sha = hashlib.sha256(
+        json.dumps(_metadata(), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+    forged = LedgerValidationReceipt.issue(
+        validation_kind="cloudflare_coverage_ledger",
+        ledger_sha256=hashlib.sha256(payload).hexdigest(),
+        validator=LedgerValidatorIdentity(
+            upstream_commit=pinned_upstream_commit(),
+            validator_sha256="b" * 64,
+            runner="native",
+            platform="linux",
+        ),
+        result=LedgerValidationResult(valid=True, record_count=1),
+        project_id=PROJECT,
+        source_ref="run-1",
+        metadata_sha256=metadata_sha,
+        issued_by="operator",
+        issued_at="2026-01-01T00:00:00Z",
+    )
+    assert forged.sealed() is True
+
+    with db.get_conn() as conn:
+        with pytest.raises(BaselineSourceRejected):
+            register_ledger_validation(
+                conn, project_id=PROJECT, source_ref="run-1", receipt=forged
+            )
+        rows = conn.execute(
+            "SELECT COUNT(*) AS total FROM coverage_ledger_validations WHERE project_id = ?",
+            (PROJECT,),
+        ).fetchone()
+    assert int(rows["total"]) == 0
+
+
+def test_registered_receipt_rejects_wrong_upstream_commit(board) -> None:
+    """E142: a receipt that names another upstream commit is refused.
+
+    The commit name is part of the validator identity, so a receipt made by
+    a different snapshot is not a receipt about this validator.
+    """
+
+    payload = _ledger_bytes([_unit()])
+    metadata_sha = hashlib.sha256(
+        json.dumps(_metadata(), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+    forged = LedgerValidationReceipt.issue(
+        validation_kind="cloudflare_coverage_ledger",
+        ledger_sha256=hashlib.sha256(payload).hexdigest(),
+        validator=LedgerValidatorIdentity(
+            upstream_commit="0" * 40,
+            validator_sha256=hashlib.sha256(
+                cf_skill_file(VALIDATE_COVERAGE_LEDGER).read_bytes()
+            ).hexdigest(),
+            runner="native",
+            platform="linux",
+        ),
+        result=LedgerValidationResult(valid=True, record_count=1),
+        project_id=PROJECT,
+        source_ref="run-1",
+        metadata_sha256=metadata_sha,
+        issued_by="operator",
+        issued_at="2026-01-01T00:00:00Z",
+    )
+
+    with db.get_conn() as conn:
+        with pytest.raises(BaselineSourceRejected):
+            register_ledger_validation(
+                conn, project_id=PROJECT, source_ref="run-1", receipt=forged
+            )
+
+
+def test_receipt_must_match_registered_source_ledger_digest(board) -> None:
+    """CR-T09: the receipt has to be about the registered source's ledger.
+
+    Three digests have to be one and the same: the bytes that are presented,
+    the ledger the source was registered with, and the ledger the receipt was
+    made for.  A receipt about other bytes - even a properly registered one -
+    does not validate this source.
+    """
+
+    payload = _ledger_bytes([_unit()])
+    other = _ledger_bytes([_unit(coverage_id=CANONICAL_ID + "-other")])
+    metadata_sha = hashlib.sha256(
+        json.dumps(_metadata(), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+    with db.get_conn() as conn:
+        _import_run(conn, board / "root", "run-1", ledger=payload)
+
+        # A receipt about other bytes, registered under the same source.
+        other_receipt = issue_ledger_validation_receipt(
+            outcome=LedgerValidationOutcome(
+                valid=True,
+                record_count=1,
+                errors=(),
+                ledger_sha256=hashlib.sha256(other).hexdigest(),
+                validator_sha256=hashlib.sha256(
+                    cf_skill_file(VALIDATE_COVERAGE_LEDGER).read_bytes()
+                ).hexdigest(),
+                upstream_commit=pinned_upstream_commit(),
+                runner=validator_runner(),
+                platform="linux",
+            ),
+            project_id=PROJECT,
+            source_ref="run-1",
+            metadata_sha256=metadata_sha,
+            issued_by="operator",
+            issued_at="2026-01-01T00:00:00Z",
+        )
+        register_ledger_validation(
+            conn, project_id=PROJECT, source_ref="run-1", receipt=other_receipt
+        )
+
+        # The registered source's ledger is still the original one.
+        source = list_baseline_sources(
+            conn, PROJECT, record_kind="historical_source"
+        )[0]
+        assert source["payload"]["ledger_sha256"] == hashlib.sha256(payload).hexdigest()
+
+        # The other bytes carry a registered receipt, but it is not about this
+        # source's ledger.
+        with pytest.raises(BaselineReferenceUnverifiable):
+            verify_ledger_validation(
+                conn,
+                project_id=PROJECT,
+                source_ref="run-1",
+                ledger_bytes=other,
+            )
 
 
 def _run_native_validator(payload: bytes, tmp_path: Path) -> subprocess.CompletedProcess:

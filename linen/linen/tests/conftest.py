@@ -1,12 +1,32 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+
+import pytest
 
 from linen.dispatcher.config import DispatchConfig
 from linen.dispatcher.protocol.client import ApiResult
 from linen.dispatcher.workers.base import DriverResult
 from linen.dispatcher.workers.health import HealthResult
 from linen.server.models import Fact, Hint, Intent, ProjectDetail, ProjectMeta
+
+
+@pytest.fixture
+def validation_auth_key(monkeypatch) -> str:
+    """Configure one trusted validation key, the way an operator would.
+
+    The key lives in the environment only.  It never reaches the database,
+    the repository, a log line or an error message - only its identifier is
+    recorded (D-058).
+    """
+
+    secret = "3f" * 32
+    monkeypatch.setenv(
+        "LINEN_BASELINE_VALIDATION_KEYS",
+        json.dumps({"baseline-validator-key-1": secret}),
+    )
+    return secret
 
 
 def make_config() -> DispatchConfig:
