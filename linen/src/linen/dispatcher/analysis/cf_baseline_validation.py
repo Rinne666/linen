@@ -427,3 +427,69 @@ def seal_historical_scope(
         conn=conn, project_id=project_id, seal=seal, envelope=envelope
     )
     return seal
+
+
+def compare_related_sources(
+    *,
+    conn: Any,
+    project_id: str,
+    historical_source_ref: str,
+    historical_ledger_bytes: bytes,
+    historical_manifest_bytes: bytes | None = None,
+    historical_findings_bytes: bytes | None = None,
+    current_source_root: Path,
+    repo_root: Path | None = None,
+    commit: str | None = None,
+    current_manifest_bytes: bytes | None = None,
+    run_id: str | None = None,
+    current_plan_paths: list[str] | None = None,
+) -> Any:
+    """Compare the related source of the current run and one historical run.
+
+    This is the controlled entry point of CF-S2-B2-B.  It answers one
+    question - did the related source change? - with ``same``, ``changed`` or
+    ``unknown`` (D-065).
+
+    It does **not** produce a ``prior_status``, does not create a finding and
+    does not write a coverage event: the resolver of CF-S2-B2-C decides what
+    the comparison is worth, and it may only use this result as one of its
+    inputs.
+
+    The compared paths are the **union** of the current trusted plan paths,
+    the paths the historical run reviewed and the paths the historical
+    findings point at.  The union is never an intersection: a path the
+    current plan forgot stays in the set (D-065).
+    """
+
+    from linen.server.source_comparison import (
+        CurrentSource,
+        RelatedPathSet,
+        compare_related_sources as _compare,
+        current_plan_paths as _current_plan_paths,
+        reviewed_paths_from_ledger,
+    )
+
+    if current_plan_paths is None and run_id is not None:
+        current_plan_paths = list(
+            _current_plan_paths(conn, project_id=project_id, run_id=run_id)
+        )
+
+    paths = RelatedPathSet(
+        current_plan_paths=tuple(current_plan_paths or ()),
+        historical_reviewed_paths=reviewed_paths_from_ledger(historical_ledger_bytes),
+    )
+    return _compare(
+        conn=conn,
+        project_id=project_id,
+        historical_source_ref=historical_source_ref,
+        historical_ledger_bytes=historical_ledger_bytes,
+        historical_manifest_bytes=historical_manifest_bytes,
+        current_source=CurrentSource(
+            root=Path(current_source_root),
+            repo_root=Path(repo_root) if repo_root is not None else None,
+            commit=commit,
+            manifest_bytes=current_manifest_bytes,
+        ),
+        relevant_paths=paths,
+        historical_findings_bytes=historical_findings_bytes,
+    )

@@ -839,3 +839,105 @@ def proof_auth_mac_input(
         }
     )
     return domain.encode("utf-8") + b"\x00" + body.encode("utf-8")
+
+
+# --- CF-S2-B2-B: the trusted comparison of the related source ----------------
+
+#: What a comparison of two audited sources may conclude.
+#:
+#: ``same``
+#:    every related path is provably identical in both audited sources;
+#: ``changed``
+#:    at least one related path is provably different;
+#: ``unknown``
+#:    the comparison could not be made, or could not be made for every path.
+#:
+#: There is no third kind of answer: a comparison that cannot decide says
+#: ``unknown`` and never ``same``.
+SourceComparisonOutcome = Literal["same", "changed", "unknown"]
+
+
+class SourcePathEvidence(ContractModel):
+    """The evidence of one compared path.
+
+    It names the file type and the mode of the path on both sides, so a
+    reviewer can see *why* the path was called the same or different - the
+    content digest alone would hide a file that turned from a script into a
+    binary (D-064).
+    """
+
+    path: str = Field(min_length=1, max_length=1024)
+    outcome: SourceComparisonOutcome
+    current_kind: str | None = Field(default=None, max_length=32)
+    current_mode: str | None = Field(default=None, max_length=16)
+    current_digest: str | None = Field(default=None)
+    historical_kind: str | None = Field(default=None, max_length=32)
+    historical_mode: str | None = Field(default=None, max_length=16)
+    historical_digest: str | None = Field(default=None)
+    evidence_ref: str = Field(min_length=1, max_length=256)
+
+    @field_validator("evidence_ref")
+    @classmethod
+    def _validate_evidence_ref(cls, value: str) -> str:
+        if not value.startswith(CF_REFERENCE_PREFIX):
+            raise ValueError(
+                f"the evidence reference must start with {CF_REFERENCE_PREFIX!r}"
+            )
+        return value
+
+    @field_validator("current_digest", "historical_digest")
+    @classmethod
+    def _validate_digests(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return validate_sha256(value)
+
+
+class SourceComparisonResult(ContractModel):
+    """The comparison of the related source of two audited runs.
+
+    The result is a **comparison**, not a verdict (D-065).  It never carries a
+    ``prior_status``, it never creates a finding and it never writes a coverage
+    event; it answers one question - did the related source change? - and it
+    answers it with ``same``, ``changed`` or ``unknown``.
+
+    The result is a pure function of its trusted inputs: the same inputs
+    always produce the same outcome and the same evidence references.
+    """
+
+    schema_version: int = 1
+    project_id: str = Field(min_length=1, max_length=2048)
+    historical_source_ref: str = Field(min_length=1, max_length=1024)
+    outcome: SourceComparisonOutcome
+    relevant_paths: list[str] = Field(default_factory=list, max_length=5000)
+    changed_paths: list[str] = Field(default_factory=list, max_length=5000)
+    unknown_paths: list[str] = Field(default_factory=list, max_length=5000)
+    unmatched_paths: list[str] = Field(default_factory=list, max_length=5000)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=200)
+    path_evidence: list[SourcePathEvidence] = Field(default_factory=list, max_length=5000)
+    reason: str = Field(default="", max_length=4096)
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def _validate_evidence_refs(cls, value: list[str]) -> list[str]:
+        for reference in value:
+            if not reference.startswith(CF_REFERENCE_PREFIX):
+                raise ValueError(
+                    f"an evidence reference must start with {CF_REFERENCE_PREFIX!r}"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> "SourceComparisonResult":
+        if self.changed_paths and self.outcome != "changed":
+            raise ValueError("a comparison with a changed path is a changed comparison")
+        if not self.changed_paths and self.unknown_paths and self.outcome != "unknown":
+            raise ValueError("a comparison with an unknown path is an unknown comparison")
+        if (
+            not self.changed_paths
+            and not self.unknown_paths
+            and self.outcome == "same"
+            and not self.relevant_paths
+        ):
+            raise ValueError("a same comparison needs at least one related path")
+        return self
