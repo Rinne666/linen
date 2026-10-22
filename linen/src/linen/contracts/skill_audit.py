@@ -18,6 +18,8 @@ from typing import Any, Literal
 from pydantic import Field, field_validator, model_validator
 
 from .common import (
+    CF_BASELINE_KINDS,
+    CF_PRIOR_STATUSES,
     ContractModel,
     cf_canonical_coverage_id,
     cf_is_legacy_coverage_id,
@@ -299,3 +301,95 @@ class CoverageUnit(ContractModel):
         if self.state == "blocked" and not self.unresolved:
             raise ValueError("blocked unit requires unresolved facts")
         return self
+
+
+class CoverageCanonicalRefs(ContractModel):
+    """The four descriptive dimensions a coverage id is derived from (N1)."""
+
+    surface: str = Field(min_length=1, max_length=300)
+    boundary: str = Field(min_length=1, max_length=300)
+    subsystem: str = Field(min_length=1, max_length=200)
+    attack_class: str = Field(min_length=1, max_length=60)
+
+    def derived_coverage_id(self) -> str:
+        """The canonical id these four dimensions produce."""
+
+        return cf_canonical_coverage_id(self.model_dump())
+
+
+class CoverageBaseline(ContractModel):
+    """The historical baseline a registration was derived from.
+
+    ``kind`` distinguishes a *verified absence* of a compatible ledger from a
+    ledger that was found and inspected.  ``lookup_ref`` is the traceable
+    reference to that check; it is never a placeholder, because a fabricated
+    reference would make the stored prior status unfalsifiable.
+    """
+
+    kind: str = Field(min_length=1, max_length=64)
+    lookup_ref: str = Field(min_length=1, max_length=1024)
+
+    @field_validator("kind")
+    @classmethod
+    def validate_kind(cls, value: str) -> str:
+        if value not in CF_BASELINE_KINDS:
+            raise ValueError(
+                "baseline kind must be one of: " + ", ".join(CF_BASELINE_KINDS)
+            )
+        return value
+
+    @field_validator("lookup_ref")
+    @classmethod
+    def validate_lookup_ref(cls, value: str) -> str:
+        if value.strip() != value or not value.strip():
+            raise ValueError("baseline lookup_ref must be a non-empty trimmed reference")
+        return value
+
+
+class UnitRegisteredPayload(ContractModel):
+    """The v1 ``unit_registered`` event payload (CF-S1-C).
+
+    The payload is the whole business content of a registration event.  The
+    database timestamp is deliberately absent: it is storage metadata and must
+    not take part in the idempotency decision, otherwise a legitimate retry
+    would look like a conflict.
+    """
+
+    schema_version: int = 1
+    canonical_refs: CoverageCanonicalRefs
+    prior_status: str = Field(min_length=1, max_length=64)
+    baseline: CoverageBaseline
+
+    @field_validator("prior_status")
+    @classmethod
+    def validate_prior_status(cls, value: str) -> str:
+        if value not in CF_PRIOR_STATUSES:
+            raise ValueError(
+                "prior_status must be one of the upstream values: "
+                + ", ".join(CF_PRIOR_STATUSES)
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_baseline_claim(self) -> "UnitRegisteredPayload":
+        """Keep the prior status and the baseline kind telling the same story.
+
+        ``none`` is a claim of verified absence, so it requires a baseline that
+        verified the absence.  A found ledger can never justify ``none``.
+        """
+
+        if self.baseline.kind == "no_compatible_ledger" and self.prior_status != "none":
+            raise ValueError(
+                "prior_status must be 'none' when no compatible ledger exists"
+            )
+        if self.baseline.kind == "compatible_ledger" and self.prior_status == "none":
+            raise ValueError(
+                "prior_status 'none' requires a verified absent baseline "
+                "(no_compatible_ledger); an unknown history is not 'none'"
+            )
+        return self
+
+    def derived_coverage_id(self) -> str:
+        """The canonical id this payload registers."""
+
+        return self.canonical_refs.derived_coverage_id()

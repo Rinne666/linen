@@ -7,6 +7,7 @@ from dataclasses import replace
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
@@ -1305,7 +1306,24 @@ def confirm_technical_finding(project_id: str, fact_id: str):
 def delete_project(project_id: str):
     with get_conn() as conn:
         get_project_or_404(conn, project_id)
-        conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        try:
+            conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        except sqlite3.IntegrityError as exc:
+            # The coverage event ledger is append-only and deliberately not
+            # cascaded, so a project that owns registration events cannot be
+            # deleted.  Report that as a conflict instead of a server error.
+            if "FOREIGN KEY" in str(exc):
+                raise HTTPException(
+                    409,
+                    {
+                        "code": "PROJECT_HAS_COVERAGE_EVENTS",
+                        "detail": (
+                            "the project owns append-only coverage events and "
+                            "cannot be deleted"
+                        ),
+                    },
+                ) from exc
+            raise
 
 
 @router.put("/projects/{project_id}/title", response_model=ProjectMeta)

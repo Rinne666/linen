@@ -87,3 +87,80 @@ fact 携带：`unit_state`、`owner_run`、`reviewed_paths`、`unresolved_facts[
   - 配置样例：`.linen-runtime/benchmark-python/dispatch-skill.yaml`（9 个种子单元，wall-clock/run 预算与 run 4 同口径）。
 - 测试：`test_skill_audit_contracts.py`（11）+ `test_skill_audit_wiring.py`（16）+ `test_cf_vendor_resources.py`（10）。**测试总数以 CI 的实际 run 记录、commit 与测试报告为准**，本文档不再写未经实测的通过数。
 - 待办 M4 运行：pi 配额恢复或 codex 独跑，用 dispatch-skill.yaml 起 dispatcher、建 proj_008、对照 run 4 基线评分。
+
+## CF-S1-C 覆盖事件账本（追加式）
+
+覆盖单元不是 fact，也不是审计事件：它是**计划边界**上的登记，因此走独立端点
+`POST /projects/{project_id}/skill-coverage-events`，不复用 append-fact（后者只允许
+observational fact 类型）。
+
+**存储**（`server/db.py`，追加式迁移位点 `_ensure_vnext_columns`）：
+
+```text
+skill_coverage_events
+    event_id / project_id / run_id / coverage_id / event_type / payload_version
+    agent_id(NULL) / wave(NULL) / event_key / payload_json / payload_sha256 / created_at
+    UNIQUE(project_id, run_id, event_key)
+    FOREIGN KEY (run_id, project_id) REFERENCES runs(run_id, project_id)
+    CREATE UNIQUE INDEX uq_skill_coverage_unit_registered
+        ON skill_coverage_events(project_id, run_id, coverage_id)
+        WHERE event_type = 'unit_registered'
+    CHECK (event_type <> 'unit_registered' OR (agent_id IS NULL AND wave IS NULL))
+```
+
+只增不改由**数据库触发器**保证（`skill_coverage_events_no_update` /
+`skill_coverage_events_no_delete`），不依赖调用方约定。该表**不随项目级联删除**：
+外键取 NO ACTION，历史登记不可随项目一起消失。
+
+**载荷**（`contracts/skill_audit.py` 的 `UnitRegisteredPayload`，v1）：
+
+```json
+{
+  "schema_version": 1,
+  "canonical_refs": {"surface": "...", "boundary": "...", "subsystem": "...", "attack_class": "..."},
+  "prior_status": "none",
+  "baseline": {"kind": "no_compatible_ledger", "lookup_ref": "..."}
+}
+```
+
+`prior_status` 取上游 11 个合法值之一；`baseline.kind` 与 `prior_status` 必须自洽：
+`none` 表示**已核验不存在**兼容历史，兼容历史存在时不允许写 `none`。摘要基于业务载荷
+的规范化 JSON（固定键序/分隔符/UTF-8），**不**包含 `created_at`/`event_id`，因此合法
+重试不会因时间变化被误判为冲突。
+
+**请求契约只说"登记什么"，不说"凭什么"**：
+
+```json
+{"run_id": "...", "event_type": "unit_registered", "payload_version": 1,
+ "coverage_id": "...", "canonical_refs": {...}}
+```
+
+请求体中**不允许**出现 `prior_status` / `baseline` / `agent_id` / `wave`（闭合模型，
+多余字段直接 422）。历史基线与 run 计划由**服务端**通过注入的可信提供者解析。
+
+**闸门（默认全部关闭）**：
+
+| 情况 | HTTP |
+|---|---|
+| 首次成功登记 | 201 |
+| 相同载荷幂等重放 | 200（返回原 event_id） |
+| 非法 canonical / 枚举 | 422 |
+| 同身份不同载荷 | 409 |
+| run 不存在或不属本 project | 404 |
+| 调用者不可信 | 403 |
+| 生产写入关闭 | 503 `registration_disabled` |
+| 可信基线不可用 | 503 `trusted_baseline_unavailable` |
+
+**当前状态**：
+
+```text
+CF-S1-C  CONTRACT / PERSISTENCE  PASS
+CF-S1-C  PRODUCTION REGISTRATION  BLOCKED — E48
+```
+
+生产注册被阻塞的原因不是实现缺失，而是**没有可信的历史基线来源**：linen 自身
+不存储任何 Cloudflare coverage ledger，因此无法证明"不存在兼容历史"，而"未知"
+不等于 `none`。默认策略（`CoverageRegistrationPolicy`）是关闭的，可信基线提供者与
+可信 run 计划只能通过应用依赖注入安装，生产代码里**没有**任何"默认视为无历史"的
+解析器。**CF 工件（coverage-ledger.json / findings.json）的生产仍等待 S2-A/B/C/D。**
+

@@ -7,7 +7,18 @@ from fastapi.staticfiles import StaticFiles
 
 from linen import __version__
 from linen.server import db
-from linen.server.routers import audit, executions, export, hints, intents, projects, reviews, settings, vnext
+from linen.server.routers import (
+    audit,
+    executions,
+    export,
+    hints,
+    intents,
+    projects,
+    reviews,
+    settings,
+    skill_coverage,
+    vnext,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -34,6 +45,7 @@ app.include_router(export.router)
 app.include_router(executions.router)
 app.include_router(audit.router)
 app.include_router(vnext.router)
+app.include_router(skill_coverage.router)
 
 
 @app.get("/", include_in_schema=False)

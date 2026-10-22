@@ -605,6 +605,51 @@ def _ensure_vnext_columns(conn: sqlite3.Connection) -> None:
         PRIMARY KEY (snapshot_id, project_id)
     );
     CREATE INDEX IF NOT EXISTS snapshots_project_idx ON snapshots(project_id, created_at, snapshot_id);
+    -- CF-S1-C coverage event ledger (append-only).
+    --
+    -- The table is deliberately *not* cascaded away with its project: an
+    -- append-only ledger must survive the objects it describes, so a project
+    -- that owns registration events can no longer be deleted.  The foreign
+    -- keys stay NO ACTION on purpose; ON DELETE CASCADE would erase history
+    -- without firing the append-only triggers (SQLite only fires user
+    -- triggers for foreign key actions when recursive_triggers is on).
+    CREATE TABLE IF NOT EXISTS skill_coverage_events (
+        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        run_id TEXT NOT NULL,
+        coverage_id TEXT NOT NULL,
+        event_type TEXT NOT NULL
+            CHECK (event_type IN ('unit_registered', 'wave_started', 'attempt_recorded')),
+        payload_version INTEGER NOT NULL DEFAULT 1 CHECK (payload_version = 1),
+        agent_id TEXT,
+        wave INTEGER,
+        event_key TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        payload_sha256 TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (project_id, run_id, event_key),
+        FOREIGN KEY (run_id, project_id) REFERENCES runs(run_id, project_id),
+        -- A registration is a plan-boundary event: it belongs to no agent and
+        -- no wave.  Only the later attempt events carry those.
+        CHECK (event_type <> 'unit_registered' OR (agent_id IS NULL AND wave IS NULL))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_skill_coverage_unit_registered
+        ON skill_coverage_events(project_id, run_id, coverage_id)
+        WHERE event_type = 'unit_registered';
+    CREATE INDEX IF NOT EXISTS skill_coverage_events_run_idx
+        ON skill_coverage_events(project_id, run_id, event_id);
+    -- Immutability is enforced by the database, not by caller discipline: a
+    -- maintenance script must not be able to rewrite a registered unit.
+    CREATE TRIGGER IF NOT EXISTS skill_coverage_events_no_update
+    BEFORE UPDATE ON skill_coverage_events
+    BEGIN
+        SELECT RAISE(ABORT, 'skill_coverage_events is append-only');
+    END;
+    CREATE TRIGGER IF NOT EXISTS skill_coverage_events_no_delete
+    BEFORE DELETE ON skill_coverage_events
+    BEGIN
+        SELECT RAISE(ABORT, 'skill_coverage_events is append-only');
+    END;
     """)
 
 

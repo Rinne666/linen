@@ -444,8 +444,36 @@ class LinenClient:
             json=body,
         )
 
-    def complete(self, project_id: str, from_ids: list[str], description: str, worker: str) -> ApiResult:
+    def register_coverage_unit(
+        self,
+        project_id: str,
+        run_id: str,
+        coverage_id: str,
+        canonical_refs: dict[str, Any],
+    ) -> ApiResult:
+        """Ask the server to register one trusted coverage unit (CF-S1-C).
+
+        Registrations are not facts and do not belong to an intent, so they
+        use their own endpoint instead of the append-fact channel.
+
+        The request only says *what* is registered.  The prior status and the
+        historical baseline are resolved by the server: a dispatcher may not
+        declare its own historical verdict.
+        """
+
         return self._request_json(
+            "POST",
+            f"/projects/{project_id}/skill-coverage-events",
+            json={
+                "run_id": run_id,
+                "event_type": "unit_registered",
+                "payload_version": 1,
+                "coverage_id": coverage_id,
+                "canonical_refs": canonical_refs,
+            },
+        )
+
+    def complete(self, project_id: str, from_ids: list[str], description: str, worker: str) -> ApiResult:        return self._request_json(
             "POST",
             f"/projects/{project_id}/complete",
             json={"from": from_ids, "description": description, "worker": worker},
