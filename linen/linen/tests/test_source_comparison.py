@@ -24,6 +24,7 @@ The acceptance ids match the PM's B2-B matrix of PM v2.9 (B-T01 ... B-T10).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -227,6 +228,7 @@ def _historical(
     reviewed_paths: list[str] | None = None,
     attest: bool = True,
     manifest_version: int = 2,
+    executable: tuple[str, ...] = (),
 ):
     """Register one historical source and prove its audited code.
 
@@ -234,12 +236,24 @@ def _historical(
     the commit the metadata names, a frozen copy of that revision, the frozen
     source manifest that names the copy, and a registered origin that names
     the host of the repository.
+
+    ``executable`` names the files the commit records as executable.  The mode
+    is a property of the revision, so it is the *commit* that says so - not
+    the file system of the machine that copies the snapshot (D-064).
     """
 
     files = FILES if files is None else files
     reviewed_paths = reviewed_paths if reviewed_paths is not None else sorted(files)
     repo = tmp_path / "repo"
     commit = _git_repo(repo, files=files)
+    if executable:
+        for name in executable:
+            _git(repo, "update-index", "--chmod=+x", name)
+            # the index and the worktree have to agree, or the worktree is
+            # "dirty" and the source identity cannot be proven at all
+            os.chmod(repo / name, 0o755)
+        _git(repo, "commit", "--quiet", "-m", "executable")
+        commit = _git(repo, "rev-parse", "HEAD")
     snapshot = _snapshot_of(repo, tmp_path / "snapshot")
 
     if manifest_version == 2:
@@ -554,45 +568,59 @@ def test_b_t08_without_a_related_path_there_is_nothing_to_compare(board, import_
 
 @requires_git
 def test_b_t09_a_different_file_mode_is_not_the_same_file(board, import_root, tmp_path, validation_auth_key):
-    """B-T09/D-064: the mode is part of the identity of a file."""
+    """B-T09/D-064: the mode is part of the identity of a file.
 
-    historical = _historical(board, import_root, tmp_path)
-    changed = dict(FILES)
-    root, manifest = _current_tree(tmp_path, files=changed)
-    # the current side declares the very same file as an executable one
-    declared = json.loads(manifest)
-    for entry in declared["files"]:
-        if entry["path"] == "app.py":
-            entry["mode"] = GIT_MODE_EXECUTABLE
+    The historical revision records ``app.py`` as an executable, the current
+    source has it as a plain file.  Both sides tell the truth, so the
+    comparison is about the mode and not about a broken fixture.
+    """
+
+    historical = _historical(
+        board, import_root, tmp_path, executable=("app.py",)
+    )
+    root, manifest = _current_tree(tmp_path, files=FILES)
     result = _compare(
         historical,
         current_root=root,
-        current_manifest=json.dumps(declared).encode("utf-8"),
+        current_manifest=manifest,
         plan_paths=("app.py",),
     )
     assert result.outcome == "changed"
     assert result.changed_paths == ["app.py"]
+    evidence = {item.path: item for item in result.path_evidence}
+    assert evidence["app.py"].historical_mode == GIT_MODE_EXECUTABLE
+    assert evidence["app.py"].current_mode == GIT_MODE_FILE
 
 
 @requires_git
+@pytest.mark.skipif(
+    os.name == "nt", reason="this platform cannot create a symlink unprivileged"
+)
 def test_b_t09_a_symlink_is_not_the_file_it_points_at(board, import_root, tmp_path, validation_auth_key):
-    """B-T09/D-064: a symlink and the file it points at are not the same."""
+    """B-T09/D-064: a symlink and the file it points at are not the same.
+
+    The historical revision has ``app.py`` as a plain file; the current source
+    has it as a symlink.  Both sides tell the truth, and the comparison sees
+    that the file **type** changed even though the bytes it points at did not.
+    """
 
     historical = _historical(board, import_root, tmp_path)
-    root, manifest = _current_tree(tmp_path, files=FILES)
-    declared = json.loads(manifest)
-    for entry in declared["files"]:
-        if entry["path"] == "app.py":
-            entry["kind"] = SOURCE_KIND_SYMLINK
-            entry["mode"] = "120000"
+    root = tmp_path / "current"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "real.py").write_text(FILES["app.py"], encoding="utf-8")
+    (root / "app.py").symlink_to("real.py")
+    manifest = json.dumps(_manifest_v2_of_tree(root)).encode("utf-8")
     result = _compare(
         historical,
         current_root=root,
-        current_manifest=json.dumps(declared).encode("utf-8"),
+        current_manifest=manifest,
         plan_paths=("app.py",),
     )
-    assert result.outcome in ("changed", "unknown")
-    assert result.outcome != "same"
+    assert result.outcome == "changed"
+    assert result.changed_paths == ["app.py"]
+    evidence = {item.path: item for item in result.path_evidence}
+    assert evidence["app.py"].current_kind == SOURCE_KIND_SYMLINK
+    assert evidence["app.py"].historical_kind == SOURCE_KIND_FILE
 
 
 # --- B-T10: the comparison replays -------------------------------------------
