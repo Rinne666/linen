@@ -703,6 +703,11 @@ def test_b_t09_a_symlink_is_not_the_file_it_points_at(board, import_root, tmp_pa
     The historical revision has ``app.py`` as a plain file; the current source
     has it as a symlink.  Both sides tell the truth, and the comparison sees
     that the file **type** changed even though the bytes it points at did not.
+
+    The current tree carries every file the historical run reviewed: the
+    related paths are the union of both sides (D-065), so a file that is only
+    on the historical side would show up as a change of its own and hide what
+    this test is about.
     """
 
     historical = _historical(board, import_root, tmp_path)
@@ -710,6 +715,8 @@ def test_b_t09_a_symlink_is_not_the_file_it_points_at(board, import_root, tmp_pa
     root.mkdir(parents=True, exist_ok=True)
     (root / "real.py").write_text(FILES["app.py"], encoding="utf-8")
     (root / "app.py").symlink_to("real.py")
+    (root / "lib").mkdir(parents=True, exist_ok=True)
+    (root / "lib/util.py").write_text(FILES["lib/util.py"], encoding="utf-8")
     manifest = json.dumps(_manifest_v2_of_tree(root)).encode("utf-8")
     result = _compare(
         historical,
@@ -719,6 +726,7 @@ def test_b_t09_a_symlink_is_not_the_file_it_points_at(board, import_root, tmp_pa
     )
     assert result.outcome == "changed"
     assert result.changed_paths == ["app.py"]
+    assert result.compared_paths == ["lib/util.py"]
     evidence = {item.path: item for item in result.path_evidence}
     assert evidence["app.py"].current_kind == SOURCE_KIND_SYMLINK
     assert evidence["app.py"].historical_kind == SOURCE_KIND_FILE
