@@ -903,6 +903,27 @@ class SourceComparisonResult(ContractModel):
 
     The result is a pure function of its trusted inputs: the same inputs
     always produce the same outcome and the same evidence references.
+
+    The path lists say what kind of evidence each path is:
+
+    ``compared_paths``
+        the source paths that were found on both sides and proved equal;
+    ``changed_paths``
+        the source paths that were proved different;
+    ``unknown_paths``
+        the paths that could not be decided (an unsafe path, an undecidable
+        file type);
+    ``unmatched_paths``
+        the source paths that are in **neither** source tree.  They are not
+        evidence of anything: they can neither prove a change nor support a
+        ``same`` (D-066);
+    ``unresolved_paths``
+        the paths whose attribution to the source namespace could not be
+        established - typically hints from findings nobody verified (D-069).
+        They never prove a change and never support a ``same``;
+    ``artifact_paths``
+        the paths that are known audit outputs rather than audited source
+        (D-067).  They are recorded and left out of the comparison.
     """
 
     schema_version: int = 1
@@ -913,6 +934,17 @@ class SourceComparisonResult(ContractModel):
     changed_paths: list[str] = Field(default_factory=list, max_length=5000)
     unknown_paths: list[str] = Field(default_factory=list, max_length=5000)
     unmatched_paths: list[str] = Field(default_factory=list, max_length=5000)
+    unresolved_paths: list[str] = Field(default_factory=list, max_length=5000)
+    artifact_paths: list[str] = Field(default_factory=list, max_length=5000)
+    compared_paths: list[str] = Field(default_factory=list, max_length=5000)
+    #: Whether the compared scope was resolved by the server from the run's
+    #: own records.  A production resolver may only use a trusted scope
+    #: (D-068, R07).
+    scope_trusted: bool = False
+    #: Where the current plan paths came from.
+    scope_source: str = Field(default="caller_supplied", max_length=64)
+    #: The coverage unit the historical paths were bound to, if any.
+    coverage_id: str = Field(default="", max_length=2048)
     evidence_refs: list[str] = Field(default_factory=list, max_length=200)
     path_evidence: list[SourcePathEvidence] = Field(default_factory=list, max_length=5000)
     reason: str = Field(default="", max_length=4096)
@@ -935,9 +967,25 @@ class SourceComparisonResult(ContractModel):
             raise ValueError("a comparison with an unknown path is an unknown comparison")
         if (
             not self.changed_paths
-            and not self.unknown_paths
-            and self.outcome == "same"
-            and not self.relevant_paths
+            and (self.unmatched_paths or self.unresolved_paths)
+            and self.outcome != "unknown"
         ):
-            raise ValueError("a same comparison needs at least one related path")
+            raise ValueError(
+                "a comparison with an undecided path is an unknown comparison: a "
+                "path that is found in neither source tree, or whose attribution "
+                "is unknown, cannot support a verdict (D-066, D-069)"
+            )
+        if self.outcome == "same":
+            if self.unknown_paths or self.unmatched_paths or self.unresolved_paths:
+                raise ValueError(
+                    "a same comparison may not carry an undecided path: a path "
+                    "that is found in neither source tree, or whose attribution "
+                    "is unknown, is not evidence that the source did not change "
+                    "(D-066, D-067, D-069)"
+                )
+            if not self.compared_paths:
+                raise ValueError(
+                    "a same comparison needs at least one related path that was "
+                    "actually compared"
+                )
         return self

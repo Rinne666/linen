@@ -442,6 +442,7 @@ def compare_related_sources(
     commit: str | None = None,
     current_manifest_bytes: bytes | None = None,
     run_id: str | None = None,
+    coverage_id: str | None = None,
     current_plan_paths: list[str] | None = None,
 ) -> Any:
     """Compare the related source of the current run and one historical run.
@@ -459,25 +460,43 @@ def compare_related_sources(
     the paths the historical run reviewed and the paths the historical
     findings point at.  The union is never an intersection: a path the
     current plan forgot stays in the set (D-065).
+
+    Two rules keep the scope honest (D-068, R07):
+
+    * the **historical** paths are always taken from the registered ledger
+      bytes, bound to ``coverage_id`` when one is named - a caller may not
+      widen the historical scope;
+    * the **current** plan paths come from the run's own coverage events when
+      a ``run_id`` is given.  A free path list may still be used for a
+      synthetic comparison, but the result then carries an untrusted scope,
+      and a production resolver has to refuse it.
     """
 
     from linen.server.source_comparison import (
+        PLAN_SOURCE_CALLER,
+        PLAN_SOURCE_TRUSTED,
+        ComparisonScope,
         CurrentSource,
         RelatedPathSet,
         compare_related_sources as _compare,
         current_plan_paths as _current_plan_paths,
-        reviewed_paths_from_ledger,
     )
 
-    if current_plan_paths is None and run_id is not None:
-        current_plan_paths = list(
-            _current_plan_paths(conn, project_id=project_id, run_id=run_id)
+    if run_id is not None:
+        # the server's own plan wins: a caller's list may not stand in for it
+        plan = list(
+            _current_plan_paths(
+                conn,
+                project_id=project_id,
+                run_id=run_id,
+                coverage_id=coverage_id,
+            )
         )
+        plan_source = PLAN_SOURCE_TRUSTED
+    else:
+        plan = list(current_plan_paths or ())
+        plan_source = PLAN_SOURCE_CALLER
 
-    paths = RelatedPathSet(
-        current_plan_paths=tuple(current_plan_paths or ()),
-        historical_reviewed_paths=reviewed_paths_from_ledger(historical_ledger_bytes),
-    )
     return _compare(
         conn=conn,
         project_id=project_id,
@@ -490,6 +509,9 @@ def compare_related_sources(
             commit=commit,
             manifest_bytes=current_manifest_bytes,
         ),
-        relevant_paths=paths,
+        related_paths=RelatedPathSet(current_plan_paths=tuple(plan)),
         historical_findings_bytes=historical_findings_bytes,
+        scope=ComparisonScope(
+            plan_source=plan_source, coverage_id=coverage_id or ""
+        ),
     )

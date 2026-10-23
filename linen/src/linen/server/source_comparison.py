@@ -12,7 +12,7 @@ nothing else.  This module deliberately does **not** produce a
 event (D-065); that is the job of the resolver in CF-S2-B2-C, and it may only
 use this comparison as one of its inputs.
 
-Three rules shape the implementation:
+Four rules shape the implementation:
 
 * **Both sides have to be proven.**  The historical side is proven by a
   registered, signed source identity attestation; the current side is proven by
@@ -20,15 +20,22 @@ Three rules shape the implementation:
   cannot be proven makes the whole comparison ``unknown`` (B-T01, B-T02).
 
 * **The compared paths are a union, never an intersection** (D-065).  The set
-  is the union of the current trusted plan paths, the paths the historical run
-  reviewed and the paths the historical findings point at.  A path the current
-  plan forgot is still a path the history says something about, so it stays in
-  the set (B-T06, B-T07).
+  is the union of the current trusted plan paths and the source paths the
+  registered historical ledger names.  A path the current plan forgot is still
+  a path the history says something about (B-T06).  The historical half of the
+  set is never taken from the caller: it is read from the registered ledger
+  bytes and bound to the target coverage unit (D-068).
 
 * **A path is only called the same when its file type, its mode and its
   content are all proven equal** (D-064).  A file whose type cannot be
   determined makes its path ``unknown``; it is never reported as the same
   file (B-T09).
+
+* **"Same" needs stronger evidence than "changed"** (D-066).  A path that is
+  found in neither source tree is not evidence of anything: it can neither
+  prove a change nor support a ``same``.  A path that is an audit output, not
+  a source file, can never prove a change either (D-067).  A path that comes
+  from findings nobody verified can only be a hint (D-069).
 
 The result is a pure function of its trusted inputs: the same inputs always
 produce the same outcome and the same evidence references (B-T10).
@@ -64,42 +71,63 @@ from .source_identity import (
     verify_git_source_snapshot,
 )
 
+#: The plan paths of a comparison that the server resolved from the run's own
+#: event stream.  This is the only source a production resolver may use.
+PLAN_SOURCE_TRUSTED = "run_event_stream"
+
+#: The plan paths a caller handed in.  Useful for a synthetic comparison, but
+#: **not** a trusted scope: a free path list may not stand in for the plan of
+#: a run (D-068, R07).
+PLAN_SOURCE_CALLER = "caller_supplied"
+
 
 class SourceComparisonRejected(ValueError):
     """The registered data is broken, so the comparison cannot be made."""
 
 
 @dataclass(frozen=True)
-class RelatedPathSet:
-    """The paths a comparison has to look at.
+class ComparisonScope:
+    """Where the compared paths came from (D-068, R07).
 
-    The set is the **union** of three collections (D-065):
+    ``plan_source`` says whether the current plan paths were resolved by the
+    server from the run's own coverage events (``run_event_stream``) or handed
+    in by the caller (``caller_supplied``).  Only the first is a trusted
+    scope, and a production resolver has to refuse the second.
+
+    ``coverage_id`` says which coverage unit the historical paths belong to.
+    Without it the historical scope is the whole run, which answers a
+    different question than "did the source of *this* unit change".
+    """
+
+    plan_source: str = PLAN_SOURCE_CALLER
+    coverage_id: str = ""
+
+    @property
+    def trusted(self) -> bool:
+        """Whether the compared scope is a trusted one."""
+
+        return self.plan_source == PLAN_SOURCE_TRUSTED
+
+
+@dataclass(frozen=True)
+class RelatedPathSet:
+    """The paths a comparison has to look at, and what kind of evidence they are.
 
     ``current_plan_paths``
-        the paths the current trusted plan points at;
-    ``historical_reviewed_paths``
-        the paths the historical run reviewed;
-    ``historical_finding_paths``
-        the paths the historical findings point at.
-
-    It is never an intersection: a path the current plan forgot is still a
-    path the history says something about.
+        the paths of the current plan - source paths;
+    ``artifact_paths``
+        paths that are known audit outputs, not audited source.  They are
+        recorded and left out of the comparison: a report that a hunter wrote
+        is not a file of the audited code (D-067);
+    ``unverified_hint_paths``
+        paths that came from findings nobody verified.  They are recorded as
+        unresolved evidence: they can never prove a change, and they can never
+        support a ``same`` (D-069).
     """
 
     current_plan_paths: tuple[str, ...] = ()
-    historical_reviewed_paths: tuple[str, ...] = ()
-    historical_finding_paths: tuple[str, ...] = ()
-
-    def union(self) -> tuple[str, ...]:
-        """Every related path, sorted and without duplicates."""
-
-        return tuple(
-            sorted(
-                set(self.current_plan_paths)
-                | set(self.historical_reviewed_paths)
-                | set(self.historical_finding_paths)
-            )
-        )
+    artifact_paths: tuple[str, ...] = ()
+    unverified_hint_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -197,8 +225,30 @@ def _ledger_units_of(ledger_bytes: bytes) -> list[Mapping[str, Any]]:
     return _ledger_units(payload)
 
 
-def reviewed_paths_from_ledger(ledger_bytes: bytes) -> tuple[str, ...]:
-    """The paths the historical run reviewed.
+def _scoped_units(
+    ledger_bytes: bytes, *, coverage_id: str | None
+) -> list[Mapping[str, Any]]:
+    """The units of the ledger, bound to one coverage unit when one is named.
+
+    Two units of the same run are two different questions.  A comparison that
+    answers "did the source of *this* unit change" may not take the paths of
+    every other unit of the run (D-068).
+    """
+
+    units = _ledger_units_of(ledger_bytes)
+    if not coverage_id:
+        return units
+    return [
+        unit
+        for unit in units
+        if str(unit.get("coverage_id") or "").strip() == coverage_id
+    ]
+
+
+def reviewed_paths_from_ledger(
+    ledger_bytes: bytes, *, coverage_id: str | None = None
+) -> tuple[str, ...]:
+    """The source paths the historical run reviewed.
 
     Both the unit level list and the paths every check owns are taken: the
     unit level list is the union of the owned paths in a valid ledger, but a
@@ -207,7 +257,7 @@ def reviewed_paths_from_ledger(ledger_bytes: bytes) -> tuple[str, ...]:
     """
 
     paths: set[str] = set()
-    for unit in _ledger_units_of(ledger_bytes):
+    for unit in _scoped_units(ledger_bytes, coverage_id=coverage_id):
         for path in unit.get("reviewed_paths") or []:
             if isinstance(path, str):
                 paths.add(path)
@@ -222,46 +272,54 @@ def reviewed_paths_from_ledger(ledger_bytes: bytes) -> tuple[str, ...]:
     return tuple(sorted(paths))
 
 
-def finding_paths_from_ledger(ledger_bytes: bytes) -> tuple[str, ...]:
-    """The paths the historical findings point at.
+def finding_paths_from_ledger(
+    ledger_bytes: bytes, *, coverage_id: str | None = None
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The paths of the historical findings, split by what they are.
 
     A unit that carries fingerprints is a unit that found something.  The
-    paths that back that finding are the paths its checks own and the evidence
-    artifacts they produced.  They are part of the related source even when the
-    current plan never mentions them (D-065).
+    paths that back that finding are the paths its checks own - those are
+    **source** paths.  The evidence artifacts its checks produced are audit
+    **outputs**, not files of the audited code (D-067), and they are returned
+    separately so that the comparison never mistakes one for the other.
     """
 
-    paths: set[str] = set()
-    for unit in _ledger_units_of(ledger_bytes):
+    source: set[str] = set()
+    artifacts: set[str] = set()
+    for unit in _scoped_units(ledger_bytes, coverage_id=coverage_id):
         fingerprints = unit.get("result_fingerprints") or []
-        if not isinstance(fingerprints, list) or not fingerprints:
-            continue
+        found_something = isinstance(fingerprints, list) and bool(fingerprints)
         checks = unit.get("local_checks") or unit.get("checks") or []
         if not isinstance(checks, list):
             continue
         for check in checks:
             if not isinstance(check, Mapping):
                 continue
-            for path in check.get("reviewed_paths") or []:
-                if isinstance(path, str):
-                    paths.add(path)
+            if found_something:
+                # A unit that found something has verified findings, and the
+                # paths its checks own are trusted source paths (D-069).
+                for path in check.get("reviewed_paths") or []:
+                    if isinstance(path, str):
+                        source.add(path)
             artifact = check.get("artifact")
             if isinstance(artifact, str) and artifact:
-                paths.add(artifact)
-    return tuple(sorted(paths))
+                # An artifact is an audit output.  It is an output whether or
+                # not the unit found anything, and it is never a file of the
+                # audited code (D-067).
+                artifacts.add(artifact)
+    return tuple(sorted(source)), tuple(sorted(artifacts))
 
 
 def finding_paths_from_findings(findings_bytes: bytes) -> tuple[str, ...]:
     """The source paths the historical findings point at.
 
     A finding names the files it walks through (``trace``) and the files it
-    cites (``evidence``).  Those are the paths the finding is about, and they
-    belong to the related source.
+    cites (``evidence``).
 
-    The findings document is a *hint* about paths, not a proof: it may only
-    **add** paths to the compared set.  Adding a path can never turn a proven
-    ``changed`` into a ``same``, so a wrong hint can only make the comparison
-    more conservative.
+    The findings document is a *hint* about paths, not a proof: nothing
+    verifies that these bytes are the findings of the registered historical
+    run.  An unverified hint may therefore never produce a ``changed`` and
+    never support a ``same``; it is recorded as unresolved evidence (D-069).
     """
 
     try:
@@ -292,6 +350,41 @@ def finding_paths_from_findings(findings_bytes: bytes) -> tuple[str, ...]:
     return tuple(sorted(paths))
 
 
+def current_plan_paths(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    run_id: str,
+    coverage_id: str | None = None,
+) -> tuple[str, ...]:
+    """The paths of the trusted plan of one run, from its own event stream.
+
+    The plan is the server's own record: it is rebuilt from the coverage
+    events the run wrote, so the paths are the paths the run really planned -
+    not the paths somebody says the run planned.
+
+    ``coverage_id`` narrows the plan to one coverage unit.  A comparison that
+    asks "did the source of *this* unit change" may not take the paths of the
+    other units of the same run (D-068).
+    """
+
+    from .skill_coverage_waves import list_coverage_events, project_multiwave
+
+    try:
+        events = list_coverage_events(
+            conn, project_id=project_id, run_id=run_id, coverage_id=coverage_id
+        )
+        units = project_multiwave(events)
+    except Exception:  # pragma: no cover - a broken stream is not a plan
+        return ()
+    paths: set[str] = set()
+    for unit in units:
+        for path in getattr(unit, "starting_paths", []) or []:
+            if isinstance(path, str):
+                paths.add(path)
+    return tuple(sorted(paths))
+
+
 def _registered_source(
     conn: sqlite3.Connection, *, project_id: str, source_ref: str
 ) -> dict[str, Any] | None:
@@ -313,18 +406,34 @@ def _registered_source(
 
 
 def _unknown(
-    project_id: str, source_ref: str, reason: str, evidence_refs: Sequence[str] = ()
+    project_id: str,
+    source_ref: str,
+    reason: str,
+    evidence_refs: Sequence[str] = (),
+    *,
+    relevant_paths: Sequence[str] = (),
+    unmatched_paths: Sequence[str] = (),
+    unresolved_paths: Sequence[str] = (),
+    artifact_paths: Sequence[str] = (),
+    scope: ComparisonScope | None = None,
 ) -> SourceComparisonResult:
     """The answer when the comparison could not be made."""
 
+    scope = scope or ComparisonScope()
     return SourceComparisonResult(
         project_id=project_id,
         historical_source_ref=source_ref,
         outcome="unknown",
-        relevant_paths=[],
+        relevant_paths=list(relevant_paths),
         changed_paths=[],
         unknown_paths=[],
-        unmatched_paths=[],
+        unmatched_paths=list(unmatched_paths),
+        unresolved_paths=list(unresolved_paths),
+        artifact_paths=list(artifact_paths),
+        compared_paths=[],
+        scope_trusted=scope.trusted,
+        scope_source=scope.plan_source,
+        coverage_id=scope.coverage_id,
         evidence_refs=list(evidence_refs),
         path_evidence=[],
         reason=reason,
@@ -383,31 +492,6 @@ def _current_state(current: CurrentSource) -> tuple[SourceTreeState, dict[str, A
     return state, facts
 
 
-def current_plan_paths(
-    conn: sqlite3.Connection, *, project_id: str, run_id: str
-) -> tuple[str, ...]:
-    """The paths of the trusted plan of one run, from its own event stream.
-
-    The plan is the server's own record: it is rebuilt from the coverage
-    events the run wrote, so the paths are the paths the run really planned -
-    not the paths somebody says the run planned.
-    """
-
-    from .skill_coverage_waves import list_coverage_events, project_multiwave
-
-    try:
-        events = list_coverage_events(conn, project_id=project_id, run_id=run_id)
-        units = project_multiwave(events)
-    except Exception:  # pragma: no cover - a broken stream is not a plan
-        return ()
-    paths: set[str] = set()
-    for unit in units:
-        for path in getattr(unit, "starting_paths", []) or []:
-            if isinstance(path, str):
-                paths.add(path)
-    return tuple(sorted(paths))
-
-
 def compare_related_sources(
     *,
     conn: sqlite3.Connection,
@@ -416,8 +500,9 @@ def compare_related_sources(
     historical_ledger_bytes: bytes,
     historical_manifest_bytes: bytes | None,
     current_source: CurrentSource,
-    relevant_paths: RelatedPathSet,
+    related_paths: RelatedPathSet,
     historical_findings_bytes: bytes | None = None,
+    scope: ComparisonScope | None = None,
 ) -> SourceComparisonResult:
     """Compare the related source of the current run and one historical run.
 
@@ -426,7 +511,14 @@ def compare_related_sources(
     that is provably different makes the comparison ``changed`` even when
     another path could not be decided, because "something related changed" is
     already enough to say that the history does not carry over.
+
+    The historical paths are **always** taken from the registered ledger
+    bytes, bound to ``scope.coverage_id`` when one is named.  A caller may not
+    widen the historical scope by handing in a path list (D-068).
     """
+
+    scope = scope or ComparisonScope()
+    coverage_id = scope.coverage_id or None
 
     # --- the historical side -------------------------------------------------
     record = _registered_source(
@@ -437,6 +529,7 @@ def compare_related_sources(
             project_id,
             historical_source_ref,
             f"the historical source {historical_source_ref!r} is not registered",
+            scope=scope,
         )
 
     ledger_digest = hashlib.sha256(historical_ledger_bytes).hexdigest()
@@ -453,6 +546,7 @@ def compare_related_sources(
             project_id,
             historical_source_ref,
             "the historical source has no trusted source identity attestation",
+            scope=scope,
         )
     attestation = status.attestations[0]
 
@@ -465,6 +559,7 @@ def compare_related_sources(
                 project_id,
                 historical_source_ref,
                 f"the frozen source manifest cannot be read: {exc}",
+                scope=scope,
             )
     if manifest is None:
         return _unknown(
@@ -472,19 +567,19 @@ def compare_related_sources(
             historical_source_ref,
             "the historical source carries no frozen source manifest, so the "
             "identity of the audited code is unknown",
+            scope=scope,
         )
     if manifest.digest() != str(record.get("source_manifest_sha256") or ""):
         raise SourceComparisonRejected(
             "the frozen source manifest does not match the digest it was "
             "registered with"
         )
-    if manifest.digest() != str(
-        attestation.verification.snapshot_digest or ""
-    ):
+    if manifest.digest() != str(attestation.verification.snapshot_digest or ""):
         return _unknown(
             project_id,
             historical_source_ref,
             "the frozen source manifest does not match the attested snapshot",
+            scope=scope,
         )
     if manifest.version != 2:
         return _unknown(
@@ -492,6 +587,7 @@ def compare_related_sources(
             historical_source_ref,
             "the frozen source manifest is a v1 manifest and carries no file "
             "type, so the related source cannot be compared (D-064)",
+            scope=scope,
         )
     historical_state = manifest.tree_state()
 
@@ -503,25 +599,58 @@ def compare_related_sources(
             project_id,
             historical_source_ref,
             f"the current source cannot be verified: {exc}",
+            scope=scope,
         )
 
     # --- the related paths ---------------------------------------------------
-    finding_paths = set(finding_paths_from_ledger(historical_ledger_bytes))
-    if historical_findings_bytes is not None:
-        finding_paths |= set(finding_paths_from_findings(historical_findings_bytes))
-    paths = RelatedPathSet(
-        current_plan_paths=tuple(relevant_paths.current_plan_paths),
-        historical_reviewed_paths=tuple(relevant_paths.historical_reviewed_paths),
-        historical_finding_paths=tuple(sorted(finding_paths)),
+    if coverage_id:
+        # The comparison is bound to one coverage unit.  If the historical
+        # ledger does not carry that unit, the historical scope of the
+        # question is empty - and an empty scope is not a source comparison
+        # (D-068).
+        scoped = _scoped_units(historical_ledger_bytes, coverage_id=coverage_id)
+        if not scoped:
+            return _unknown(
+                project_id,
+                historical_source_ref,
+                f"the historical ledger carries no coverage unit {coverage_id!r}",
+                scope=scope,
+            )
+    historical_source_paths = reviewed_paths_from_ledger(
+        historical_ledger_bytes, coverage_id=coverage_id
     )
-    union = paths.union()
+    finding_source_paths, finding_artifact_paths = finding_paths_from_ledger(
+        historical_ledger_bytes, coverage_id=coverage_id
+    )
+    hint_paths = set(related_paths.unverified_hint_paths)
+    if historical_findings_bytes is not None:
+        hint_paths |= set(finding_paths_from_findings(historical_findings_bytes))
+    artifact_paths = tuple(
+        sorted(set(related_paths.artifact_paths) | set(finding_artifact_paths))
+    )
+    source_paths = tuple(
+        sorted(
+            set(related_paths.current_plan_paths)
+            | set(historical_source_paths)
+            | set(finding_source_paths)
+        )
+    )
 
-    unsafe = [path for path in union if not cf_is_safe_relative_path(path)]
-    safe = [path for path in union if cf_is_safe_relative_path(path)]
+    unsafe = [path for path in source_paths if not cf_is_safe_relative_path(path)]
+    safe = [path for path in source_paths if cf_is_safe_relative_path(path)]
+    # An unverified hint is recorded as unresolved evidence: it can never prove
+    # a change and it can never support a "same" (D-069).  A hint that is
+    # already a known audit output is an artifact, not an unresolved hint.
+    unresolved = sorted(
+        path
+        for path in hint_paths
+        if path not in source_paths and path not in artifact_paths
+    )
 
     changed: list[str] = []
     unknown: list[str] = []
     unmatched: list[str] = []
+    compared: list[str] = []
     evidence: list[SourcePathEvidence] = []
 
     for path in sorted(unsafe):
@@ -540,7 +669,23 @@ def compare_related_sources(
         current_path = _path_state(current_state, path)
         historical_path = _path_state(historical_state, path)
         if current_path is None and historical_path is None:
+            # The path is in neither source tree.  That is not evidence that
+            # the source did not change: it is evidence that the path is not
+            # part of the compared source at all (D-066).
             unmatched.append(path)
+            evidence.append(
+                SourcePathEvidence(
+                    path=path,
+                    outcome="unknown",
+                    evidence_ref=encode_reference(
+                        {
+                            "kind": "path-comparison",
+                            "path": path,
+                            "reason": "in-neither-source",
+                        }
+                    ),
+                )
+            )
             continue
         if (
             current_path is None
@@ -550,6 +695,7 @@ def compare_related_sources(
             changed.append(path)
             outcome = "changed"
         else:
+            compared.append(path)
             outcome = "same"
         evidence.append(
             SourcePathEvidence(
@@ -591,10 +737,10 @@ def compare_related_sources(
     if changed:
         outcome = "changed"
         reason = "at least one related path is provably different"
-    elif unknown:
+    elif unknown or unmatched or unresolved:
         outcome = "unknown"
         reason = "at least one related path could not be decided"
-    elif safe:
+    elif compared:
         outcome = "same"
         reason = "every related path is provably the same"
     else:
@@ -617,14 +763,21 @@ def compare_related_sources(
     ]
     evidence_refs.extend(item.evidence_ref for item in evidence)
 
+    relevant = sorted(set(source_paths) | set(artifact_paths) | set(unresolved))
     return SourceComparisonResult(
         project_id=project_id,
         historical_source_ref=historical_source_ref,
         outcome=outcome,
-        relevant_paths=list(union),
+        relevant_paths=relevant,
         changed_paths=sorted(changed),
         unknown_paths=sorted(unknown),
         unmatched_paths=sorted(unmatched),
+        unresolved_paths=sorted(unresolved),
+        artifact_paths=sorted(artifact_paths),
+        compared_paths=sorted(compared),
+        scope_trusted=scope.trusted,
+        scope_source=scope.plan_source,
+        coverage_id=scope.coverage_id,
         evidence_refs=evidence_refs,
         path_evidence=evidence,
         reason=reason,
