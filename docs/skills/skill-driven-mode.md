@@ -1044,3 +1044,92 @@ Q61 = required check 目标不变，由有权限的维护者在 PR 流程准备�
   `same/changed/unknown` 只是**比较凭据**；
 - **不**开放生产注册与多轮写入；**不**恢复 D-014 / I4 三位语义；
 - **不**在 B2-B 里落库比较结果（D-048 的追加式凭据是 B2-C 的活）。
+
+## CF-S2-B2-C 可信 prior_status 解析器（C1 + C2）
+
+**PM v3.0 裁定**：Q60 = **授权进入 B2-C**，但**两步顺序**：先关闭 B2-B-R01–R08（本轮已完成），
+再实现 resolver；Q58 明确 **D-048 不撤销**——B2-C 必须保存**追加式、可复核**的解析凭据
+（不能只存 SHA-256）。
+
+【事实】本轮实现 **C1（可信输入汇合）+ C2（确定性状态映射）**，契约与纯函数已就位；
+**C3（追加式解析凭据落库）本轮不做**，见下文「本片不做的事」。
+
+### 三态，不是十二个 prior_status
+
+```text
+resolved   历史读到了，而且只说一件事：11 个上游 prior_status 之一
+unknown    历史读不到能下结论的程度 → **不携带任何 prior_status**
+failed     已登记的记录自相矛盾
+```
+
+【事实】契约层强制这条边界：`state != resolved` 时 `prior_status` **必须为空**
+（`unknown` 不是第十二个 prior_status，猜一个比留空更糟——猜会压掉本该重做的工作）。
+
+【事实】`reason_code` 是**稳定标识符**（`RESOLUTION_REASON_CODES`），复核可以按原因计数，
+而不是按散文计数。
+
+### N6 冻结的 11 值映射
+
+| 历史证据条件 | `prior_status` |
+|---|---|
+| 没有兼容的历史 ledger（可信、完整、且范围为空） | `none` |
+| 有兼容历史 ledger，但当前 unit 不在其中 | `new` |
+| 历史漏洞已确认，相关源码未变化 | `prior_confirmed_same_source` |
+| 历史漏洞已确认，相关源码已变化 | `prior_confirmed_changed_source` |
+| 历史漏洞仍需验证 | `prior_needs_validation` |
+| 历史覆盖因配额等原因延后 | `prior_deferred` |
+| 历史覆盖受阻 | `prior_blocked` |
+| 历史覆盖不在范围内 | `prior_out_of_scope` |
+| 历史覆盖完成，相关源码未变化 | `prior_covered_same_source` |
+| 历史覆盖完成，相关源码已变化 | `prior_covered_changed_source` |
+| 历史被否定的漏洞主张出现实质性新证据 | `prior_rejected_claim_changed` |
+
+【事实】**`none` 与 `new` 是两件事**：`none` 说「根本没有兼容的历史 ledger」，
+`new` 说「有兼容历史，只是这个 unit 是新的」。两者**都**依赖
+**可信且完整**的历史范围（verified lineage seal + `completeness = complete`）：
+范围不可信或不完整时，**缺席不能被当成结论**。
+
+【事实】**裁定优先于覆盖状态**：有可信历史裁定时按裁定映射；没有时才按 unit 的覆盖状态映射。
+
+【事实】源码比较判不出来（`unknown`）时，**不**折算成 `same` 或 `changed`——
+结论保持 `unknown`。
+
+### 可信输入（C1）
+
+| 输入 | 来源 | 谁能伪造 |
+|---|---|---|
+| 历史范围 | 服务端核验过的 lineage seal 状态 | 不能 |
+| 历史 unit 状态 | **登记过的** ledger 字节（先核对登记摘要） | 不能 |
+| 源码比较 | CF-S2-B2-B 的比较器 | 不能 |
+| 历史裁定 | 带证据引用的可信裁定 | 不能 |
+| 当前 claim | 带证据摘要的当前主张 | 不能 |
+
+【事实】ledger 字节与登记摘要不符时**直接拒绝**（`BaselineResolutionRejected`），
+不是「过滤掉这一份继续算」。
+
+【事实】两个成员对同一个 unit 的状态说法不一致时 → `failed`（冲突），
+**不按顺序挑第一个**。
+
+### 当前做不到的事（诚实记录）
+
+【事实】**历史裁定还没有可信来源**：finding 的裁定不在 coverage ledger 里，
+它在 findings 工件里，而 findings 工件**尚未登记**（B2-A 只登记了 ledger / metadata /
+冻结源码清单）。因此依赖裁定的 4 个值
+（`prior_confirmed_*` / `prior_needs_validation` / `prior_rejected_claim_changed`）
+在**生产路径上目前不可达**，解析器会给出 `unknown` 而不是猜。
+合成用例可以覆盖它们，那只是**映射矩阵**，不是真实历史解析成功。
+
+### 本片验收
+
+【事实】`test_baseline_resolution.py`：27 条，覆盖 11 值矩阵全可达、
+`unknown` 不携带 prior_status、范围不可信/不完整/冲突的失败关闭、
+比较判不出来时不折算、两个成员冲突、同输入同摘要、
+以及受控入口「自己取可信范围」与「拒绝未登记 ledger」。
+
+### 本片不做的事
+
+- **不**落库解析凭据（D-048 的 `coverage_baseline_resolutions` 是 **C3**，本轮不做）；
+- **不**开放生产注册与多轮写入；
+- **不**恢复 D-014 / I4 三位语义；
+- **不**把解析结果接进 `unit_registered`（不改既有事件）；
+- **不**用合成用例冒充真实历史来源解析成功。
