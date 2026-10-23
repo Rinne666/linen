@@ -27,11 +27,18 @@ verified.
 from __future__ import annotations
 
 import re
+from enum import Enum
 from typing import Any, Literal, Mapping
 
 from pydantic import Field, field_validator, model_validator
 
-from .common import ContractModel, cf_canonical_json, cf_payload_digest, validate_sha256
+from .common import (
+    CF_PRIOR_STATUSES,
+    ContractModel,
+    cf_canonical_json,
+    cf_payload_digest,
+    validate_sha256,
+)
 
 #: The versioned prefix of an immutable reference (D-031 in PM v2.1).
 CF_REFERENCE_PREFIX = "cf-ref-v1:"
@@ -891,6 +898,144 @@ class SourcePathEvidence(ContractModel):
         if value is None:
             return None
         return validate_sha256(value)
+
+
+class PriorStatusResolutionState(str, Enum):
+    """The three states of one prior status resolution (CF-S2-B2-C).
+
+    ``resolved``
+        the history was found and it says one thing: exactly one of the eleven
+        upstream ``prior_status`` values;
+    ``unknown``
+        the history could not be read well enough to say anything.  **``unknown``
+        is not a twelfth prior status** - it carries no ``prior_status`` at all;
+    ``failed``
+        the resolution itself broke: a registered record contradicts itself.
+    """
+
+    resolved = "resolved"
+    unknown = "unknown"
+    failed = "failed"
+
+
+#: The reason codes of a resolution.  They are stable identifiers, so a review
+#: can be counted by reason and not by prose.
+RESOLUTION_REASON_CODES: tuple[str, ...] = (
+    # no compatible history at all, proven by a trusted negative scope
+    "no_compatible_history",
+    # compatible history exists, but this coverage unit is new in it
+    "unit_absent_from_complete_history",
+    # the historical unit carried a coverage state
+    "historical_unit_deferred",
+    "historical_unit_blocked",
+    "historical_unit_out_of_scope",
+    "historical_unit_covered_same_source",
+    "historical_unit_covered_changed_source",
+    # the historical unit carried a verdict
+    "historical_finding_confirmed_same_source",
+    "historical_finding_confirmed_changed_source",
+    "historical_finding_needs_validation",
+    "historical_rejected_claim_has_new_evidence",
+    # the resolution could not be made
+    "history_scope_not_trusted",
+    "history_scope_not_read",
+    "history_scope_conflict",
+    "source_comparison_unknown",
+    "no_trusted_historical_verdict",
+    "no_trusted_current_claim",
+    "historical_unit_has_no_evidence",
+)
+
+
+class PriorStatusResolution(ContractModel):
+    """The resolution of one coverage unit's ``prior_status`` (CF-S2-B2-C).
+
+    The resolution is the **only** thing that may carry a ``prior_status``.
+    It says which history it read, which proof it relied on, and why it
+    answered the way it did - and it says nothing at all when it does not
+    know: an ``unknown`` resolution carries an empty ``prior_status`` rather
+    than a guess.
+
+    The mapping itself is the one the PM froze as N6: eleven legal values, a
+    single value per unit, and ``none``/``new`` kept apart from each other.
+    """
+
+    schema_version: int = 1
+    project_id: str = Field(min_length=1, max_length=2048)
+    run_id: str = Field(min_length=1, max_length=2048)
+    coverage_id: str = Field(min_length=1, max_length=2048)
+    state: PriorStatusResolutionState
+    #: The upstream prior status.  Empty unless the state is ``resolved``.
+    prior_status: str = Field(default="", max_length=64)
+    #: A stable identifier of the reason.
+    reason_code: str = Field(min_length=1, max_length=64)
+    #: The prose of the reason.
+    reason: str = Field(default="", max_length=4096)
+    #: The structured reference to the history the resolution read (D-037).
+    lookup_ref: str = Field(default="", max_length=256)
+    #: The trusted lineage seal the scope came from, when there is one.
+    lineage_seal_ref: str = Field(default="", max_length=256)
+    #: The trusted source attestations the comparison relied on.
+    source_attestation_refs: list[str] = Field(default_factory=list, max_length=200)
+    #: The digest of the source comparison the resolution used.
+    source_comparison_digest: str = Field(default="", max_length=64)
+    #: The status the historical unit carried, when one was found.
+    historical_unit_status: str = Field(default="", max_length=64)
+    #: The fingerprints of the historical unit, when one was found.
+    historical_fingerprints: list[str] = Field(default_factory=list, max_length=500)
+    #: The evidence references a reviewer can look up.
+    evidence_refs: list[str] = Field(default_factory=list, max_length=200)
+    #: The digest of this resolution's own body.
+    resolution_digest: str = Field(min_length=64, max_length=64)
+
+    @field_validator("reason_code")
+    @classmethod
+    def _validate_reason_code(cls, value: str) -> str:
+        if value not in RESOLUTION_REASON_CODES:
+            raise ValueError(
+                "the reason code must be one of the stable identifiers: "
+                + ", ".join(RESOLUTION_REASON_CODES)
+            )
+        return value
+
+    @field_validator("resolution_digest")
+    @classmethod
+    def _validate_resolution_digest(cls, value: str) -> str:
+        return validate_sha256(value)
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> "PriorStatusResolution":
+        if self.state == PriorStatusResolutionState.resolved:
+            if self.prior_status not in CF_PRIOR_STATUSES:
+                raise ValueError(
+                    "a resolved prior status must be one of the upstream values: "
+                    + ", ".join(CF_PRIOR_STATUSES)
+                )
+        elif self.prior_status:
+            raise ValueError(
+                "an unresolved resolution carries no prior status: 'unknown' is "
+                "not a twelfth prior status, and a guess is worse than a gap"
+            )
+        if self.source_comparison_digest:
+            validate_sha256(self.source_comparison_digest)
+        return self
+
+    def body(self) -> dict[str, Any]:
+        """The body the resolution digest is computed over."""
+
+        content = self.model_dump(mode="json")
+        content.pop("resolution_digest", None)
+        return content
+
+    @classmethod
+    def issue(cls, **fields: Any) -> "PriorStatusResolution":
+        """Seal a resolution over the fields that describe one decision."""
+
+        payload = {
+            key: value for key, value in fields.items() if key != "resolution_digest"
+        }
+        digest = cf_payload_digest(cls(**payload, resolution_digest="0" * 64).body())
+        return cls(**payload, resolution_digest=digest)
 
 
 class SourceComparisonResult(ContractModel):

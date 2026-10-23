@@ -34,7 +34,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from linen.contracts.baseline import (
     LedgerValidationReceipt,
@@ -427,6 +427,78 @@ def seal_historical_scope(
         conn=conn, project_id=project_id, seal=seal, envelope=envelope
     )
     return seal
+
+
+def resolve_prior_status(
+    *,
+    conn: Any,
+    project_id: str,
+    run_id: str,
+    coverage_id: str,
+    historical_ledgers: Mapping[str, bytes] | None = None,
+    comparison: Any | None = None,
+    verdict: Any | None = None,
+    current_claim: Any | None = None,
+    lookup_ref: str = "",
+) -> Any:
+    """Resolve the ``prior_status`` of one coverage unit (CF-S2-B2-C).
+
+    This is the controlled entry point of the resolver.  It gathers the
+    **trusted** inputs and then maps them onto the eleven upstream values:
+
+    * the historical scope comes from the run's own lineage seal status, and
+      only a verified, complete seal may carry a negative conclusion;
+    * the historical unit state is read from the registered ledger bytes,
+      after their digests were checked against the registration;
+    * the source comparison is the one CF-S2-B2-B produced.
+
+    It does **not** write anything down: the resolution receipt is a separate
+    concern (D-048), and until it exists the resolution is a result, not a
+    record.
+    """
+
+    from linen.server.baseline_proofs import (
+        lineage_seal_status,
+        source_attestation_status,
+    )
+    from linen.server.baseline_resolution import (
+        TrustedHistoryScope,
+        resolve_prior_status as _resolve,
+        unit_state_from_ledgers,
+        verified_historical_ledgers,
+    )
+
+    seal_status = lineage_seal_status(conn, project_id=project_id, run_id=run_id)
+    scope = TrustedHistoryScope.from_seal_status(seal_status)
+
+    ledgers = verified_historical_ledgers(
+        conn, project_id=project_id, ledgers=dict(historical_ledgers or {})
+    )
+    unit, conflict = unit_state_from_ledgers(ledgers, coverage_id=coverage_id)
+
+    attestation_refs: list[str] = []
+    for source_ref in sorted(ledgers):
+        status = source_attestation_status(
+            conn, project_id=project_id, source_ref=source_ref
+        )
+        attestation_refs.extend(
+            attestation.evidence_ref for attestation in status.attestations
+        )
+
+    return _resolve(
+        project_id=project_id,
+        run_id=run_id,
+        coverage_id=coverage_id,
+        scope=scope,
+        unit=unit,
+        comparison=comparison,
+        verdict=verdict,
+        current_claim=current_claim,
+        lookup_ref=lookup_ref,
+        source_attestation_refs=attestation_refs,
+        unit_conflict=conflict,
+        read_source_refs=tuple(sorted(ledgers)),
+    )
 
 
 def compare_related_sources(
